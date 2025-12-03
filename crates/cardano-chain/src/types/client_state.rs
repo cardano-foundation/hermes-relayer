@@ -1,13 +1,17 @@
 //! Cardano client state for IBC
 
+use ibc_relayer_types::core::ics02_client::client_state::ClientState;
+use ibc_relayer_types::core::ics02_client::client_type::ClientType;
+use ibc_relayer_types::core::ics24_host::identifier::ChainId;
 use ibc_relayer_types::Height;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// Cardano IBC client state
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardanoClientState {
     /// Chain ID
-    pub chain_id: String,
+    pub chain_id: ChainId,
     
     /// Latest height
     pub latest_height: Height,
@@ -34,7 +38,7 @@ impl CardanoClientState {
         mithril_genesis_vkey: Vec<u8>,
     ) -> Self {
         Self {
-            chain_id,
+            chain_id: ChainId::from_string(&chain_id),
             latest_height,
             trusting_period,
             unbonding_period,
@@ -42,9 +46,28 @@ impl CardanoClientState {
             mithril_genesis_vkey,
         }
     }
-    
-    pub fn is_frozen(&self) -> bool {
-        self.frozen_height.is_some()
+}
+
+impl ClientState for CardanoClientState {
+    fn chain_id(&self) -> ChainId {
+        self.chain_id.clone()
+    }
+
+    fn client_type(&self) -> ClientType {
+        ClientType::Cardano
+    }
+
+    fn latest_height(&self) -> Height {
+        self.latest_height
+    }
+
+    fn frozen_height(&self) -> Option<Height> {
+        self.frozen_height
+    }
+
+    fn expired(&self, elapsed: Duration) -> bool {
+        // Check if the client is expired based on the trusting period
+        elapsed > Duration::from_secs(self.trusting_period)
     }
 }
 

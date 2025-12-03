@@ -4051,6 +4051,7 @@ dependencies = [
  "ibc-proto",
  "ibc-relayer",
  "ibc-relayer-types",
+ "lazy_static",
  "pallas-codec",
  "pallas-primitives",
  "prost",
