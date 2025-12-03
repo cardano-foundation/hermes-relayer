@@ -2,7 +2,7 @@
 //!
 //! This module implements the ChainEndpoint trait required by Hermes for custom chain support.
 
-use crate::config::CardanoChainConfig;
+use ibc_relayer::chain::cardano::CardanoConfig;
 use crate::error::Error as CardanoError;
 use crate::gateway_client::GatewayClient;
 use crate::keyring::CardanoKeyring;
@@ -69,7 +69,7 @@ impl From<CardanoSigningKeyPair> for AnySigningKeyPair {
 
 /// Cardano ChainEndpoint implementation
 pub struct CardanoChainEndpoint {
-    config: CardanoChainConfig,
+    config: CardanoConfig,
     rt: Arc<TokioRuntime>,
     gateway_client: GatewayClient,
     keyring: KeyRing<CardanoSigningKeyPair>,
@@ -84,21 +84,62 @@ impl ChainEndpoint for CardanoChainEndpoint {
     type SigningKeyPair = CardanoSigningKeyPair;
 
     fn id(&self) -> &ChainId {
-        todo!("Implement id()")
+        &self.config.id
     }
 
     fn config(&self) -> ChainConfig {
-        todo!("Implement config()")
+        ChainConfig::Cardano(self.config.clone())
     }
 
     fn bootstrap(config: ChainConfig, rt: Arc<TokioRuntime>) -> Result<Self, Error> {
         tracing::info!("Bootstrapping Cardano chain endpoint");
         
-        // TODO: Parse Cardano-specific config
-        // TODO: Initialize Gateway client
-        // TODO: Setup keyring
-        
-        Err(Error::config(ConfigError::wrong_type()))
+        // Extract Cardano-specific config
+        let cardano_config: CardanoConfig = match config {
+            ChainConfig::Cardano(config) => config,
+            _ => {
+                tracing::error!("Invalid config type provided to Cardano bootstrap");
+                return Err(Error::config(ConfigError::wrong_type()));
+            }
+        };
+
+        tracing::info!(
+            "Initializing Cardano endpoint for chain: {}, gateway: {}",
+            cardano_config.id,
+            cardano_config.gateway_url
+        );
+
+        // Initialize Gateway client (async operation, so use rt.block_on)
+        let gateway_client = rt
+            .block_on(GatewayClient::new(cardano_config.gateway_url.clone()))
+            .map_err(|e| {
+                tracing::error!("Failed to initialize Gateway client: {}", e);
+                Error::config(ConfigError::wrong_type())
+            })?;
+
+        tracing::info!("Gateway client initialized successfully");
+
+        // Initialize keyring
+        // Note: Cardano uses "addr" as account prefix (similar to how Cosmos uses prefixes)
+        let keyring = KeyRing::new(
+            cardano_config.key_store_type,
+            "addr", // Cardano address prefix
+            &cardano_config.id,
+            &cardano_config.key_store_folder,
+        )
+        .map_err(Error::key_base)?;
+
+        tracing::info!("Keyring initialized successfully");
+
+        let endpoint = Self {
+            config: cardano_config,
+            rt,
+            gateway_client,
+            keyring,
+        };
+
+        tracing::info!("Cardano chain endpoint bootstrap complete");
+        Ok(endpoint)
     }
 
     fn shutdown(self) -> Result<(), Error> {

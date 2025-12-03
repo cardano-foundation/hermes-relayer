@@ -4048,6 +4048,7 @@ dependencies = [
  "ed25519-dalek 2.1.1",
  "hdpath",
  "hex",
+ "humantime-serde",
  "ibc-proto",
  "ibc-relayer",
  "ibc-relayer-types",
