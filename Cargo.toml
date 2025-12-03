@@ -9,6 +9,7 @@ members = [
     "crates/relayer-rest",
     "crates/telemetry",
     "crates/chain-registry",
+    "crates/cardano-chain",
     "tools/integration-test",
     "tools/test-framework",
 ]
