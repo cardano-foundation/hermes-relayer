@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 humantime-serde = { workspace = true }
+tendermint = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tonic = { workspace = true }
 prost = { workspace = true }

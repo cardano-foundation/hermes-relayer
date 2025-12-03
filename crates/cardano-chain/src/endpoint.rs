@@ -37,7 +37,7 @@ use ibc_relayer::denom::DenomTrace;
 use ibc_relayer::config::Error as ConfigError;
 use ibc_relayer::error::Error;
 use ibc_relayer::event::IbcEventWithHeight;
-use ibc_relayer::keyring::{AnySigningKeyPair, KeyRing, SigningKeyPairSized};
+use ibc_relayer::keyring::{AnySigningKeyPair, KeyRing, SigningKeyPair, SigningKeyPairSized};
 use ibc_relayer::misbehaviour::MisbehaviourEvidence;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
 use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header};
@@ -49,6 +49,7 @@ use ibc_relayer_types::core::ics23_commitment::merkle::MerkleProof;
 use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ChannelId, ClientId, ConnectionId, PortId};
 use ibc_relayer_types::proofs::Proofs;
 use ibc_relayer_types::signer::Signer;
+use std::str::FromStr;
 use ibc_relayer_types::Height as ICSHeight;
 use tendermint_rpc::endpoint::broadcast::tx_sync::Response as TxResponse;
 use tokio::runtime::Runtime as TokioRuntime;
@@ -166,13 +167,20 @@ impl ChainEndpoint for CardanoChainEndpoint {
     }
 
     fn get_signer(&self) -> Result<Signer, Error> {
-        // TODO: Get signer address from keyring
-        todo!("Implement get_signer()")
+        // Get the key from keyring and return its address as signer
+        let key = self.keyring.get_key(&self.config.key_name)
+            .map_err(Error::key_base)?;
+        
+        // Use the account (Cardano address) as the signer
+        // Signer must be created from a string using FromStr
+        Signer::from_str(&key.account())
+            .map_err(|e| Error::key_base(ibc_relayer::keyring::errors::Error::invalid_mnemonic(anyhow::anyhow!("Invalid signer address: {}", e))))
     }
 
     fn get_key(&self) -> Result<Self::SigningKeyPair, Error> {
-        // TODO: Get signing key from keyring
-        todo!("Implement get_key()")
+        // Get the signing key pair from keyring
+        self.keyring.get_key(&self.config.key_name)
+            .map_err(Error::key_base)
     }
 
     fn version_specs(&self) -> Result<Specs, Error> {
@@ -253,9 +261,22 @@ impl ChainEndpoint for CardanoChainEndpoint {
     }
 
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
-        // TODO: Query latest block via Gateway
-        tracing::warn!("query_application_status: stub implementation");
-        todo!("Implement query_application_status()")
+        tracing::debug!("Querying Cardano application status via Gateway");
+        
+        // Query latest height from Gateway
+        let height = self.rt.block_on(self.gateway_client.query_latest_height())
+            .map_err(|e| {
+                tracing::error!("Failed to query latest height: {}", e);
+                Error::query(format!("Gateway query_latest_height failed: {}", e))
+            })?;
+        
+        tracing::info!("Cardano chain at height: {}", height);
+        
+        Ok(ChainStatus {
+            height,
+            // Use current time as timestamp; TODO: Get actual timestamp from Gateway
+            timestamp: tendermint::Time::now().into(),
+        })
     }
 
     fn query_clients(
@@ -272,9 +293,28 @@ impl ChainEndpoint for CardanoChainEndpoint {
         request: QueryClientStateRequest,
         include_proof: IncludeProof,
     ) -> Result<(AnyClientState, Option<MerkleProof>), Error> {
-        // TODO: Query specific client state via Gateway
-        tracing::warn!("query_client_state: stub implementation");
-        todo!("Implement query_client_state()")
+        tracing::debug!("Querying client state for: {}", request.client_id);
+        
+        // Query client state from Gateway
+        let client_state = self.rt.block_on(
+            self.gateway_client.query_client_state(request.client_id.as_str())
+        ).map_err(|e| {
+            tracing::error!("Failed to query client state: {}", e);
+            Error::query(format!("Gateway query_client_state failed: {}", e))
+        })?;
+        
+        // Convert to AnyClientState using the From trait
+        let any_client_state: AnyClientState = client_state.into();
+        
+        // TODO: Generate proof if include_proof is true
+        let proof = if include_proof == IncludeProof::Yes {
+            tracing::warn!("Proof generation not yet implemented");
+            None
+        } else {
+            None
+        };
+        
+        Ok((any_client_state, proof))
     }
 
     fn query_consensus_state(
@@ -282,9 +322,35 @@ impl ChainEndpoint for CardanoChainEndpoint {
         request: QueryConsensusStateRequest,
         include_proof: IncludeProof,
     ) -> Result<(AnyConsensusState, Option<MerkleProof>), Error> {
-        // TODO: Query consensus state via Gateway
-        tracing::warn!("query_consensus_state: stub implementation");
-        todo!("Implement query_consensus_state()")
+        tracing::debug!(
+            "Querying consensus state for client: {} at height: {:?}",
+            request.client_id,
+            request.consensus_height
+        );
+        
+        // Query consensus state from Gateway
+        let consensus_state = self.rt.block_on(
+            self.gateway_client.query_consensus_state(
+                request.client_id.as_str(),
+                request.consensus_height
+            )
+        ).map_err(|e| {
+            tracing::error!("Failed to query consensus state: {}", e);
+            Error::query(format!("Gateway query_consensus_state failed: {}", e))
+        })?;
+        
+        // Convert to AnyConsensusState using the From trait
+        let any_consensus_state: AnyConsensusState = consensus_state.into();
+        
+        // TODO: Generate proof if include_proof is true
+        let proof = if include_proof == IncludeProof::Yes {
+            tracing::warn!("Proof generation not yet implemented");
+            None
+        } else {
+            None
+        };
+        
+        Ok((any_consensus_state, proof))
     }
 
     fn query_consensus_state_heights(
