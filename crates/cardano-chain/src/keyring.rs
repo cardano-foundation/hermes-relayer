@@ -6,7 +6,6 @@ use digest::Digest;
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer};
 use slip10::BIP32Path;
 use std::str::FromStr;
-use tiny_bip39::{Mnemonic, Seed};
 
 /// Cardano keyring for signing transactions
 pub struct CardanoKeyring {
@@ -20,11 +19,11 @@ impl CardanoKeyring {
     /// Uses CIP-1852 derivation: m/1852'/1815'/account'/2'/0'
     pub fn from_mnemonic(mnemonic: &str, account: u32) -> Result<Self, Error> {
         // Parse mnemonic
-        let mnemonic = Mnemonic::from_phrase(mnemonic, tiny_bip39::Language::English)
+        let mnemonic = tiny_bip39::Mnemonic::from_phrase(mnemonic, tiny_bip39::Language::English)
             .map_err(|e| Error::Keyring(format!("Invalid mnemonic: {:?}", e)))?;
 
         // Generate seed
-        let seed = Seed::new(&mnemonic, "");
+        let seed = tiny_bip39::Seed::new(&mnemonic, "");
         let seed_bytes = seed.as_bytes();
 
         // CIP-1852 path: m/1852'/1815'/account'/2'/0'

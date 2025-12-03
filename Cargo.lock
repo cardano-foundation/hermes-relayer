@@ -4047,6 +4047,7 @@ dependencies = [
  "digest 0.10.7",
  "ed25519-dalek 2.1.1",
  "hex",
+ "ibc-proto",
  "ibc-relayer",
  "ibc-relayer-types",
  "pallas-codec",

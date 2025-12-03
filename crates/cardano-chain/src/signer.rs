@@ -2,7 +2,7 @@
 
 use crate::error::Error;
 use crate::keyring::CardanoKeyring;
-use blake2::{Blake2b256, Digest};
+use blake2::digest::Digest;
 use pallas_codec::minicbor;
 use pallas_primitives::babbage::{MintedTx, VKeyWitness};
 
@@ -19,7 +19,7 @@ pub fn sign_transaction(
     let tx_body_cbor = minicbor::to_vec(&tx.transaction_body)
         .map_err(|e| Error::Signer(format!("Failed to encode transaction body: {:?}", e)))?;
 
-    let mut hasher = Blake2b256::new();
+    let mut hasher = blake2::Blake2b256::new();
     hasher.update(&tx_body_cbor);
     let tx_hash = hasher.finalize();
 

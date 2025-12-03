@@ -12,6 +12,7 @@ description = "Cardano chain implementation for IBC Relayer"
 # Hermes workspace dependencies
 ibc-relayer = { workspace = true }
 ibc-relayer-types = { workspace = true }
+ibc-proto = { workspace = true }
 
 # Standard workspace dependencies
 anyhow = { workspace = true }
@@ -35,7 +36,7 @@ digest = { workspace = true }
 
 # Cardano-specific
 slip10 = "0.4"
-blake2 = { version = "0.10", features = ["std"] }
+blake2 = "0.10"
 pallas-primitives = "0.30"
 pallas-codec = "0.30"
 

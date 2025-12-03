@@ -9,7 +9,7 @@ use crate::keyring::CardanoKeyring;
 use crate::signer;
 use crate::types::{CardanoClientState, CardanoConsensusState, CardanoHeader};
 
-use alloc::sync::Arc;
+use std::sync::Arc;
 use async_trait::async_trait;
 use ibc_relayer::account::Balance;
 use ibc_relayer::chain::client::ClientSettings;
@@ -17,6 +17,7 @@ use ibc_relayer::chain::endpoint::{ChainEndpoint, ChainStatus, HealthCheck};
 use ibc_relayer::chain::handle::Subscription;
 use ibc_relayer::chain::requests::*;
 use ibc_relayer::chain::tracking::TrackedMsgs;
+use ibc_relayer::chain::cosmos::version::Specs as CosmosSpecs;
 use ibc_relayer::chain::version::Specs;
 use ibc_relayer::client_state::{AnyClientState, IdentifiedAnyClientState};
 use ibc_relayer::config::ChainConfig;
@@ -34,7 +35,7 @@ use ibc_relayer_types::core::ics04_channel::channel::{ChannelEnd, IdentifiedChan
 use ibc_relayer_types::core::ics04_channel::packet::Sequence;
 use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentPrefix;
 use ibc_relayer_types::core::ics23_commitment::merkle::MerkleProof;
-use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ClientId, ConnectionId};
+use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ChannelId, ClientId, ConnectionId, PortId};
 use ibc_relayer_types::proofs::Proofs;
 use ibc_relayer_types::signer::Signer;
 use ibc_relayer_types::Height as ICSHeight;
@@ -95,9 +96,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // TODO: Initialize Gateway client
         // TODO: Setup keyring
         
-        Err(Error::config_validation_json_type(
-            "Cardano bootstrap not yet implemented".to_string(),
-        ))
+        Err(Error::config(format!("Cardano bootstrap not yet implemented")))
     }
 
     fn shutdown(self) -> Result<(), Error> {
@@ -112,9 +111,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn subscribe(&mut self) -> Result<Subscription, Error> {
         // TODO: Implement event subscription via Gateway
-        Err(Error::config_validation_json_type(
-            "Event subscription not yet implemented for Cardano".to_string(),
-        ))
+        Err(Error::config(format!("Event subscription not yet implemented for Cardano")))
     }
 
     fn keybase(&self) -> &KeyRing<Self::SigningKeyPair> {
@@ -137,7 +134,12 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn version_specs(&self) -> Result<Specs, Error> {
         // TODO: Return Cardano version info
-        Ok(Specs::default())
+        // Return empty Cosmos specs for now (Cardano doesn't use Cosmos SDK)
+        Ok(Specs::Cosmos(CosmosSpecs {
+            cosmos_sdk: None,
+            ibc_go: None,
+            consensus: None,
+        }))
     }
 
     fn send_messages_and_wait_commit(
@@ -196,12 +198,10 @@ impl ChainEndpoint for CardanoChainEndpoint {
         Ok(vec![])
     }
 
-    fn query_denom_trace(&self, hash: String) -> Result<DenomTrace, Error> {
+    fn query_denom_trace(&self, _hash: String) -> Result<DenomTrace, Error> {
         // Not applicable to Cardano (native assets)
         tracing::warn!("query_denom_trace: not applicable for Cardano");
-        Err(Error::config_validation_json_type(
-            "Denom trace not applicable for Cardano".to_string(),
-        ))
+        Err(Error::config(format!("Denom trace not applicable for Cardano")))
     }
 
     fn query_commitment_prefix(&self) -> Result<CommitmentPrefix, Error> {
@@ -462,20 +462,86 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn build_header(
         &mut self,
-        trusted_height: ICSHeight,
-        target_height: ICSHeight,
-        client_state: &AnyClientState,
+        _trusted_height: ICSHeight,
+        _target_height: ICSHeight,
+        _client_state: &AnyClientState,
     ) -> Result<(Self::Header, Vec<Self::Header>), Error> {
         // TODO: Build Cardano header with Mithril proof
         tracing::warn!("build_header: stub implementation");
         todo!("Implement build_header()")
     }
+
+    fn maybe_register_counterparty_payee(
+        &mut self,
+        _channel_id: &ChannelId,
+        _port_id: &PortId,
+        _counterparty_payee: &Signer,
+    ) -> Result<(), Error> {
+        // ICS-29 fee middleware - not implemented for Cardano yet
+        tracing::warn!("maybe_register_counterparty_payee: not implemented for Cardano");
+        Ok(())
+    }
+
+    fn cross_chain_query(
+        &self,
+        _requests: Vec<ibc_relayer_types::applications::ics31_icq::response::CrossChainQueryRequest>,
+    ) -> Result<Vec<ibc_relayer_types::applications::ics31_icq::response::CrossChainQueryResponse>, Error> {
+        // ICS-31 cross-chain query - not implemented for Cardano yet
+        tracing::warn!("cross_chain_query: not implemented for Cardano");
+        Ok(vec![])
+    }
+
+    fn query_incentivized_packet(
+        &self,
+        _request: ibc_proto::ibc::apps::fee::v1::QueryIncentivizedPacketRequest,
+    ) -> Result<ibc_proto::ibc::apps::fee::v1::QueryIncentivizedPacketResponse, Error> {
+        // ICS-29 fee middleware - not implemented for Cardano yet
+        tracing::warn!("query_incentivized_packet: not implemented for Cardano");
+        Err(Error::config(format!("ICS-29 fee middleware not implemented for Cardano")))
+    }
+
+    fn query_consumer_chains(&self) -> Result<Vec<ibc_relayer_types::applications::ics28_ccv::msgs::ConsumerChain>, Error> {
+        // ICS-28 CCV (Cross-Chain Validation) - not applicable to Cardano
+        tracing::warn!("query_consumer_chains: not applicable for Cardano");
+        Ok(vec![])
+    }
+
+    fn query_upgrade(
+        &self,
+        _request: ibc_proto::ibc::core::channel::v1::QueryUpgradeRequest,
+        _height: ibc_relayer_types::Height,
+        _include_proof: IncludeProof,
+    ) -> Result<(ibc_relayer_types::core::ics04_channel::upgrade::Upgrade, Option<MerkleProof>), Error> {
+        // Channel upgrades - not implemented for Cardano yet
+        tracing::warn!("query_upgrade: not implemented for Cardano");
+        todo!("Implement query_upgrade()")
+    }
+
+    fn query_upgrade_error(
+        &self,
+        _request: ibc_proto::ibc::core::channel::v1::QueryUpgradeErrorRequest,
+        _height: ibc_relayer_types::Height,
+        _include_proof: IncludeProof,
+    ) -> Result<(ibc_relayer_types::core::ics04_channel::upgrade::ErrorReceipt, Option<MerkleProof>), Error> {
+        // Channel upgrades - not implemented for Cardano yet
+        tracing::warn!("query_upgrade_error: not implemented for Cardano");
+        todo!("Implement query_upgrade_error()")
+    }
+
+    fn query_ccv_consumer_id(
+        &self,
+        _client_id: ClientId,
+    ) -> Result<ibc_relayer_types::applications::ics28_ccv::msgs::ConsumerId, Error> {
+        // ICS-28 CCV - not applicable to Cardano
+        tracing::warn!("query_ccv_consumer_id: not applicable for Cardano");
+        todo!("Implement query_ccv_consumer_id()")
+    }
 }
 
 // Implement Header trait for CardanoHeader to satisfy ChainEndpoint requirements
 impl Header for CardanoHeader {
-    fn client_type(&self) -> String {
-        "08-cardano".to_string()
+    fn client_type(&self) -> ibc_relayer_types::core::ics02_client::client_type::ClientType {
+        ibc_relayer_types::core::ics02_client::client_type::ClientType::Cardano
     }
 
     fn height(&self) -> ICSHeight {
