@@ -3,6 +3,7 @@
 use crate::error::Error;
 use crate::keyring::CardanoKeyring;
 use blake2::digest::Digest;
+use blake2::Blake2b512;
 use pallas_codec::minicbor;
 use pallas_primitives::babbage::{MintedTx, VKeyWitness};
 
@@ -19,9 +20,11 @@ pub fn sign_transaction(
     let tx_body_cbor = minicbor::to_vec(&tx.transaction_body)
         .map_err(|e| Error::Signer(format!("Failed to encode transaction body: {:?}", e)))?;
 
-    let mut hasher = blake2::Blake2b256::new();
+    // Cardano uses Blake2b-256 for transaction hashing
+    let mut hasher = Blake2b512::new();
     hasher.update(&tx_body_cbor);
-    let tx_hash = hasher.finalize();
+    let hash_output = hasher.finalize();
+    let tx_hash = &hash_output[..32]; // Take first 32 bytes for Blake2b-256
 
     // 3. Sign the transaction hash
     let signature = keyring.sign(&tx_hash);
@@ -35,22 +38,32 @@ pub fn sign_transaction(
         signature: sig.into(),
     };
 
-    // 5. Add witness to witness set
-    let mut witness_set = tx.transaction_witness_set.clone();
+    // 5. Reconstruct the transaction with the new witness
+    // We need to work around Pallas's KeepRaw immutability by reconstructing the entire tx
+    let mut new_vkeywitnesses = tx.transaction_witness_set.vkeywitness.clone().unwrap_or_default().to_vec();
+    new_vkeywitnesses.push(vkey_witness);
     
-    if witness_set.vkeywitness.is_none() {
-        witness_set.vkeywitness = Some(vec![]);
-    }
+    // Create a new witness set with the added signature
+    let new_witness_set = pallas_primitives::babbage::MintedWitnessSet {
+        vkeywitness: Some(new_vkeywitnesses.into()),
+        native_script: tx.transaction_witness_set.native_script.clone(),
+        bootstrap_witness: tx.transaction_witness_set.bootstrap_witness.clone(),
+        plutus_v1_script: tx.transaction_witness_set.plutus_v1_script.clone(),
+        plutus_data: tx.transaction_witness_set.plutus_data.clone(),
+        redeemer: tx.transaction_witness_set.redeemer.clone(),
+        plutus_v2_script: tx.transaction_witness_set.plutus_v2_script.clone(),
+    };
     
-    if let Some(ref mut vkeys) = witness_set.vkeywitness {
-        vkeys.push(vkey_witness);
-    }
+    // Create new transaction with updated witness set
+    let signed_tx = pallas_primitives::babbage::MintedTx {
+        transaction_body: tx.transaction_body.clone(),
+        transaction_witness_set: new_witness_set,
+        success: tx.success,
+        auxiliary_data: tx.auxiliary_data.clone(),
+    };
 
-    // 6. Update the transaction with new witness set
-    tx.transaction_witness_set = witness_set;
-
-    // 7. Re-encode the signed transaction
-    let signed_tx_cbor = minicbor::to_vec(&tx)
+    // 6. Encode the signed transaction
+    let signed_tx_cbor = minicbor::to_vec(&signed_tx)
         .map_err(|e| Error::Signer(format!("Failed to encode signed transaction: {:?}", e)))?;
 
     Ok(signed_tx_cbor)

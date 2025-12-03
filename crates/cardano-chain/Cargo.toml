@@ -32,7 +32,7 @@ hdpath = { workspace = true }
 
 # Cryptography
 ed25519-dalek = { workspace = true }
-tiny-bip39 = { workspace = true }
+tiny-bip39 = { version = "1.0", package = "tiny-bip39" }
 digest = { workspace = true }
 
 # Cardano-specific

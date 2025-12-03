@@ -3,6 +3,7 @@
 //! This crate provides a Cardano-specific implementation of the ChainEndpoint trait
 //! for the Hermes IBC relayer.
 
+pub mod any_conversions;
 pub mod chain_handle;
 pub mod config;
 pub mod endpoint;
