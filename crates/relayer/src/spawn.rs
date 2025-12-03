@@ -87,6 +87,12 @@ pub fn spawn_chain_runtime_with_config<Handle: ChainHandle>(
         ChainConfig::CosmosSdk(_) => ChainRuntime::<CosmosSdkChain>::spawn(config, rt),
         ChainConfig::Namada(_) => ChainRuntime::<NamadaChain>::spawn(config, rt),
         ChainConfig::Penumbra(_) => ChainRuntime::<PenumbraChain>::spawn(config, rt),
+        ChainConfig::Cardano(_) => {
+            // TODO: Implement ChainRuntime for Cardano
+            return Err(SpawnError::relayer(crate::error::Error::config(
+                crate::config::Error::wrong_type(),
+            )));
+        }
     }
     .map_err(SpawnError::relayer)?;
 

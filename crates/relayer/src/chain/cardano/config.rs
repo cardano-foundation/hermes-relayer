@@ -5,10 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::config::PacketFilter;
+use crate::keyring::Store;
+
 /// Minimal configuration for Cardano chain integration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct CardanoChainConfig {
+pub struct CardanoConfig {
     /// The chain's network identifier
     pub id: ChainId,
 
@@ -23,7 +26,7 @@ pub struct CardanoChainConfig {
 
     /// Keystore type (test, file, etc.)
     #[serde(default)]
-    pub key_store_type: ibc_relayer::keyring::Store,
+    pub key_store_type: Store,
 
     /// Optional path to keystore folder
     pub key_store_folder: Option<PathBuf>,
@@ -38,30 +41,52 @@ pub struct CardanoChainConfig {
 
     /// Packet filter configuration
     #[serde(default)]
-    pub packet_filter: ibc_relayer::config::PacketFilter,
+    pub packet_filter: PacketFilter,
 
     /// Optional trust threshold (not used by Cardano but required by config interface)
     #[serde(default)]
     pub trust_threshold: Option<ibc_relayer_types::core::ics02_client::trust_threshold::TrustThreshold>,
+
+    /// How many packets to fetch at once from the chain when clearing packets
+    #[serde(default = "default_query_packets_chunk_size")]
+    pub query_packets_chunk_size: usize,
+
+    /// Optional clear interval
+    pub clear_interval: Option<u64>,
+
+    /// Clock drift tolerance
+    #[serde(default = "default_clock_drift", with = "humantime_serde")]
+    pub clock_drift: Duration,
 }
 
 fn default_max_block_time() -> Duration {
     Duration::from_secs(30)
 }
 
-impl Default for CardanoChainConfig {
+fn default_query_packets_chunk_size() -> usize {
+    50
+}
+
+fn default_clock_drift() -> Duration {
+    Duration::from_secs(5)
+}
+
+impl Default for CardanoConfig {
     fn default() -> Self {
         Self {
             id: ChainId::from_string("cardano-test"),
             gateway_url: "http://localhost:3001".to_string(),
             network_id: 0,
             key_name: "default".to_string(),
-            key_store_type: ibc_relayer::keyring::Store::Test,
+            key_store_type: Store::Test,
             key_store_folder: None,
             account: 0,
             max_block_time: default_max_block_time(),
-            packet_filter: ibc_relayer::config::PacketFilter::default(),
+            packet_filter: PacketFilter::default(),
             trust_threshold: None,
+            query_packets_chunk_size: default_query_packets_chunk_size(),
+            clear_interval: None,
+            clock_drift: default_clock_drift(),
         }
     }
 }
