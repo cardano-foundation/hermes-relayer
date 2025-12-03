@@ -33,7 +33,7 @@ impl CardanoSigningKeyPair {
     /// Create a new CardanoSigningKeyPair from components
     pub fn new(mnemonic: String, account: u32, network_id: u8) -> Result<Self, KeyringError> {
         let keyring = CardanoKeyring::from_mnemonic(&mnemonic, account)
-            .map_err(|e| KeyringError::encode(e.to_string()))?;
+            .map_err(|_| KeyringError::invalid_mnemonic(anyhow::anyhow!("Failed to derive Cardano key from mnemonic")))?;
         
         Ok(Self {
             keyring: Some(keyring),
@@ -47,7 +47,7 @@ impl CardanoSigningKeyPair {
     fn ensure_keyring(&mut self) -> Result<(), KeyringError> {
         if self.keyring.is_none() {
             let keyring = CardanoKeyring::from_mnemonic(&self.mnemonic, self.account)
-                .map_err(|e| KeyringError::encode(e.to_string()))?;
+                .map_err(|_| KeyringError::invalid_mnemonic(anyhow::anyhow!("Failed to reinitialize keyring")))?;
             self.keyring = Some(keyring);
         }
         Ok(())
@@ -57,7 +57,7 @@ impl CardanoSigningKeyPair {
     fn keyring(&mut self) -> Result<&CardanoKeyring, KeyringError> {
         self.ensure_keyring()?;
         self.keyring.as_ref().ok_or_else(|| {
-            KeyringError::encode("Keyring not initialized".to_string())
+            KeyringError::key_not_found()
         })
     }
 
@@ -65,7 +65,7 @@ impl CardanoSigningKeyPair {
     fn keyring_mut(&mut self) -> Result<&mut CardanoKeyring, KeyringError> {
         self.ensure_keyring()?;
         self.keyring.as_mut().ok_or_else(|| {
-            KeyringError::encode("Keyring not initialized".to_string())
+            KeyringError::key_not_found()
         })
     }
 }
@@ -158,7 +158,7 @@ mod tests {
         let json = serde_json::to_string(&key_pair).unwrap();
         
         // Deserialize
-        let mut deserialized: CardanoSigningKeyPair = serde_json::from_str(&json).unwrap();
+        let deserialized: CardanoSigningKeyPair = serde_json::from_str(&json).unwrap();
         
         // Test that it still works
         let message = b"test";

@@ -7,6 +7,11 @@ use ibc_proto::Protobuf;
 use ibc_relayer_types::clients::ics07_tendermint::consensus_state::{
     ConsensusState as TmConsensusState, TENDERMINT_CONSENSUS_STATE_TYPE_URL,
 };
+
+#[cfg(feature = "cardano")]
+use ibc_cardano_chain::types::CardanoConsensusState;
+
+const CARDANO_CONSENSUS_STATE_TYPE_URL: &str = "/ibc.lightclients.cardano.v1.ConsensusState";
 use ibc_relayer_types::core::ics02_client::client_type::ClientType;
 use ibc_relayer_types::core::ics02_client::consensus_state::ConsensusState;
 use ibc_relayer_types::core::ics02_client::error::Error;
@@ -18,18 +23,24 @@ use ibc_relayer_types::Height;
 #[serde(tag = "type")]
 pub enum AnyConsensusState {
     Tendermint(TmConsensusState),
+    #[cfg(feature = "cardano")]
+    Cardano(CardanoConsensusState),
 }
 
 impl AnyConsensusState {
     pub fn timestamp(&self) -> Timestamp {
         match self {
             Self::Tendermint(cs_state) => cs_state.timestamp.into(),
+            #[cfg(feature = "cardano")]
+            Self::Cardano(cs_state) => ConsensusState::timestamp(cs_state),
         }
     }
 
     pub fn client_type(&self) -> ClientType {
         match self {
             AnyConsensusState::Tendermint(_cs) => ClientType::Tendermint,
+            #[cfg(feature = "cardano")]
+            AnyConsensusState::Cardano(_cs) => ClientType::Cardano,
         }
     }
 }
@@ -48,6 +59,14 @@ impl TryFrom<Any> for AnyConsensusState {
                     .map_err(Error::decode_raw_client_state)?,
             )),
 
+            #[cfg(feature = "cardano")]
+            CARDANO_CONSENSUS_STATE_TYPE_URL => {
+                // For now, deserialize from JSON (will need proper protobuf later)
+                let cardano_state: CardanoConsensusState = serde_json::from_slice(&value.value)
+                    .map_err(|e| Error::decode_raw_client_state(e.into()))?;
+                Ok(AnyConsensusState::Cardano(cardano_state))
+            }
+
             _ => Err(Error::unknown_consensus_state_type(value.type_url)),
         }
     }
@@ -60,6 +79,12 @@ impl From<AnyConsensusState> for Any {
                 type_url: TENDERMINT_CONSENSUS_STATE_TYPE_URL.to_string(),
                 value: Protobuf::<RawConsensusState>::encode_vec(value),
             },
+            #[cfg(feature = "cardano")]
+            AnyConsensusState::Cardano(value) => Any {
+                type_url: CARDANO_CONSENSUS_STATE_TYPE_URL.to_string(),
+                // For now, serialize to JSON (will need proper protobuf later)
+                value: serde_json::to_vec(&value).unwrap_or_default(),
+            },
         }
     }
 }
@@ -67,6 +92,13 @@ impl From<AnyConsensusState> for Any {
 impl From<TmConsensusState> for AnyConsensusState {
     fn from(cs: TmConsensusState) -> Self {
         Self::Tendermint(cs)
+    }
+}
+
+#[cfg(feature = "cardano")]
+impl From<CardanoConsensusState> for AnyConsensusState {
+    fn from(cs: CardanoConsensusState) -> Self {
+        Self::Cardano(cs)
     }
 }
 
@@ -115,6 +147,8 @@ impl ConsensusState for AnyConsensusState {
     fn root(&self) -> &CommitmentRoot {
         match self {
             Self::Tendermint(cs_state) => cs_state.root(),
+            #[cfg(feature = "cardano")]
+            Self::Cardano(cs_state) => ConsensusState::root(cs_state),
         }
     }
 

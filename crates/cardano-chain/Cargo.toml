@@ -15,7 +15,7 @@ ibc-relayer-types = { workspace = true }
 ibc-proto = { workspace = true }
 
 # Standard workspace dependencies
-anyhow = { workspace = true }
+anyhow = { workspace = true, features = ["std"] }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

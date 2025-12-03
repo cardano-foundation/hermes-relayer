@@ -121,7 +121,7 @@ mod tests {
         assert!(height.revision_height() > 0);
 
         let client_state = client.query_client_state("test-client").await.unwrap();
-        assert_eq!(client_state.chain_id, "cardano-test");
+        assert_eq!(client_state.chain_id.to_string(), "cardano-test");
     }
 }
 

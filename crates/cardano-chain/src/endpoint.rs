@@ -34,6 +34,7 @@ use ibc_relayer::config::ChainConfig;
 use ibc_relayer::connection::ConnectionMsgType;
 use ibc_relayer::consensus_state::AnyConsensusState;
 use ibc_relayer::denom::DenomTrace;
+use ibc_relayer::config::Error as ConfigError;
 use ibc_relayer::error::Error;
 use ibc_relayer::event::IbcEventWithHeight;
 use ibc_relayer::keyring::{AnySigningKeyPair, KeyRing, SigningKeyPairSized};
@@ -97,7 +98,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // TODO: Initialize Gateway client
         // TODO: Setup keyring
         
-        Err(Error::config(format!("Cardano bootstrap not yet implemented")))
+        Err(Error::config(ConfigError::wrong_type()))
     }
 
     fn shutdown(self) -> Result<(), Error> {
@@ -112,7 +113,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn subscribe(&mut self) -> Result<Subscription, Error> {
         // TODO: Implement event subscription via Gateway
-        Err(Error::config(format!("Event subscription not yet implemented for Cardano")))
+        Err(Error::config(ConfigError::wrong_type()))
     }
 
     fn keybase(&self) -> &KeyRing<Self::SigningKeyPair> {
@@ -202,7 +203,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
     fn query_denom_trace(&self, _hash: String) -> Result<DenomTrace, Error> {
         // Not applicable to Cardano (native assets)
         tracing::warn!("query_denom_trace: not applicable for Cardano");
-        Err(Error::config(format!("Denom trace not applicable for Cardano")))
+        Err(Error::config(ConfigError::wrong_type()))
     }
 
     fn query_commitment_prefix(&self) -> Result<CommitmentPrefix, Error> {
@@ -498,7 +499,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
     ) -> Result<ibc_proto::ibc::apps::fee::v1::QueryIncentivizedPacketResponse, Error> {
         // ICS-29 fee middleware - not implemented for Cardano yet
         tracing::warn!("query_incentivized_packet: not implemented for Cardano");
-        Err(Error::config(format!("ICS-29 fee middleware not implemented for Cardano")))
+        Err(Error::config(ConfigError::wrong_type()))
     }
 
     fn query_consumer_chains(&self) -> Result<Vec<ibc_relayer_types::applications::ics28_ccv::msgs::ConsumerChain>, Error> {

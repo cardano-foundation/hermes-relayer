@@ -5,6 +5,7 @@ use crate::keyring::CardanoKeyring;
 use blake2::digest::Digest;
 use blake2::Blake2b512;
 use pallas_codec::minicbor;
+use pallas_codec::utils::KeepRaw;
 use pallas_primitives::babbage::{MintedTx, VKeyWitness};
 
 /// Sign a Cardano transaction
@@ -39,32 +40,88 @@ pub fn sign_transaction(
     };
 
     // 5. Reconstruct the transaction with the new witness
-    // We need to work around Pallas's KeepRaw immutability by reconstructing the entire tx
+    // We need to work around Pallas's KeepRaw immutability by manually building CBOR
+    
+    // Get existing witnesses
     let mut new_vkeywitnesses = tx.transaction_witness_set.vkeywitness.clone().unwrap_or_default().to_vec();
     new_vkeywitnesses.push(vkey_witness);
     
-    // Create a new witness set with the added signature
-    let new_witness_set = pallas_primitives::babbage::MintedWitnessSet {
-        vkeywitness: Some(new_vkeywitnesses.into()),
-        native_script: tx.transaction_witness_set.native_script.clone(),
-        bootstrap_witness: tx.transaction_witness_set.bootstrap_witness.clone(),
-        plutus_v1_script: tx.transaction_witness_set.plutus_v1_script.clone(),
-        plutus_data: tx.transaction_witness_set.plutus_data.clone(),
-        redeemer: tx.transaction_witness_set.redeemer.clone(),
-        plutus_v2_script: tx.transaction_witness_set.plutus_v2_script.clone(),
-    };
+    // Encode the new witness set manually
+    let mut witness_set_cbor = Vec::new();
+    {
+        let mut encoder = minicbor::Encoder::new(&mut witness_set_cbor);
+        
+        // Witness set is a CBOR map
+        encoder.map(7).map_err(|e| Error::Signer(format!("Failed to encode witness map: {:?}", e)))?;
+        
+        // Key 0: vkeywitness array
+        encoder.u8(0).map_err(|e| Error::Signer(format!("Failed to encode key: {:?}", e)))?;
+        encoder.array(new_vkeywitnesses.len() as u64).map_err(|e| Error::Signer(format!("Failed to encode array: {:?}", e)))?;
+        for witness in &new_vkeywitnesses {
+            encoder.encode(witness).map_err(|e| Error::Signer(format!("Failed to encode witness: {:?}", e)))?;
+        }
+        
+        // Copy other witness set fields if present
+        if let Some(ref native_scripts) = tx.transaction_witness_set.native_script {
+            encoder.u8(1).map_err(|e| Error::Signer(format!("Failed to encode key: {:?}", e)))?;
+            encoder.encode(native_scripts).map_err(|e| Error::Signer(format!("Failed to encode native scripts: {:?}", e)))?;
+        }
+        
+        if let Some(ref bootstrap) = tx.transaction_witness_set.bootstrap_witness {
+            encoder.u8(2).map_err(|e| Error::Signer(format!("Failed to encode key: {:?}", e)))?;
+            encoder.encode(bootstrap).map_err(|e| Error::Signer(format!("Failed to encode bootstrap: {:?}", e)))?;
+        }
+        
+        if let Some(ref plutus_v1) = tx.transaction_witness_set.plutus_v1_script {
+            encoder.u8(3).map_err(|e| Error::Signer(format!("Failed to encode key: {:?}", e)))?;
+            encoder.encode(plutus_v1).map_err(|e| Error::Signer(format!("Failed to encode plutus v1: {:?}", e)))?;
+        }
+        
+        if let Some(ref plutus_data) = tx.transaction_witness_set.plutus_data {
+            encoder.u8(4).map_err(|e| Error::Signer(format!("Failed to encode key: {:?}", e)))?;
+            encoder.encode(plutus_data).map_err(|e| Error::Signer(format!("Failed to encode plutus data: {:?}", e)))?;
+        }
+        
+        if let Some(ref redeemers) = tx.transaction_witness_set.redeemer {
+            encoder.u8(5).map_err(|e| Error::Signer(format!("Failed to encode key: {:?}", e)))?;
+            encoder.encode(redeemers).map_err(|e| Error::Signer(format!("Failed to encode redeemers: {:?}", e)))?;
+        }
+        
+        if let Some(ref plutus_v2) = tx.transaction_witness_set.plutus_v2_script {
+            encoder.u8(6).map_err(|e| Error::Signer(format!("Failed to encode key: {:?}", e)))?;
+            encoder.encode(plutus_v2).map_err(|e| Error::Signer(format!("Failed to encode plutus v2: {:?}", e)))?;
+        }
+    }
     
-    // Create new transaction with updated witness set
-    let signed_tx = pallas_primitives::babbage::MintedTx {
-        transaction_body: tx.transaction_body.clone(),
-        transaction_witness_set: new_witness_set,
-        success: tx.success,
-        auxiliary_data: tx.auxiliary_data.clone(),
-    };
-
-    // 6. Encode the signed transaction
-    let signed_tx_cbor = minicbor::to_vec(&signed_tx)
-        .map_err(|e| Error::Signer(format!("Failed to encode signed transaction: {:?}", e)))?;
+    // Build the final signed transaction CBOR
+    // Transaction is an array: [transaction_body, transaction_witness_set, success, auxiliary_data?]
+    let mut signed_tx_cbor = Vec::new();
+    {
+        let mut encoder = minicbor::Encoder::new(&mut signed_tx_cbor);
+        
+        // Check if auxiliary data is present using Nullable
+        let has_aux_data = matches!(tx.auxiliary_data, pallas_codec::utils::Nullable::Some(_));
+        encoder.array(if has_aux_data { 4 } else { 3 })
+            .map_err(|e| Error::Signer(format!("Failed to encode tx array: {:?}", e)))?;
+        
+        // Encode transaction body (already have the CBOR from earlier)
+        encoder.encode(&tx.transaction_body)
+            .map_err(|e| Error::Signer(format!("Failed to encode tx body: {:?}", e)))?;
+        
+        // Encode the witness set we just built (as raw bytes)
+        encoder.bytes(&witness_set_cbor)
+            .map_err(|e| Error::Signer(format!("Failed to encode witness set: {:?}", e)))?;
+        
+        // Encode success flag
+        encoder.bool(tx.success)
+            .map_err(|e| Error::Signer(format!("Failed to encode success: {:?}", e)))?;
+        
+        // Encode auxiliary data if present
+        if let pallas_codec::utils::Nullable::Some(ref aux_data) = tx.auxiliary_data {
+            encoder.encode(aux_data)
+                .map_err(|e| Error::Signer(format!("Failed to encode aux data: {:?}", e)))?;
+        }
+    }
 
     Ok(signed_tx_cbor)
 }

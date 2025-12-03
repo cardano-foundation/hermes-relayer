@@ -2,7 +2,6 @@
 
 use crate::error::Error;
 use blake2::{Blake2b512, Digest as Blake2Digest};
-use digest::Digest;
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer};
 use slip10::BIP32Path;
 use std::str::FromStr;
