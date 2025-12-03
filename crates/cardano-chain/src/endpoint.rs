@@ -15,7 +15,16 @@ use ibc_relayer::account::Balance;
 use ibc_relayer::chain::client::ClientSettings;
 use ibc_relayer::chain::endpoint::{ChainEndpoint, ChainStatus, HealthCheck};
 use ibc_relayer::chain::handle::Subscription;
-use ibc_relayer::chain::requests::*;
+use ibc_relayer::chain::requests::{
+    CrossChainQueryRequest, IncludeProof, QueryApplicationStatusRequest, QueryChannelClientStateRequest,
+    QueryChannelRequest, QueryChannelsRequest, QueryClientConnectionsRequest, QueryClientStateRequest,
+    QueryClientStatesRequest, QueryConnectionChannelsRequest, QueryConnectionRequest, QueryConnectionsRequest,
+    QueryConsensusStateHeightsRequest, QueryConsensusStateRequest, QueryHostConsensusStateRequest,
+    QueryNextSequenceReceiveRequest, QueryPacketAcknowledgementRequest, QueryPacketAcknowledgementsRequest,
+    QueryPacketCommitmentRequest, QueryPacketCommitmentsRequest, QueryPacketEventDataRequest,
+    QueryPacketReceiptRequest, QueryTxRequest, QueryUnreceivedAcksRequest, QueryUnreceivedPacketsRequest,
+    QueryUpgradedClientStateRequest, QueryUpgradedConsensusStateRequest,
+};
 use ibc_relayer::chain::tracking::TrackedMsgs;
 use ibc_relayer::chain::cosmos::version::Specs as CosmosSpecs;
 use ibc_relayer::chain::version::Specs;
@@ -484,7 +493,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn cross_chain_query(
         &self,
-        _requests: Vec<ibc_relayer_types::applications::ics31_icq::response::CrossChainQueryRequest>,
+        _requests: Vec<CrossChainQueryRequest>,
     ) -> Result<Vec<ibc_relayer_types::applications::ics31_icq::response::CrossChainQueryResponse>, Error> {
         // ICS-31 cross-chain query - not implemented for Cardano yet
         tracing::warn!("cross_chain_query: not implemented for Cardano");
