@@ -10,6 +10,7 @@ pub mod error;
 pub mod gateway_client;
 pub mod keyring;
 pub mod signer;
+pub mod signing_key_pair;
 pub mod types;
 
 // Re-export key types for convenience
@@ -18,4 +19,5 @@ pub use endpoint::CardanoChainEndpoint;
 pub use error::Error;
 pub use gateway_client::GatewayClient;
 pub use keyring::CardanoKeyring;
+pub use signing_key_pair::CardanoSigningKeyPair;
 

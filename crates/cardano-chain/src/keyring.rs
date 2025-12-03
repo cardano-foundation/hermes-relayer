@@ -8,6 +8,7 @@ use slip10::BIP32Path;
 use std::str::FromStr;
 
 /// Cardano keyring for signing transactions
+#[derive(Clone, Debug)]
 pub struct CardanoKeyring {
     signing_key: SigningKey,
     verifying_key: VerifyingKey,

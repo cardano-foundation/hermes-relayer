@@ -7,6 +7,7 @@ use crate::error::Error as CardanoError;
 use crate::gateway_client::GatewayClient;
 use crate::keyring::CardanoKeyring;
 use crate::signer;
+use crate::signing_key_pair::CardanoSigningKeyPair;
 use crate::types::{CardanoClientState, CardanoConsensusState, CardanoHeader};
 
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use ibc_relayer::chain::client::ClientSettings;
 use ibc_relayer::chain::endpoint::{ChainEndpoint, ChainStatus, HealthCheck};
 use ibc_relayer::chain::handle::Subscription;
 use ibc_relayer::chain::requests::{
-    CrossChainQueryRequest, IncludeProof, QueryApplicationStatusRequest, QueryChannelClientStateRequest,
+    CrossChainQueryRequest, IncludeProof, QueryChannelClientStateRequest,
     QueryChannelRequest, QueryChannelsRequest, QueryClientConnectionsRequest, QueryClientStateRequest,
     QueryClientStatesRequest, QueryConnectionChannelsRequest, QueryConnectionRequest, QueryConnectionsRequest,
     QueryConsensusStateHeightsRequest, QueryConsensusStateRequest, QueryHostConsensusStateRequest,
@@ -57,16 +58,7 @@ pub struct CardanoLightBlock {
     pub header: CardanoHeader,
 }
 
-/// Cardano-specific implementation of signing key pair
-#[derive(Clone)]
-pub struct CardanoSigningKeyPair {
-    keyring: Arc<CardanoKeyring>,
-}
-
-impl SigningKeyPairSized for CardanoSigningKeyPair {
-    // Implementation of SigningKeyPairSized methods will go here
-    // This is a placeholder to satisfy the trait bound
-}
+// CardanoSigningKeyPair is now defined in signing_key_pair.rs
 
 impl From<CardanoSigningKeyPair> for AnySigningKeyPair {
     fn from(_pair: CardanoSigningKeyPair) -> Self {
