@@ -7,8 +7,8 @@ use ibc_relayer_types::core::ics24_host::identifier::ChainId;
 
 use crate::{
     chain::{
-        cosmos::CosmosSdkChain, handle::ChainHandle, namada::NamadaChain, penumbra::PenumbraChain,
-        runtime::ChainRuntime,
+        cosmos::CosmosSdkChain, handle::ChainHandle, namada::NamadaChain,
+        penumbra::PenumbraChain, runtime::ChainRuntime,
     },
     config::{ChainConfig, Config},
     error::Error as RelayerError,
@@ -88,7 +88,12 @@ pub fn spawn_chain_runtime_with_config<Handle: ChainHandle>(
         ChainConfig::Namada(_) => ChainRuntime::<NamadaChain>::spawn(config, rt),
         ChainConfig::Penumbra(_) => ChainRuntime::<PenumbraChain>::spawn(config, rt),
         ChainConfig::Cardano(_) => {
-            // TODO: Implement ChainRuntime for Cardano
+            // Cardano chain spawning is handled by the standalone ibc-cardano-chain crate
+            // which implements ChainEndpoint directly. The circular dependency prevents
+            // us from importing it here. Users should use the cardano-chain binary or
+            // integrate ibc-cardano-chain directly in their application.
+            tracing::error!("Cardano chain spawning not yet integrated into Hermes spawn system");
+            tracing::info!("To use Cardano, run the ibc-cardano-chain binary separately");
             return Err(SpawnError::relayer(crate::error::Error::config(
                 crate::config::Error::wrong_type(),
             )));
