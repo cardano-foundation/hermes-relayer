@@ -233,12 +233,30 @@ impl GatewayClient {
 
     /// Build unsigned transaction for IBC message via Gateway
     /// Gateway returns CBOR hex that Hermes will sign
+    /// 
+    /// This method needs to:
+    /// 1. Deserialize message_data into the appropriate IBC message type
+    /// 2. Call the corresponding Gateway Msg service (CreateClient, UpdateClient, etc.)
+    /// 3. Return the unsigned CBOR transaction
+    /// 
+    /// The Gateway exposes these Msg services:
+    /// - Msg.CreateClient
+    /// - Msg.UpdateClient
+    /// - Msg.ConnectionOpenInit/Try/Ack/Confirm
+    /// - Msg.ChannelOpenInit/Try/Ack/Confirm
+    /// - Msg.RecvPacket
+    /// - Msg.Acknowledgement
+    /// - Msg.Timeout
+    /// 
+    /// TODO: Generate gRPC client for ibc.core.client.v1.Msg service
+    /// TODO: Generate gRPC client for ibc.core.connection.v1.Msg service
+    /// TODO: Generate gRPC client for ibc.core.channel.v1.Msg service
+    /// TODO: Implement message type routing and proto deserialization
     pub async fn build_ibc_tx(&self, message_type: &str, _message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
         tracing::info!("Building unsigned transaction for message type: {}", message_type);
         
-        // TODO: Call Gateway's Msg service to build unsigned transaction
-        // For now, return a stub
-        tracing::warn!("build_ibc_tx: stub implementation");
+        // Stub implementation - requires full Msg service proto generation
+        tracing::warn!("build_ibc_tx: requires Msg service proto generation (CreateClient, UpdateClient, etc.)");
         Ok(UnsignedTx {
             cbor_hex: "00".to_string(),
             description: format!("Unsigned {} transaction", message_type),
@@ -293,9 +311,23 @@ impl GatewayClient {
     }
 
     /// Fetch a Mithril certificate for a specific chain point
-    pub async fn fetch_mithril_certificate(&self, _slot: u64, _epoch: u64) -> Result<Vec<u8>, Error> {
-        // TODO: Implement Mithril certificate fetching
-        tracing::warn!("fetch_mithril_certificate: stub implementation");
+    /// 
+    /// This should query the Gateway's Mithril aggregator endpoint to get:
+    /// 1. The latest Mithril certificate covering the requested slot/epoch
+    /// 2. The certificate chain back to genesis (if needed)
+    /// 3. The multi-signature proof
+    /// 
+    /// The certificate is used by the light client to verify Cardano block headers
+    /// without needing to sync the full chain.
+    /// 
+    /// TODO: Add custom proto for Mithril certificate query
+    /// TODO: Implement certificate chain verification
+    /// TODO: Cache certificates to avoid redundant queries
+    pub async fn fetch_mithril_certificate(&self, slot: u64, epoch: u64) -> Result<Vec<u8>, Error> {
+        tracing::info!("Fetching Mithril certificate for slot={}, epoch={}", slot, epoch);
+        
+        // Stub implementation - requires custom Mithril proto
+        tracing::warn!("fetch_mithril_certificate: requires custom proto for Mithril aggregator endpoint");
         Ok(vec![])
     }
 
