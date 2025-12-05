@@ -4600,6 +4600,7 @@ dependencies = [
  "penumbra-sdk-view",
  "penumbra-sdk-wallet",
  "prost",
+ "prost-types",
  "regex",
  "reqwest 0.11.27",
  "retry",
