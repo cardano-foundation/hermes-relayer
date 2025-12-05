@@ -532,15 +532,41 @@ impl ChainEndpoint for CardanoChainEndpoint {
         
         // Block on async operation
         self.rt.block_on(async {
-            // TODO: Query actual connection from Gateway
-            // Gateway should query the connection UTXO from Cardano
-            tracing::warn!("query_connection: using stub implementation");
+            // Query connection from Gateway
+            let response_bytes = self.gateway_client
+                .query_connection(&request.connection_id.to_string())
+                .await
+                .map_err(|e| Error::query(format!("Failed to query connection: {}", e)))?;
             
-            // Return error for now - connection queries require proper Gateway integration
-            Err(Error::query(format!(
-                "Connection query not yet implemented for connection_id={}",
-                request.connection_id
-            )))
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::connection::v1::QueryConnectionResponse;
+            
+            let response = QueryConnectionResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode connection response: {}", e)))?;
+            
+            let connection_end = response.connection
+                .ok_or_else(|| Error::query("No connection in response".to_string()))?;
+            
+            // Convert proto ConnectionEnd to domain ConnectionEnd
+            let connection = ConnectionEnd::try_from(connection_end)
+                .map_err(|e| Error::query(format!("Failed to parse ConnectionEnd: {}", e)))?;
+            
+            // Parse proof if requested
+            let proof = if matches!(include_proof, IncludeProof::Yes) {
+                if !response.proof.is_empty() {
+                    use ibc_proto::ibc::core::commitment::v1::MerkleProof as RawMerkleProof;
+                    let raw_proof = RawMerkleProof::decode(&response.proof[..])
+                        .map_err(|e| Error::query(format!("Failed to decode proof: {}", e)))?;
+                    Some(MerkleProof::from(raw_proof))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
+            Ok((connection, proof))
         })
     }
 
@@ -571,15 +597,41 @@ impl ChainEndpoint for CardanoChainEndpoint {
         
         // Block on async operation
         self.rt.block_on(async {
-            // TODO: Query actual channel from Gateway
-            // Gateway should query the channel UTXO from Cardano
-            tracing::warn!("query_channel: using stub implementation");
+            // Query channel from Gateway
+            let response_bytes = self.gateway_client
+                .query_channel(&request.port_id.to_string(), &request.channel_id.to_string())
+                .await
+                .map_err(|e| Error::query(format!("Failed to query channel: {}", e)))?;
             
-            // Return error for now - channel queries require proper Gateway integration
-            Err(Error::query(format!(
-                "Channel query not yet implemented for port={}, channel={}",
-                request.port_id, request.channel_id
-            )))
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::channel::v1::QueryChannelResponse;
+            
+            let response = QueryChannelResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode channel response: {}", e)))?;
+            
+            let channel_proto = response.channel
+                .ok_or_else(|| Error::query("No channel in response".to_string()))?;
+            
+            // Convert proto Channel to domain ChannelEnd
+            let channel = ChannelEnd::try_from(channel_proto)
+                .map_err(|e| Error::query(format!("Failed to parse ChannelEnd: {}", e)))?;
+            
+            // Parse proof if requested
+            let proof = if matches!(include_proof, IncludeProof::Yes) {
+                if !response.proof.is_empty() {
+                    use ibc_proto::ibc::core::commitment::v1::MerkleProof as RawMerkleProof;
+                    let raw_proof = RawMerkleProof::decode(&response.proof[..])
+                        .map_err(|e| Error::query(format!("Failed to decode proof: {}", e)))?;
+                    Some(MerkleProof::from(raw_proof))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
+            Ok((channel, proof))
         })
     }
 
@@ -602,14 +654,34 @@ impl ChainEndpoint for CardanoChainEndpoint {
         
         // Block on async operation
         self.rt.block_on(async {
-            // TODO: Query actual packet commitment from Gateway
-            tracing::warn!("query_packet_commitment: using stub implementation");
+            // Query packet commitment from Gateway
+            let response_bytes = self.gateway_client
+                .query_packet_commitment(&request.port_id.to_string(), &request.channel_id.to_string(), request.sequence.into())
+                .await
+                .map_err(|e| Error::query(format!("Failed to query packet commitment: {}", e)))?;
             
-            // Return error for now
-            Err(Error::query(format!(
-                "Packet commitment query not yet implemented for port={}, channel={}, seq={}",
-                request.port_id, request.channel_id, request.sequence
-            )))
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::channel::v1::QueryPacketCommitmentResponse;
+            
+            let response = QueryPacketCommitmentResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode packet commitment response: {}", e)))?;
+            
+            // Parse proof if requested
+            let proof = if matches!(include_proof, IncludeProof::Yes) {
+                if !response.proof.is_empty() {
+                    use ibc_proto::ibc::core::commitment::v1::MerkleProof as RawMerkleProof;
+                    let raw_proof = RawMerkleProof::decode(&response.proof[..])
+                        .map_err(|e| Error::query(format!("Failed to decode proof: {}", e)))?;
+                    Some(MerkleProof::from(raw_proof))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
+            Ok((response.commitment, proof))
         })
     }
 
