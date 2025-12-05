@@ -62,13 +62,23 @@ impl GatewayClient {
     }
 
     /// Query the latest block height from the Gateway
-    /// This uses a stub implementation for now - real implementation would query
-    /// the Gateway's custom LatestHeight endpoint
     pub async fn query_latest_height(&self) -> Result<Height, Error> {
-        // TODO: Implement custom Query.LatestHeight gRPC call
-        // The Gateway exposes this as a custom endpoint not in standard ibc-proto
-        tracing::warn!("query_latest_height: using stub implementation - needs custom proto generation");
-        Ok(Height::new(0, 1000).map_err(|e| Error::Query(e.to_string()))?)
+        use super::generated::ibc::core::client::v1::{QueryLatestHeightRequest, query_client::QueryClient};
+        
+        let mut client = QueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryLatestHeightRequest {});
+        
+        let response = client.latest_height(request)
+            .await?
+            .into_inner();
+        
+        tracing::info!("Queried latest height: {}", response.height);
+        
+        // Height format: revision_number-revision_height
+        // For Cardano, we use revision_number = 0
+        Height::new(0, response.height)
+            .map_err(|e| Error::Query(format!("Invalid height {}: {}", response.height, e)))
     }
 
     /// Query client state for a specific client ID
@@ -83,17 +93,18 @@ impl GatewayClient {
             .await?
             .into_inner();
         
-        // TODO: Parse the Any proto message and deserialize into CardanoClientState
-        // For now, return a stub
-        tracing::warn!("query_client_state: proto parsing not yet implemented");
+        // Parse the Any proto message into CardanoClientState
+        let client_state_any = response.client_state
+            .ok_or_else(|| Error::Query("No client_state in response".to_string()))?;
         
-        Ok(CardanoClientState::new(
-            client_id.to_string(),
-            Height::new(0, 1000).map_err(|e| Error::Query(e.to_string()))?,
-            86400,
-            1814400,
-            vec![0u8; 32],
-        ))
+        // Convert ibc_proto::Any to prost_types::Any
+        let prost_any = prost_types::Any {
+            type_url: client_state_any.type_url,
+            value: client_state_any.value,
+        };
+        
+        tracing::info!("Parsing client state for client_id: {}", client_id);
+        super::proto_parser::parse_client_state_from_any(prost_any)
     }
 
     /// Query consensus state for a specific client ID and height
@@ -115,16 +126,18 @@ impl GatewayClient {
             .await?
             .into_inner();
         
-        // TODO: Parse the Any proto message and deserialize into CardanoConsensusState
-        // For now, return a stub with the queried height
-        tracing::warn!("query_consensus_state: proto parsing not yet implemented");
+        // Parse the Any proto message into CardanoConsensusState
+        let consensus_state_any = response.consensus_state
+            .ok_or_else(|| Error::Query("No consensus_state in response".to_string()))?;
         
-        Ok(CardanoConsensusState::new(
-            vec![0u8; 32],  // placeholder root
-            0,  // timestamp - TODO: extract from proto
-            0,  // slot - TODO: extract from proto
-            0,  // epoch - TODO: extract from proto
-        ))
+        // Convert ibc_proto::Any to prost_types::Any
+        let prost_any = prost_types::Any {
+            type_url: consensus_state_any.type_url,
+            value: consensus_state_any.value,
+        };
+        
+        tracing::info!("Parsing consensus state for client_id: {} at height: {}", client_id, height);
+        super::proto_parser::parse_consensus_state_from_any(prost_any)
     }
 
     /// Query header at a specific height
