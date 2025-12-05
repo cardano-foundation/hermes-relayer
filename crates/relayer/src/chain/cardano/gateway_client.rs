@@ -313,15 +313,23 @@ impl GatewayClient {
         let mut client = GenClientMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
         
-        let response = client.create_client(request).await?;
+        let response = client.create_client(request).await?.into_inner();
         
-        // TODO: Extract unsigned CBOR from response
-        // The Gateway needs to return the unsigned transaction in the response
-        tracing::warn!("CreateClient response received, but CBOR extraction not yet implemented");
+        // Extract unsigned CBOR from response
+        // Gateway returns unsigned_tx as google.protobuf.Any with CBOR hex in the value field
+        let unsigned_tx_any = response.unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in CreateClient response".to_string()))?;
+        
+        // The value field contains the CBOR hex string
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+        
+        tracing::info!("CreateClient: received unsigned CBOR (length: {}), client_id: {}", 
+            cbor_hex.len(), response.client_id);
         
         Ok(UnsignedTx {
-            cbor_hex: "00".to_string(),
-            description: "MsgCreateClient transaction".to_string(),
+            cbor_hex,
+            description: format!("MsgCreateClient (client_id: {})", response.client_id),
         })
     }
 
@@ -332,16 +340,25 @@ impl GatewayClient {
         let msg = MsgUpdateClient::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgUpdateClient: {}", e)))?;
         
+        let client_id = msg.client_id.clone();
+        
         let mut client = GenClientMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
         
-        let response = client.update_client(request).await?;
+        let response = client.update_client(request).await?.into_inner();
         
-        tracing::warn!("UpdateClient response received, but CBOR extraction not yet implemented");
+        let unsigned_tx_any = response.unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in UpdateClient response".to_string()))?;
+        
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+        
+        tracing::info!("UpdateClient: received unsigned CBOR (length: {}), client_id: {}", 
+            cbor_hex.len(), client_id);
         
         Ok(UnsignedTx {
-            cbor_hex: "00".to_string(),
-            description: "MsgUpdateClient transaction".to_string(),
+            cbor_hex,
+            description: format!("MsgUpdateClient (client_id: {})", client_id),
         })
     }
 
@@ -352,16 +369,25 @@ impl GatewayClient {
         let msg = MsgConnectionOpenInit::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgConnectionOpenInit: {}", e)))?;
         
+        let client_id = msg.client_id.clone();
+        
         let mut client = GenConnectionMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
         
-        let response = client.connection_open_init(request).await?;
+        let response = client.connection_open_init(request).await?.into_inner();
         
-        tracing::warn!("ConnectionOpenInit response received, but CBOR extraction not yet implemented");
+        let unsigned_tx_any = response.unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in ConnectionOpenInit response".to_string()))?;
+        
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+        
+        tracing::info!("ConnectionOpenInit: received unsigned CBOR (length: {}), client_id: {}", 
+            cbor_hex.len(), client_id);
         
         Ok(UnsignedTx {
-            cbor_hex: "00".to_string(),
-            description: "MsgConnectionOpenInit transaction".to_string(),
+            cbor_hex,
+            description: format!("MsgConnectionOpenInit (client_id: {})", client_id),
         })
     }
 
@@ -372,16 +398,25 @@ impl GatewayClient {
         let msg = MsgConnectionOpenTry::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgConnectionOpenTry: {}", e)))?;
         
+        let client_id = msg.client_id.clone();
+        
         let mut client = GenConnectionMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
         
-        let response = client.connection_open_try(request).await?;
+        let response = client.connection_open_try(request).await?.into_inner();
         
-        tracing::warn!("ConnectionOpenTry response received, but CBOR extraction not yet implemented");
+        let unsigned_tx_any = response.unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in ConnectionOpenTry response".to_string()))?;
+        
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+        
+        tracing::info!("ConnectionOpenTry: received unsigned CBOR (length: {}), client_id: {}", 
+            cbor_hex.len(), client_id);
         
         Ok(UnsignedTx {
-            cbor_hex: "00".to_string(),
-            description: "MsgConnectionOpenTry transaction".to_string(),
+            cbor_hex,
+            description: format!("MsgConnectionOpenTry (client_id: {})", client_id),
         })
     }
 
@@ -392,16 +427,25 @@ impl GatewayClient {
         let msg = MsgConnectionOpenAck::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgConnectionOpenAck: {}", e)))?;
         
+        let connection_id = msg.connection_id.clone();
+        
         let mut client = GenConnectionMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
         
-        let response = client.connection_open_ack(request).await?;
+        let response = client.connection_open_ack(request).await?.into_inner();
         
-        tracing::warn!("ConnectionOpenAck response received, but CBOR extraction not yet implemented");
+        let unsigned_tx_any = response.unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in ConnectionOpenAck response".to_string()))?;
+        
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+        
+        tracing::info!("ConnectionOpenAck: received unsigned CBOR (length: {}), connection_id: {}", 
+            cbor_hex.len(), connection_id);
         
         Ok(UnsignedTx {
-            cbor_hex: "00".to_string(),
-            description: "MsgConnectionOpenAck transaction".to_string(),
+            cbor_hex,
+            description: format!("MsgConnectionOpenAck (connection_id: {})", connection_id),
         })
     }
 
@@ -412,16 +456,25 @@ impl GatewayClient {
         let msg = MsgConnectionOpenConfirm::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgConnectionOpenConfirm: {}", e)))?;
         
+        let connection_id = msg.connection_id.clone();
+        
         let mut client = GenConnectionMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
         
-        let response = client.connection_open_confirm(request).await?;
+        let response = client.connection_open_confirm(request).await?.into_inner();
         
-        tracing::warn!("ConnectionOpenConfirm response received, but CBOR extraction not yet implemented");
+        let unsigned_tx_any = response.unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in ConnectionOpenConfirm response".to_string()))?;
+        
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+        
+        tracing::info!("ConnectionOpenConfirm: received unsigned CBOR (length: {}), connection_id: {}", 
+            cbor_hex.len(), connection_id);
         
         Ok(UnsignedTx {
-            cbor_hex: "00".to_string(),
-            description: "MsgConnectionOpenConfirm transaction".to_string(),
+            cbor_hex,
+            description: format!("MsgConnectionOpenConfirm (connection_id: {})", connection_id),
         })
     }
 
@@ -432,16 +485,25 @@ impl GatewayClient {
         let msg = MsgChannelOpenInit::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgChannelOpenInit: {}", e)))?;
         
+        let port_id = msg.port_id.clone();
+        
         let mut client = GenChannelMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
         
-        let response = client.channel_open_init(request).await?;
+        let response = client.channel_open_init(request).await?.into_inner();
         
-        tracing::warn!("ChannelOpenInit response received, but CBOR extraction not yet implemented");
+        let unsigned_tx_any = response.unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in ChannelOpenInit response".to_string()))?;
+        
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+        
+        tracing::info!("ChannelOpenInit: received unsigned CBOR (length: {}), port_id: {}, channel_id: {}", 
+            cbor_hex.len(), port_id, response.channel_id);
         
         Ok(UnsignedTx {
-            cbor_hex: "00".to_string(),
-            description: "MsgChannelOpenInit transaction".to_string(),
+            cbor_hex,
+            description: format!("MsgChannelOpenInit (port: {}, channel: {})", port_id, response.channel_id),
         })
     }
 
@@ -452,16 +514,25 @@ impl GatewayClient {
         let msg = MsgChannelOpenTry::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgChannelOpenTry: {}", e)))?;
         
+        let port_id = msg.port_id.clone();
+        
         let mut client = GenChannelMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
         
-        let response = client.channel_open_try(request).await?;
+        let response = client.channel_open_try(request).await?.into_inner();
         
-        tracing::warn!("ChannelOpenTry response received, but CBOR extraction not yet implemented");
+        let unsigned_tx_any = response.unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in ChannelOpenTry response".to_string()))?;
+        
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+        
+        tracing::info!("ChannelOpenTry: received unsigned CBOR (length: {}), port_id: {}", 
+            cbor_hex.len(), port_id);
         
         Ok(UnsignedTx {
-            cbor_hex: "00".to_string(),
-            description: "MsgChannelOpenTry transaction".to_string(),
+            cbor_hex,
+            description: format!("MsgChannelOpenTry (port: {})", port_id),
         })
     }
 
@@ -472,16 +543,26 @@ impl GatewayClient {
         let msg = MsgChannelOpenAck::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgChannelOpenAck: {}", e)))?;
         
+        let port_id = msg.port_id.clone();
+        let channel_id = msg.channel_id.clone();
+        
         let mut client = GenChannelMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
         
-        let response = client.channel_open_ack(request).await?;
+        let response = client.channel_open_ack(request).await?.into_inner();
         
-        tracing::warn!("ChannelOpenAck response received, but CBOR extraction not yet implemented");
+        let unsigned_tx_any = response.unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in ChannelOpenAck response".to_string()))?;
+        
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+        
+        tracing::info!("ChannelOpenAck: received unsigned CBOR (length: {}), port_id: {}, channel_id: {}", 
+            cbor_hex.len(), port_id, channel_id);
         
         Ok(UnsignedTx {
-            cbor_hex: "00".to_string(),
-            description: "MsgChannelOpenAck transaction".to_string(),
+            cbor_hex,
+            description: format!("MsgChannelOpenAck (port: {}, channel: {})", port_id, channel_id),
         })
     }
 
@@ -492,16 +573,26 @@ impl GatewayClient {
         let msg = MsgChannelOpenConfirm::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgChannelOpenConfirm: {}", e)))?;
         
+        let port_id = msg.port_id.clone();
+        let channel_id = msg.channel_id.clone();
+        
         let mut client = GenChannelMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
         
-        let response = client.channel_open_confirm(request).await?;
+        let response = client.channel_open_confirm(request).await?.into_inner();
         
-        tracing::warn!("ChannelOpenConfirm response received, but CBOR extraction not yet implemented");
+        let unsigned_tx_any = response.unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in ChannelOpenConfirm response".to_string()))?;
+        
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+        
+        tracing::info!("ChannelOpenConfirm: received unsigned CBOR (length: {}), port_id: {}, channel_id: {}", 
+            cbor_hex.len(), port_id, channel_id);
         
         Ok(UnsignedTx {
-            cbor_hex: "00".to_string(),
-            description: "MsgChannelOpenConfirm transaction".to_string(),
+            cbor_hex,
+            description: format!("MsgChannelOpenConfirm (port: {}, channel: {})", port_id, channel_id),
         })
     }
 
@@ -512,16 +603,27 @@ impl GatewayClient {
         let msg = MsgRecvPacket::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgRecvPacket: {}", e)))?;
         
+        let sequence = msg.packet.as_ref()
+            .map(|p| p.sequence)
+            .unwrap_or(0);
+        
         let mut client = GenChannelMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
         
-        let response = client.recv_packet(request).await?;
+        let response = client.recv_packet(request).await?.into_inner();
         
-        tracing::warn!("RecvPacket response received, but CBOR extraction not yet implemented");
+        let unsigned_tx_any = response.unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in RecvPacket response".to_string()))?;
+        
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+        
+        tracing::info!("RecvPacket: received unsigned CBOR (length: {}), sequence: {}", 
+            cbor_hex.len(), sequence);
         
         Ok(UnsignedTx {
-            cbor_hex: "00".to_string(),
-            description: "MsgRecvPacket transaction".to_string(),
+            cbor_hex,
+            description: format!("MsgRecvPacket (sequence: {})", sequence),
         })
     }
 
@@ -532,16 +634,27 @@ impl GatewayClient {
         let msg = MsgAcknowledgement::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgAcknowledgement: {}", e)))?;
         
+        let sequence = msg.packet.as_ref()
+            .map(|p| p.sequence)
+            .unwrap_or(0);
+        
         let mut client = GenChannelMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
         
-        let response = client.acknowledgement(request).await?;
+        let response = client.acknowledgement(request).await?.into_inner();
         
-        tracing::warn!("Acknowledgement response received, but CBOR extraction not yet implemented");
+        let unsigned_tx_any = response.unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in Acknowledgement response".to_string()))?;
+        
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+        
+        tracing::info!("Acknowledgement: received unsigned CBOR (length: {}), sequence: {}", 
+            cbor_hex.len(), sequence);
         
         Ok(UnsignedTx {
-            cbor_hex: "00".to_string(),
-            description: "MsgAcknowledgement transaction".to_string(),
+            cbor_hex,
+            description: format!("MsgAcknowledgement (sequence: {})", sequence),
         })
     }
 
@@ -552,16 +665,27 @@ impl GatewayClient {
         let msg = MsgTimeout::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgTimeout: {}", e)))?;
         
+        let sequence = msg.packet.as_ref()
+            .map(|p| p.sequence)
+            .unwrap_or(0);
+        
         let mut client = GenChannelMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
         
-        let response = client.timeout(request).await?;
+        let response = client.timeout(request).await?.into_inner();
         
-        tracing::warn!("Timeout response received, but CBOR extraction not yet implemented");
+        let unsigned_tx_any = response.unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in Timeout response".to_string()))?;
+        
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+        
+        tracing::info!("Timeout: received unsigned CBOR (length: {}), sequence: {}", 
+            cbor_hex.len(), sequence);
         
         Ok(UnsignedTx {
-            cbor_hex: "00".to_string(),
-            description: "MsgTimeout transaction".to_string(),
+            cbor_hex,
+            description: format!("MsgTimeout (sequence: {})", sequence),
         })
     }
 
