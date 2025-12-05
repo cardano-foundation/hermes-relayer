@@ -8,7 +8,7 @@ log_level = 'info'
 [telemetry]
 enabled = true
 host = '127.0.0.1'
-port = 3001
+port = 3002
 
 [telemetry.buckets.latency_submitted]
 start = 500
@@ -59,7 +59,7 @@ type = 'Cardano'
 id = 'cardano-testnet'
 
 # Gateway gRPC endpoint - this is your NestJS Gateway
-gateway_url = 'http://localhost:3002'
+gateway_url = 'http://localhost:3001'
 
 # Cardano network ID (1 = mainnet, 0 = testnet)
 network_id = 0
