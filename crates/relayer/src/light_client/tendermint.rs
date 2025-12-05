@@ -156,6 +156,10 @@ impl super::LightClient<CosmosSdkChain> for LightClient {
 
         let update_header = match any_header {
             AnyHeader::Tendermint(header) => Ok::<_, Error>(header),
+            AnyHeader::Cardano(_) => Err(Error::misbehaviour(format!(
+                "received Cardano header in Tendermint light client for chain {}",
+                self.chain_id
+            ))),
         }?;
 
         let client_state = match client_state {
