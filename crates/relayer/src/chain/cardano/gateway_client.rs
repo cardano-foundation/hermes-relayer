@@ -5,6 +5,9 @@
 
 use super::error::Error;
 use super::generated::ibc::cardano::v1::{cardano_msg_client::CardanoMsgClient, SubmitSignedTxRequest, SubmitSignedTxResponse};
+use super::generated::ibc::core::client::v1::msg_client::MsgClient as GenClientMsgClient;
+use super::generated::ibc::core::connection::v1::msg_client::MsgClient as GenConnectionMsgClient;
+use super::generated::ibc::core::channel::v1::msg_client::MsgClient as GenChannelMsgClient;
 use super::types::{CardanoClientState, CardanoConsensusState};
 use ibc_proto::ibc::core::client::v1::query_client::QueryClient as ClientQueryClient;
 use ibc_proto::ibc::core::client::v1::{QueryClientStateRequest, QueryConsensusStateRequest};
@@ -234,29 +237,41 @@ impl GatewayClient {
     /// Build unsigned transaction for IBC message via Gateway
     /// Gateway returns CBOR hex that Hermes will sign
     /// 
-    /// This method needs to:
-    /// 1. Deserialize message_data into the appropriate IBC message type
-    /// 2. Call the corresponding Gateway Msg service (CreateClient, UpdateClient, etc.)
-    /// 3. Return the unsigned CBOR transaction
+    /// This method routes IBC messages to the appropriate Gateway Msg service:
+    /// - Client messages: CreateClient, UpdateClient
+    /// - Connection messages: ConnectionOpenInit/Try/Ack/Confirm
+    /// - Channel messages: ChannelOpenInit/Try/Ack/Confirm
+    /// - Packet messages: RecvPacket, Acknowledgement, Timeout
     /// 
-    /// The Gateway exposes these Msg services:
-    /// - Msg.CreateClient
-    /// - Msg.UpdateClient
-    /// - Msg.ConnectionOpenInit/Try/Ack/Confirm
-    /// - Msg.ChannelOpenInit/Try/Ack/Confirm
-    /// - Msg.RecvPacket
-    /// - Msg.Acknowledgement
-    /// - Msg.Timeout
+    /// The Gateway Msg services are now available via generated gRPC clients:
+    /// - `GenClientMsgClient` for client operations
+    /// - `GenConnectionMsgClient` for connection operations
+    /// - `GenChannelMsgClient` for channel and packet operations
     /// 
-    /// TODO: Generate gRPC client for ibc.core.client.v1.Msg service
-    /// TODO: Generate gRPC client for ibc.core.connection.v1.Msg service
-    /// TODO: Generate gRPC client for ibc.core.channel.v1.Msg service
-    /// TODO: Implement message type routing and proto deserialization
+    /// TODO: Implement message type routing based on message_type string
+    /// TODO: Deserialize message_data into appropriate proto message
+    /// TODO: Call the corresponding Msg service method
+    /// TODO: Extract unsigned CBOR from response
     pub async fn build_ibc_tx(&self, message_type: &str, _message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
         tracing::info!("Building unsigned transaction for message type: {}", message_type);
         
-        // Stub implementation - requires full Msg service proto generation
-        tracing::warn!("build_ibc_tx: requires Msg service proto generation (CreateClient, UpdateClient, etc.)");
+        // Create Msg service clients (now available from generated protos)
+        let _client_msg_client = GenClientMsgClient::new(self.channel.clone());
+        let _connection_msg_client = GenConnectionMsgClient::new(self.channel.clone());
+        let _channel_msg_client = GenChannelMsgClient::new(self.channel.clone());
+        
+        // TODO: Route to appropriate service based on message_type
+        // Example routing:
+        // match message_type {
+        //     "MsgCreateClient" => client_msg_client.create_client(...),
+        //     "MsgUpdateClient" => client_msg_client.update_client(...),
+        //     "MsgConnectionOpenInit" => connection_msg_client.connection_open_init(...),
+        //     "MsgChannelOpenInit" => channel_msg_client.channel_open_init(...),
+        //     "MsgRecvPacket" => channel_msg_client.recv_packet(...),
+        //     _ => return Err(Error::Transaction(format!("Unknown message type: {}", message_type))),
+        // }
+        
+        tracing::warn!("build_ibc_tx: message routing not yet implemented");
         Ok(UnsignedTx {
             cbor_hex: "00".to_string(),
             description: format!("Unsigned {} transaction", message_type),
