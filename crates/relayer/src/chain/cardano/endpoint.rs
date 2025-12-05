@@ -250,12 +250,20 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 tracing::info!("Transaction submitted: {} at height {:?}", tx_response.tx_hash, tx_response.height);
                 
                 // Step 4: Parse events from transaction result
-                // TODO: Convert Gateway events to IbcEventWithHeight
-                // For now, we'll create a stub event
-                if let Some(height) = tx_response.height {
-                    // TODO: Parse actual IBC events from tx_response.events
-                    tracing::warn!("Event parsing not yet implemented, returning empty events");
+                // Log all events for debugging
+                for event in &tx_response.events {
+                    tracing::debug!("Gateway event: type={} attributes={:?}", event.event_type, event.attributes);
                 }
+                
+                // TODO: Full event parsing - convert Gateway events to IbcEventWithHeight
+                // This requires:
+                // 1. Parsing event types (e.g., "send_packet", "acknowledge_packet", "create_client")
+                // 2. Extracting attributes from event.attributes
+                // 3. Constructing appropriate IbcEvent variants (from ibc-relayer-types)
+                // 4. Wrapping in IbcEventWithHeight with the transaction height
+                //
+                // For now, we log events and return empty vector
+                tracing::warn!("Full event parsing not yet implemented - events logged but not returned to Hermes")
             }
             
             Ok(all_events)
