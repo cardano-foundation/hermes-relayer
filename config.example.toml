@@ -67,7 +67,8 @@ network_id = 0
 # Key configuration
 key_name = 'cardano-relayer'
 key_store_type = 'Test'  # or 'Memory' for production
-key_store_folder = '~/.hermes/keys'
+# Note: Use absolute path, tilde expansion may not work
+# key_store_folder = '/Users/yourusername/.hermes/keys'
 
 # Account index for CIP-1852 key derivation (m/1852'/1815'/account'/2'/0')
 account = 0

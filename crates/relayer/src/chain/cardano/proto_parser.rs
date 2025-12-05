@@ -148,7 +148,7 @@ mod tests {
         };
         
         let client_state = parse_client_state_from_any(any).unwrap();
-        assert_eq!(client_state.chain_id, "cardano-testnet");
+        assert_eq!(client_state.chain_id.to_string(), "cardano-testnet");
         assert_eq!(client_state.latest_height.revision_height(), 1000);
     }
     

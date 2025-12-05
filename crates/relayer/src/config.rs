@@ -739,9 +739,19 @@ impl ChainConfig {
                     .collect()
             }
             ChainConfig::Penumbra(_) => vec![],
-            ChainConfig::Cardano(_config) => {
-                // TODO: Implement Cardano keyring listing
-                vec![]
+            ChainConfig::Cardano(config) => {
+                use crate::chain::cardano::signing_key_pair::CardanoSigningKeyPair;
+                let keyring: KeyRing<CardanoSigningKeyPair> = KeyRing::new(
+                    config.key_store_type,
+                    "cardano",
+                    &config.id,
+                    &config.key_store_folder,
+                )?;
+                keyring
+                    .keys()?
+                    .into_iter()
+                    .map(|(key_name, keys)| (key_name, keys.into()))
+                    .collect()
             }
         };
 
@@ -1053,6 +1063,7 @@ mod tests {
                 chain_config.excluded_sequences.clone()
             }
             ChainConfig::Penumbra(_) => panic!("expected cosmos chain config"),
+            ChainConfig::Cardano(_) => panic!("expected cosmos chain config"),
         };
 
         assert_eq!(excluded_sequences1, excluded_sequences2);

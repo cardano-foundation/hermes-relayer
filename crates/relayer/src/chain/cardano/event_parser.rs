@@ -28,7 +28,7 @@ use super::error::Error;
 use super::generated::ibc::cardano::v1::{Event, EventAttribute};
 
 /// Parse a list of Gateway events into Hermes IbcEvent types
-pub fn parse_events(gateway_events: Vec<Event>, height: Height) -> Result<Vec<IbcEvent>, Error> {
+pub fn parse_events(gateway_events: Vec<Event>, _height: Height) -> Result<Vec<IbcEvent>, Error> {
     let mut ibc_events = Vec::new();
     
     for event in gateway_events {
