@@ -237,44 +237,331 @@ impl GatewayClient {
     /// Build unsigned transaction for IBC message via Gateway
     /// Gateway returns CBOR hex that Hermes will sign
     /// 
-    /// This method routes IBC messages to the appropriate Gateway Msg service:
-    /// - Client messages: CreateClient, UpdateClient
-    /// - Connection messages: ConnectionOpenInit/Try/Ack/Confirm
-    /// - Channel messages: ChannelOpenInit/Try/Ack/Confirm
-    /// - Packet messages: RecvPacket, Acknowledgement, Timeout
-    /// 
-    /// The Gateway Msg services are now available via generated gRPC clients:
-    /// - `GenClientMsgClient` for client operations
-    /// - `GenConnectionMsgClient` for connection operations
-    /// - `GenChannelMsgClient` for channel and packet operations
-    /// 
-    /// TODO: Implement message type routing based on message_type string
-    /// TODO: Deserialize message_data into appropriate proto message
-    /// TODO: Call the corresponding Msg service method
-    /// TODO: Extract unsigned CBOR from response
-    pub async fn build_ibc_tx(&self, message_type: &str, _message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
-        tracing::info!("Building unsigned transaction for message type: {}", message_type);
+    /// This method routes IBC messages to the appropriate Gateway Msg service based on the type_url.
+    /// The type_url format is: "/ibc.core.{module}.v1.Msg{Operation}"
+    pub async fn build_ibc_tx(&self, type_url: &str, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        tracing::info!("Building unsigned transaction for message type: {}", type_url);
         
-        // Create Msg service clients (now available from generated protos)
-        let _client_msg_client = GenClientMsgClient::new(self.channel.clone());
-        let _connection_msg_client = GenConnectionMsgClient::new(self.channel.clone());
-        let _channel_msg_client = GenChannelMsgClient::new(self.channel.clone());
+        // Route based on type_url
+        match type_url {
+            // IBC Client messages
+            "/ibc.core.client.v1.MsgCreateClient" => {
+                self.build_create_client_tx(message_data).await
+            }
+            "/ibc.core.client.v1.MsgUpdateClient" => {
+                self.build_update_client_tx(message_data).await
+            }
+            
+            // IBC Connection messages
+            "/ibc.core.connection.v1.MsgConnectionOpenInit" => {
+                self.build_connection_open_init_tx(message_data).await
+            }
+            "/ibc.core.connection.v1.MsgConnectionOpenTry" => {
+                self.build_connection_open_try_tx(message_data).await
+            }
+            "/ibc.core.connection.v1.MsgConnectionOpenAck" => {
+                self.build_connection_open_ack_tx(message_data).await
+            }
+            "/ibc.core.connection.v1.MsgConnectionOpenConfirm" => {
+                self.build_connection_open_confirm_tx(message_data).await
+            }
+            
+            // IBC Channel messages
+            "/ibc.core.channel.v1.MsgChannelOpenInit" => {
+                self.build_channel_open_init_tx(message_data).await
+            }
+            "/ibc.core.channel.v1.MsgChannelOpenTry" => {
+                self.build_channel_open_try_tx(message_data).await
+            }
+            "/ibc.core.channel.v1.MsgChannelOpenAck" => {
+                self.build_channel_open_ack_tx(message_data).await
+            }
+            "/ibc.core.channel.v1.MsgChannelOpenConfirm" => {
+                self.build_channel_open_confirm_tx(message_data).await
+            }
+            
+            // IBC Packet messages
+            "/ibc.core.channel.v1.MsgRecvPacket" => {
+                self.build_recv_packet_tx(message_data).await
+            }
+            "/ibc.core.channel.v1.MsgAcknowledgement" => {
+                self.build_acknowledgement_tx(message_data).await
+            }
+            "/ibc.core.channel.v1.MsgTimeout" => {
+                self.build_timeout_tx(message_data).await
+            }
+            
+            // Unknown message type
+            _ => {
+                tracing::error!("Unsupported message type: {}", type_url);
+                Err(Error::Transaction(format!("Unsupported message type: {}", type_url)))
+            }
+        }
+    }
+
+    //
+    // Helper methods for building each message type
+    //
+
+    async fn build_create_client_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::client::v1::MsgCreateClient;
         
-        // TODO: Route to appropriate service based on message_type
-        // Example routing:
-        // match message_type {
-        //     "MsgCreateClient" => client_msg_client.create_client(...),
-        //     "MsgUpdateClient" => client_msg_client.update_client(...),
-        //     "MsgConnectionOpenInit" => connection_msg_client.connection_open_init(...),
-        //     "MsgChannelOpenInit" => channel_msg_client.channel_open_init(...),
-        //     "MsgRecvPacket" => channel_msg_client.recv_packet(...),
-        //     _ => return Err(Error::Transaction(format!("Unknown message type: {}", message_type))),
-        // }
+        let msg = MsgCreateClient::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgCreateClient: {}", e)))?;
         
-        tracing::warn!("build_ibc_tx: message routing not yet implemented");
+        let mut client = GenClientMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+        
+        let response = client.create_client(request).await?;
+        
+        // TODO: Extract unsigned CBOR from response
+        // The Gateway needs to return the unsigned transaction in the response
+        tracing::warn!("CreateClient response received, but CBOR extraction not yet implemented");
+        
         Ok(UnsignedTx {
             cbor_hex: "00".to_string(),
-            description: format!("Unsigned {} transaction", message_type),
+            description: "MsgCreateClient transaction".to_string(),
+        })
+    }
+
+    async fn build_update_client_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::client::v1::MsgUpdateClient;
+        
+        let msg = MsgUpdateClient::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgUpdateClient: {}", e)))?;
+        
+        let mut client = GenClientMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+        
+        let response = client.update_client(request).await?;
+        
+        tracing::warn!("UpdateClient response received, but CBOR extraction not yet implemented");
+        
+        Ok(UnsignedTx {
+            cbor_hex: "00".to_string(),
+            description: "MsgUpdateClient transaction".to_string(),
+        })
+    }
+
+    async fn build_connection_open_init_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::connection::v1::MsgConnectionOpenInit;
+        
+        let msg = MsgConnectionOpenInit::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgConnectionOpenInit: {}", e)))?;
+        
+        let mut client = GenConnectionMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+        
+        let response = client.connection_open_init(request).await?;
+        
+        tracing::warn!("ConnectionOpenInit response received, but CBOR extraction not yet implemented");
+        
+        Ok(UnsignedTx {
+            cbor_hex: "00".to_string(),
+            description: "MsgConnectionOpenInit transaction".to_string(),
+        })
+    }
+
+    async fn build_connection_open_try_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::connection::v1::MsgConnectionOpenTry;
+        
+        let msg = MsgConnectionOpenTry::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgConnectionOpenTry: {}", e)))?;
+        
+        let mut client = GenConnectionMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+        
+        let response = client.connection_open_try(request).await?;
+        
+        tracing::warn!("ConnectionOpenTry response received, but CBOR extraction not yet implemented");
+        
+        Ok(UnsignedTx {
+            cbor_hex: "00".to_string(),
+            description: "MsgConnectionOpenTry transaction".to_string(),
+        })
+    }
+
+    async fn build_connection_open_ack_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::connection::v1::MsgConnectionOpenAck;
+        
+        let msg = MsgConnectionOpenAck::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgConnectionOpenAck: {}", e)))?;
+        
+        let mut client = GenConnectionMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+        
+        let response = client.connection_open_ack(request).await?;
+        
+        tracing::warn!("ConnectionOpenAck response received, but CBOR extraction not yet implemented");
+        
+        Ok(UnsignedTx {
+            cbor_hex: "00".to_string(),
+            description: "MsgConnectionOpenAck transaction".to_string(),
+        })
+    }
+
+    async fn build_connection_open_confirm_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::connection::v1::MsgConnectionOpenConfirm;
+        
+        let msg = MsgConnectionOpenConfirm::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgConnectionOpenConfirm: {}", e)))?;
+        
+        let mut client = GenConnectionMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+        
+        let response = client.connection_open_confirm(request).await?;
+        
+        tracing::warn!("ConnectionOpenConfirm response received, but CBOR extraction not yet implemented");
+        
+        Ok(UnsignedTx {
+            cbor_hex: "00".to_string(),
+            description: "MsgConnectionOpenConfirm transaction".to_string(),
+        })
+    }
+
+    async fn build_channel_open_init_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::channel::v1::MsgChannelOpenInit;
+        
+        let msg = MsgChannelOpenInit::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgChannelOpenInit: {}", e)))?;
+        
+        let mut client = GenChannelMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+        
+        let response = client.channel_open_init(request).await?;
+        
+        tracing::warn!("ChannelOpenInit response received, but CBOR extraction not yet implemented");
+        
+        Ok(UnsignedTx {
+            cbor_hex: "00".to_string(),
+            description: "MsgChannelOpenInit transaction".to_string(),
+        })
+    }
+
+    async fn build_channel_open_try_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::channel::v1::MsgChannelOpenTry;
+        
+        let msg = MsgChannelOpenTry::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgChannelOpenTry: {}", e)))?;
+        
+        let mut client = GenChannelMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+        
+        let response = client.channel_open_try(request).await?;
+        
+        tracing::warn!("ChannelOpenTry response received, but CBOR extraction not yet implemented");
+        
+        Ok(UnsignedTx {
+            cbor_hex: "00".to_string(),
+            description: "MsgChannelOpenTry transaction".to_string(),
+        })
+    }
+
+    async fn build_channel_open_ack_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::channel::v1::MsgChannelOpenAck;
+        
+        let msg = MsgChannelOpenAck::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgChannelOpenAck: {}", e)))?;
+        
+        let mut client = GenChannelMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+        
+        let response = client.channel_open_ack(request).await?;
+        
+        tracing::warn!("ChannelOpenAck response received, but CBOR extraction not yet implemented");
+        
+        Ok(UnsignedTx {
+            cbor_hex: "00".to_string(),
+            description: "MsgChannelOpenAck transaction".to_string(),
+        })
+    }
+
+    async fn build_channel_open_confirm_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::channel::v1::MsgChannelOpenConfirm;
+        
+        let msg = MsgChannelOpenConfirm::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgChannelOpenConfirm: {}", e)))?;
+        
+        let mut client = GenChannelMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+        
+        let response = client.channel_open_confirm(request).await?;
+        
+        tracing::warn!("ChannelOpenConfirm response received, but CBOR extraction not yet implemented");
+        
+        Ok(UnsignedTx {
+            cbor_hex: "00".to_string(),
+            description: "MsgChannelOpenConfirm transaction".to_string(),
+        })
+    }
+
+    async fn build_recv_packet_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::channel::v1::MsgRecvPacket;
+        
+        let msg = MsgRecvPacket::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgRecvPacket: {}", e)))?;
+        
+        let mut client = GenChannelMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+        
+        let response = client.recv_packet(request).await?;
+        
+        tracing::warn!("RecvPacket response received, but CBOR extraction not yet implemented");
+        
+        Ok(UnsignedTx {
+            cbor_hex: "00".to_string(),
+            description: "MsgRecvPacket transaction".to_string(),
+        })
+    }
+
+    async fn build_acknowledgement_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::channel::v1::MsgAcknowledgement;
+        
+        let msg = MsgAcknowledgement::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgAcknowledgement: {}", e)))?;
+        
+        let mut client = GenChannelMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+        
+        let response = client.acknowledgement(request).await?;
+        
+        tracing::warn!("Acknowledgement response received, but CBOR extraction not yet implemented");
+        
+        Ok(UnsignedTx {
+            cbor_hex: "00".to_string(),
+            description: "MsgAcknowledgement transaction".to_string(),
+        })
+    }
+
+    async fn build_timeout_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::channel::v1::MsgTimeout;
+        
+        let msg = MsgTimeout::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgTimeout: {}", e)))?;
+        
+        let mut client = GenChannelMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+        
+        let response = client.timeout(request).await?;
+        
+        tracing::warn!("Timeout response received, but CBOR extraction not yet implemented");
+        
+        Ok(UnsignedTx {
+            cbor_hex: "00".to_string(),
+            description: "MsgTimeout transaction".to_string(),
         })
     }
 
