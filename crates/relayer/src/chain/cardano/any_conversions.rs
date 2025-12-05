@@ -7,9 +7,9 @@
 //! For now, these implementations will panic if called, as they're only needed
 //! to satisfy the trait bounds in ChainEndpoint.
 
-use crate::types::{CardanoClientState, CardanoConsensusState};
-use ibc_relayer::client_state::AnyClientState;
-use ibc_relayer::consensus_state::AnyConsensusState;
+use super::types::{CardanoClientState, CardanoConsensusState};
+use crate::client_state::AnyClientState;
+use crate::consensus_state::AnyConsensusState;
 
 /// Stub implementation - will be replaced when Cardano is added to AnyClientState enum
 impl From<CardanoClientState> for AnyClientState {

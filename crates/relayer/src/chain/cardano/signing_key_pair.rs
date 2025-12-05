@@ -1,10 +1,10 @@
 //! Cardano SigningKeyPair implementation for Hermes keyring
 
-use crate::error::Error as CardanoError;
-use crate::keyring::CardanoKeyring;
+use super::error::Error as CardanoError;
+use super::keyring::CardanoKeyring;
 use hdpath::StandardHDPath;
-use ibc_relayer::config::AddressType;
-use ibc_relayer::keyring::{errors::Error as KeyringError, KeyType, SigningKeyPair};
+use crate::config::AddressType;
+use crate::keyring::{errors::Error as KeyringError, KeyType, SigningKeyPair};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 

@@ -1,7 +1,7 @@
 //! Cardano transaction signing using Pallas
 
-use crate::error::Error;
-use crate::keyring::CardanoKeyring;
+use super::error::Error;
+use super::keyring::CardanoKeyring;
 use blake2::digest::Digest;
 use blake2::Blake2b512;
 use pallas_codec::minicbor;
@@ -14,7 +14,7 @@ pub fn sign_transaction(
     keyring: &CardanoKeyring,
 ) -> Result<Vec<u8>, Error> {
     // 1. Parse the unsigned transaction
-    let mut tx: MintedTx = minicbor::decode(unsigned_tx_cbor)
+    let tx: MintedTx<'_> = minicbor::decode(unsigned_tx_cbor)
         .map_err(|e| Error::CborDecode(format!("Failed to decode transaction: {:?}", e)))?;
 
     // 2. Extract and hash the transaction body

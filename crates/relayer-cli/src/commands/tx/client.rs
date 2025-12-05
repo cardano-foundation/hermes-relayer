@@ -212,6 +212,7 @@ impl Runnable for TxUpdateClientCmd {
                     ChainConfig::Penumbra(chain_config) => {
                         chain_config.genesis_restart = Some(restart_params)
                     }
+                    ChainConfig::Cardano(_) => unimplemented!("genesis_restart not yet supported for cardano"),
                 },
                 None => {
                     Output::error(format!(

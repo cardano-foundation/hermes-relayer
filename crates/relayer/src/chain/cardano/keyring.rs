@@ -1,6 +1,6 @@
 //! Cardano keyring implementation with CIP-1852 derivation
 
-use crate::error::Error;
+use super::error::Error;
 use blake2::{Blake2b512, Digest as Blake2Digest};
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer};
 use slip10::BIP32Path;
@@ -18,12 +18,12 @@ impl CardanoKeyring {
     /// Create a new keyring from a mnemonic phrase
     /// Uses CIP-1852 derivation: m/1852'/1815'/account'/2'/0'
     pub fn from_mnemonic(mnemonic: &str, account: u32) -> Result<Self, Error> {
-        // Parse mnemonic
-        let mnemonic = tiny_bip39::Mnemonic::from_phrase(mnemonic, tiny_bip39::Language::English)
+        // Parse mnemonic using tiny-bip39 crate (hyphenated crate name, underscore in code)
+        let mnemonic = bip39::Mnemonic::from_phrase(mnemonic, bip39::Language::English)
             .map_err(|e| Error::Keyring(format!("Invalid mnemonic: {:?}", e)))?;
 
         // Generate seed
-        let seed = tiny_bip39::Seed::new(&mnemonic, "");
+        let seed = bip39::Seed::new(&mnemonic, "");
         let seed_bytes = seed.as_bytes();
 
         // CIP-1852 path: m/1852'/1815'/account'/2'/0'

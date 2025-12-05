@@ -92,6 +92,13 @@ tracing                          = { workspace = true }
 tracing-subscriber               = { workspace = true, features = ["fmt", "env-filter", "json"] }
 uuid                             = { workspace = true, features = ["v4"] }
 
+# Cardano-specific dependencies
+slip10                           = "0.4"
+blake2                           = "0.10"
+pallas-primitives                = "0.30"
+pallas-codec                     = "0.30"
+lazy_static                      = "1.4"
+
 [dev-dependencies]
 ibc-relayer-types = { workspace = true }
 serial_test       = { workspace = true }

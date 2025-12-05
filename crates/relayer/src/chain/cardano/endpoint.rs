@@ -2,21 +2,20 @@
 //!
 //! This module implements the ChainEndpoint trait required by Hermes for custom chain support.
 
-use ibc_relayer::chain::cardano::CardanoConfig;
-use crate::error::Error as CardanoError;
-use crate::gateway_client::GatewayClient;
-use crate::keyring::CardanoKeyring;
-use crate::signer;
-use crate::signing_key_pair::CardanoSigningKeyPair;
-use crate::types::{CardanoClientState, CardanoConsensusState, CardanoHeader};
+use super::config::CardanoConfig;
+use super::error::Error as CardanoError;
+use super::gateway_client::GatewayClient;
+use super::keyring::CardanoKeyring;
+use super::signer;
+use super::signing_key_pair::CardanoSigningKeyPair;
+use super::types::{CardanoClientState, CardanoConsensusState, CardanoHeader};
 
 use std::sync::Arc;
-use async_trait::async_trait;
-use ibc_relayer::account::Balance;
-use ibc_relayer::chain::client::ClientSettings;
-use ibc_relayer::chain::endpoint::{ChainEndpoint, ChainStatus, HealthCheck};
-use ibc_relayer::chain::handle::Subscription;
-use ibc_relayer::chain::requests::{
+use crate::account::Balance;
+use crate::chain::client::ClientSettings;
+use crate::chain::endpoint::{ChainEndpoint, ChainStatus, HealthCheck};
+use crate::chain::handle::Subscription;
+use crate::chain::requests::{
     CrossChainQueryRequest, IncludeProof, QueryChannelClientStateRequest,
     QueryChannelRequest, QueryChannelsRequest, QueryClientConnectionsRequest, QueryClientStateRequest,
     QueryClientStatesRequest, QueryConnectionChannelsRequest, QueryConnectionRequest, QueryConnectionsRequest,
@@ -26,19 +25,18 @@ use ibc_relayer::chain::requests::{
     QueryPacketReceiptRequest, QueryTxRequest, QueryUnreceivedAcksRequest, QueryUnreceivedPacketsRequest,
     QueryUpgradedClientStateRequest, QueryUpgradedConsensusStateRequest,
 };
-use ibc_relayer::chain::tracking::TrackedMsgs;
-use ibc_relayer::chain::cosmos::version::Specs as CosmosSpecs;
-use ibc_relayer::chain::version::Specs;
-use ibc_relayer::client_state::{AnyClientState, IdentifiedAnyClientState};
-use ibc_relayer::config::ChainConfig;
-use ibc_relayer::connection::ConnectionMsgType;
-use ibc_relayer::consensus_state::AnyConsensusState;
-use ibc_relayer::denom::DenomTrace;
-use ibc_relayer::config::Error as ConfigError;
-use ibc_relayer::error::Error;
-use ibc_relayer::event::IbcEventWithHeight;
-use ibc_relayer::keyring::{AnySigningKeyPair, KeyRing, SigningKeyPair, SigningKeyPairSized};
-use ibc_relayer::misbehaviour::MisbehaviourEvidence;
+use crate::chain::tracking::TrackedMsgs;
+use crate::chain::cosmos::version::Specs as CosmosSpecs;
+use crate::chain::version::Specs;
+use crate::client_state::{AnyClientState, IdentifiedAnyClientState};
+use crate::config::{ChainConfig, Error as ConfigError};
+use crate::connection::ConnectionMsgType;
+use crate::consensus_state::AnyConsensusState;
+use crate::denom::DenomTrace;
+use crate::error::Error;
+use crate::event::IbcEventWithHeight;
+use crate::keyring::{AnySigningKeyPair, KeyRing, SigningKeyPair, SigningKeyPairSized};
+use crate::misbehaviour::MisbehaviourEvidence;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
 use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header};
 use ibc_relayer_types::core::ics03_connection::connection::{ConnectionEnd, IdentifiedConnectionEnd};
@@ -174,7 +172,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // Use the account (Cardano address) as the signer
         // Signer must be created from a string using FromStr
         Signer::from_str(&key.account())
-            .map_err(|e| Error::key_base(ibc_relayer::keyring::errors::Error::invalid_mnemonic(anyhow::anyhow!("Invalid signer address: {}", e))))
+            .map_err(|e| Error::key_base(crate::keyring::errors::Error::invalid_mnemonic(anyhow::anyhow!("Invalid signer address: {}", e))))
     }
 
     fn get_key(&self) -> Result<Self::SigningKeyPair, Error> {

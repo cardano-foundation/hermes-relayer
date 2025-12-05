@@ -1,7 +1,7 @@
 //! gRPC client for Cardano Gateway
 
-use crate::error::Error;
-use crate::types::{CardanoClientState, CardanoConsensusState, CardanoHeader};
+use super::error::Error;
+use super::types::{CardanoClientState, CardanoConsensusState, CardanoHeader};
 use ibc_relayer_types::Height;
 use tonic::transport::Channel;
 
