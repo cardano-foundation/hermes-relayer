@@ -8,7 +8,10 @@ use super::gateway_client::GatewayClient;
 use super::keyring::CardanoKeyring;
 use super::signer;
 use super::signing_key_pair::CardanoSigningKeyPair;
-use super::types::{CardanoClientState, CardanoConsensusState, CardanoHeader};
+use super::types::{CardanoClientState, CardanoConsensusState};
+
+// Use CardanoHeader from ibc-relayer-types (where AnyHeader is defined)
+use ibc_relayer_types::clients::ics08_cardano::CardanoHeader;
 
 use std::sync::Arc;
 use crate::account::Balance;
@@ -59,24 +62,7 @@ pub struct CardanoLightBlock {
 }
 
 // CardanoSigningKeyPair is now defined in signing_key_pair.rs
-
-impl From<CardanoSigningKeyPair> for AnySigningKeyPair {
-    fn from(pair: CardanoSigningKeyPair) -> Self {
-        // AnySigningKeyPair is an enum with different variants for each chain type
-        // Since we can't add a Cardano variant without modifying ibc-relayer,
-        // we'll use a workaround for now
-        tracing::debug!("Converting CardanoSigningKeyPair to AnySigningKeyPair");
-        
-        // For now, this conversion is not directly supported
-        // In production, AnySigningKeyPair needs a Cardano variant
-        // This is a limitation of the current Hermes architecture
-        tracing::error!("CardanoSigningKeyPair -> AnySigningKeyPair conversion not yet supported");
-        
-        // Return a stub - this will need proper implementation
-        // when CardanoSigningKeyPair is added to AnySigningKeyPair enum
-        panic!("CardanoSigningKeyPair conversion not yet implemented - AnySigningKeyPair needs Cardano variant")
-    }
-}
+// From<CardanoSigningKeyPair> for AnySigningKeyPair is implemented in ibc-relayer/src/keyring/any_signing_key_pair.rs
 
 /// Cardano ChainEndpoint implementation
 pub struct CardanoChainEndpoint {
@@ -872,37 +858,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
     }
 }
 
-// Implement Header trait for CardanoHeader to satisfy ChainEndpoint requirements
-impl Header for CardanoHeader {
-    fn client_type(&self) -> ibc_relayer_types::core::ics02_client::client_type::ClientType {
-        ibc_relayer_types::core::ics02_client::client_type::ClientType::Cardano
-    }
-
-    fn height(&self) -> ICSHeight {
-        self.height
-    }
-
-    fn timestamp(&self) -> ibc_relayer_types::timestamp::Timestamp {
-        ibc_relayer_types::timestamp::Timestamp::from_nanoseconds(self.timestamp as u64 * 1_000_000_000)
-            .unwrap()
-    }
-}
-
-// Implement conversion to AnyHeader
-impl From<CardanoHeader> for AnyHeader {
-    fn from(header: CardanoHeader) -> Self {
-        // AnyHeader is an enum with different variants for each chain type
-        // Since we can't add a Cardano variant without modifying ibc-relayer-types,
-        // this is a known limitation
-        tracing::debug!("Converting CardanoHeader to AnyHeader at height {:?}", header.height);
-        
-        // For now, this conversion is not directly supported
-        // In production, AnyHeader needs a Cardano variant
-        tracing::error!("CardanoHeader -> AnyHeader conversion not yet supported");
-        
-        // Return a stub - this will need proper implementation
-        // when CardanoHeader is added to AnyHeader enum in ibc-relayer-types
-        panic!("CardanoHeader conversion not yet implemented - AnyHeader needs Cardano variant")
-    }
-}
+// Header trait and From<CardanoHeader> for AnyHeader are now implemented
+// in ibc-relayer-types/src/clients/ics08_cardano/header.rs and
+// ibc-relayer-types/src/core/ics02_client/header.rs respectively
 

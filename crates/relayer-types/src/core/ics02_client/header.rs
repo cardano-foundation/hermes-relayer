@@ -8,6 +8,9 @@ use ibc_proto::Protobuf;
 use crate::clients::ics07_tendermint::header::{
     decode_header as tm_decode_header, Header as TendermintHeader, TENDERMINT_HEADER_TYPE_URL,
 };
+use crate::clients::ics08_cardano::header::{
+    Header as CardanoHeader, CARDANO_HEADER_TYPE_URL,
+};
 use crate::core::ics02_client::client_type::ClientType;
 use crate::core::ics02_client::error::Error;
 use crate::timestamp::Timestamp;
@@ -41,24 +44,28 @@ pub fn decode_header(header_bytes: &[u8]) -> Result<AnyHeader, Error> {
 #[allow(clippy::large_enum_variant)]
 pub enum AnyHeader {
     Tendermint(TendermintHeader),
+    Cardano(CardanoHeader),
 }
 
 impl Header for AnyHeader {
     fn client_type(&self) -> ClientType {
         match self {
             Self::Tendermint(header) => header.client_type(),
+            Self::Cardano(header) => header.client_type(),
         }
     }
 
     fn height(&self) -> Height {
         match self {
             Self::Tendermint(header) => header.height(),
+            Self::Cardano(header) => header.height(),
         }
     }
 
     fn timestamp(&self) -> Timestamp {
         match self {
             Self::Tendermint(header) => header.timestamp(),
+            Self::Cardano(header) => header.timestamp(),
         }
     }
 }
@@ -89,6 +96,11 @@ impl From<AnyHeader> for Any {
                 type_url: TENDERMINT_HEADER_TYPE_URL.to_string(),
                 value: Protobuf::<RawHeader>::encode_vec(header),
             },
+            AnyHeader::Cardano(header) => Any {
+                type_url: CARDANO_HEADER_TYPE_URL.to_string(),
+                // TODO: Implement proper protobuf encoding for CardanoHeader
+                value: vec![], // Placeholder
+            },
         }
     }
 }
@@ -96,5 +108,11 @@ impl From<AnyHeader> for Any {
 impl From<TendermintHeader> for AnyHeader {
     fn from(header: TendermintHeader) -> Self {
         Self::Tendermint(header)
+    }
+}
+
+impl From<CardanoHeader> for AnyHeader {
+    fn from(header: CardanoHeader) -> Self {
+        Self::Cardano(header)
     }
 }

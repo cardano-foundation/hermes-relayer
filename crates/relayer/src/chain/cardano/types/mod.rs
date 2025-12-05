@@ -2,9 +2,10 @@
 
 pub mod client_state;
 pub mod consensus_state;
-pub mod header;
 
 pub use client_state::CardanoClientState;
 pub use consensus_state::CardanoConsensusState;
-pub use header::CardanoHeader;
+
+// Re-export CardanoHeader from ibc-relayer-types for convenience
+pub use ibc_relayer_types::clients::ics08_cardano::CardanoHeader;
 
