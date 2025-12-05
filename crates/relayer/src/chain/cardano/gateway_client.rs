@@ -7,7 +7,7 @@ use super::error::Error;
 use super::generated::ibc::cardano::v1::{cardano_msg_client::CardanoMsgClient, SubmitSignedTxRequest, SubmitSignedTxResponse};
 use super::types::{CardanoClientState, CardanoConsensusState};
 use ibc_proto::ibc::core::client::v1::query_client::QueryClient as ClientQueryClient;
-use ibc_proto::ibc::core::client::v1::QueryClientStateRequest;
+use ibc_proto::ibc::core::client::v1::{QueryClientStateRequest, QueryConsensusStateRequest};
 use ibc_proto::ibc::core::connection::v1::query_client::QueryClient as ConnectionQueryClient;
 use ibc_proto::ibc::core::connection::v1::{QueryConnectionRequest, QueryConnectionsRequest};
 use ibc_proto::ibc::core::channel::v1::query_client::QueryClient as ChannelQueryClient;
@@ -96,29 +96,54 @@ impl GatewayClient {
     /// Query consensus state for a specific client ID and height
     pub async fn query_consensus_state(
         &self,
-        _client_id: &str,
-        _height: Height,
+        client_id: &str,
+        height: Height,
     ) -> Result<CardanoConsensusState, Error> {
-        // TODO: Implement real consensus state query
-        tracing::warn!("query_consensus_state: stub implementation");
+        let mut client = ClientQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryConsensusStateRequest {
+            client_id: client_id.to_string(),
+            revision_number: height.revision_number(),
+            revision_height: height.revision_height(),
+            latest_height: false,
+        });
+        
+        let response = client.consensus_state(request)
+            .await?
+            .into_inner();
+        
+        // TODO: Parse the Any proto message and deserialize into CardanoConsensusState
+        // For now, return a stub with the queried height
+        tracing::warn!("query_consensus_state: proto parsing not yet implemented");
+        
         Ok(CardanoConsensusState::new(
-            vec![0u8; 32],
-            0,
-            0,
-            0,
+            vec![0u8; 32],  // placeholder root
+            0,  // timestamp - TODO: extract from proto
+            0,  // slot - TODO: extract from proto
+            0,  // epoch - TODO: extract from proto
         ))
     }
 
     /// Query header at a specific height
-    pub async fn query_header(&self, _height: Height) -> Result<CardanoHeader, Error> {
-        // TODO: Implement real header query
-        tracing::warn!("query_header: stub implementation");
+    /// 
+    /// TODO: This requires generating custom proto for Gateway's QueryBlockData endpoint
+    /// which is not in standard ibc-proto. For now, this returns stub data.
+    /// 
+    /// To implement fully:
+    /// 1. Add ibc/core/client/v1/query.proto (with QueryBlockData) to build.rs
+    /// 2. Generate the proto code
+    /// 3. Call client.block_data(QueryBlockDataRequest { height })
+    /// 4. Parse the BlockData proto to extract block_hash, timestamp, slot, epoch
+    pub async fn query_header(&self, height: Height) -> Result<CardanoHeader, Error> {
+        tracing::warn!("query_header: requires custom proto generation for Gateway's BlockData endpoint");
+        
+        // Stub implementation - returns header with correct height but placeholder data
         Ok(CardanoHeader::new(
-            Height::new(0, 1000).map_err(|e| Error::Query(e.to_string()))?,
-            vec![0u8; 32],
-            0,
-            0,
-            0,
+            height,
+            vec![0u8; 32],  // placeholder block hash
+            0,  // timestamp - TODO: extract from BlockData
+            0,  // slot - TODO: extract from BlockData
+            0,  // epoch - TODO: extract from BlockData
         ))
     }
 
