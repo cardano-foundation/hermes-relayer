@@ -243,7 +243,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 
                 // Step 3: Submit signed transaction via Gateway
                 let tx_response = self.gateway_client
-                    .submit_signed_tx(signed_cbor_hex, unsigned_tx.description.clone())
+                    .submit_signed_tx(&signed_cbor_hex)
                     .await
                     .map_err(|e| Error::send_tx(format!("Failed to submit transaction: {}", e)))?;
                 
@@ -283,31 +283,13 @@ impl ChainEndpoint for CardanoChainEndpoint {
         self.rt.block_on(async {
             // Step 1: Fetch the header for the target height
             let header = self.gateway_client
-                .query_block_header(target)
+                .query_header(target)
                 .await
                 .map_err(|e| Error::query(format!("Failed to fetch header at {:?}: {}", target, e)))?;
             
             // Step 2: Verify the Mithril certificate if present
-            if let Some(ref mithril_cert) = header.mithril_certificate {
-                tracing::info!("Verifying Mithril certificate for height {:?}", target);
-                
-                // TODO: Implement actual Mithril verification
-                // This should:
-                // 1. Extract the Mithril certificate from the header
-                // 2. Verify the certificate chain back to the genesis verification key in client_state
-                // 3. Verify the certificate signatures using Mithril's multi-signature scheme
-                // 4. Ensure the certificate covers the target block
-                
-                tracing::warn!("Mithril verification not yet fully implemented - accepting certificate");
-                
-                // For now, we accept any certificate as valid (stub implementation)
-                // In production, this MUST verify:
-                // - Certificate signature validity
-                // - Certificate chain back to genesis
-                // - Certificate covers the claimed block
-            } else {
-                tracing::warn!("No Mithril certificate present in header - this should not happen in production");
-            }
+            // TODO: Add mithril_certificate field to CardanoHeader
+            tracing::warn!("Mithril verification not yet fully implemented");
             
             // Step 3: Construct and return the light block
             let light_block = CardanoLightBlock {
@@ -769,21 +751,16 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // Block on async operations
         self.rt.block_on(async {
             // Step 1: Query the block header at target height
-            let mut header = self.gateway_client
-                .query_block_header(target_height)
+            let header = self.gateway_client
+                .query_header(target_height)
                 .await
                 .map_err(|e| Error::query(format!("Failed to fetch block at {:?}: {}", target_height, e)))?;
             
             // Step 2: Fetch Mithril certificate for this block
-            let mithril_cert = self.gateway_client
-                .fetch_mithril_certificate(target_height)
-                .await
-                .map_err(|e| Error::query(format!("Failed to fetch Mithril certificate at {:?}: {}", target_height, e)))?;
+            // TODO: Implement Mithril certificate fetching with proper slot/epoch calculation
+            tracing::warn!("Mithril certificate fetching not yet implemented in build_header");
             
-            // Attach Mithril certificate to header
-            header = header.with_mithril_certificate(mithril_cert);
-            
-            tracing::info!("Built Cardano header with Mithril certificate at height {:?}", target_height);
+            tracing::info!("Built Cardano header at height {:?}", target_height);
             
             // Return target header and empty support headers vector
             // (Cardano doesn't need intermediate headers like Tendermint)

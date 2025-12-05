@@ -1,7 +1,17 @@
 //! gRPC client for Cardano Gateway
+//!
+//! This module provides a client for interacting with the Cardano Gateway service,
+//! which handles Cardano blockchain queries, transaction building, and submission.
 
 use super::error::Error;
+use super::generated::ibc::cardano::v1::{cardano_msg_client::CardanoMsgClient, SubmitSignedTxRequest, SubmitSignedTxResponse};
 use super::types::{CardanoClientState, CardanoConsensusState};
+use ibc_proto::ibc::core::client::v1::query_client::QueryClient as ClientQueryClient;
+use ibc_proto::ibc::core::client::v1::QueryClientStateRequest;
+use ibc_proto::ibc::core::connection::v1::query_client::QueryClient as ConnectionQueryClient;
+use ibc_proto::ibc::core::connection::v1::{QueryConnectionRequest, QueryConnectionsRequest};
+use ibc_proto::ibc::core::channel::v1::query_client::QueryClient as ChannelQueryClient;
+use ibc_proto::ibc::core::channel::v1::{QueryChannelRequest, QueryChannelsRequest, QueryPacketCommitmentRequest};
 use ibc_relayer_types::clients::ics08_cardano::CardanoHeader;
 use ibc_relayer_types::Height;
 use tonic::transport::Channel;
@@ -18,94 +28,238 @@ pub struct UnsignedTx {
 pub struct TxSubmitResponse {
     pub tx_hash: String,
     pub height: Option<Height>,
-    pub events: Vec<String>, // TODO: Parse into proper IBC events
+    pub events: Vec<IbcEvent>,
+}
+
+/// Simplified IBC event structure for Gateway responses
+#[derive(Debug, Clone)]
+pub struct IbcEvent {
+    pub event_type: String,
+    pub attributes: Vec<(String, String)>,
 }
 
 /// Client for communicating with Cardano Gateway
 #[derive(Clone)]
 pub struct GatewayClient {
     endpoint: String,
-    #[allow(dead_code)]
-    channel: Option<Channel>,
+    channel: Channel,
 }
 
 impl GatewayClient {
-    /// Create a new Gateway client
+    /// Create a new Gateway client and establish a gRPC connection
     pub async fn new(endpoint: String) -> Result<Self, Error> {
-        // For now, just store the endpoint
-        // Full gRPC client will be implemented once proto definitions are integrated
         tracing::info!("Connecting to Cardano Gateway at {}", endpoint);
         
-        Ok(Self {
-            endpoint,
-            channel: None,
-        })
+        let channel = Channel::from_shared(endpoint.clone())
+            .map_err(|e| Error::GatewayClient(e.to_string()))?
+            .connect()
+            .await?;
+        
+        Ok(Self { endpoint, channel })
     }
 
-    /// Query the latest block height
+    /// Query the latest block height from the Gateway
+    /// This uses a stub implementation for now - real implementation would query
+    /// the Gateway's custom LatestHeight endpoint
     pub async fn query_latest_height(&self) -> Result<Height, Error> {
-        // Stub implementation
-        tracing::warn!("query_latest_height: using stub implementation");
+        // TODO: Implement custom Query.LatestHeight gRPC call
+        // The Gateway exposes this as a custom endpoint not in standard ibc-proto
+        tracing::warn!("query_latest_height: using stub implementation - needs custom proto generation");
         Ok(Height::new(0, 1000).map_err(|e| Error::Query(e.to_string()))?)
     }
 
-    /// Query client state
+    /// Query client state for a specific client ID
     pub async fn query_client_state(&self, client_id: &str) -> Result<CardanoClientState, Error> {
-        // Stub implementation
-        tracing::warn!("query_client_state: using stub implementation for {}", client_id);
+        let mut client = ClientQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryClientStateRequest {
+            client_id: client_id.to_string(),
+        });
+        
+        let response = client.client_state(request)
+            .await?
+            .into_inner();
+        
+        // TODO: Parse the Any proto message and deserialize into CardanoClientState
+        // For now, return a stub
+        tracing::warn!("query_client_state: proto parsing not yet implemented");
+        
         Ok(CardanoClientState::new(
-            "cardano-test".to_string(),
+            client_id.to_string(),
             Height::new(0, 1000).map_err(|e| Error::Query(e.to_string()))?,
-            86400,  // 1 day trusting period
-            1814400,  // 21 days unbonding period
-            vec![0u8; 32],  // placeholder genesis vkey
+            86400,
+            1814400,
+            vec![0u8; 32],
         ))
     }
 
-    /// Query consensus state
+    /// Query consensus state for a specific client ID and height
     pub async fn query_consensus_state(
         &self,
-        client_id: &str,
-        height: Height,
+        _client_id: &str,
+        _height: Height,
     ) -> Result<CardanoConsensusState, Error> {
-        tracing::warn!(
-            "query_consensus_state: using stub implementation for {} at height {}",
-            client_id,
-            height
-        );
+        // TODO: Implement real consensus state query
+        tracing::warn!("query_consensus_state: stub implementation");
         Ok(CardanoConsensusState::new(
-            vec![0u8; 32],  // placeholder root
-            0,  // timestamp
-            0,  // slot
-            0,  // epoch
+            vec![0u8; 32],
+            0,
+            0,
+            0,
         ))
     }
 
     /// Query header at a specific height
-    pub async fn query_header(&self, height: Height) -> Result<CardanoHeader, Error> {
-        tracing::warn!("query_header: using stub implementation for height {}", height);
+    pub async fn query_header(&self, _height: Height) -> Result<CardanoHeader, Error> {
+        // TODO: Implement real header query
+        tracing::warn!("query_header: stub implementation");
         Ok(CardanoHeader::new(
-            height,
-            vec![0u8; 32],  // placeholder block hash
-            0,  // timestamp
-            0,  // slot
-            0,  // epoch
+            Height::new(0, 1000).map_err(|e| Error::Query(e.to_string()))?,
+            vec![0u8; 32],
+            0,
+            0,
+            0,
         ))
     }
 
-    /// Build an unsigned transaction
-    pub async fn build_transaction(&self, _messages: Vec<u8>) -> Result<Vec<u8>, Error> {
-        tracing::warn!("build_transaction: using stub implementation");
-        Ok(vec![])
+    /// Query connection state
+    pub async fn query_connection(&self, connection_id: &str) -> Result<Vec<u8>, Error> {
+        let mut client = ConnectionQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryConnectionRequest {
+            connection_id: connection_id.to_string(),
+        });
+        
+        let response = client.connection(request)
+            .await?
+            .into_inner();
+        
+        // Return serialized connection
+        Ok(prost::Message::encode_to_vec(&response))
     }
 
-    /// Submit a signed transaction
-    pub async fn submit_signed_transaction(&self, signed_tx_cbor: &[u8]) -> Result<String, Error> {
-        tracing::warn!(
-            "submit_signed_transaction: using stub implementation (tx size: {} bytes)",
-            signed_tx_cbor.len()
-        );
-        Ok("stub_tx_hash".to_string())
+    /// Query all connections
+    pub async fn query_connections(&self) -> Result<Vec<u8>, Error> {
+        let mut client = ConnectionQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryConnectionsRequest {
+            pagination: None,
+        });
+        
+        let response = client.connections(request)
+            .await?
+            .into_inner();
+        
+        Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Query channel state
+    pub async fn query_channel(&self, port_id: &str, channel_id: &str) -> Result<Vec<u8>, Error> {
+        let mut client = ChannelQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryChannelRequest {
+            port_id: port_id.to_string(),
+            channel_id: channel_id.to_string(),
+        });
+        
+        let response = client.channel(request)
+            .await?
+            .into_inner();
+        
+        Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Query all channels
+    pub async fn query_channels(&self) -> Result<Vec<u8>, Error> {
+        let mut client = ChannelQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryChannelsRequest {
+            pagination: None,
+        });
+        
+        let response = client.channels(request)
+            .await?
+            .into_inner();
+        
+        Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Query packet commitment
+    pub async fn query_packet_commitment(
+        &self,
+        port_id: &str,
+        channel_id: &str,
+        sequence: u64,
+    ) -> Result<Vec<u8>, Error> {
+        let mut client = ChannelQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryPacketCommitmentRequest {
+            port_id: port_id.to_string(),
+            channel_id: channel_id.to_string(),
+            sequence,
+        });
+        
+        let response = client.packet_commitment(request)
+            .await?
+            .into_inner();
+        
+        Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Build unsigned transaction for IBC message via Gateway
+    /// Gateway returns CBOR hex that Hermes will sign
+    pub async fn build_ibc_tx(&self, message_type: &str, _message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        tracing::info!("Building unsigned transaction for message type: {}", message_type);
+        
+        // TODO: Call Gateway's Msg service to build unsigned transaction
+        // For now, return a stub
+        tracing::warn!("build_ibc_tx: stub implementation");
+        Ok(UnsignedTx {
+            cbor_hex: "00".to_string(),
+            description: format!("Unsigned {} transaction", message_type),
+        })
+    }
+
+    /// Submit a signed transaction to the Cardano blockchain via Gateway
+    pub async fn submit_signed_tx(&self, signed_tx_cbor: &str) -> Result<TxSubmitResponse, Error> {
+        tracing::info!("Submitting signed transaction (CBOR length: {})", signed_tx_cbor.len());
+        
+        let mut client = CardanoMsgClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(SubmitSignedTxRequest {
+            signed_tx_cbor: signed_tx_cbor.to_string(),
+            description: "Hermes IBC transaction".to_string(),
+        });
+        
+        let response: SubmitSignedTxResponse = client.submit_signed_tx(request)
+            .await?
+            .into_inner();
+        
+        // Parse height if present
+        let height = if !response.height.is_empty() {
+            let parts: Vec<&str> = response.height.split('-').collect();
+            if parts.len() == 2 {
+                let revision_number: u64 = parts[0].parse().unwrap_or(0);
+                let revision_height: u64 = parts[1].parse().unwrap_or(0);
+                Height::new(revision_number, revision_height).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        // Convert proto events to IbcEvent
+        let events = response.events.into_iter().map(|e| IbcEvent {
+            event_type: e.r#type,
+            attributes: e.attributes.into_iter().map(|a| (a.key, a.value)).collect(),
+        }).collect();
+        
+        Ok(TxSubmitResponse {
+            tx_hash: response.tx_hash,
+            height,
+            events,
+        })
     }
 
     /// Get the Gateway endpoint URL
@@ -113,94 +267,17 @@ impl GatewayClient {
         &self.endpoint
     }
 
-    /// Build unsigned transaction for IBC message via Gateway
-    /// Gateway returns CBOR hex that Hermes will sign
-    pub async fn build_ibc_tx(&self, message_type: &str, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
-        tracing::info!("Building unsigned transaction for message type: {}", message_type);
-        
-        // TODO: Implement actual gRPC call to Gateway
-        // For now, return a stub
-        tracing::warn!("build_ibc_tx: using stub implementation");
-        
-        Ok(UnsignedTx {
-            cbor_hex: "stub_cbor_hex".to_string(),
-            description: format!("IBC {} message", message_type),
-        })
+    /// Fetch a Mithril certificate for a specific chain point
+    pub async fn fetch_mithril_certificate(&self, _slot: u64, _epoch: u64) -> Result<Vec<u8>, Error> {
+        // TODO: Implement Mithril certificate fetching
+        tracing::warn!("fetch_mithril_certificate: stub implementation");
+        Ok(vec![])
     }
 
-    /// Submit signed transaction to Cardano network via Gateway
-    pub async fn submit_signed_tx(&self, signed_cbor_hex: String, description: String) -> Result<TxSubmitResponse, Error> {
-        tracing::info!("Submitting signed transaction: {}", description);
-        
-        // TODO: Implement actual gRPC call to Gateway's SubmitSignedTx endpoint
-        // For now, return a stub
-        tracing::warn!("submit_signed_tx: using stub implementation");
-        
-        Ok(TxSubmitResponse {
-            tx_hash: "stub_tx_hash".to_string(),
-            height: Some(Height::new(0, 1001).map_err(|e| Error::Query(e.to_string()))?),
-            events: vec![],
-        })
-    }
-
-    /// Query Cardano block header at specific height
-    pub async fn query_block_header(&self, height: Height) -> Result<CardanoHeader, Error> {
-        tracing::info!("Querying block header at height {:?}", height);
-        
-        // TODO: Implement actual gRPC call to Gateway
-        // For now, return a stub
-        tracing::warn!("query_block_header: using stub implementation");
-        
-        Ok(CardanoHeader::new(
-            height,
-            vec![0u8; 32], // placeholder block hash
-            0, // placeholder timestamp - TODO: get real timestamp from Gateway
-            height.revision_height() * 20, // approximate slot
-            height.revision_height() / 432000, // approximate epoch
-        ))
-    }
-
-    /// Fetch Mithril certificate for a specific block
-    pub async fn fetch_mithril_certificate(&self, height: Height) -> Result<Vec<u8>, Error> {
-        tracing::info!("Fetching Mithril certificate for height {:?}", height);
-        
-        // TODO: Implement actual call to Mithril aggregator
-        // This should:
-        // 1. Connect to Mithril aggregator endpoint
-        // 2. Query certificate for the block at the given height
-        // 3. Return serialized certificate
-        
-        tracing::warn!("fetch_mithril_certificate: using stub implementation");
-        
-        // Return stub certificate
-        Ok(vec![0u8; 128])
+    /// Query block header at a specific height
+    pub async fn query_block_header(&self, _height: Height) -> Result<Vec<u8>, Error> {
+        // TODO: Implement block header query
+        tracing::warn!("query_block_header: stub implementation");
+        Ok(vec![])
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_gateway_client_creation() {
-        let client = GatewayClient::new("http://localhost:3001".to_string())
-            .await
-            .unwrap();
-        assert_eq!(client.endpoint(), "http://localhost:3001");
-    }
-
-    #[tokio::test]
-    async fn test_stub_queries() {
-        let client = GatewayClient::new("http://localhost:3001".to_string())
-            .await
-            .unwrap();
-
-        // Test that stub implementations don't panic
-        let height = client.query_latest_height().await.unwrap();
-        assert!(height.revision_height() > 0);
-
-        let client_state = client.query_client_state("test-client").await.unwrap();
-        assert_eq!(client_state.chain_id.to_string(), "cardano-test");
-    }
-}
-

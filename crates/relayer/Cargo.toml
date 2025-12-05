@@ -99,6 +99,9 @@ pallas-primitives                = "0.30"
 pallas-codec                     = "0.30"
 lazy_static                      = "1.4"
 
+[build-dependencies]
+tonic-build = "0.12"
+
 [dev-dependencies]
 ibc-relayer-types = { workspace = true }
 serial_test       = { workspace = true }

@@ -9,6 +9,7 @@ pub mod config;
 pub mod endpoint;
 pub mod error;
 pub mod gateway_client;
+pub mod generated;
 pub mod keyring;
 pub mod signer;
 pub mod signing_key_pair;
