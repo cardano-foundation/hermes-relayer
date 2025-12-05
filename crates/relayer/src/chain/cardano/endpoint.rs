@@ -38,6 +38,7 @@ use crate::consensus_state::AnyConsensusState;
 use crate::denom::DenomTrace;
 use crate::error::Error;
 use crate::event::IbcEventWithHeight;
+use ibc_relayer_types::core::ics02_client::height::Height;
 use crate::keyring::{AnySigningKeyPair, KeyRing, SigningKeyPair, SigningKeyPairSized};
 use crate::misbehaviour::MisbehaviourEvidence;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
@@ -247,23 +248,46 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     .await
                     .map_err(|e| Error::send_tx(format!("Failed to submit transaction: {}", e)))?;
                 
-                tracing::info!("Transaction submitted: {} at height {:?}", tx_response.tx_hash, tx_response.height);
-                
                 // Step 4: Parse events from transaction result
+                let height = tx_response.height
+                    .ok_or_else(|| Error::send_tx("No height in transaction response".to_string()))?;
+                
+                tracing::info!("Transaction submitted: {} at height {}", tx_response.tx_hash, height);
+                
                 // Log all events for debugging
                 for event in &tx_response.events {
                     tracing::debug!("Gateway event: type={} attributes={:?}", event.event_type, event.attributes);
                 }
                 
-                // TODO: Full event parsing - convert Gateway events to IbcEventWithHeight
-                // This requires:
-                // 1. Parsing event types (e.g., "send_packet", "acknowledge_packet", "create_client")
-                // 2. Extracting attributes from event.attributes
-                // 3. Constructing appropriate IbcEvent variants (from ibc-relayer-types)
-                // 4. Wrapping in IbcEventWithHeight with the transaction height
-                //
-                // For now, we log events and return empty vector
-                tracing::warn!("Full event parsing not yet implemented - events logged but not returned to Hermes")
+                // Convert custom IbcEvent to proto Event format for parsing
+                let proto_events: Vec<super::generated::ibc::cardano::v1::Event> = tx_response.events
+                    .into_iter()
+                    .map(|e| super::generated::ibc::cardano::v1::Event {
+                        r#type: e.event_type,
+                        attributes: e.attributes
+                            .into_iter()
+                            .map(|(k, v)| super::generated::ibc::cardano::v1::EventAttribute {
+                                key: k,
+                                value: v,
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                
+                // Parse Gateway events into Hermes IbcEvent types
+                let parsed_events = super::event_parser::parse_events(proto_events, height)
+                    .map_err(|e| Error::send_tx(format!("Failed to parse events: {}", e)))?;
+                
+                tracing::info!("Parsed {} IBC events from transaction", parsed_events.len());
+                
+                // Wrap events with height
+                let events_with_height: Vec<IbcEventWithHeight> = parsed_events
+                    .into_iter()
+                    .map(|event| IbcEventWithHeight::new(event, height))
+                    .collect();
+                
+                // Add parsed events to result
+                all_events.extend(events_with_height);
             }
             
             Ok(all_events)

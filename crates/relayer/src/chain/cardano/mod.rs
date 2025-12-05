@@ -8,6 +8,7 @@ pub mod chain_handle;
 pub mod config;
 pub mod endpoint;
 pub mod error;
+pub mod event_parser;
 pub mod gateway_client;
 pub mod generated;
 pub mod keyring;

@@ -28,6 +28,9 @@ pub enum Error {
     #[error("IBC error: {0}")]
     Ibc(String),
 
+    #[error("Event attribute error: {0}")]
+    EventAttribute(String),
+
     #[error("Generic error: {0}")]
     Generic(String),
 }
