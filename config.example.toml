@@ -56,7 +56,7 @@ tx_confirmation = true
 #
 [[chains]]
 type = 'Cardano'
-id = 'cardano-testnet'
+id = 'cardano-devnet'
 
 # Gateway gRPC endpoint - this is your NestJS Gateway
 gateway_url = 'http://localhost:3001'

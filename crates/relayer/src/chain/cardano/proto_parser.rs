@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn test_parse_client_state_from_any() {
         let json = r#"{
-            "chain_id": "cardano-testnet",
+            "chain_id": "cardano-devnet",
             "latest_height": {
                 "revision_number": 0,
                 "revision_height": 1000
@@ -148,7 +148,7 @@ mod tests {
         };
         
         let client_state = parse_client_state_from_any(any).unwrap();
-        assert_eq!(client_state.chain_id.to_string(), "cardano-testnet");
+        assert_eq!(client_state.chain_id.to_string(), "cardano-devnet");
         assert_eq!(client_state.latest_height.revision_height(), 1000);
     }
     
