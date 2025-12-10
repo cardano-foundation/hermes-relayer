@@ -689,9 +689,39 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &self,
         request: QueryPacketCommitmentsRequest,
     ) -> Result<(Vec<Sequence>, ICSHeight), Error> {
-        // TODO: Query packet commitments via Gateway
-        tracing::warn!("query_packet_commitments: stub implementation");
-        Ok((vec![], ICSHeight::new(0, 1).unwrap()))
+        tracing::info!("Querying packet commitments: port={}, channel={}", 
+            request.port_id, request.channel_id);
+        
+        // Block on async operation
+        self.rt.block_on(async {
+            // Query packet commitments from Gateway
+            let response_bytes = self.gateway_client
+                .query_packet_commitments(&request.port_id.to_string(), &request.channel_id.to_string())
+                .await
+                .map_err(|e| Error::query(format!("Failed to query packet commitments: {}", e)))?;
+            
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::channel::v1::QueryPacketCommitmentsResponse;
+            
+            let response = QueryPacketCommitmentsResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode packet commitments response: {}", e)))?;
+            
+            // Extract sequences from packet_states
+            let sequences: Vec<Sequence> = response.commitments
+                .iter()
+                .map(|state| Sequence::from(state.sequence))
+                .collect();
+            
+            // Extract height from response
+            let height = response.height
+                .ok_or_else(|| Error::query("No height in packet commitments response".to_string()))?;
+            
+            let ics_height = ICSHeight::new(height.revision_number, height.revision_height)
+                .map_err(|e| Error::query(format!("Invalid height: {}", e)))?;
+            
+            Ok((sequences, ics_height))
+        })
     }
 
     fn query_packet_receipt(
@@ -704,14 +734,41 @@ impl ChainEndpoint for CardanoChainEndpoint {
         
         // Block on async operation
         self.rt.block_on(async {
-            // TODO: Query actual packet receipt from Gateway
-            tracing::warn!("query_packet_receipt: using stub implementation");
+            // Query packet receipt from Gateway
+            let response_bytes = self.gateway_client
+                .query_packet_receipt(&request.port_id.to_string(), &request.channel_id.to_string(), request.sequence.into())
+                .await
+                .map_err(|e| Error::query(format!("Failed to query packet receipt: {}", e)))?;
             
-            // Return error for now
-            Err(Error::query(format!(
-                "Packet receipt query not yet implemented for port={}, channel={}, seq={}",
-                request.port_id, request.channel_id, request.sequence
-            )))
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::channel::v1::QueryPacketReceiptResponse;
+            
+            let response = QueryPacketReceiptResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode packet receipt response: {}", e)))?;
+            
+            // The receipt is a boolean - convert to bytes
+            let receipt_bytes = if response.received {
+                vec![1u8]
+            } else {
+                vec![0u8]
+            };
+            
+            // Parse proof if requested
+            let proof = if matches!(include_proof, IncludeProof::Yes) {
+                if !response.proof.is_empty() {
+                    use ibc_proto::ibc::core::commitment::v1::MerkleProof as RawMerkleProof;
+                    let raw_proof = RawMerkleProof::decode(&response.proof[..])
+                        .map_err(|e| Error::query(format!("Failed to decode proof: {}", e)))?;
+                    Some(MerkleProof::from(raw_proof))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
+            Ok((receipt_bytes, proof))
         })
     }
 
@@ -719,9 +776,36 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &self,
         request: QueryUnreceivedPacketsRequest,
     ) -> Result<Vec<Sequence>, Error> {
-        // TODO: Query unreceived packets via Gateway
-        tracing::warn!("query_unreceived_packets: stub implementation");
-        Ok(vec![])
+        tracing::info!("Querying unreceived packets: port={}, channel={}", 
+            request.port_id, request.channel_id);
+        
+        // Block on async operation
+        self.rt.block_on(async {
+            // Query unreceived packets from Gateway
+            let response_bytes = self.gateway_client
+                .query_unreceived_packets(
+                    &request.port_id.to_string(), 
+                    &request.channel_id.to_string(),
+                    request.packet_commitment_sequences.iter().map(|s| s.into()).collect()
+                )
+                .await
+                .map_err(|e| Error::query(format!("Failed to query unreceived packets: {}", e)))?;
+            
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::channel::v1::QueryUnreceivedPacketsResponse;
+            
+            let response = QueryUnreceivedPacketsResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode unreceived packets response: {}", e)))?;
+            
+            // Extract sequences from response
+            let sequences: Vec<Sequence> = response.sequences
+                .iter()
+                .map(|s| Sequence::from(*s))
+                .collect();
+            
+            Ok(sequences)
+        })
     }
 
     fn query_packet_acknowledgement(
@@ -734,14 +818,34 @@ impl ChainEndpoint for CardanoChainEndpoint {
         
         // Block on async operation
         self.rt.block_on(async {
-            // TODO: Query actual packet acknowledgement from Gateway
-            tracing::warn!("query_packet_acknowledgement: using stub implementation");
+            // Query packet acknowledgement from Gateway
+            let response_bytes = self.gateway_client
+                .query_packet_acknowledgement(&request.port_id.to_string(), &request.channel_id.to_string(), request.sequence.into())
+                .await
+                .map_err(|e| Error::query(format!("Failed to query packet acknowledgement: {}", e)))?;
             
-            // Return error for now
-            Err(Error::query(format!(
-                "Packet acknowledgement query not yet implemented for port={}, channel={}, seq={}",
-                request.port_id, request.channel_id, request.sequence
-            )))
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::channel::v1::QueryPacketAcknowledgementResponse;
+            
+            let response = QueryPacketAcknowledgementResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode packet acknowledgement response: {}", e)))?;
+            
+            // Parse proof if requested
+            let proof = if matches!(include_proof, IncludeProof::Yes) {
+                if !response.proof.is_empty() {
+                    use ibc_proto::ibc::core::commitment::v1::MerkleProof as RawMerkleProof;
+                    let raw_proof = RawMerkleProof::decode(&response.proof[..])
+                        .map_err(|e| Error::query(format!("Failed to decode proof: {}", e)))?;
+                    Some(MerkleProof::from(raw_proof))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
+            Ok((response.acknowledgement, proof))
         })
     }
 
@@ -749,18 +853,75 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &self,
         request: QueryPacketAcknowledgementsRequest,
     ) -> Result<(Vec<Sequence>, ICSHeight), Error> {
-        // TODO: Query packet acknowledgements via Gateway
-        tracing::warn!("query_packet_acknowledgements: stub implementation");
-        Ok((vec![], ICSHeight::new(0, 1).unwrap()))
+        tracing::info!("Querying packet acknowledgements: port={}, channel={}", 
+            request.port_id, request.channel_id);
+        
+        // Block on async operation
+        self.rt.block_on(async {
+            // Query packet acknowledgements from Gateway
+            let response_bytes = self.gateway_client
+                .query_packet_acknowledgements(&request.port_id.to_string(), &request.channel_id.to_string())
+                .await
+                .map_err(|e| Error::query(format!("Failed to query packet acknowledgements: {}", e)))?;
+            
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::channel::v1::QueryPacketAcknowledgementsResponse;
+            
+            let response = QueryPacketAcknowledgementsResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode packet acknowledgements response: {}", e)))?;
+            
+            // Extract sequences from acknowledgements
+            let sequences: Vec<Sequence> = response.acknowledgements
+                .iter()
+                .map(|ack| Sequence::from(ack.sequence))
+                .collect();
+            
+            // Extract height from response
+            let height = response.height
+                .ok_or_else(|| Error::query("No height in packet acknowledgements response".to_string()))?;
+            
+            let ics_height = ICSHeight::new(height.revision_number, height.revision_height)
+                .map_err(|e| Error::query(format!("Invalid height: {}", e)))?;
+            
+            Ok((sequences, ics_height))
+        })
     }
 
     fn query_unreceived_acknowledgements(
         &self,
         request: QueryUnreceivedAcksRequest,
     ) -> Result<Vec<Sequence>, Error> {
-        // TODO: Query unreceived acknowledgements via Gateway
-        tracing::warn!("query_unreceived_acknowledgements: stub implementation");
-        Ok(vec![])
+        tracing::info!("Querying unreceived acknowledgements: port={}, channel={}", 
+            request.port_id, request.channel_id);
+        
+        // Block on async operation
+        self.rt.block_on(async {
+            // Query unreceived acknowledgements from Gateway
+            let response_bytes = self.gateway_client
+                .query_unreceived_acknowledgements(
+                    &request.port_id.to_string(), 
+                    &request.channel_id.to_string(),
+                    request.packet_ack_sequences.iter().map(|s| s.into()).collect()
+                )
+                .await
+                .map_err(|e| Error::query(format!("Failed to query unreceived acknowledgements: {}", e)))?;
+            
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::channel::v1::QueryUnreceivedAcksResponse;
+            
+            let response = QueryUnreceivedAcksResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode unreceived acks response: {}", e)))?;
+            
+            // Extract sequences from response
+            let sequences: Vec<Sequence> = response.sequences
+                .iter()
+                .map(|s| Sequence::from(*s))
+                .collect();
+            
+            Ok(sequences)
+        })
     }
 
     fn query_next_sequence_receive(
@@ -768,9 +929,42 @@ impl ChainEndpoint for CardanoChainEndpoint {
         request: QueryNextSequenceReceiveRequest,
         include_proof: IncludeProof,
     ) -> Result<(Sequence, Option<MerkleProof>), Error> {
-        // TODO: Query next sequence receive via Gateway
-        tracing::warn!("query_next_sequence_receive: stub implementation");
-        todo!("Implement query_next_sequence_receive()")
+        tracing::info!("Querying next sequence receive: port={}, channel={}", 
+            request.port_id, request.channel_id);
+        
+        // Block on async operation
+        self.rt.block_on(async {
+            // Query next sequence receive from Gateway
+            let response_bytes = self.gateway_client
+                .query_next_sequence_receive(&request.port_id.to_string(), &request.channel_id.to_string())
+                .await
+                .map_err(|e| Error::query(format!("Failed to query next sequence receive: {}", e)))?;
+            
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::channel::v1::QueryNextSequenceReceiveResponse;
+            
+            let response = QueryNextSequenceReceiveResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode next sequence receive response: {}", e)))?;
+            
+            let sequence = Sequence::from(response.next_sequence_receive);
+            
+            // Parse proof if requested
+            let proof = if matches!(include_proof, IncludeProof::Yes) {
+                if !response.proof.is_empty() {
+                    use ibc_proto::ibc::core::commitment::v1::MerkleProof as RawMerkleProof;
+                    let raw_proof = RawMerkleProof::decode(&response.proof[..])
+                        .map_err(|e| Error::query(format!("Failed to decode proof: {}", e)))?;
+                    Some(MerkleProof::from(raw_proof))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
+            Ok((sequence, proof))
+        })
     }
 
     fn query_txs(&self, request: QueryTxRequest) -> Result<Vec<IbcEventWithHeight>, Error> {

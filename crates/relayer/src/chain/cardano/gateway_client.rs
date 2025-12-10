@@ -14,7 +14,13 @@ use ibc_proto::ibc::core::client::v1::{QueryClientStateRequest, QueryConsensusSt
 use ibc_proto::ibc::core::connection::v1::query_client::QueryClient as ConnectionQueryClient;
 use ibc_proto::ibc::core::connection::v1::{QueryConnectionRequest, QueryConnectionsRequest};
 use ibc_proto::ibc::core::channel::v1::query_client::QueryClient as ChannelQueryClient;
-use ibc_proto::ibc::core::channel::v1::{QueryChannelRequest, QueryChannelsRequest, QueryPacketCommitmentRequest};
+use ibc_proto::ibc::core::channel::v1::{
+    QueryChannelRequest, QueryChannelsRequest, QueryPacketCommitmentRequest,
+    QueryPacketCommitmentsRequest, QueryPacketReceiptRequest,
+    QueryPacketAcknowledgementRequest, QueryPacketAcknowledgementsRequest,
+    QueryUnreceivedPacketsRequest, QueryUnreceivedAcksRequest,
+    QueryNextSequenceReceiveRequest,
+};
 use ibc_relayer_types::clients::ics08_cardano::CardanoHeader;
 use ibc_relayer_types::Height;
 use tonic::transport::Channel;
@@ -241,6 +247,157 @@ impl GatewayClient {
         });
         
         let response = client.packet_commitment(request)
+            .await?
+            .into_inner();
+        
+        Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Query all packet commitments for a channel
+    pub async fn query_packet_commitments(
+        &self,
+        port_id: &str,
+        channel_id: &str,
+    ) -> Result<Vec<u8>, Error> {
+        let mut client = ChannelQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryPacketCommitmentsRequest {
+            port_id: port_id.to_string(),
+            channel_id: channel_id.to_string(),
+            pagination: None,
+        });
+        
+        let response = client.packet_commitments(request)
+            .await?
+            .into_inner();
+        
+        Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Query packet receipt
+    pub async fn query_packet_receipt(
+        &self,
+        port_id: &str,
+        channel_id: &str,
+        sequence: u64,
+    ) -> Result<Vec<u8>, Error> {
+        let mut client = ChannelQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryPacketReceiptRequest {
+            port_id: port_id.to_string(),
+            channel_id: channel_id.to_string(),
+            sequence,
+        });
+        
+        let response = client.packet_receipt(request)
+            .await?
+            .into_inner();
+        
+        Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Query packet acknowledgement
+    pub async fn query_packet_acknowledgement(
+        &self,
+        port_id: &str,
+        channel_id: &str,
+        sequence: u64,
+    ) -> Result<Vec<u8>, Error> {
+        let mut client = ChannelQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryPacketAcknowledgementRequest {
+            port_id: port_id.to_string(),
+            channel_id: channel_id.to_string(),
+            sequence,
+        });
+        
+        let response = client.packet_acknowledgement(request)
+            .await?
+            .into_inner();
+        
+        Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Query all packet acknowledgements for a channel
+    pub async fn query_packet_acknowledgements(
+        &self,
+        port_id: &str,
+        channel_id: &str,
+    ) -> Result<Vec<u8>, Error> {
+        let mut client = ChannelQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryPacketAcknowledgementsRequest {
+            port_id: port_id.to_string(),
+            channel_id: channel_id.to_string(),
+            pagination: None,
+            packet_commitment_sequences: vec![],
+        });
+        
+        let response = client.packet_acknowledgements(request)
+            .await?
+            .into_inner();
+        
+        Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Query unreceived packets
+    pub async fn query_unreceived_packets(
+        &self,
+        port_id: &str,
+        channel_id: &str,
+        sequences: Vec<u64>,
+    ) -> Result<Vec<u8>, Error> {
+        let mut client = ChannelQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryUnreceivedPacketsRequest {
+            port_id: port_id.to_string(),
+            channel_id: channel_id.to_string(),
+            packet_commitment_sequences: sequences,
+        });
+        
+        let response = client.unreceived_packets(request)
+            .await?
+            .into_inner();
+        
+        Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Query unreceived acknowledgements
+    pub async fn query_unreceived_acknowledgements(
+        &self,
+        port_id: &str,
+        channel_id: &str,
+        sequences: Vec<u64>,
+    ) -> Result<Vec<u8>, Error> {
+        let mut client = ChannelQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryUnreceivedAcksRequest {
+            port_id: port_id.to_string(),
+            channel_id: channel_id.to_string(),
+            packet_ack_sequences: sequences,
+        });
+        
+        let response = client.unreceived_acks(request)
+            .await?
+            .into_inner();
+        
+        Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Query next sequence receive for a channel
+    pub async fn query_next_sequence_receive(
+        &self,
+        port_id: &str,
+        channel_id: &str,
+    ) -> Result<Vec<u8>, Error> {
+        let mut client = ChannelQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryNextSequenceReceiveRequest {
+            port_id: port_id.to_string(),
+            channel_id: channel_id.to_string(),
+        });
+        
+        let response = client.next_sequence_receive(request)
             .await?
             .into_inner();
         
