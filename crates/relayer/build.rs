@@ -19,6 +19,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Cardano-specific transaction service
         proto_types_dir.join("ibc/cardano/v1/tx.proto"),
         
+        // Cardano-specific query service (events)
+        proto_types_dir.join("ibc/cardano/v1/query.proto"),
+        
+        // IBC core types (block results, events)
+        proto_types_dir.join("ibc/core/types/v1/block.proto"),
+        proto_types_dir.join("ibc/core/types/v1/query.proto"),
+        
         // IBC core client query service (includes BlockData, LatestHeight)
         proto_types_dir.join("ibc/core/client/v1/query.proto"),
         

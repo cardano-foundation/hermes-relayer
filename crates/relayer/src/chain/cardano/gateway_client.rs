@@ -982,28 +982,26 @@ impl GatewayClient {
 
     /// Query IBC events since a given height
     /// Returns events grouped by block height
-    pub async fn query_events(&self, since_height: Height) -> Result<EventsQueryResponse, Error> {
-        // TODO: Implement actual gRPC call to Gateway once endpoint is available
-        // For now, return empty response
+    pub async fn query_events(&self, since_height: Height) -> Result<super::generated::ibc::cardano::v1::QueryEventsResponse, Error> {
+        use super::generated::ibc::cardano::v1::{query_client::QueryClient, QueryEventsRequest};
+        
         tracing::debug!("Querying events since height: {}", since_height);
         
-        Ok(EventsQueryResponse {
-            current_height: since_height,
-            block_events: vec![],
-        })
+        let mut client = QueryClient::new(self.channel.clone());
+        let request = tonic::Request::new(QueryEventsRequest {
+            since_height: since_height.revision_height(),
+        });
+        
+        let response = client.events(request)
+            .await?
+            .into_inner();
+        
+        tracing::debug!(
+            "Received {} block events, current height: {}",
+            response.events.len(),
+            response.current_height
+        );
+        
+        Ok(response)
     }
-}
-
-/// Response for events query (will be replaced with protobuf generated types)
-#[derive(Debug, Clone)]
-pub struct EventsQueryResponse {
-    pub current_height: Height,
-    pub block_events: Vec<BlockEvents>,
-}
-
-/// Events for a single block
-#[derive(Debug, Clone)]
-pub struct BlockEvents {
-    pub height: Height,
-    pub events: Vec<super::generated::ibc::cardano::v1::Event>,
 }

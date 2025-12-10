@@ -63,6 +63,11 @@ pub mod ibc {
                 include!("ibc.core.commitment.v1.rs");
             }
         }
+        pub mod types {
+            pub mod v1 {
+                include!("ibc.core.types.v1.rs");
+            }
+        }
     }
 }
 

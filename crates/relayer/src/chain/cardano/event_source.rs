@@ -147,18 +147,19 @@ impl CardanoEventSource {
             .await
             .map_err(|e| Error::collect_events_failed(format!("Failed to query Gateway events: {}", e)))?;
 
-        let current_height = response.current_height;
+        let current_height = Height::new(0, response.current_height)
+            .map_err(|e| Error::collect_events_failed(format!("Invalid height from Gateway: {}", e)))?;
 
         // Process events if we have new blocks
-        if !response.block_events.is_empty() {
+        if !response.events.is_empty() {
             trace!(
                 "received {} block(s) of events from height {} to {}",
-                response.block_events.len(),
+                response.events.len(),
                 self.last_fetched_height,
                 current_height
             );
 
-            for block_events in response.block_events {
+            for block_events in response.events {
                 let batch = self.process_block_events(block_events)?;
                 
                 // Check for commands before broadcasting
@@ -204,16 +205,40 @@ impl CardanoEventSource {
     /// Process events from a single block
     fn process_block_events(
         &self,
-        block_events: super::gateway_client::BlockEvents,
+        block_events: super::generated::ibc::cardano::v1::BlockEvents,
     ) -> Result<Option<EventBatch>> {
-        let height = block_events.height;
+        let height = Height::new(0, block_events.height)
+            .map_err(|e| Error::collect_events_failed(format!("Invalid block height: {}", e)))?;
 
         if block_events.events.is_empty() {
             return Ok(None);
         }
 
+        // Flatten all events from all ResponseDeliverTx items and convert to cardano Event type
+        let gateway_events: Vec<_> = block_events.events
+            .into_iter()
+            .flat_map(|tx_result| {
+                tx_result.events.into_iter().map(|core_event| {
+                    // Convert ibc.core.types.v1.Event to ibc.cardano.v1.Event
+                    super::generated::ibc::cardano::v1::Event {
+                        r#type: core_event.r#type,
+                        attributes: core_event.event_attribute.into_iter().map(|attr| {
+                            super::generated::ibc::cardano::v1::EventAttribute {
+                                key: attr.key,
+                                value: attr.value,
+                            }
+                        }).collect(),
+                    }
+                })
+            })
+            .collect();
+
+        if gateway_events.is_empty() {
+            return Ok(None);
+        }
+
         // Parse Gateway events into IBC events
-        let ibc_events = event_parser::parse_events(block_events.events, height)
+        let ibc_events = event_parser::parse_events(gateway_events, height)
             .map_err(|e| Error::collect_events_failed(format!("Failed to parse events: {}", e)))?;
 
         if ibc_events.is_empty() {
