@@ -9,6 +9,7 @@ pub mod config;
 pub mod endpoint;
 pub mod error;
 pub mod event_parser;
+pub mod event_source;
 pub mod gateway_client;
 pub mod generated;
 pub mod keyring;

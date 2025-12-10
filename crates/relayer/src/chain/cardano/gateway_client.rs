@@ -979,4 +979,31 @@ impl GatewayClient {
         tracing::warn!("query_block_header: stub implementation");
         Ok(vec![])
     }
+
+    /// Query IBC events since a given height
+    /// Returns events grouped by block height
+    pub async fn query_events(&self, since_height: Height) -> Result<EventsQueryResponse, Error> {
+        // TODO: Implement actual gRPC call to Gateway once endpoint is available
+        // For now, return empty response
+        tracing::debug!("Querying events since height: {}", since_height);
+        
+        Ok(EventsQueryResponse {
+            current_height: since_height,
+            block_events: vec![],
+        })
+    }
+}
+
+/// Response for events query (will be replaced with protobuf generated types)
+#[derive(Debug, Clone)]
+pub struct EventsQueryResponse {
+    pub current_height: Height,
+    pub block_events: Vec<BlockEvents>,
+}
+
+/// Events for a single block
+#[derive(Debug, Clone)]
+pub struct BlockEvents {
+    pub height: Height,
+    pub events: Vec<super::generated::ibc::cardano::v1::Event>,
 }

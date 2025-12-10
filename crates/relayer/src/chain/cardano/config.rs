@@ -58,6 +58,10 @@ pub struct CardanoConfig {
     /// Clock drift tolerance
     #[serde(default = "default_clock_drift", with = "humantime_serde")]
     pub clock_drift: Duration,
+
+    /// Event polling interval for monitoring IBC events
+    #[serde(default = "default_event_poll_interval", with = "humantime_serde")]
+    pub event_poll_interval: Option<Duration>,
 }
 
 fn default_max_block_time() -> Duration {
@@ -70,6 +74,10 @@ fn default_query_packets_chunk_size() -> usize {
 
 fn default_clock_drift() -> Duration {
     Duration::from_secs(5)
+}
+
+fn default_event_poll_interval() -> Option<Duration> {
+    Some(Duration::from_secs(5))
 }
 
 impl Default for CardanoConfig {
@@ -88,6 +96,7 @@ impl Default for CardanoConfig {
             query_packets_chunk_size: default_query_packets_chunk_size(),
             clear_interval: None,
             clock_drift: default_clock_drift(),
+            event_poll_interval: default_event_poll_interval(),
         }
     }
 }

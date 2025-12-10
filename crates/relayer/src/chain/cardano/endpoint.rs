@@ -71,6 +71,7 @@ pub struct CardanoChainEndpoint {
     rt: Arc<TokioRuntime>,
     gateway_client: GatewayClient,
     keyring: KeyRing<CardanoSigningKeyPair>,
+    event_source_cmd: Option<crate::event::source::TxEventSourceCmd>,
 }
 
 impl CardanoChainEndpoint {
@@ -96,6 +97,32 @@ impl CardanoChainEndpoint {
         
         // Convert back to hex
         Ok(hex::encode(signed_tx_bytes))
+    }
+
+    /// Initialize the event source for monitoring Cardano chain events
+    fn init_event_source(&mut self) -> Result<crate::event::source::TxEventSourceCmd, Error> {
+        use super::event_source::CardanoEventSource;
+        use std::thread;
+        use std::time::Duration;
+        
+        tracing::info!("Initializing Cardano event source with polling");
+        
+        // Get poll interval from config (default 5 seconds)
+        let poll_interval = self.config.event_poll_interval
+            .unwrap_or_else(|| Duration::from_secs(5));
+        
+        let (event_source, monitor_tx) = CardanoEventSource::new(
+            self.config.id.clone(),
+            self.gateway_client.clone(),
+            poll_interval,
+            self.rt.clone(),
+        ).map_err(Error::event_source)?;
+        
+        thread::spawn(move || event_source.run());
+        
+        tracing::info!("Event source initialized, polling every {:?}", poll_interval);
+        
+        Ok(monitor_tx)
     }
 }
 
@@ -160,6 +187,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             rt,
             gateway_client,
             keyring,
+            event_source_cmd: None, // Initialized lazily on first subscribe() call
         };
 
         tracing::info!("Cardano chain endpoint bootstrap complete");
@@ -177,8 +205,19 @@ impl ChainEndpoint for CardanoChainEndpoint {
     }
 
     fn subscribe(&mut self) -> Result<Subscription, Error> {
-        // TODO: Implement event subscription via Gateway
-        Err(Error::config(ConfigError::wrong_type()))
+        let event_source_cmd = match &self.event_source_cmd {
+            Some(cmd) => cmd,
+            None => {
+                let cmd = self.init_event_source()?;
+                self.event_source_cmd = Some(cmd);
+                self.event_source_cmd.as_ref().unwrap()
+            }
+        };
+
+        let subscription = event_source_cmd
+            .subscribe()
+            .map_err(Error::event_source)?;
+        Ok(subscription)
     }
 
     fn keybase(&self) -> &KeyRing<Self::SigningKeyPair> {
@@ -962,7 +1001,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 .query_unreceived_packets(
                     &request.port_id.to_string(), 
                     &request.channel_id.to_string(),
-                    request.packet_commitment_sequences.iter().map(|s| s.into()).collect()
+                    request.packet_commitment_sequences.iter().map(|s| (*s).into()).collect()
                 )
                 .await
                 .map_err(|e| Error::query(format!("Failed to query unreceived packets: {}", e)))?;
@@ -1078,7 +1117,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 .query_unreceived_acknowledgements(
                     &request.port_id.to_string(), 
                     &request.channel_id.to_string(),
-                    request.packet_ack_sequences.iter().map(|s| s.into()).collect()
+                    request.packet_ack_sequences.iter().map(|s| (*s).into()).collect()
                 )
                 .await
                 .map_err(|e| Error::query(format!("Failed to query unreceived acknowledgements: {}", e)))?;
