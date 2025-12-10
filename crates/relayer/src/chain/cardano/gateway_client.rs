@@ -10,13 +10,13 @@ use super::generated::ibc::core::connection::v1::msg_client::MsgClient as GenCon
 use super::generated::ibc::core::channel::v1::msg_client::MsgClient as GenChannelMsgClient;
 use super::types::{CardanoClientState, CardanoConsensusState};
 use ibc_proto::ibc::core::client::v1::query_client::QueryClient as ClientQueryClient;
-use ibc_proto::ibc::core::client::v1::{QueryClientStateRequest, QueryConsensusStateRequest};
+use ibc_proto::ibc::core::client::v1::{QueryClientStateRequest, QueryClientStatesRequest, QueryConsensusStateRequest};
 use ibc_proto::ibc::core::connection::v1::query_client::QueryClient as ConnectionQueryClient;
-use ibc_proto::ibc::core::connection::v1::{QueryConnectionRequest, QueryConnectionsRequest};
+use ibc_proto::ibc::core::connection::v1::{QueryConnectionRequest, QueryConnectionsRequest, QueryClientConnectionsRequest};
 use ibc_proto::ibc::core::channel::v1::query_client::QueryClient as ChannelQueryClient;
 use ibc_proto::ibc::core::channel::v1::{
-    QueryChannelRequest, QueryChannelsRequest, QueryPacketCommitmentRequest,
-    QueryPacketCommitmentsRequest, QueryPacketReceiptRequest,
+    QueryChannelRequest, QueryChannelsRequest, QueryConnectionChannelsRequest,
+    QueryPacketCommitmentRequest, QueryPacketCommitmentsRequest, QueryPacketReceiptRequest,
     QueryPacketAcknowledgementRequest, QueryPacketAcknowledgementsRequest,
     QueryUnreceivedPacketsRequest, QueryUnreceivedAcksRequest,
     QueryNextSequenceReceiveRequest,
@@ -225,6 +225,52 @@ impl GatewayClient {
         });
         
         let response = client.channels(request)
+            .await?
+            .into_inner();
+        
+        Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Query all clients
+    pub async fn query_clients(&self) -> Result<Vec<u8>, Error> {
+        let mut client = ClientQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryClientStatesRequest {
+            pagination: None,
+        });
+        
+        let response = client.client_states(request)
+            .await?
+            .into_inner();
+        
+        Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Query connections associated with a client
+    pub async fn query_client_connections(&self, client_id: &str) -> Result<Vec<u8>, Error> {
+        let mut client = ConnectionQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryClientConnectionsRequest {
+            client_id: client_id.to_string(),
+        });
+        
+        let response = client.client_connections(request)
+            .await?
+            .into_inner();
+        
+        Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Query channels associated with a connection
+    pub async fn query_connection_channels(&self, connection_id: &str) -> Result<Vec<u8>, Error> {
+        let mut client = ChannelQueryClient::new(self.channel.clone());
+        
+        let request = tonic::Request::new(QueryConnectionChannelsRequest {
+            connection: connection_id.to_string(),
+            pagination: None,
+        });
+        
+        let response = client.connection_channels(request)
             .await?
             .into_inner();
         

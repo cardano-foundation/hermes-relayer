@@ -408,9 +408,50 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &self,
         request: QueryClientStatesRequest,
     ) -> Result<Vec<IdentifiedAnyClientState>, Error> {
-        // TODO: Query all clients via Gateway
-        tracing::warn!("query_clients: stub implementation");
-        Ok(vec![])
+        tracing::debug!("Querying all clients");
+        
+        // Block on async operation
+        self.rt.block_on(async {
+            // Query clients from Gateway
+            let response_bytes = self.gateway_client
+                .query_clients()
+                .await
+                .map_err(|e| Error::query(format!("Failed to query clients: {}", e)))?;
+            
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::client::v1::QueryClientStatesResponse;
+            
+            let response = QueryClientStatesResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode clients response: {}", e)))?;
+            
+            // Convert proto client states to domain types, filtering out unsupported types
+            let clients: Vec<IdentifiedAnyClientState> = response
+                .client_states
+                .into_iter()
+                .filter_map(|cs| {
+                    IdentifiedAnyClientState::try_from(cs.clone())
+                        .map_err(|e| {
+                            let (client_type, client_id) = (
+                                if let Some(client_state) = &cs.client_state {
+                                    client_state.type_url.clone()
+                                } else {
+                                    "None".to_string()
+                                },
+                                &cs.client_id
+                            );
+                            tracing::warn!(
+                                "Encountered unsupported client type `{}` while scanning client `{}`, skipping the client",
+                                client_type, client_id
+                            );
+                            tracing::debug!("Failed to parse client state. Error: {}", e);
+                        })
+                        .ok()
+                })
+                .collect();
+            
+            Ok(clients)
+        })
     }
 
     fn query_client_state(
@@ -509,18 +550,89 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &self,
         request: QueryConnectionsRequest,
     ) -> Result<Vec<IdentifiedConnectionEnd>, Error> {
-        // TODO: Query connections via Gateway
-        tracing::warn!("query_connections: stub implementation");
-        Ok(vec![])
+        tracing::debug!("Querying all connections");
+        
+        // Block on async operation
+        self.rt.block_on(async {
+            // Query connections from Gateway
+            let response_bytes = self.gateway_client
+                .query_connections()
+                .await
+                .map_err(|e| Error::query(format!("Failed to query connections: {}", e)))?;
+            
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::connection::v1::QueryConnectionsResponse;
+            
+            let response = QueryConnectionsResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode connections response: {}", e)))?;
+            
+            // Convert proto connections to domain types, filtering out parsing errors
+            let connections: Vec<IdentifiedConnectionEnd> = response
+                .connections
+                .into_iter()
+                .filter_map(|co| {
+                    IdentifiedConnectionEnd::try_from(co.clone())
+                        .map_err(|e| {
+                            tracing::warn!(
+                                "Connection with ID {} failed parsing. Error: {}",
+                                co.id, e
+                            );
+                        })
+                        .ok()
+                })
+                .collect();
+            
+            Ok(connections)
+        })
     }
 
     fn query_client_connections(
         &self,
         request: QueryClientConnectionsRequest,
     ) -> Result<Vec<ConnectionId>, Error> {
-        // TODO: Query client connections via Gateway
-        tracing::warn!("query_client_connections: stub implementation");
-        Ok(vec![])
+        tracing::debug!("Querying connections for client: {}", request.client_id);
+        
+        // Block on async operation
+        self.rt.block_on(async {
+            // Query client connections from Gateway
+            let response_bytes = self.gateway_client
+                .query_client_connections(&request.client_id.to_string())
+                .await
+                .map_err(|e| {
+                    // If not found, return empty list
+                    if e.to_string().contains("NotFound") {
+                        return Error::query("Client connections not found".to_string());
+                    }
+                    Error::query(format!("Failed to query client connections: {}", e))
+                })?;
+            
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::connection::v1::QueryClientConnectionsResponse;
+            use std::str::FromStr;
+            
+            let response = QueryClientConnectionsResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode client connections response: {}", e)))?;
+            
+            // Parse connection_paths strings into ConnectionId instances
+            let connection_ids: Vec<ConnectionId> = response
+                .connection_paths
+                .iter()
+                .filter_map(|id| {
+                    ConnectionId::from_str(id)
+                        .map_err(|e| {
+                            tracing::warn!(
+                                "Connection with ID {} failed parsing. Error: {}",
+                                id, e
+                            );
+                        })
+                        .ok()
+                })
+                .collect();
+            
+            Ok(connection_ids)
+        })
     }
 
     fn query_connection(
@@ -574,18 +686,82 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &self,
         request: QueryConnectionChannelsRequest,
     ) -> Result<Vec<IdentifiedChannelEnd>, Error> {
-        // TODO: Query connection channels via Gateway
-        tracing::warn!("query_connection_channels: stub implementation");
-        Ok(vec![])
+        tracing::debug!("Querying channels for connection: {}", request.connection_id);
+        
+        // Block on async operation
+        self.rt.block_on(async {
+            // Query connection channels from Gateway
+            let response_bytes = self.gateway_client
+                .query_connection_channels(&request.connection_id.to_string())
+                .await
+                .map_err(|e| Error::query(format!("Failed to query connection channels: {}", e)))?;
+            
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::channel::v1::QueryConnectionChannelsResponse;
+            
+            let response = QueryConnectionChannelsResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode connection channels response: {}", e)))?;
+            
+            // Convert proto channels to domain types, filtering out parsing errors
+            let channels: Vec<IdentifiedChannelEnd> = response
+                .channels
+                .into_iter()
+                .filter_map(|ch| {
+                    IdentifiedChannelEnd::try_from(ch.clone())
+                        .map_err(|e| {
+                            tracing::warn!(
+                                "Channel with port {} and ID {} failed parsing. Error: {}",
+                                ch.port_id, ch.channel_id, e
+                            );
+                        })
+                        .ok()
+                })
+                .collect();
+            
+            Ok(channels)
+        })
     }
 
     fn query_channels(
         &self,
         request: QueryChannelsRequest,
     ) -> Result<Vec<IdentifiedChannelEnd>, Error> {
-        // TODO: Query channels via Gateway
-        tracing::warn!("query_channels: stub implementation");
-        Ok(vec![])
+        tracing::debug!("Querying all channels");
+        
+        // Block on async operation
+        self.rt.block_on(async {
+            // Query channels from Gateway
+            let response_bytes = self.gateway_client
+                .query_channels()
+                .await
+                .map_err(|e| Error::query(format!("Failed to query channels: {}", e)))?;
+            
+            // Decode the response
+            use prost::Message;
+            use ibc_proto::ibc::core::channel::v1::QueryChannelsResponse;
+            
+            let response = QueryChannelsResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode channels response: {}", e)))?;
+            
+            // Convert proto channels to domain types, filtering out parsing errors
+            let channels: Vec<IdentifiedChannelEnd> = response
+                .channels
+                .into_iter()
+                .filter_map(|ch| {
+                    IdentifiedChannelEnd::try_from(ch.clone())
+                        .map_err(|e| {
+                            tracing::warn!(
+                                "Channel with port {} and ID {} failed parsing. Error: {}",
+                                ch.port_id, ch.channel_id, e
+                            );
+                        })
+                        .ok()
+                })
+                .collect();
+            
+            Ok(channels)
+        })
     }
 
     fn query_channel(
