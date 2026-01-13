@@ -87,12 +87,14 @@ impl CardanoChainEndpoint {
         let key = self.keyring.get_key(&self.config.key_name)
             .map_err(|e| Error::key_base(e))?;
         
-        // Get the CardanoKeyring from the signing key pair
-        let cardano_keyring = key.as_any().downcast_ref::<CardanoKeyring>()
-            .ok_or_else(|| Error::send_tx("Failed to downcast to CardanoKeyring".to_string()))?;
+        // Get the CardanoSigningKeyPair and extract the CardanoKeyring
+        let signing_key_pair = key.as_any().downcast_ref::<CardanoSigningKeyPair>()
+            .ok_or_else(|| Error::send_tx("Failed to downcast to CardanoSigningKeyPair".to_string()))?;
+        let cardano_keyring = signing_key_pair.get_cardano_keyring()
+            .map_err(|e| Error::send_tx(format!("Failed to get CardanoKeyring: {}", e)))?;
         
         // Sign the transaction
-        let signed_tx_bytes = signer::sign_transaction(&unsigned_tx_bytes, cardano_keyring)
+        let signed_tx_bytes = signer::sign_transaction(&unsigned_tx_bytes, &cardano_keyring)
             .map_err(|e| Error::send_tx(format!("Failed to sign transaction: {}", e)))?;
         
         // Convert back to hex

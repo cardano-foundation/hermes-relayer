@@ -31,13 +31,20 @@ pub struct CardanoSigningKeyPair {
 
 impl CardanoSigningKeyPair {
     /// Create a new CardanoSigningKeyPair from components
-    pub fn new(mnemonic: String, account: u32, network_id: u8) -> Result<Self, KeyringError> {
-        let keyring = CardanoKeyring::from_mnemonic(&mnemonic, account)
-            .map_err(|_| KeyringError::invalid_mnemonic(anyhow::anyhow!("Failed to derive Cardano key from mnemonic")))?;
+    /// Supports both mnemonic phrases and bech32-encoded private keys (ed25519_sk...)
+    pub fn new(mnemonic_or_key: String, account: u32, network_id: u8) -> Result<Self, KeyringError> {
+        // Check if this is a bech32 private key instead of a mnemonic
+        let keyring = if mnemonic_or_key.starts_with("ed25519_sk") {
+            CardanoKeyring::from_bech32_key(&mnemonic_or_key)
+                .map_err(|_| KeyringError::invalid_mnemonic(anyhow::anyhow!("Failed to load Cardano key from bech32")))?
+        } else {
+            CardanoKeyring::from_mnemonic(&mnemonic_or_key, account)
+                .map_err(|_| KeyringError::invalid_mnemonic(anyhow::anyhow!("Failed to derive Cardano key from mnemonic")))?
+        };
         
         Ok(Self {
             keyring: Some(keyring),
-            mnemonic,
+            mnemonic: mnemonic_or_key,
             account,
             network_id,
         })
@@ -46,8 +53,13 @@ impl CardanoSigningKeyPair {
     /// Ensure the keyring is initialized (for after deserialization)
     fn ensure_keyring(&mut self) -> Result<(), KeyringError> {
         if self.keyring.is_none() {
-            let keyring = CardanoKeyring::from_mnemonic(&self.mnemonic, self.account)
-                .map_err(|_| KeyringError::invalid_mnemonic(anyhow::anyhow!("Failed to reinitialize keyring")))?;
+            let keyring = if self.mnemonic.starts_with("ed25519_sk") {
+                CardanoKeyring::from_bech32_key(&self.mnemonic)
+                    .map_err(|_| KeyringError::invalid_mnemonic(anyhow::anyhow!("Failed to reinitialize keyring from bech32")))?
+            } else {
+                CardanoKeyring::from_mnemonic(&self.mnemonic, self.account)
+                    .map_err(|_| KeyringError::invalid_mnemonic(anyhow::anyhow!("Failed to reinitialize keyring from mnemonic")))?
+            };
             self.keyring = Some(keyring);
         }
         Ok(())
@@ -67,6 +79,14 @@ impl CardanoSigningKeyPair {
         self.keyring.as_mut().ok_or_else(|| {
             KeyringError::key_not_found()
         })
+    }
+
+    /// Get a clone of the CardanoKeyring (public method for external signing)
+    /// This clones self internally to handle lazy initialization
+    pub fn get_cardano_keyring(&self) -> Result<CardanoKeyring, KeyringError> {
+        let mut mutable_self = self.clone();
+        mutable_self.ensure_keyring()?;
+        mutable_self.keyring.ok_or_else(|| KeyringError::key_not_found())
     }
 }
 

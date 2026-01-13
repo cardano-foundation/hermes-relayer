@@ -15,6 +15,46 @@ pub struct CardanoKeyring {
 }
 
 impl CardanoKeyring {
+    /// Create a keyring from a bech32-encoded private key (ed25519_sk...)
+    pub fn from_bech32_key(bech32_key: &str) -> Result<Self, Error> {
+        use bech32::FromBase32;
+        
+        // Decode bech32 key
+        let (hrp, data, _variant) = bech32::decode(bech32_key)
+            .map_err(|e| Error::Keyring(format!("Invalid bech32 key: {:?}", e)))?;
+        
+        if hrp != "ed25519_sk" {
+            return Err(Error::Keyring(format!(
+                "Expected ed25519_sk prefix, got: {}",
+                hrp
+            )));
+        }
+        
+        // Convert from base32 (u5) to bytes
+        let bytes = Vec::<u8>::from_base32(&data)
+            .map_err(|e| Error::Keyring(format!("Failed to decode base32: {:?}", e)))?;
+        
+        // Data should be 32 bytes for Ed25519 private key
+        if bytes.len() != 32 {
+            return Err(Error::Keyring(format!(
+                "Invalid key length: expected 32, got {}",
+                bytes.len()
+            )));
+        }
+        
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(&bytes);
+        
+        let signing_key = SigningKey::from_bytes(&key_bytes);
+        let verifying_key = signing_key.verifying_key();
+        
+        Ok(Self {
+            signing_key,
+            verifying_key,
+            account: 0,
+        })
+    }
+
     /// Create a new keyring from a mnemonic phrase
     /// Uses CIP-1852 derivation: m/1852'/1815'/account'/2'/0'
     pub fn from_mnemonic(mnemonic: &str, account: u32) -> Result<Self, Error> {
@@ -123,5 +163,12 @@ mod tests {
         // Different accounts should produce different addresses
         assert_ne!(keyring1.address(0), keyring2.address(0));
     }
-}
 
+    #[test]
+    fn test_from_bech32_key() {
+        let key = "ed25519_sk1rvgjxs8sddhl46uqtv862s53vu4jf6lnk63rcn7f0qwzyq85wnlqgrsx42";
+        let result = CardanoKeyring::from_bech32_key(key);
+        println!("Result: {:?}", result);
+        assert!(result.is_ok(), "Failed to load from bech32 key: {:?}", result.err());
+    }
+}
