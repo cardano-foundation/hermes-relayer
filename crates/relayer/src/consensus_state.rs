@@ -7,9 +7,11 @@ use ibc_proto::Protobuf;
 use ibc_relayer_types::clients::ics07_tendermint::consensus_state::{
     ConsensusState as TmConsensusState, TENDERMINT_CONSENSUS_STATE_TYPE_URL,
 };
+use ibc_relayer_types::clients::ics2000_mithril::consensus_state::{
+    ConsensusState as MithrilConsensusState, MITHRIL_CONSENSUS_STATE_TYPE_URL,
+};
 
-#[cfg(feature = "cardano")]
-use ibc_cardano_chain::types::CardanoConsensusState;
+use crate::chain::cardano::types::consensus_state::CardanoConsensusState;
 
 const CARDANO_CONSENSUS_STATE_TYPE_URL: &str = "/ibc.lightclients.cardano.v1.ConsensusState";
 use ibc_relayer_types::core::ics02_client::client_type::ClientType;
@@ -23,24 +25,24 @@ use ibc_relayer_types::Height;
 #[serde(tag = "type")]
 pub enum AnyConsensusState {
     Tendermint(TmConsensusState),
-    #[cfg(feature = "cardano")]
     Cardano(CardanoConsensusState),
+    Mithril(MithrilConsensusState),
 }
 
 impl AnyConsensusState {
     pub fn timestamp(&self) -> Timestamp {
         match self {
             Self::Tendermint(cs_state) => cs_state.timestamp.into(),
-            #[cfg(feature = "cardano")]
             Self::Cardano(cs_state) => ConsensusState::timestamp(cs_state),
+            Self::Mithril(cs_state) => ConsensusState::timestamp(cs_state),
         }
     }
 
     pub fn client_type(&self) -> ClientType {
         match self {
             AnyConsensusState::Tendermint(_cs) => ClientType::Tendermint,
-            #[cfg(feature = "cardano")]
             AnyConsensusState::Cardano(_cs) => ClientType::Cardano,
+            AnyConsensusState::Mithril(_cs) => ClientType::CardanoMithril,
         }
     }
 }
@@ -59,13 +61,13 @@ impl TryFrom<Any> for AnyConsensusState {
                     .map_err(Error::decode_raw_client_state)?,
             )),
 
-            #[cfg(feature = "cardano")]
             CARDANO_CONSENSUS_STATE_TYPE_URL => {
-                // For now, deserialize from JSON (will need proper protobuf later)
-                let cardano_state: CardanoConsensusState = serde_json::from_slice(&value.value)
-                    .map_err(|e| Error::decode_raw_client_state(e.into()))?;
-                Ok(AnyConsensusState::Cardano(cardano_state))
+                Err(Error::unknown_consensus_state_type(format!(
+                    "{CARDANO_CONSENSUS_STATE_TYPE_URL} (Cardano consensus state decoding is not implemented)"
+                )))
             }
+
+            MITHRIL_CONSENSUS_STATE_TYPE_URL => Ok(AnyConsensusState::Mithril(value.try_into()?)),
 
             _ => Err(Error::unknown_consensus_state_type(value.type_url)),
         }
@@ -79,12 +81,12 @@ impl From<AnyConsensusState> for Any {
                 type_url: TENDERMINT_CONSENSUS_STATE_TYPE_URL.to_string(),
                 value: Protobuf::<RawConsensusState>::encode_vec(value),
             },
-            #[cfg(feature = "cardano")]
             AnyConsensusState::Cardano(value) => Any {
                 type_url: CARDANO_CONSENSUS_STATE_TYPE_URL.to_string(),
-                // For now, serialize to JSON (will need proper protobuf later)
+                // Placeholder encoding: do not rely on this for on-chain messages.
                 value: serde_json::to_vec(&value).unwrap_or_default(),
             },
+            AnyConsensusState::Mithril(value) => value.into(),
         }
     }
 }
@@ -95,10 +97,15 @@ impl From<TmConsensusState> for AnyConsensusState {
     }
 }
 
-#[cfg(feature = "cardano")]
 impl From<CardanoConsensusState> for AnyConsensusState {
     fn from(cs: CardanoConsensusState) -> Self {
         Self::Cardano(cs)
+    }
+}
+
+impl From<MithrilConsensusState> for AnyConsensusState {
+    fn from(cs: MithrilConsensusState) -> Self {
+        Self::Mithril(cs)
     }
 }
 
@@ -147,8 +154,8 @@ impl ConsensusState for AnyConsensusState {
     fn root(&self) -> &CommitmentRoot {
         match self {
             Self::Tendermint(cs_state) => cs_state.root(),
-            #[cfg(feature = "cardano")]
             Self::Cardano(cs_state) => ConsensusState::root(cs_state),
+            Self::Mithril(cs_state) => ConsensusState::root(cs_state),
         }
     }
 

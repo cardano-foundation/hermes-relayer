@@ -58,8 +58,11 @@ impl IbcHeader for Header {
     }
 
     fn timestamp(&self) -> Timestamp {
-        Timestamp::from_nanoseconds(self.timestamp as u64 * 1_000_000_000)
-            .expect("timestamp conversion")
+        let seconds = u64::try_from(self.timestamp).ok();
+        let nanos = seconds.and_then(|s| s.checked_mul(1_000_000_000));
+
+        nanos
+            .and_then(|n| Timestamp::from_nanoseconds(n).ok())
+            .unwrap_or_else(Timestamp::none)
     }
 }
-

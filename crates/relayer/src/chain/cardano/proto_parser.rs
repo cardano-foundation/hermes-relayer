@@ -3,7 +3,6 @@
 // The Gateway returns IBC states wrapped in google.protobuf.Any messages.
 // This module provides helpers to unwrap and parse these messages.
 
-use prost::Message;
 use super::error::Error;
 use super::types::client_state::CardanoClientState;
 use super::types::consensus_state::CardanoConsensusState;
@@ -172,4 +171,3 @@ mod tests {
         assert_eq!(consensus_state.epoch, 100);
     }
 }
-

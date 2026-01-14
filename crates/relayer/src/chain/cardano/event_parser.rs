@@ -18,7 +18,7 @@ use ibc_relayer_types::{
         },
         ics24_host::identifier::{ClientId, ConnectionId, ChannelId, PortId},
     },
-    events::{IbcEvent, IbcEventType},
+    events::IbcEvent,
     timestamp::Timestamp,
 };
 use std::collections::HashMap;
@@ -461,4 +461,3 @@ fn parse_packet(attrs: &HashMap<String, String>) -> Result<Packet, Error> {
         timeout_timestamp,
     })
 }
-

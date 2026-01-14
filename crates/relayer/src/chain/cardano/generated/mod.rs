@@ -29,6 +29,10 @@ pub mod cosmos {
     }
 }
 
+// The `google.api` proto includes documentation snippets that are not valid Rust code.
+// Exclude it from doctest builds to keep `cargo test` (which runs doctests by default)
+// working without disabling doctests for the whole crate.
+#[cfg(not(doctest))]
 pub mod google {
     pub mod api {
         include!("google.api.rs");
@@ -70,4 +74,3 @@ pub mod ibc {
         }
     }
 }
-

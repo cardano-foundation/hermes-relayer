@@ -3,7 +3,6 @@
 //! This module provides complete Cardano integration following the same pattern
 //! as Cosmos and Penumbra implementations in Hermes.
 
-pub mod any_conversions;
 pub mod chain_handle;
 pub mod config;
 pub mod endpoint;
@@ -28,4 +27,3 @@ pub use signing_key_pair::CardanoSigningKeyPair;
 
 // Type alias matching Cosmos/Penumbra pattern
 pub type CardanoChain = CardanoChainEndpoint;
-

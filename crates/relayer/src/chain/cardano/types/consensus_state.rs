@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CardanoConsensusState {
     /// Block hash (commitment root)
-    pub root: Vec<u8>,
+    pub root: CommitmentRoot,
     
     /// Timestamp (Unix time in seconds)
     pub timestamp: i64,
@@ -28,7 +28,7 @@ pub struct CardanoConsensusState {
 impl CardanoConsensusState {
     pub fn new(root: Vec<u8>, timestamp: i64, slot: u64, epoch: u64) -> Self {
         Self {
-            root,
+            root: CommitmentRoot::from(root),
             timestamp,
             slot,
             epoch,
@@ -48,18 +48,15 @@ impl ConsensusState for CardanoConsensusState {
     }
 
     fn root(&self) -> &CommitmentRoot {
-        // Create a commitment root from the block hash
-        // For now, return a reference to a lazily created root
-        // In production, this should be stored as a CommitmentRoot directly
-        lazy_static::lazy_static! {
-            static ref DEFAULT_ROOT: CommitmentRoot = CommitmentRoot::from_bytes(&[0u8; 32]);
-        }
-        &DEFAULT_ROOT
+        &self.root
     }
 
     fn timestamp(&self) -> Timestamp {
-        Timestamp::from_nanoseconds(self.timestamp as u64 * 1_000_000_000)
-            .expect("Invalid timestamp")
+        let seconds = u64::try_from(self.timestamp).ok();
+        let nanos = seconds.and_then(|s| s.checked_mul(1_000_000_000));
+
+        nanos
+            .and_then(|n| Timestamp::from_nanoseconds(n).ok())
+            .unwrap_or_else(Timestamp::none)
     }
 }
-

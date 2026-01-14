@@ -3,15 +3,11 @@
 //! This module implements the ChainEndpoint trait required by Hermes for custom chain support.
 
 use super::config::CardanoConfig;
-use super::error::Error as CardanoError;
 use super::gateway_client::GatewayClient;
-use super::keyring::CardanoKeyring;
-use super::signer;
 use super::signing_key_pair::CardanoSigningKeyPair;
 use super::types::{CardanoClientState, CardanoConsensusState};
 
-// Use CardanoHeader from ibc-relayer-types (where AnyHeader is defined)
-use ibc_relayer_types::clients::ics08_cardano::CardanoHeader;
+use ibc_relayer_types::clients::ics2000_mithril::header::Header as MithrilHeader;
 
 use std::sync::Arc;
 use crate::account::Balance;
@@ -33,23 +29,19 @@ use crate::chain::cosmos::version::Specs as CosmosSpecs;
 use crate::chain::version::Specs;
 use crate::client_state::{AnyClientState, IdentifiedAnyClientState};
 use crate::config::{ChainConfig, Error as ConfigError};
-use crate::connection::ConnectionMsgType;
 use crate::consensus_state::AnyConsensusState;
 use crate::denom::DenomTrace;
 use crate::error::Error;
 use crate::event::IbcEventWithHeight;
-use ibc_relayer_types::core::ics02_client::height::Height;
-use crate::keyring::{AnySigningKeyPair, KeyRing, SigningKeyPair, SigningKeyPairSized};
+use crate::keyring::{KeyRing, SigningKeyPair};
 use crate::misbehaviour::MisbehaviourEvidence;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
-use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header};
 use ibc_relayer_types::core::ics03_connection::connection::{ConnectionEnd, IdentifiedConnectionEnd};
 use ibc_relayer_types::core::ics04_channel::channel::{ChannelEnd, IdentifiedChannelEnd};
 use ibc_relayer_types::core::ics04_channel::packet::Sequence;
 use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentPrefix;
 use ibc_relayer_types::core::ics23_commitment::merkle::MerkleProof;
 use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ChannelId, ClientId, ConnectionId, PortId};
-use ibc_relayer_types::proofs::Proofs;
 use ibc_relayer_types::signer::Signer;
 use std::str::FromStr;
 use ibc_relayer_types::Height as ICSHeight;
@@ -59,7 +51,7 @@ use tokio::runtime::Runtime as TokioRuntime;
 /// Cardano light block (placeholder)
 #[derive(Debug, Clone)]
 pub struct CardanoLightBlock {
-    pub header: CardanoHeader,
+    pub header: MithrilHeader,
 }
 
 // CardanoSigningKeyPair is now defined in signing_key_pair.rs
@@ -130,7 +122,7 @@ impl CardanoChainEndpoint {
 
 impl ChainEndpoint for CardanoChainEndpoint {
     type LightBlock = CardanoLightBlock;
-    type Header = CardanoHeader;
+    type Header = MithrilHeader;
     type ConsensusState = CardanoConsensusState;
     type ClientState = CardanoClientState;
     type Time = i64; // Unix timestamp
@@ -337,47 +329,29 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn send_messages_and_wait_check_tx(
         &mut self,
-        tracked_msgs: TrackedMsgs,
+        _tracked_msgs: TrackedMsgs,
     ) -> Result<Vec<TxResponse>, Error> {
-        // Similar to send_messages_and_wait_commit but returns raw responses
-        tracing::warn!("send_messages_and_wait_check_tx: stub implementation");
-        Ok(vec![])
+        Err(Error::send_tx(
+            "Cardano `send_messages_and_wait_check_tx` is not implemented".to_string(),
+        ))
     }
 
     fn verify_header(
         &mut self,
-        trusted: ICSHeight,
-        target: ICSHeight,
-        client_state: &AnyClientState,
+        _trusted: ICSHeight,
+        _target: ICSHeight,
+        _client_state: &AnyClientState,
     ) -> Result<Self::LightBlock, Error> {
-        tracing::info!("Verifying Cardano header from trusted={:?} to target={:?}", trusted, target);
-        
-        // Block on async operations
-        self.rt.block_on(async {
-            // Step 1: Fetch the header for the target height
-            let header = self.gateway_client
-                .query_header(target)
-                .await
-                .map_err(|e| Error::query(format!("Failed to fetch header at {:?}: {}", target, e)))?;
-            
-            // Step 2: Verify the Mithril certificate if present
-            // TODO: Add mithril_certificate field to CardanoHeader
-            tracing::warn!("Mithril verification not yet fully implemented");
-            
-            // Step 3: Construct and return the light block
-            let light_block = CardanoLightBlock {
-                header,
-            };
-            
-            tracing::info!("Header verification complete for height {:?}", target);
-            Ok(light_block)
-        })
+        Err(Error::query(
+            "Cardano header verification is not implemented; requires canonical decoding of /ibc.lightclients.cardano.v1.Header plus Mithril verification"
+                .to_string(),
+        ))
     }
 
     fn check_misbehaviour(
         &mut self,
-        update: &UpdateClient,
-        client_state: &AnyClientState,
+        _update: &UpdateClient,
+        _client_state: &AnyClientState,
     ) -> Result<Option<MisbehaviourEvidence>, Error> {
         // TODO: Check for Cardano misbehaviour
         tracing::warn!("check_misbehaviour: stub implementation");
@@ -385,34 +359,19 @@ impl ChainEndpoint for CardanoChainEndpoint {
     }
 
     fn query_balance(&self, key_name: Option<&str>, denom: Option<&str>) -> Result<Balance, Error> {
-        let key_name = key_name.unwrap_or(&self.config.key_name);
         let denom = denom.unwrap_or("lovelace"); // Cardano's base unit
-        
-        tracing::info!("Querying balance for key={}, denom={}", key_name, denom);
-        
-        // Get the address for this key
-        let key = self.keyring.get_key(key_name)
-            .map_err(|e| Error::key_base(e))?;
-        
-        let address = key.account();
-        
-        // Block on async operation
-        self.rt.block_on(async {
-            // TODO: Query actual balance via Gateway
-            // For now, return a stub balance
-            tracing::warn!("query_balance: using stub implementation");
-            
-            Ok(Balance {
-                amount: "1000000000".to_string(), // 1000 ADA in lovelace
-                denom: denom.to_string(),
-            })
-        })
+        let key_name = key_name.unwrap_or(&self.config.key_name);
+
+        Err(Error::query(format!(
+            "Cardano balance query is not implemented (key={key_name}, denom={denom}); requires Gateway UTXO/balance query support"
+        )))
     }
 
     fn query_all_balances(&self, key_name: Option<&str>) -> Result<Vec<Balance>, Error> {
-        // TODO: Query all balances via Gateway
-        tracing::warn!("query_all_balances: stub implementation");
-        Ok(vec![])
+        let key_name = key_name.unwrap_or(&self.config.key_name);
+        Err(Error::query(format!(
+            "Cardano all-balances query is not implemented (key={key_name}); requires Gateway UTXO/balance query support"
+        )))
     }
 
     fn query_denom_trace(&self, _hash: String) -> Result<DenomTrace, Error> {
@@ -423,7 +382,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn query_commitment_prefix(&self) -> Result<CommitmentPrefix, Error> {
         // Cardano uses "ibc" as commitment prefix
-        Ok(CommitmentPrefix::try_from(b"ibc".to_vec()).unwrap())
+        CommitmentPrefix::try_from(b"ibc".to_vec())
+            .map_err(|e| Error::query(format!("invalid commitment prefix for Cardano: {e}")))
     }
 
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
@@ -447,7 +407,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn query_clients(
         &self,
-        request: QueryClientStatesRequest,
+        _request: QueryClientStatesRequest,
     ) -> Result<Vec<IdentifiedAnyClientState>, Error> {
         tracing::debug!("Querying all clients");
         
@@ -562,7 +522,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn query_consensus_state_heights(
         &self,
-        request: QueryConsensusStateHeightsRequest,
+        _request: QueryConsensusStateHeightsRequest,
     ) -> Result<Vec<ICSHeight>, Error> {
         // TODO: Query consensus state heights via Gateway
         tracing::warn!("query_consensus_state_heights: stub implementation");
@@ -571,25 +531,25 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn query_upgraded_client_state(
         &self,
-        request: QueryUpgradedClientStateRequest,
+        _request: QueryUpgradedClientStateRequest,
     ) -> Result<(AnyClientState, MerkleProof), Error> {
-        // TODO: Query upgraded client state
-        tracing::warn!("query_upgraded_client_state: stub implementation");
-        todo!("Implement query_upgraded_client_state()")
+        Err(Error::query(
+            "Cardano upgraded client state query is not implemented".to_string(),
+        ))
     }
 
     fn query_upgraded_consensus_state(
         &self,
-        request: QueryUpgradedConsensusStateRequest,
+        _request: QueryUpgradedConsensusStateRequest,
     ) -> Result<(AnyConsensusState, MerkleProof), Error> {
-        // TODO: Query upgraded consensus state
-        tracing::warn!("query_upgraded_consensus_state: stub implementation");
-        todo!("Implement query_upgraded_consensus_state()")
+        Err(Error::query(
+            "Cardano upgraded consensus state query is not implemented".to_string(),
+        ))
     }
 
     fn query_connections(
         &self,
-        request: QueryConnectionsRequest,
+        _request: QueryConnectionsRequest,
     ) -> Result<Vec<IdentifiedConnectionEnd>, Error> {
         tracing::debug!("Querying all connections");
         
@@ -766,7 +726,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn query_channels(
         &self,
-        request: QueryChannelsRequest,
+        _request: QueryChannelsRequest,
     ) -> Result<Vec<IdentifiedChannelEnd>, Error> {
         tracing::debug!("Querying all channels");
         
@@ -854,7 +814,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn query_channel_client_state(
         &self,
-        request: QueryChannelClientStateRequest,
+        _request: QueryChannelClientStateRequest,
     ) -> Result<Option<IdentifiedAnyClientState>, Error> {
         // TODO: Query channel client state via Gateway
         tracing::warn!("query_channel_client_state: stub implementation");
@@ -1184,7 +1144,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         })
     }
 
-    fn query_txs(&self, request: QueryTxRequest) -> Result<Vec<IbcEventWithHeight>, Error> {
+    fn query_txs(&self, _request: QueryTxRequest) -> Result<Vec<IbcEventWithHeight>, Error> {
         // TODO: Query transactions via Gateway
         tracing::warn!("query_txs: stub implementation");
         Ok(vec![])
@@ -1192,7 +1152,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn query_packet_events(
         &self,
-        request: QueryPacketEventDataRequest,
+        _request: QueryPacketEventDataRequest,
     ) -> Result<Vec<IbcEventWithHeight>, Error> {
         // TODO: Query packet events via Gateway
         tracing::warn!("query_packet_events: stub implementation");
@@ -1201,17 +1161,17 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn query_host_consensus_state(
         &self,
-        request: QueryHostConsensusStateRequest,
+        _request: QueryHostConsensusStateRequest,
     ) -> Result<Self::ConsensusState, Error> {
-        // TODO: Query host consensus state
-        tracing::warn!("query_host_consensus_state: stub implementation");
-        todo!("Implement query_host_consensus_state()")
+        Err(Error::query(
+            "Cardano host consensus state query is not implemented".to_string(),
+        ))
     }
 
     fn build_client_state(
         &self,
         height: ICSHeight,
-        settings: ClientSettings,
+        _settings: ClientSettings,
     ) -> Result<Self::ClientState, Error> {
         tracing::info!("Building Cardano client state at height {:?}", height);
         
@@ -1242,45 +1202,26 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn build_consensus_state(
         &self,
-        light_block: Self::LightBlock,
+        _light_block: Self::LightBlock,
     ) -> Result<Self::ConsensusState, Error> {
-        // TODO: Build consensus state from light block
-        tracing::warn!("build_consensus_state: stub implementation");
-        Ok(CardanoConsensusState::new(
-            light_block.header.block_hash,
-            light_block.header.timestamp,
-            light_block.header.slot,
-            light_block.header.epoch,
+        Err(Error::query(
+            "Cardano consensus state construction is not implemented for Mithril headers"
+                .to_string(),
         ))
     }
 
     fn build_header(
         &mut self,
-        trusted_height: ICSHeight,
+        _trusted_height: ICSHeight,
         target_height: ICSHeight,
         _client_state: &AnyClientState,
     ) -> Result<(Self::Header, Vec<Self::Header>), Error> {
-        tracing::info!("Building Cardano header from trusted_height={:?} to target_height={:?}", 
-            trusted_height, target_height);
-        
-        // Block on async operations
-        self.rt.block_on(async {
-            // Step 1: Query the block header at target height
-            let header = self.gateway_client
-                .query_header(target_height)
-                .await
-                .map_err(|e| Error::query(format!("Failed to fetch block at {:?}: {}", target_height, e)))?;
-            
-            // Step 2: Fetch Mithril certificate for this block
-            // TODO: Implement Mithril certificate fetching with proper slot/epoch calculation
-            tracing::warn!("Mithril certificate fetching not yet implemented in build_header");
-            
-            tracing::info!("Built Cardano header at height {:?}", target_height);
-            
-            // Return target header and empty support headers vector
-            // (Cardano doesn't need intermediate headers like Tendermint)
-            Ok((header, vec![]))
-        })
+        let header = self
+            .rt
+            .block_on(self.gateway_client.query_header(target_height))
+            .map_err(|e| Error::query(format!("Gateway query_header failed: {e}")))?;
+
+        Ok((header, vec![]))
     }
 
     fn maybe_register_counterparty_payee(
@@ -1298,24 +1239,24 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &self,
         _requests: Vec<CrossChainQueryRequest>,
     ) -> Result<Vec<ibc_relayer_types::applications::ics31_icq::response::CrossChainQueryResponse>, Error> {
-        // ICS-31 cross-chain query - not implemented for Cardano yet
-        tracing::warn!("cross_chain_query: not implemented for Cardano");
-        Ok(vec![])
+        Err(Error::query(
+            "ICS-31 cross-chain queries are not supported for Cardano".to_string(),
+        ))
     }
 
     fn query_incentivized_packet(
         &self,
         _request: ibc_proto::ibc::apps::fee::v1::QueryIncentivizedPacketRequest,
     ) -> Result<ibc_proto::ibc::apps::fee::v1::QueryIncentivizedPacketResponse, Error> {
-        // ICS-29 fee middleware - not implemented for Cardano yet
-        tracing::warn!("query_incentivized_packet: not implemented for Cardano");
-        Err(Error::config(ConfigError::wrong_type()))
+        Err(Error::query(
+            "ICS-29 fee middleware is not supported for Cardano".to_string(),
+        ))
     }
 
     fn query_consumer_chains(&self) -> Result<Vec<ibc_relayer_types::applications::ics28_ccv::msgs::ConsumerChain>, Error> {
-        // ICS-28 CCV (Cross-Chain Validation) - not applicable to Cardano
-        tracing::warn!("query_consumer_chains: not applicable for Cardano");
-        Ok(vec![])
+        Err(Error::query(
+            "ICS-28 CCV (Cross-Chain Validation) is not applicable to Cardano".to_string(),
+        ))
     }
 
     fn query_upgrade(
@@ -1324,9 +1265,9 @@ impl ChainEndpoint for CardanoChainEndpoint {
         _height: ibc_relayer_types::Height,
         _include_proof: IncludeProof,
     ) -> Result<(ibc_relayer_types::core::ics04_channel::upgrade::Upgrade, Option<MerkleProof>), Error> {
-        // Channel upgrades - not implemented for Cardano yet
-        tracing::warn!("query_upgrade: not implemented for Cardano");
-        todo!("Implement query_upgrade()")
+        Err(Error::query(
+            "IBC channel upgrades are not implemented for Cardano".to_string(),
+        ))
     }
 
     fn query_upgrade_error(
@@ -1335,22 +1276,21 @@ impl ChainEndpoint for CardanoChainEndpoint {
         _height: ibc_relayer_types::Height,
         _include_proof: IncludeProof,
     ) -> Result<(ibc_relayer_types::core::ics04_channel::upgrade::ErrorReceipt, Option<MerkleProof>), Error> {
-        // Channel upgrades - not implemented for Cardano yet
-        tracing::warn!("query_upgrade_error: not implemented for Cardano");
-        todo!("Implement query_upgrade_error()")
+        Err(Error::query(
+            "IBC channel upgrades are not implemented for Cardano".to_string(),
+        ))
     }
 
     fn query_ccv_consumer_id(
         &self,
         _client_id: ClientId,
     ) -> Result<ibc_relayer_types::applications::ics28_ccv::msgs::ConsumerId, Error> {
-        // ICS-28 CCV - not applicable to Cardano
-        tracing::warn!("query_ccv_consumer_id: not applicable for Cardano");
-        todo!("Implement query_ccv_consumer_id()")
+        Err(Error::query(
+            "ICS-28 CCV (Cross-Chain Validation) is not applicable to Cardano".to_string(),
+        ))
     }
 }
 
-// Header trait and From<CardanoHeader> for AnyHeader are now implemented
+// Mithril header is decoded from Gateway as `google.protobuf.Any`.
 // in ibc-relayer-types/src/clients/ics08_cardano/header.rs and
 // ibc-relayer-types/src/core/ics02_client/header.rs respectively
-

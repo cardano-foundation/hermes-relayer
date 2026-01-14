@@ -4582,7 +4582,6 @@ dependencies = [
  "ibc-relayer-types",
  "ibc-telemetry",
  "itertools 0.14.0",
- "lazy_static",
  "moka",
  "namada_sdk",
  "num-bigint",

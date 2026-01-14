@@ -208,7 +208,9 @@ fn subscribe(
             let subscription = monitor_tx.subscribe()?;
             Ok(subscription)
         }
-        ChainConfig::Cardano(_) => unimplemented!("event subscription not yet supported for cardano"),
+        ChainConfig::Cardano(_) => Err(eyre!(
+            "event subscription is not implemented for Cardano; requires Gateway-backed event source support in `hermes listen`"
+        )),
     }
 }
 
@@ -219,7 +221,11 @@ fn detect_compatibility_mode(
     let rpc_addr = match config {
         ChainConfig::CosmosSdk(config) | ChainConfig::Namada(config) => config.rpc_addr.clone(),
         ChainConfig::Penumbra(config) => config.rpc_addr.clone(),
-        ChainConfig::Cardano(_) => unimplemented!("rpc_addr not yet supported for cardano"),
+        ChainConfig::Cardano(_) => {
+            return Err(eyre!(
+                "compatibility mode detection is not applicable for Cardano (no Tendermint RPC)"
+            ));
+        }
     };
 
     let client = HttpClient::builder(rpc_addr.try_into()?)
@@ -234,7 +240,11 @@ fn detect_compatibility_mode(
             let status = rt.block_on(client.status())?;
             penumbra::util::compat_mode_from_version(&config.compat_mode, status.node_info.version)?
         }
-        ChainConfig::Cardano(_) => unimplemented!("compat_mode not yet supported for cardano"),
+        ChainConfig::Cardano(_) => {
+            return Err(eyre!(
+                "compatibility mode detection is not applicable for Cardano (no Tendermint RPC)"
+            ));
+        }
     };
 
     Ok(compat_mode)

@@ -2,3 +2,4 @@
 
 pub mod ics07_tendermint;
 pub mod ics08_cardano;
+pub mod ics2000_mithril;

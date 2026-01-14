@@ -21,7 +21,8 @@ use ibc_proto::ibc::core::channel::v1::{
     QueryUnreceivedPacketsRequest, QueryUnreceivedAcksRequest,
     QueryNextSequenceReceiveRequest,
 };
-use ibc_relayer_types::clients::ics08_cardano::CardanoHeader;
+use ibc_proto::google::protobuf::Any as ProtoAny;
+use ibc_relayer_types::clients::ics2000_mithril::header::Header as MithrilHeader;
 use ibc_relayer_types::Height;
 use tonic::transport::Channel;
 
@@ -148,25 +149,31 @@ impl GatewayClient {
 
     /// Query header at a specific height
     /// 
-    /// TODO: This requires generating custom proto for Gateway's QueryBlockData endpoint
-    /// which is not in standard ibc-proto. For now, this returns stub data.
-    /// 
-    /// To implement fully:
-    /// 1. Add ibc/core/client/v1/query.proto (with QueryBlockData) to build.rs
-    /// 2. Generate the proto code
-    /// 3. Call client.block_data(QueryBlockDataRequest { height })
-    /// 4. Parse the BlockData proto to extract block_hash, timestamp, slot, epoch
-    pub async fn query_header(&self, height: Height) -> Result<CardanoHeader, Error> {
-        tracing::warn!("query_header: requires custom proto generation for Gateway's BlockData endpoint");
-        
-        // Stub implementation - returns header with correct height but placeholder data
-        Ok(CardanoHeader::new(
-            height,
-            vec![0u8; 32],  // placeholder block hash
-            0,  // timestamp - TODO: extract from BlockData
-            0,  // slot - TODO: extract from BlockData
-            0,  // epoch - TODO: extract from BlockData
-        ))
+    /// This is required for building headers used in `MsgUpdateClient`.
+    pub async fn query_header(&self, height: Height) -> Result<MithrilHeader, Error> {
+        use super::generated::ibc::core::types::v1::query_client::QueryClient as TypesQueryClient;
+        use super::generated::ibc::core::types::v1::QueryIbcHeaderRequest;
+
+        let mut client = TypesQueryClient::new(self.channel.clone());
+
+        let request = tonic::Request::new(QueryIbcHeaderRequest {
+            height: height.revision_height(),
+        });
+
+        let response = client.ibc_header(request).await?.into_inner();
+
+        let header_any = response
+            .header
+            .ok_or_else(|| Error::Query("No header in response".to_string()))?;
+
+        let header_any = ProtoAny {
+            type_url: header_any.type_url,
+            value: header_any.value,
+        };
+
+        header_any
+            .try_into()
+            .map_err(|e: ibc_relayer_types::core::ics02_client::error::Error| Error::Ibc(e.to_string()))
     }
 
     /// Query connection state

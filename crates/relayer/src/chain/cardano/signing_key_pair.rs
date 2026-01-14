@@ -1,6 +1,5 @@
 //! Cardano SigningKeyPair implementation for Hermes keyring
 
-use super::error::Error as CardanoError;
 use super::keyring::CardanoKeyring;
 use hdpath::StandardHDPath;
 use crate::config::AddressType;
@@ -186,4 +185,3 @@ mod tests {
         assert_eq!(signature.len(), 64);
     }
 }
-

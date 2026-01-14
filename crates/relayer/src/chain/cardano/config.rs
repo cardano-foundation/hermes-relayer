@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use crate::config::PacketFilter;
 use crate::keyring::Store;
-use ibc_relayer_types::core::ics02_client::trust_threshold::TrustThreshold;
 
 /// Minimal configuration for Cardano chain integration
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -100,4 +99,3 @@ impl Default for CardanoConfig {
         }
     }
 }
-

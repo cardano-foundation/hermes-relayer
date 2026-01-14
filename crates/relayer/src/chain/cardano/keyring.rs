@@ -11,7 +11,6 @@ use std::str::FromStr;
 pub struct CardanoKeyring {
     signing_key: SigningKey,
     verifying_key: VerifyingKey,
-    account: u32,
 }
 
 impl CardanoKeyring {
@@ -51,7 +50,6 @@ impl CardanoKeyring {
         Ok(Self {
             signing_key,
             verifying_key,
-            account: 0,
         })
     }
 
@@ -82,7 +80,6 @@ impl CardanoKeyring {
         Ok(Self {
             signing_key,
             verifying_key,
-            account,
         })
     }
 

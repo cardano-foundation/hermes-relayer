@@ -16,7 +16,6 @@ use ibc_relayer_types::{
         ics02_client::height::Height,
         ics24_host::identifier::ChainId,
     },
-    events::IbcEvent,
 };
 
 use crate::{
@@ -26,7 +25,6 @@ use crate::{
 };
 
 use super::{
-    error::Error as CardanoError,
     event_parser,
     gateway_client::GatewayClient,
 };
