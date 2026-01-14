@@ -8,14 +8,18 @@ use super::generated::ibc::cardano::v1::{cardano_msg_client::CardanoMsgClient, S
 use super::generated::ibc::core::client::v1::msg_client::MsgClient as GenClientMsgClient;
 use super::generated::ibc::core::connection::v1::msg_client::MsgClient as GenConnectionMsgClient;
 use super::generated::ibc::core::channel::v1::msg_client::MsgClient as GenChannelMsgClient;
-use super::types::{CardanoClientState, CardanoConsensusState};
 use ibc_proto::ibc::core::client::v1::query_client::QueryClient as ClientQueryClient;
-use ibc_proto::ibc::core::client::v1::{QueryClientStateRequest, QueryClientStatesRequest, QueryConsensusStateRequest};
+use ibc_proto::ibc::core::client::v1::{
+    QueryClientStateRequest, QueryClientStatesRequest, QueryConsensusStateRequest,
+    QueryClientStateResponse, QueryConsensusStateResponse, QueryConsensusStateHeightsRequest,
+    QueryConsensusStateHeightsResponse, QueryConsensusStatesRequest, QueryConsensusStatesResponse,
+};
 use ibc_proto::ibc::core::connection::v1::query_client::QueryClient as ConnectionQueryClient;
 use ibc_proto::ibc::core::connection::v1::{QueryConnectionRequest, QueryConnectionsRequest, QueryClientConnectionsRequest};
 use ibc_proto::ibc::core::channel::v1::query_client::QueryClient as ChannelQueryClient;
 use ibc_proto::ibc::core::channel::v1::{
     QueryChannelRequest, QueryChannelsRequest, QueryConnectionChannelsRequest,
+    QueryChannelClientStateRequest, QueryChannelClientStateResponse,
     QueryPacketCommitmentRequest, QueryPacketCommitmentsRequest, QueryPacketReceiptRequest,
     QueryPacketAcknowledgementRequest, QueryPacketAcknowledgementsRequest,
     QueryUnreceivedPacketsRequest, QueryUnreceivedAcksRequest,
@@ -89,29 +93,19 @@ impl GatewayClient {
     }
 
     /// Query client state for a specific client ID
-    pub async fn query_client_state(&self, client_id: &str) -> Result<CardanoClientState, Error> {
+    pub async fn query_client_state(&self, client_id: &str) -> Result<QueryClientStateResponse, Error> {
         let mut client = ClientQueryClient::new(self.channel.clone());
         
         let request = tonic::Request::new(QueryClientStateRequest {
             client_id: client_id.to_string(),
         });
         
-        let response = client.client_state(request)
+        let response = client
+            .client_state(request)
             .await?
             .into_inner();
-        
-        // Parse the Any proto message into CardanoClientState
-        let client_state_any = response.client_state
-            .ok_or_else(|| Error::Query("No client_state in response".to_string()))?;
-        
-        // Convert ibc_proto::Any to prost_types::Any
-        let prost_any = prost_types::Any {
-            type_url: client_state_any.type_url,
-            value: client_state_any.value,
-        };
-        
-        tracing::info!("Parsing client state for client_id: {}", client_id);
-        super::proto_parser::parse_client_state_from_any(prost_any)
+
+        Ok(response)
     }
 
     /// Query consensus state for a specific client ID and height
@@ -119,7 +113,7 @@ impl GatewayClient {
         &self,
         client_id: &str,
         height: Height,
-    ) -> Result<CardanoConsensusState, Error> {
+    ) -> Result<QueryConsensusStateResponse, Error> {
         let mut client = ClientQueryClient::new(self.channel.clone());
         
         let request = tonic::Request::new(QueryConsensusStateRequest {
@@ -129,22 +123,34 @@ impl GatewayClient {
             latest_height: false,
         });
         
-        let response = client.consensus_state(request)
+        let response = client
+            .consensus_state(request)
             .await?
             .into_inner();
-        
-        // Parse the Any proto message into CardanoConsensusState
-        let consensus_state_any = response.consensus_state
-            .ok_or_else(|| Error::Query("No consensus_state in response".to_string()))?;
-        
-        // Convert ibc_proto::Any to prost_types::Any
-        let prost_any = prost_types::Any {
-            type_url: consensus_state_any.type_url,
-            value: consensus_state_any.value,
-        };
-        
-        tracing::info!("Parsing consensus state for client_id: {} at height: {}", client_id, height);
-        super::proto_parser::parse_consensus_state_from_any(prost_any)
+
+        Ok(response)
+    }
+
+    /// Query consensus state heights for a specific client ID.
+    pub async fn query_consensus_state_heights(
+        &self,
+        request: QueryConsensusStateHeightsRequest,
+    ) -> Result<QueryConsensusStateHeightsResponse, Error> {
+        let mut client = ClientQueryClient::new(self.channel.clone());
+        let request = tonic::Request::new(request);
+        let response = client.consensus_state_heights(request).await?.into_inner();
+        Ok(response)
+    }
+
+    /// Query all consensus states for a specific client ID.
+    pub async fn query_consensus_states(
+        &self,
+        request: QueryConsensusStatesRequest,
+    ) -> Result<QueryConsensusStatesResponse, Error> {
+        let mut client = ClientQueryClient::new(self.channel.clone());
+        let request = tonic::Request::new(request);
+        let response = client.consensus_states(request).await?.into_inner();
+        Ok(response)
     }
 
     /// Query header at a specific height
@@ -174,6 +180,80 @@ impl GatewayClient {
         header_any
             .try_into()
             .map_err(|e: ibc_relayer_types::core::ics02_client::error::Error| Error::Ibc(e.to_string()))
+    }
+
+    /// Query block results at a specific height.
+    pub async fn query_block_results(
+        &self,
+        height: u64,
+    ) -> Result<super::generated::ibc::core::types::v1::QueryBlockResultsResponse, Error> {
+        use super::generated::ibc::core::types::v1::query_client::QueryClient as TypesQueryClient;
+        use super::generated::ibc::core::types::v1::QueryBlockResultsRequest;
+
+        let mut client = TypesQueryClient::new(self.channel.clone());
+
+        let request = tonic::Request::new(QueryBlockResultsRequest { height });
+        let response = client.block_results(request).await?.into_inner();
+
+        Ok(response)
+    }
+
+    /// Search for blocks containing packet-related events.
+    pub async fn query_block_search(
+        &self,
+        packet_src_channel: String,
+        packet_dst_channel: String,
+        packet_sequence: String,
+        limit: u64,
+    ) -> Result<super::generated::ibc::core::types::v1::QueryBlockSearchResponse, Error> {
+        use super::generated::ibc::core::types::v1::query_client::QueryClient as TypesQueryClient;
+        use super::generated::ibc::core::types::v1::QueryBlockSearchRequest;
+
+        let mut client = TypesQueryClient::new(self.channel.clone());
+
+        let request = tonic::Request::new(QueryBlockSearchRequest {
+            packet_src_channel,
+            packet_dst_channel,
+            packet_sequence,
+            limit,
+            page: 1,
+        });
+
+        let response = client.block_search(request).await?.into_inner();
+        Ok(response)
+    }
+
+    /// Query a transaction by hash.
+    pub async fn query_transaction_by_hash(
+        &self,
+        hash: String,
+    ) -> Result<super::generated::ibc::core::types::v1::QueryTransactionByHashResponse, Error> {
+        use super::generated::ibc::core::types::v1::query_client::QueryClient as TypesQueryClient;
+        use super::generated::ibc::core::types::v1::QueryTransactionByHashRequest;
+
+        let mut client = TypesQueryClient::new(self.channel.clone());
+
+        let request = tonic::Request::new(QueryTransactionByHashRequest { hash });
+        let response = client.transaction_by_hash(request).await?.into_inner();
+        Ok(response)
+    }
+
+    /// Query the client state associated with a channel.
+    pub async fn query_channel_client_state(
+        &self,
+        port_id: &str,
+        channel_id: &str,
+    ) -> Result<Vec<u8>, Error> {
+        let mut client = ChannelQueryClient::new(self.channel.clone());
+
+        let request = tonic::Request::new(QueryChannelClientStateRequest {
+            port_id: port_id.to_string(),
+            channel_id: channel_id.to_string(),
+        });
+
+        let response: QueryChannelClientStateResponse = client.channel_client_state(request).await?.into_inner();
+
+        Ok(prost::Message::encode_to_vec(&response))
     }
 
     /// Query connection state

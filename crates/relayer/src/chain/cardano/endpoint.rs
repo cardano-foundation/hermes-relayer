@@ -194,8 +194,12 @@ impl ChainEndpoint for CardanoChainEndpoint {
     }
 
     fn health_check(&mut self) -> Result<HealthCheck, Error> {
-        // TODO: Query Gateway health
-        Ok(HealthCheck::Healthy)
+        match self.rt.block_on(self.gateway_client.query_latest_height()) {
+            Ok(_) => Ok(HealthCheck::Healthy),
+            Err(e) => Ok(HealthCheck::Unhealthy(Box::new(Error::query(format!(
+                "Gateway health check failed: {e}"
+            ))))),
+        }
     }
 
     fn subscribe(&mut self) -> Result<Subscription, Error> {
@@ -462,21 +466,46 @@ impl ChainEndpoint for CardanoChainEndpoint {
     ) -> Result<(AnyClientState, Option<MerkleProof>), Error> {
         tracing::debug!("Querying client state for: {}", request.client_id);
         
-        // Query client state from Gateway
-        let client_state = self.rt.block_on(
-            self.gateway_client.query_client_state(request.client_id.as_str())
-        ).map_err(|e| {
-            tracing::error!("Failed to query client state: {}", e);
-            Error::query(format!("Gateway query_client_state failed: {}", e))
-        })?;
-        
-        // Convert to AnyClientState using the From trait
-        let any_client_state: AnyClientState = client_state.into();
-        
-        // TODO: Generate proof if include_proof is true
-        let proof = if include_proof == IncludeProof::Yes {
-            tracing::warn!("Proof generation not yet implemented");
-            None
+        let response = self
+            .rt
+            .block_on(self.gateway_client.query_client_state(request.client_id.as_str()))
+            .map_err(|e| {
+                tracing::error!("Failed to query client state: {}", e);
+                Error::query(format!("Gateway query_client_state failed: {}", e))
+            })?;
+
+        let client_state_any = response
+            .client_state
+            .ok_or_else(|| Error::query("No client_state in response".to_string()))?;
+
+        let any_client_state: AnyClientState = match AnyClientState::try_from(client_state_any.clone()) {
+            Ok(cs) => cs,
+            Err(_e) if client_state_any.type_url == "/ibc.lightclients.cardano.v1.ClientState" => {
+                let prost_any = prost_types::Any {
+                    type_url: client_state_any.type_url,
+                    value: client_state_any.value,
+                };
+
+                let cs = super::proto_parser::parse_client_state_from_any(prost_any)
+                    .map_err(|e| Error::query(format!("Failed to parse Cardano client state: {e}")))?;
+
+                cs.into()
+            }
+            Err(e) => {
+                return Err(Error::query(format!(
+                    "Unsupported client state type_url {}: {e}",
+                    client_state_any.type_url
+                )))
+            }
+        };
+
+        let proof = if include_proof == IncludeProof::Yes && !response.proof.is_empty() {
+            use ibc_proto::ibc::core::commitment::v1::MerkleProof as RawMerkleProof;
+            use prost::Message;
+
+            let raw_proof = RawMerkleProof::decode(&response.proof[..])
+                .map_err(|e| Error::query(format!("Failed to decode proof: {e}")))?;
+            Some(MerkleProof::from(raw_proof))
         } else {
             None
         };
@@ -495,24 +524,49 @@ impl ChainEndpoint for CardanoChainEndpoint {
             request.consensus_height
         );
         
-        // Query consensus state from Gateway
-        let consensus_state = self.rt.block_on(
-            self.gateway_client.query_consensus_state(
+        let response = self
+            .rt
+            .block_on(self.gateway_client.query_consensus_state(
                 request.client_id.as_str(),
-                request.consensus_height
-            )
-        ).map_err(|e| {
-            tracing::error!("Failed to query consensus state: {}", e);
-            Error::query(format!("Gateway query_consensus_state failed: {}", e))
-        })?;
-        
-        // Convert to AnyConsensusState using the From trait
-        let any_consensus_state: AnyConsensusState = consensus_state.into();
-        
-        // TODO: Generate proof if include_proof is true
-        let proof = if include_proof == IncludeProof::Yes {
-            tracing::warn!("Proof generation not yet implemented");
-            None
+                request.consensus_height,
+            ))
+            .map_err(|e| {
+                tracing::error!("Failed to query consensus state: {}", e);
+                Error::query(format!("Gateway query_consensus_state failed: {}", e))
+            })?;
+
+        let consensus_state_any = response
+            .consensus_state
+            .ok_or_else(|| Error::query("No consensus_state in response".to_string()))?;
+
+        let any_consensus_state: AnyConsensusState = match AnyConsensusState::try_from(consensus_state_any.clone()) {
+            Ok(cs) => cs,
+            Err(_e) if consensus_state_any.type_url == "/ibc.lightclients.cardano.v1.ConsensusState" => {
+                let prost_any = prost_types::Any {
+                    type_url: consensus_state_any.type_url,
+                    value: consensus_state_any.value,
+                };
+
+                let cs = super::proto_parser::parse_consensus_state_from_any(prost_any)
+                    .map_err(|e| Error::query(format!("Failed to parse Cardano consensus state: {e}")))?;
+
+                cs.into()
+            }
+            Err(e) => {
+                return Err(Error::query(format!(
+                    "Unsupported consensus state type_url {}: {e}",
+                    consensus_state_any.type_url
+                )))
+            }
+        };
+
+        let proof = if include_proof == IncludeProof::Yes && !response.proof.is_empty() {
+            use ibc_proto::ibc::core::commitment::v1::MerkleProof as RawMerkleProof;
+            use prost::Message;
+
+            let raw_proof = RawMerkleProof::decode(&response.proof[..])
+                .map_err(|e| Error::query(format!("Failed to decode proof: {e}")))?;
+            Some(MerkleProof::from(raw_proof))
         } else {
             None
         };
@@ -522,11 +576,71 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn query_consensus_state_heights(
         &self,
-        _request: QueryConsensusStateHeightsRequest,
+        request: QueryConsensusStateHeightsRequest,
     ) -> Result<Vec<ICSHeight>, Error> {
-        // TODO: Query consensus state heights via Gateway
-        tracing::warn!("query_consensus_state_heights: stub implementation");
-        Ok(vec![])
+        tracing::debug!(
+            "Querying consensus state heights for client: {}",
+            request.client_id
+        );
+
+        self.rt.block_on(async {
+            let grpc_request: ibc_proto::ibc::core::client::v1::QueryConsensusStateHeightsRequest =
+                request.clone().into();
+
+            let heights_response = self
+                .gateway_client
+                .query_consensus_state_heights(grpc_request)
+                .await;
+
+            let consensus_state_heights = match heights_response {
+                Ok(res) => res.consensus_state_heights,
+                Err(heights_err) => {
+                    // Some chains do not implement `ConsensusStateHeights`; fall back to
+                    // `ConsensusStates` and extract the heights.
+                    let states_request: ibc_proto::ibc::core::client::v1::QueryConsensusStatesRequest =
+                        ibc_proto::ibc::core::client::v1::QueryConsensusStatesRequest {
+                            client_id: request.client_id.to_string(),
+                            pagination: request.pagination.map(|p| p.into()),
+                        };
+
+                    let states = self
+                        .gateway_client
+                        .query_consensus_states(states_request)
+                        .await
+                        .map_err(|states_err| {
+                            Error::query(format!(
+                                "Failed to query consensus state heights ({heights_err}) and fallback consensus states ({states_err})"
+                            ))
+                        })?;
+
+                    states
+                        .consensus_states
+                        .into_iter()
+                        .filter_map(|cs| cs.height)
+                        .collect()
+                }
+            };
+
+            let mut heights: Vec<_> = consensus_state_heights
+                .into_iter()
+                .filter_map(|h| {
+                    ICSHeight::new(h.revision_number, h.revision_height)
+                        .map_err(|e| {
+                            tracing::warn!(
+                                "Failed to parse consensus state height {}-{}: {}",
+                                h.revision_number,
+                                h.revision_height,
+                                e
+                            );
+                        })
+                        .ok()
+                })
+                .collect();
+
+            heights.sort_unstable();
+
+            Ok(heights)
+        })
     }
 
     fn query_upgraded_client_state(
@@ -814,11 +928,36 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn query_channel_client_state(
         &self,
-        _request: QueryChannelClientStateRequest,
+        request: QueryChannelClientStateRequest,
     ) -> Result<Option<IdentifiedAnyClientState>, Error> {
-        // TODO: Query channel client state via Gateway
-        tracing::warn!("query_channel_client_state: stub implementation");
-        Ok(None)
+        tracing::debug!(
+            "Querying channel client state: port={}, channel={}",
+            request.port_id,
+            request.channel_id
+        );
+
+        self.rt.block_on(async {
+            let response_bytes = self
+                .gateway_client
+                .query_channel_client_state(
+                    &request.port_id.to_string(),
+                    &request.channel_id.to_string(),
+                )
+                .await
+                .map_err(|e| Error::query(format!("Failed to query channel client state: {e}")))?;
+
+            use prost::Message;
+            use ibc_proto::ibc::core::channel::v1::QueryChannelClientStateResponse;
+
+            let response = QueryChannelClientStateResponse::decode(&response_bytes[..])
+                .map_err(|e| Error::query(format!("Failed to decode channel client state response: {e}")))?;
+
+            let identified = response
+                .identified_client_state
+                .and_then(|ics| IdentifiedAnyClientState::try_from(ics).ok());
+
+            Ok(identified)
+        })
     }
 
     fn query_packet_commitment(
@@ -1145,18 +1284,193 @@ impl ChainEndpoint for CardanoChainEndpoint {
     }
 
     fn query_txs(&self, _request: QueryTxRequest) -> Result<Vec<IbcEventWithHeight>, Error> {
-        // TODO: Query transactions via Gateway
-        tracing::warn!("query_txs: stub implementation");
-        Ok(vec![])
+        use crate::chain::requests::{QueryHeight, QueryTxRequest};
+        use ibc_relayer_types::events::WithBlockDataType;
+
+        match _request {
+            QueryTxRequest::Transaction(tx) => {
+                self.rt.block_on(async {
+                    let response = self
+                        .gateway_client
+                        .query_transaction_by_hash(tx.0.to_string())
+                        .await
+                        .map_err(|e| Error::query(format!("Failed to query transaction by hash: {e}")))?;
+
+                    let height = ICSHeight::new(0, response.height)
+                        .map_err(|e| Error::query(format!("Invalid tx height {}: {e}", response.height)))?;
+
+                    let proto_events: Vec<super::generated::ibc::cardano::v1::Event> = response
+                        .events
+                        .into_iter()
+                        .map(|e| super::generated::ibc::cardano::v1::Event {
+                            r#type: e.r#type,
+                            attributes: e
+                                .event_attribute
+                                .into_iter()
+                                .map(|a| super::generated::ibc::cardano::v1::EventAttribute {
+                                    key: a.key,
+                                    value: a.value,
+                                })
+                                .collect(),
+                        })
+                        .collect();
+
+                    let parsed_events = super::event_parser::parse_events(proto_events, height)
+                        .map_err(|e| Error::query(format!("Failed to parse tx events: {e}")))?;
+
+                    Ok(parsed_events
+                        .into_iter()
+                        .map(|ev| IbcEventWithHeight::new(ev, height))
+                        .collect())
+                })
+            }
+
+            QueryTxRequest::Client(request) => {
+                // Best-effort: query the specified height (when provided) and filter for the event.
+                let target_height_u64 = match request.query_height {
+                    QueryHeight::Specific(h) => h.revision_height(),
+                    QueryHeight::Latest => {
+                        let latest = self
+                            .rt
+                            .block_on(self.gateway_client.query_latest_height())
+                            .map_err(|e| Error::query(format!("Failed to query latest height: {e}")))?;
+                        latest.revision_height()
+                    }
+                };
+
+                self.rt.block_on(async {
+                    let response = self
+                        .gateway_client
+                        .query_block_results(target_height_u64)
+                        .await
+                        .map_err(|e| Error::query(format!("Failed to query block results: {e}")))?;
+
+                    let block_results = response
+                        .block_results
+                        .ok_or_else(|| Error::query("No block_results in response".to_string()))?;
+
+                    let height = block_results
+                        .height
+                        .map(|h| ICSHeight::new(h.revision_number, h.revision_height))
+                        .transpose()
+                        .map_err(|e| Error::query(format!("Invalid height in block results: {e}")))?
+                        .unwrap_or_else(|| ICSHeight::new(0, target_height_u64).expect("valid height"));
+
+                    let proto_events: Vec<super::generated::ibc::cardano::v1::Event> = block_results
+                        .txs_results
+                        .into_iter()
+                        .flat_map(|tx| tx.events)
+                        .map(|e| super::generated::ibc::cardano::v1::Event {
+                            r#type: e.r#type,
+                            attributes: e
+                                .event_attribute
+                                .into_iter()
+                                .map(|a| super::generated::ibc::cardano::v1::EventAttribute {
+                                    key: a.key,
+                                    value: a.value,
+                                })
+                                .collect(),
+                        })
+                        .collect();
+
+                    let parsed_events = super::event_parser::parse_events(proto_events, height)
+                        .map_err(|e| Error::query(format!("Failed to parse block tx events: {e}")))?;
+
+                    let filtered = parsed_events
+                        .into_iter()
+                        .filter(|ev| match (&request.event_id, ev) {
+                            (
+                                WithBlockDataType::CreateClient,
+                                ibc_relayer_types::events::IbcEvent::CreateClient(e),
+                            ) => e.client_id() == &request.client_id
+                                && e.0.consensus_height == request.consensus_height,
+                            (
+                                WithBlockDataType::UpdateClient,
+                                ibc_relayer_types::events::IbcEvent::UpdateClient(e),
+                            ) => e.common.client_id == request.client_id
+                                && e.common.consensus_height == request.consensus_height,
+                            _ => false,
+                        })
+                        .map(|ev| IbcEventWithHeight::new(ev, height))
+                        .collect();
+
+                    Ok(filtered)
+                })
+            }
+        }
     }
 
     fn query_packet_events(
         &self,
-        _request: QueryPacketEventDataRequest,
+        request: QueryPacketEventDataRequest,
     ) -> Result<Vec<IbcEventWithHeight>, Error> {
-        // TODO: Query packet events via Gateway
-        tracing::warn!("query_packet_events: stub implementation");
-        Ok(vec![])
+        use crate::chain::requests::{Qualified, QueryHeight};
+
+        let max_height: Option<u64> = match request.height {
+            Qualified::SmallerEqual(QueryHeight::Specific(h)) => Some(h.revision_height()),
+            Qualified::Equal(QueryHeight::Specific(h)) => Some(h.revision_height()),
+            _ => None,
+        };
+
+        let must_equal_height: Option<u64> = match request.height {
+            Qualified::Equal(QueryHeight::Specific(h)) => Some(h.revision_height()),
+            _ => None,
+        };
+
+        self.rt.block_on(async {
+            let mut out = Vec::new();
+
+            // If the request targets a single height, avoid block search and inspect that block only.
+            if let Some(h) = must_equal_height {
+                let response = self
+                    .gateway_client
+                    .query_block_results(h)
+                    .await
+                    .map_err(|e| Error::query(format!("Failed to query block results: {e}")))?;
+
+                out.extend(filter_packet_events_from_block_results(&request, response.block_results, h)?);
+                return Ok(out);
+            }
+
+            for seq in &request.sequences {
+                let search = self
+                    .gateway_client
+                    .query_block_search(
+                        request.source_channel_id.to_string(),
+                        request.destination_channel_id.to_string(),
+                        seq.to_string(),
+                        50,
+                    )
+                    .await
+                    .map_err(|e| Error::query(format!("Failed to search blocks: {e}")))?;
+
+                let mut heights: Vec<u64> = search
+                    .blocks
+                    .into_iter()
+                    .filter_map(|b| b.block.map(|bi| bi.height))
+                    .filter_map(|h| u64::try_from(h).ok())
+                    .collect();
+
+                heights.sort_unstable();
+                heights.dedup();
+
+                if let Some(max_h) = max_height {
+                    heights.retain(|h| *h <= max_h);
+                }
+
+                for h in heights {
+                    let response = self
+                        .gateway_client
+                        .query_block_results(h)
+                        .await
+                        .map_err(|e| Error::query(format!("Failed to query block results: {e}")))?;
+
+                    out.extend(filter_packet_events_from_block_results(&request, response.block_results, h)?);
+                }
+            }
+
+            Ok(out)
+        })
     }
 
     fn query_host_consensus_state(
@@ -1289,6 +1603,70 @@ impl ChainEndpoint for CardanoChainEndpoint {
             "ICS-28 CCV (Cross-Chain Validation) is not applicable to Cardano".to_string(),
         ))
     }
+}
+
+fn filter_packet_events_from_block_results(
+    request: &QueryPacketEventDataRequest,
+    block_results: Option<super::generated::ibc::core::types::v1::ResultBlockResults>,
+    fallback_height: u64,
+) -> Result<Vec<IbcEventWithHeight>, Error> {
+    use ibc_relayer_types::events::{IbcEvent as RelayerIbcEvent, WithBlockDataType};
+
+    let block_results = match block_results {
+        Some(br) => br,
+        None => return Ok(vec![]),
+    };
+
+    let height = block_results
+        .height
+        .map(|h| ICSHeight::new(h.revision_number, h.revision_height))
+        .transpose()
+        .map_err(|e| Error::query(format!("Invalid height in block results: {e}")))?
+        .unwrap_or_else(|| ICSHeight::new(0, fallback_height).expect("valid height"));
+
+    let proto_events: Vec<super::generated::ibc::cardano::v1::Event> = block_results
+        .txs_results
+        .into_iter()
+        .flat_map(|tx| tx.events)
+        .map(|e| super::generated::ibc::cardano::v1::Event {
+            r#type: e.r#type,
+            attributes: e
+                .event_attribute
+                .into_iter()
+                .map(|a| super::generated::ibc::cardano::v1::EventAttribute {
+                    key: a.key,
+                    value: a.value,
+                })
+                .collect(),
+        })
+        .collect();
+
+    let parsed_events = super::event_parser::parse_events(proto_events, height)
+        .map_err(|e| Error::query(format!("Failed to parse block events: {e}")))?;
+
+    let filtered: Vec<IbcEventWithHeight> = parsed_events
+        .into_iter()
+        .filter(|ev| match (&request.event_id, ev) {
+            (WithBlockDataType::SendPacket, RelayerIbcEvent::SendPacket(e)) => {
+                request.sequences.contains(&e.packet.sequence)
+                    && e.src_port_id() == &request.source_port_id
+                    && e.src_channel_id() == &request.source_channel_id
+                    && e.dst_port_id() == &request.destination_port_id
+                    && e.dst_channel_id() == &request.destination_channel_id
+            }
+            (WithBlockDataType::WriteAck, RelayerIbcEvent::WriteAcknowledgement(e)) => {
+                request.sequences.contains(&e.packet.sequence)
+                    && e.src_port_id() == &request.source_port_id
+                    && e.src_channel_id() == &request.source_channel_id
+                    && e.dst_port_id() == &request.destination_port_id
+                    && e.dst_channel_id() == &request.destination_channel_id
+            }
+            _ => false,
+        })
+        .map(|ev| IbcEventWithHeight::new(ev, height))
+        .collect();
+
+    Ok(filtered)
 }
 
 // Mithril header is decoded from Gateway as `google.protobuf.Any`.
