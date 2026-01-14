@@ -333,11 +333,63 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn send_messages_and_wait_check_tx(
         &mut self,
-        _tracked_msgs: TrackedMsgs,
+        tracked_msgs: TrackedMsgs,
     ) -> Result<Vec<TxResponse>, Error> {
-        Err(Error::send_tx(
-            "Cardano `send_messages_and_wait_check_tx` is not implemented".to_string(),
-        ))
+        tracing::info!(
+            "send_messages_and_wait_check_tx: processing {} messages",
+            tracked_msgs.msgs.len()
+        );
+
+        if tracked_msgs.msgs.is_empty() {
+            return Ok(vec![]);
+        }
+
+        self.rt.block_on(async {
+            use bytes::Bytes;
+            use tendermint::abci::Code;
+            use tendermint::Hash;
+
+            let mut responses = Vec::with_capacity(tracked_msgs.msgs.len());
+
+            for msg in tracked_msgs.msgs.iter() {
+                tracing::debug!("Processing message type: {:?}", msg.type_url);
+
+                let unsigned_tx = self
+                    .gateway_client
+                    .build_ibc_tx(&msg.type_url, msg.value.clone())
+                    .await
+                    .map_err(|e| Error::send_tx(format!("Failed to build transaction: {e}")))?;
+
+                let signed_cbor_hex = self.sign_transaction_helper(&unsigned_tx.cbor_hex)?;
+
+                let tx_response = self
+                    .gateway_client
+                    .submit_signed_tx(&signed_cbor_hex)
+                    .await
+                    .map_err(|e| Error::send_tx(format!("Failed to submit transaction: {e}")))?;
+
+                let hash = match Hash::from_str(&tx_response.tx_hash.to_ascii_uppercase()) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to parse tx hash `{}` as Tendermint hash: {e}",
+                            tx_response.tx_hash
+                        );
+                        Hash::None
+                    }
+                };
+
+                responses.push(TxResponse {
+                    codespace: String::new(),
+                    code: Code::Ok,
+                    data: Bytes::new(),
+                    log: format!("submitted tx {}", tx_response.tx_hash),
+                    hash,
+                });
+            }
+
+            Ok(responses)
+        })
     }
 
     fn verify_header(
@@ -401,11 +453,20 @@ impl ChainEndpoint for CardanoChainEndpoint {
             })?;
         
         tracing::info!("Cardano chain at height: {}", height);
+
+        let timestamp = match self.rt.block_on(self.gateway_client.query_header(height)) {
+            Ok(header) => header.timestamp,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to query header at height {height} for timestamp (falling back to local time): {e}"
+                );
+                tendermint::Time::now().into()
+            }
+        };
         
         Ok(ChainStatus {
             height,
-            // Use current time as timestamp; TODO: Get actual timestamp from Gateway
-            timestamp: tendermint::Time::now().into(),
+            timestamp,
         })
     }
 
@@ -1326,75 +1387,121 @@ impl ChainEndpoint for CardanoChainEndpoint {
             }
 
             QueryTxRequest::Client(request) => {
-                // Best-effort: query the specified height (when provided) and filter for the event.
-                let target_height_u64 = match request.query_height {
-                    QueryHeight::Specific(h) => h.revision_height(),
-                    QueryHeight::Latest => {
-                        let latest = self
-                            .rt
-                            .block_on(self.gateway_client.query_latest_height())
-                            .map_err(|e| Error::query(format!("Failed to query latest height: {e}")))?;
-                        latest.revision_height()
-                    }
-                };
-
                 self.rt.block_on(async {
-                    let response = self
-                        .gateway_client
-                        .query_block_results(target_height_u64)
-                        .await
-                        .map_err(|e| Error::query(format!("Failed to query block results: {e}")))?;
+                    const LOOKBACK_WINDOW: u64 = 50;
 
-                    let block_results = response
-                        .block_results
-                        .ok_or_else(|| Error::query("No block_results in response".to_string()))?;
+                    let filter_events = |height: ICSHeight,
+                                         proto_events: Vec<super::generated::ibc::cardano::v1::Event>|
+                     -> Result<Vec<IbcEventWithHeight>, Error> {
+                        let parsed_events = super::event_parser::parse_events(proto_events, height)
+                            .map_err(|e| Error::query(format!("Failed to parse tx events: {e}")))?;
 
-                    let height = block_results
-                        .height
-                        .map(|h| ICSHeight::new(h.revision_number, h.revision_height))
-                        .transpose()
-                        .map_err(|e| Error::query(format!("Invalid height in block results: {e}")))?
-                        .unwrap_or_else(|| ICSHeight::new(0, target_height_u64).expect("valid height"));
+                        Ok(parsed_events
+                            .into_iter()
+                            .filter(|ev| match (&request.event_id, ev) {
+                                (
+                                    WithBlockDataType::CreateClient,
+                                    ibc_relayer_types::events::IbcEvent::CreateClient(e),
+                                ) => e.client_id() == &request.client_id
+                                    && e.0.consensus_height == request.consensus_height,
+                                (
+                                    WithBlockDataType::UpdateClient,
+                                    ibc_relayer_types::events::IbcEvent::UpdateClient(e),
+                                ) => e.common.client_id == request.client_id
+                                    && e.common.consensus_height == request.consensus_height,
+                                _ => false,
+                            })
+                            .map(|ev| IbcEventWithHeight::new(ev, height))
+                            .collect())
+                    };
 
-                    let proto_events: Vec<super::generated::ibc::cardano::v1::Event> = block_results
-                        .txs_results
-                        .into_iter()
-                        .flat_map(|tx| tx.events)
-                        .map(|e| super::generated::ibc::cardano::v1::Event {
-                            r#type: e.r#type,
-                            attributes: e
-                                .event_attribute
+                    match request.query_height {
+                        QueryHeight::Specific(h) => {
+                            let target_height_u64 = h.revision_height();
+
+                            let response = self
+                                .gateway_client
+                                .query_block_results(target_height_u64)
+                                .await
+                                .map_err(|e| Error::query(format!("Failed to query block results: {e}")))?;
+
+                            let block_results = response
+                                .block_results
+                                .ok_or_else(|| Error::query("No block_results in response".to_string()))?;
+
+                            let height = block_results
+                                .height
+                                .map(|h| ICSHeight::new(h.revision_number, h.revision_height))
+                                .transpose()
+                                .map_err(|e| Error::query(format!("Invalid height in block results: {e}")))?
+                                .unwrap_or_else(|| ICSHeight::new(0, target_height_u64).expect("valid height"));
+
+                            let proto_events: Vec<super::generated::ibc::cardano::v1::Event> = block_results
+                                .txs_results
                                 .into_iter()
-                                .map(|a| super::generated::ibc::cardano::v1::EventAttribute {
-                                    key: a.key,
-                                    value: a.value,
+                                .flat_map(|tx| tx.events)
+                                .map(|e| super::generated::ibc::cardano::v1::Event {
+                                    r#type: e.r#type,
+                                    attributes: e
+                                        .event_attribute
+                                        .into_iter()
+                                        .map(|a| super::generated::ibc::cardano::v1::EventAttribute {
+                                            key: a.key,
+                                            value: a.value,
+                                        })
+                                        .collect(),
                                 })
-                                .collect(),
-                        })
-                        .collect();
+                                .collect();
 
-                    let parsed_events = super::event_parser::parse_events(proto_events, height)
-                        .map_err(|e| Error::query(format!("Failed to parse block tx events: {e}")))?;
+                            filter_events(height, proto_events)
+                        }
+                        QueryHeight::Latest => {
+                            let latest = self
+                                .gateway_client
+                                .query_latest_height()
+                                .await
+                                .map_err(|e| Error::query(format!("Failed to query latest height: {e}")))?;
 
-                    let filtered = parsed_events
-                        .into_iter()
-                        .filter(|ev| match (&request.event_id, ev) {
-                            (
-                                WithBlockDataType::CreateClient,
-                                ibc_relayer_types::events::IbcEvent::CreateClient(e),
-                            ) => e.client_id() == &request.client_id
-                                && e.0.consensus_height == request.consensus_height,
-                            (
-                                WithBlockDataType::UpdateClient,
-                                ibc_relayer_types::events::IbcEvent::UpdateClient(e),
-                            ) => e.common.client_id == request.client_id
-                                && e.common.consensus_height == request.consensus_height,
-                            _ => false,
-                        })
-                        .map(|ev| IbcEventWithHeight::new(ev, height))
-                        .collect();
+                            let latest_h = latest.revision_height();
+                            let since_h = latest_h.saturating_sub(LOOKBACK_WINDOW);
+                            let since_h = since_h.max(1);
+                            let since_height = ICSHeight::new(0, since_h)
+                                .map_err(|e| Error::query(format!("Invalid since height {since_h}: {e}")))?;
 
-                    Ok(filtered)
+                            let response = self
+                                .gateway_client
+                                .query_events(since_height)
+                                .await
+                                .map_err(|e| Error::query(format!("Failed to query events: {e}")))?;
+
+                            let mut out = Vec::new();
+                            for block in response.events {
+                                let height = ICSHeight::new(0, block.height)
+                                    .map_err(|e| Error::query(format!("Invalid block height {}: {e}", block.height)))?;
+
+                                let proto_events: Vec<super::generated::ibc::cardano::v1::Event> = block
+                                    .events
+                                    .into_iter()
+                                    .flat_map(|tx| tx.events)
+                                    .map(|e| super::generated::ibc::cardano::v1::Event {
+                                        r#type: e.r#type,
+                                        attributes: e
+                                            .event_attribute
+                                            .into_iter()
+                                            .map(|a| super::generated::ibc::cardano::v1::EventAttribute {
+                                                key: a.key,
+                                                value: a.value,
+                                            })
+                                            .collect(),
+                                    })
+                                    .collect();
+
+                                out.extend(filter_events(height, proto_events)?);
+                            }
+
+                            Ok(out)
+                        }
+                    }
                 })
             }
         }
@@ -1432,15 +1539,15 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 return Ok(out);
             }
 
-            for seq in &request.sequences {
-                let search = self
-                    .gateway_client
-                    .query_block_search(
-                        request.source_channel_id.to_string(),
-                        request.destination_channel_id.to_string(),
-                        seq.to_string(),
-                        50,
-                    )
+                for seq in &request.sequences {
+                    let search = self
+                        .gateway_client
+                        .query_block_search_all(
+                            request.source_channel_id.to_string(),
+                            request.destination_channel_id.to_string(),
+                            seq.to_string(),
+                            50,
+                        )
                     .await
                     .map_err(|e| Error::query(format!("Failed to search blocks: {e}")))?;
 

@@ -80,7 +80,9 @@ impl CardanoEventSource {
             poll_interval,
             event_bus,
             rx_cmd,
-            last_fetched_height: Height::new(0, 0).map_err(|e| {
+            // Start at a valid (non-zero) height; `run()` will immediately reset this
+            // to the latest height if the gateway is reachable.
+            last_fetched_height: Height::new(0, 1).map_err(|e| {
                 Error::collect_events_failed(format!("Failed to create initial height: {}", e))
             })?,
         };

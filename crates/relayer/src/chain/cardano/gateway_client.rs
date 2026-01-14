@@ -206,6 +206,73 @@ impl GatewayClient {
         packet_sequence: String,
         limit: u64,
     ) -> Result<super::generated::ibc::core::types::v1::QueryBlockSearchResponse, Error> {
+        self.query_block_search_page(
+            packet_src_channel,
+            packet_dst_channel,
+            packet_sequence,
+            limit,
+            1,
+        )
+        .await
+    }
+
+    /// Search for blocks containing packet-related events, returning all pages.
+    pub async fn query_block_search_all(
+        &self,
+        packet_src_channel: String,
+        packet_dst_channel: String,
+        packet_sequence: String,
+        limit: u64,
+    ) -> Result<super::generated::ibc::core::types::v1::QueryBlockSearchResponse, Error> {
+        let mut page = 1u64;
+        let mut blocks = Vec::new();
+        let mut total_count = None;
+
+        loop {
+            let response = self
+                .query_block_search_page(
+                    packet_src_channel.clone(),
+                    packet_dst_channel.clone(),
+                    packet_sequence.clone(),
+                    limit,
+                    page,
+                )
+                .await?;
+
+            if total_count.is_none() {
+                total_count = Some(response.total_count);
+            }
+
+            let page_is_empty = response.blocks.is_empty();
+            blocks.extend(response.blocks);
+
+            let total = total_count.unwrap_or(0);
+            if total == 0 || blocks.len() as u64 >= total {
+                break;
+            }
+
+            // Defensive: avoid infinite pagination if server returns empty pages.
+            if page > 1 && page_is_empty {
+                break;
+            }
+
+            page = page.saturating_add(1);
+        }
+
+        Ok(super::generated::ibc::core::types::v1::QueryBlockSearchResponse {
+            total_count: total_count.unwrap_or(blocks.len() as u64),
+            blocks,
+        })
+    }
+
+    async fn query_block_search_page(
+        &self,
+        packet_src_channel: String,
+        packet_dst_channel: String,
+        packet_sequence: String,
+        limit: u64,
+        page: u64,
+    ) -> Result<super::generated::ibc::core::types::v1::QueryBlockSearchResponse, Error> {
         use super::generated::ibc::core::types::v1::query_client::QueryClient as TypesQueryClient;
         use super::generated::ibc::core::types::v1::QueryBlockSearchRequest;
 
@@ -216,7 +283,7 @@ impl GatewayClient {
             packet_dst_channel,
             packet_sequence,
             limit,
-            page: 1,
+            page,
         });
 
         let response = client.block_search(request).await?.into_inner();
