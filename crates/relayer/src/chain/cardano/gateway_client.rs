@@ -649,7 +649,13 @@ impl GatewayClient {
             "/ibc.core.channel.v1.MsgChannelOpenConfirm" => {
                 self.build_channel_open_confirm_tx(message_data).await
             }
-            
+            "/ibc.core.channel.v1.MsgChannelCloseInit" => {
+                self.build_channel_close_init_tx(message_data).await
+            }
+            "/ibc.core.channel.v1.MsgChannelCloseConfirm" => {
+                self.build_channel_close_confirm_tx(message_data).await
+            }
+             
             // IBC Packet messages
             "/ibc.core.channel.v1.MsgRecvPacket" => {
                 self.build_recv_packet_tx(message_data).await
@@ -660,7 +666,10 @@ impl GatewayClient {
             "/ibc.core.channel.v1.MsgTimeout" => {
                 self.build_timeout_tx(message_data).await
             }
-            
+            "/ibc.core.channel.v1.MsgTimeoutOnClose" => {
+                self.build_timeout_on_close_tx(message_data).await
+            }
+             
             // Unknown message type
             _ => {
                 tracing::error!("Unsupported message type: {}", type_url);
@@ -966,6 +975,79 @@ impl GatewayClient {
         })
     }
 
+    async fn build_channel_close_init_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::channel::v1::MsgChannelCloseInit;
+
+        let msg = MsgChannelCloseInit::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgChannelCloseInit: {}", e)))?;
+
+        let port_id = msg.port_id.clone();
+        let channel_id = msg.channel_id.clone();
+
+        let mut client = GenChannelMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+
+        let response = client.channel_close_init(request).await?.into_inner();
+
+        let unsigned_tx_any = response
+            .unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in ChannelCloseInit response".to_string()))?;
+
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+
+        tracing::info!(
+            "ChannelCloseInit: received unsigned CBOR (length: {}), port_id: {}, channel_id: {}",
+            cbor_hex.len(),
+            port_id,
+            channel_id
+        );
+
+        Ok(UnsignedTx {
+            cbor_hex,
+            description: format!("MsgChannelCloseInit (port: {}, channel: {})", port_id, channel_id),
+        })
+    }
+
+    async fn build_channel_close_confirm_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::channel::v1::MsgChannelCloseConfirm;
+
+        let msg = MsgChannelCloseConfirm::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgChannelCloseConfirm: {}", e)))?;
+
+        let port_id = msg.port_id.clone();
+        let channel_id = msg.channel_id.clone();
+
+        let mut client = GenChannelMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+
+        let response = client.channel_close_confirm(request).await?.into_inner();
+
+        let unsigned_tx_any = response.unsigned_tx.ok_or_else(|| {
+            Error::Transaction("No unsigned_tx in ChannelCloseConfirm response".to_string())
+        })?;
+
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+
+        tracing::info!(
+            "ChannelCloseConfirm: received unsigned CBOR (length: {}), port_id: {}, channel_id: {}",
+            cbor_hex.len(),
+            port_id,
+            channel_id
+        );
+
+        Ok(UnsignedTx {
+            cbor_hex,
+            description: format!(
+                "MsgChannelCloseConfirm (port: {}, channel: {})",
+                port_id, channel_id
+            ),
+        })
+    }
+
     async fn build_recv_packet_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
         use prost::Message;
         use super::generated::ibc::core::channel::v1::MsgRecvPacket;
@@ -1056,6 +1138,39 @@ impl GatewayClient {
         Ok(UnsignedTx {
             cbor_hex,
             description: format!("MsgTimeout (sequence: {})", sequence),
+        })
+    }
+
+    async fn build_timeout_on_close_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+        use super::generated::ibc::core::channel::v1::MsgTimeoutOnClose;
+
+        let msg = MsgTimeoutOnClose::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgTimeoutOnClose: {}", e)))?;
+
+        let sequence = msg.packet.as_ref().map(|p| p.sequence).unwrap_or(0);
+
+        let mut client = GenChannelMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(msg);
+
+        let response = client.timeout_on_close(request).await?.into_inner();
+
+        let unsigned_tx_any = response
+            .unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in TimeoutOnClose response".to_string()))?;
+
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+
+        tracing::info!(
+            "TimeoutOnClose: received unsigned CBOR (length: {}), sequence: {}",
+            cbor_hex.len(),
+            sequence
+        );
+
+        Ok(UnsignedTx {
+            cbor_hex,
+            description: format!("MsgTimeoutOnClose (sequence: {})", sequence),
         })
     }
 

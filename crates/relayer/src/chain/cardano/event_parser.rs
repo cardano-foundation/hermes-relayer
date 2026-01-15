@@ -65,6 +65,7 @@ pub fn parse_events(gateway_events: Vec<Event>, _height: Height) -> Result<Vec<I
             "write_acknowledgement" => parse_write_acknowledgement_event(attrs)?,
             "acknowledge_packet" => parse_acknowledge_packet_event(attrs)?,
             "timeout_packet" => parse_timeout_packet_event(attrs)?,
+            "timeout_on_close_packet" => parse_timeout_on_close_packet_event(attrs)?,
             
             // Unknown event type - log warning and skip
             _ => {
@@ -347,6 +348,11 @@ fn parse_timeout_packet_event(attrs: HashMap<String, String>) -> Result<IbcEvent
     Ok(IbcEvent::TimeoutPacket(ChannelEvents::TimeoutPacket { packet }))
 }
 
+fn parse_timeout_on_close_packet_event(attrs: HashMap<String, String>) -> Result<IbcEvent, Error> {
+    let packet = parse_packet(&attrs)?;
+    Ok(IbcEvent::TimeoutOnClosePacket(ChannelEvents::TimeoutOnClosePacket { packet }))
+}
+
 //
 // Helper functions for parsing attribute values
 //
@@ -460,4 +466,78 @@ fn parse_packet(attrs: &HashMap<String, String>) -> Result<Packet, Error> {
         timeout_height: timeout_height.into(),
         timeout_timestamp,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ibc_relayer_types::core::ics02_client::height::Height;
+    use ibc_relayer_types::events::IbcEvent as RelayerIbcEvent;
+
+    fn attrs(kvs: &[(&str, &str)]) -> Vec<EventAttribute> {
+        kvs.iter()
+            .map(|(k, v)| EventAttribute {
+                key: (*k).to_string(),
+                value: (*v).to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_timeout_on_close_packet_event_ok() {
+        let gateway_event = Event {
+            r#type: "timeout_on_close_packet".to_string(),
+            attributes: attrs(&[
+                ("packet_sequence", "7"),
+                ("packet_src_port", "transfer"),
+                ("packet_src_channel", "channel-0"),
+                ("packet_dst_port", "transfer"),
+                ("packet_dst_channel", "channel-1"),
+                ("packet_data", "deadbeef"),
+                ("packet_timeout_height", "0-10"),
+                ("packet_timeout_timestamp", "1000"),
+            ]),
+        };
+
+        let height = Height::new(0, 1).unwrap();
+        let events = parse_events(vec![gateway_event], height).unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            RelayerIbcEvent::TimeoutOnClosePacket(ev) => {
+                assert_eq!(ev.packet.sequence, 7.into());
+                assert_eq!(ev.packet.source_port.as_str(), "transfer");
+                assert_eq!(ev.packet.source_channel.as_str(), "channel-0");
+                assert_eq!(ev.packet.destination_port.as_str(), "transfer");
+                assert_eq!(ev.packet.destination_channel.as_str(), "channel-1");
+                assert_eq!(ev.packet.data, hex::decode("deadbeef").unwrap());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_timeout_on_close_packet_event_missing_attr_fails() {
+        let gateway_event = Event {
+            r#type: "timeout_on_close_packet".to_string(),
+            attributes: attrs(&[
+                ("packet_sequence", "7"),
+                ("packet_src_port", "transfer"),
+                ("packet_src_channel", "channel-0"),
+                ("packet_dst_port", "transfer"),
+                ("packet_dst_channel", "channel-1"),
+                // packet_data missing
+                ("packet_timeout_height", "0-10"),
+                ("packet_timeout_timestamp", "1000"),
+            ]),
+        };
+
+        let height = Height::new(0, 1).unwrap();
+        let err = parse_events(vec![gateway_event], height).unwrap_err();
+
+        match err {
+            Error::EventAttribute(msg) => assert!(msg.contains("Missing attribute: packet_data")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 }
