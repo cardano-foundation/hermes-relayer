@@ -11,9 +11,6 @@ use ibc_relayer_types::clients::ics2000_mithril::consensus_state::{
     ConsensusState as MithrilConsensusState, MITHRIL_CONSENSUS_STATE_TYPE_URL,
 };
 
-use crate::chain::cardano::types::consensus_state::CardanoConsensusState;
-
-const CARDANO_CONSENSUS_STATE_TYPE_URL: &str = "/ibc.lightclients.cardano.v1.ConsensusState";
 use ibc_relayer_types::core::ics02_client::client_type::ClientType;
 use ibc_relayer_types::core::ics02_client::consensus_state::ConsensusState;
 use ibc_relayer_types::core::ics02_client::error::Error;
@@ -25,7 +22,7 @@ use ibc_relayer_types::Height;
 #[serde(tag = "type")]
 pub enum AnyConsensusState {
     Tendermint(TmConsensusState),
-    Cardano(CardanoConsensusState),
+    /// Cardano-tracking consensus state (`08-cardano`), encoded as `ibc.clients.mithril.v1.ConsensusState`.
     Mithril(MithrilConsensusState),
 }
 
@@ -33,7 +30,6 @@ impl AnyConsensusState {
     pub fn timestamp(&self) -> Timestamp {
         match self {
             Self::Tendermint(cs_state) => cs_state.timestamp.into(),
-            Self::Cardano(cs_state) => ConsensusState::timestamp(cs_state),
             Self::Mithril(cs_state) => ConsensusState::timestamp(cs_state),
         }
     }
@@ -41,8 +37,7 @@ impl AnyConsensusState {
     pub fn client_type(&self) -> ClientType {
         match self {
             AnyConsensusState::Tendermint(_cs) => ClientType::Tendermint,
-            AnyConsensusState::Cardano(_cs) => ClientType::Cardano,
-            AnyConsensusState::Mithril(_cs) => ClientType::CardanoMithril,
+            AnyConsensusState::Mithril(_cs) => ClientType::Cardano,
         }
     }
 }
@@ -61,12 +56,6 @@ impl TryFrom<Any> for AnyConsensusState {
                     .map_err(Error::decode_raw_client_state)?,
             )),
 
-            CARDANO_CONSENSUS_STATE_TYPE_URL => {
-                Err(Error::unknown_consensus_state_type(format!(
-                    "{CARDANO_CONSENSUS_STATE_TYPE_URL} (Cardano consensus state decoding is not implemented)"
-                )))
-            }
-
             MITHRIL_CONSENSUS_STATE_TYPE_URL => Ok(AnyConsensusState::Mithril(value.try_into()?)),
 
             _ => Err(Error::unknown_consensus_state_type(value.type_url)),
@@ -81,11 +70,6 @@ impl From<AnyConsensusState> for Any {
                 type_url: TENDERMINT_CONSENSUS_STATE_TYPE_URL.to_string(),
                 value: Protobuf::<RawConsensusState>::encode_vec(value),
             },
-            AnyConsensusState::Cardano(value) => Any {
-                type_url: CARDANO_CONSENSUS_STATE_TYPE_URL.to_string(),
-                // Placeholder encoding: do not rely on this for on-chain messages.
-                value: serde_json::to_vec(&value).unwrap_or_default(),
-            },
             AnyConsensusState::Mithril(value) => value.into(),
         }
     }
@@ -94,12 +78,6 @@ impl From<AnyConsensusState> for Any {
 impl From<TmConsensusState> for AnyConsensusState {
     fn from(cs: TmConsensusState) -> Self {
         Self::Tendermint(cs)
-    }
-}
-
-impl From<CardanoConsensusState> for AnyConsensusState {
-    fn from(cs: CardanoConsensusState) -> Self {
-        Self::Cardano(cs)
     }
 }
 
@@ -154,7 +132,6 @@ impl ConsensusState for AnyConsensusState {
     fn root(&self) -> &CommitmentRoot {
         match self {
             Self::Tendermint(cs_state) => cs_state.root(),
-            Self::Cardano(cs_state) => ConsensusState::root(cs_state),
             Self::Mithril(cs_state) => ConsensusState::root(cs_state),
         }
     }

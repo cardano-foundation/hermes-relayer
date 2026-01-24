@@ -24,11 +24,16 @@ pub struct Header {
     pub mithril_stake_distribution_certificate: raw::MithrilCertificate,
     pub transaction_snapshot: raw::CardanoTransactionSnapshot,
     pub transaction_snapshot_certificate: raw::MithrilCertificate,
+    pub previous_mithril_stake_distribution_certificates: Vec<raw::MithrilCertificate>,
+    pub host_state_tx_hash: String,
+    pub host_state_tx_body_cbor: Vec<u8>,
+    pub host_state_tx_output_index: u32,
+    pub host_state_tx_proof: Vec<u8>,
 }
 
 impl crate::core::ics02_client::header::Header for Header {
     fn client_type(&self) -> ClientType {
-        ClientType::CardanoMithril
+        ClientType::Cardano
     }
 
     fn height(&self) -> Height {
@@ -46,14 +51,27 @@ impl TryFrom<RawHeader> for Header {
     type Error = Error;
 
     fn try_from(raw: RawHeader) -> Result<Self, Self::Error> {
-        let transaction_snapshot: raw::CardanoTransactionSnapshot = raw
-            .transaction_snapshot
+        let RawHeader {
+            mithril_stake_distribution,
+            mithril_stake_distribution_certificate,
+            transaction_snapshot,
+            transaction_snapshot_certificate,
+            previous_mithril_stake_distribution_certificates,
+            host_state_tx_hash,
+            host_state_tx_body_cbor,
+            host_state_tx_output_index,
+            host_state_tx_proof,
+        } = raw;
+
+        let transaction_snapshot: raw::CardanoTransactionSnapshot = transaction_snapshot
             .ok_or_else(|| Error::missing_field("transaction_snapshot"))?;
 
-        let transaction_snapshot_certificate: raw::MithrilCertificate = raw
-            .transaction_snapshot_certificate
+        let transaction_snapshot_certificate: raw::MithrilCertificate = transaction_snapshot_certificate
             .ok_or_else(|| Error::missing_field("transaction_snapshot_certificate"))?;
 
+        // IBC heights are `(revision_number, revision_height)`.
+        // For Cardano we use `revision_number = 0` and interpret `revision_height` as the
+        // Cardano block number from the Mithril transaction snapshot (not a slot number).
         let height = Height::new(0, transaction_snapshot.block_number).map_err(|e| {
             Error::height_conversion(format!(
                 "failed to construct height from block_number {}: {e}",
@@ -92,17 +110,28 @@ impl TryFrom<RawHeader> for Header {
                 .map_err(|e| Error::timestamp_conversion(e.to_string()))?
         };
 
+        if host_state_tx_body_cbor.is_empty() {
+            return Err(Error::missing_field("host_state_tx_body_cbor"));
+        }
+
+        if host_state_tx_proof.is_empty() {
+            return Err(Error::missing_field("host_state_tx_proof"));
+        }
+
         Ok(Self {
             height,
             timestamp,
-            mithril_stake_distribution: raw
-                .mithril_stake_distribution
+            mithril_stake_distribution: mithril_stake_distribution
                 .ok_or_else(|| Error::missing_field("mithril_stake_distribution"))?,
-            mithril_stake_distribution_certificate: raw
-                .mithril_stake_distribution_certificate
+            mithril_stake_distribution_certificate: mithril_stake_distribution_certificate
                 .ok_or_else(|| Error::missing_field("mithril_stake_distribution_certificate"))?,
             transaction_snapshot,
             transaction_snapshot_certificate,
+            previous_mithril_stake_distribution_certificates,
+            host_state_tx_hash,
+            host_state_tx_body_cbor,
+            host_state_tx_output_index,
+            host_state_tx_proof,
         })
     }
 }
@@ -114,6 +143,11 @@ impl From<Header> for RawHeader {
             mithril_stake_distribution_certificate: Some(value.mithril_stake_distribution_certificate),
             transaction_snapshot: Some(value.transaction_snapshot),
             transaction_snapshot_certificate: Some(value.transaction_snapshot_certificate),
+            previous_mithril_stake_distribution_certificates: value.previous_mithril_stake_distribution_certificates,
+            host_state_tx_hash: value.host_state_tx_hash,
+            host_state_tx_body_cbor: value.host_state_tx_body_cbor,
+            host_state_tx_output_index: value.host_state_tx_output_index,
+            host_state_tx_proof: value.host_state_tx_proof,
         }
     }
 }

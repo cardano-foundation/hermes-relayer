@@ -30,6 +30,10 @@ pub struct ClientState {
     pub protocol_parameters: ::core::option::Option<MithrilProtocolParameters>,
     #[prost(string, repeated, tag = "7")]
     pub upgrade_path: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bytes = "vec", tag = "8")]
+    pub host_state_nft_policy_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "9")]
+    pub host_state_nft_token_name: ::prost::alloc::vec::Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
@@ -40,6 +44,8 @@ pub struct ConsensusState {
     pub first_cert_hash_latest_epoch: ::core::option::Option<MithrilCertificate>,
     #[prost(string, tag = "3")]
     pub latest_cert_hash_tx_snapshot: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "4")]
+    pub ibc_state_root: ::prost::alloc::vec::Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message, Serialize, Deserialize)]
@@ -62,6 +68,16 @@ pub struct MithrilHeader {
     pub transaction_snapshot: ::core::option::Option<CardanoTransactionSnapshot>,
     #[prost(message, optional, tag = "4")]
     pub transaction_snapshot_certificate: ::core::option::Option<MithrilCertificate>,
+    #[prost(message, repeated, tag = "9")]
+    pub previous_mithril_stake_distribution_certificates: ::prost::alloc::vec::Vec<MithrilCertificate>,
+    #[prost(string, tag = "5")]
+    pub host_state_tx_hash: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "6")]
+    pub host_state_tx_body_cbor: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint32, tag = "7")]
+    pub host_state_tx_output_index: u32,
+    #[prost(bytes = "vec", tag = "8")]
+    pub host_state_tx_proof: ::prost::alloc::vec::Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]

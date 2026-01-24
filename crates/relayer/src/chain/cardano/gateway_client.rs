@@ -84,12 +84,28 @@ impl GatewayClient {
             .await?
             .into_inner();
         
-        tracing::info!("Queried latest height: {}", response.height);
+        tracing::debug!("Queried latest height: {}", response.height);
         
         // Height format: revision_number-revision_height
         // For Cardano, we use revision_number = 0
         Height::new(0, response.height)
             .map_err(|e| Error::Query(format!("Invalid height {}: {}", response.height, e)))
+    }
+
+    /// Query the canonical Mithril client state/consensus state for creating a new client.
+    pub async fn query_new_client(
+        &self,
+        height: u64,
+    ) -> Result<super::generated::ibc::core::client::v1::QueryNewClientResponse, Error> {
+        use super::generated::ibc::core::client::v1::{
+            query_client::QueryClient, QueryNewClientRequest,
+        };
+
+        let mut client = QueryClient::new(self.channel.clone());
+        let request = tonic::Request::new(QueryNewClientRequest { height });
+        let response = client.new_client(request).await?.into_inner();
+
+        Ok(response)
     }
 
     /// Query client state for a specific client ID

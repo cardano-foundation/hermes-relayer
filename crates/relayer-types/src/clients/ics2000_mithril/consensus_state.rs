@@ -18,8 +18,6 @@ type RawConsensusState = raw::ConsensusState;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsensusState {
-    /// Commitment root is not carried by the Mithril client proto yet.
-    /// For MVP relaying, Hermes does not perform proof verification locally.
     pub root: CommitmentRoot,
     pub timestamp: u64,
     pub first_cert_hash_latest_epoch: raw::MithrilCertificate,
@@ -28,12 +26,13 @@ pub struct ConsensusState {
 
 impl ConsensusState {
     pub fn new(
+        root: CommitmentRoot,
         timestamp: u64,
         first_cert_hash_latest_epoch: raw::MithrilCertificate,
         latest_cert_hash_tx_snapshot: String,
     ) -> Self {
         Self {
-            root: CommitmentRoot::from_bytes(&[]),
+            root,
             timestamp,
             first_cert_hash_latest_epoch,
             latest_cert_hash_tx_snapshot,
@@ -43,7 +42,7 @@ impl ConsensusState {
 
 impl Ics2ConsensusState for ConsensusState {
     fn client_type(&self) -> ClientType {
-        ClientType::CardanoMithril
+        ClientType::Cardano
     }
 
     fn root(&self) -> &CommitmentRoot {
@@ -61,14 +60,34 @@ impl TryFrom<RawConsensusState> for ConsensusState {
     type Error = Error;
 
     fn try_from(raw: RawConsensusState) -> Result<Self, Self::Error> {
-        let first = raw
-            .first_cert_hash_latest_epoch
+        let RawConsensusState {
+            timestamp,
+            first_cert_hash_latest_epoch,
+            latest_cert_hash_tx_snapshot,
+            ibc_state_root,
+        } = raw;
+
+        let first = first_cert_hash_latest_epoch
             .ok_or_else(|| Error::missing_field("first_cert_hash_latest_epoch"))?;
 
+        if ibc_state_root.is_empty() {
+            return Err(Error::missing_field("ibc_state_root"));
+        }
+
+        if ibc_state_root.len() != 32 {
+            return Err(Error::invalid_field(
+                "ibc_state_root",
+                format!("expected 32 bytes, got {}", ibc_state_root.len()),
+            ));
+        }
+
+        let root = CommitmentRoot::from_bytes(&ibc_state_root);
+
         Ok(Self::new(
-            raw.timestamp,
+            root,
+            timestamp,
             first,
-            raw.latest_cert_hash_tx_snapshot,
+            latest_cert_hash_tx_snapshot,
         ))
     }
 }
@@ -79,6 +98,7 @@ impl From<ConsensusState> for RawConsensusState {
             timestamp: value.timestamp,
             first_cert_hash_latest_epoch: Some(value.first_cert_hash_latest_epoch),
             latest_cert_hash_tx_snapshot: value.latest_cert_hash_tx_snapshot,
+            ibc_state_root: value.root.as_bytes().to_vec(),
         }
     }
 }
@@ -112,4 +132,3 @@ impl From<ConsensusState> for Any {
         }
     }
 }
-

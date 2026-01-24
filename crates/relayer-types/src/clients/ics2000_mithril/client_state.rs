@@ -28,6 +28,8 @@ pub struct ClientState {
     pub trusting_period: Duration,
     pub protocol_parameters: raw::MithrilProtocolParameters,
     pub upgrade_path: Vec<String>,
+    pub host_state_nft_policy_id: Vec<u8>,
+    pub host_state_nft_token_name: Vec<u8>,
 }
 
 impl Ics2ClientState for ClientState {
@@ -36,7 +38,7 @@ impl Ics2ClientState for ClientState {
     }
 
     fn client_type(&self) -> ClientType {
-        ClientType::CardanoMithril
+        ClientType::Cardano
     }
 
     fn latest_height(&self) -> Height {
@@ -59,33 +61,58 @@ impl TryFrom<RawClientState> for ClientState {
     type Error = Error;
 
     fn try_from(raw: RawClientState) -> Result<Self, Self::Error> {
-        // `ChainId` parsing is infallible in Hermes.
-        let chain_id = ChainId::from_string(&raw.chain_id);
+        let RawClientState {
+            chain_id: raw_chain_id,
+            latest_height,
+            frozen_height,
+            current_epoch,
+            trusting_period,
+            protocol_parameters,
+            upgrade_path,
+            host_state_nft_policy_id,
+            host_state_nft_token_name,
+        } = raw;
 
-        let latest_height = raw
-            .latest_height
+        // `ChainId` parsing is infallible in Hermes.
+        let chain_id = ChainId::from_string(&raw_chain_id);
+
+        let latest_height = latest_height
             .ok_or_else(|| Error::missing_field("latest_height"))?
             .try_into()?;
 
-        let frozen_height = raw.frozen_height.and_then(|h| h.try_into().ok());
+        let frozen_height = frozen_height.and_then(|h| h.try_into().ok());
 
-        let trusting_period = raw
-            .trusting_period
+        let trusting_period = trusting_period
             .and_then(|d| duration_from_proto(d).ok())
             .ok_or_else(|| Error::missing_field("trusting_period"))?;
 
-        let protocol_parameters = raw
-            .protocol_parameters
+        let protocol_parameters = protocol_parameters
             .ok_or_else(|| Error::missing_field("protocol_parameters"))?;
+
+        if host_state_nft_policy_id.is_empty() {
+            return Err(Error::missing_field("host_state_nft_policy_id"));
+        }
+
+        if host_state_nft_policy_id.len() != 28 {
+            return Err(Error::invalid_field(
+                "host_state_nft_policy_id",
+                format!(
+                    "expected 28 bytes, got {}",
+                    host_state_nft_policy_id.len()
+                ),
+            ));
+        }
 
         Ok(Self {
             chain_id,
             latest_height,
             frozen_height,
-            current_epoch: raw.current_epoch,
+            current_epoch,
             trusting_period,
             protocol_parameters,
-            upgrade_path: raw.upgrade_path,
+            upgrade_path,
+            host_state_nft_policy_id,
+            host_state_nft_token_name,
         })
     }
 }
@@ -100,6 +127,8 @@ impl From<ClientState> for RawClientState {
             trusting_period: Some(duration_to_proto(value.trusting_period)),
             protocol_parameters: Some(value.protocol_parameters),
             upgrade_path: value.upgrade_path,
+            host_state_nft_policy_id: value.host_state_nft_policy_id,
+            host_state_nft_token_name: value.host_state_nft_token_name,
         }
     }
 }

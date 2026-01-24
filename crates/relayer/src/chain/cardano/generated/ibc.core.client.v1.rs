@@ -113,8 +113,6 @@ pub struct QueryClientStateRequest {
     /// client state unique identifier
     #[prost(string, tag = "1")]
     pub client_id: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "2")]
-    pub height: u64,
 }
 /// QueryClientStateResponse is the response type for the Query/ClientState RPC
 /// method. Besides the client state, it includes a proof and the height from
@@ -163,14 +161,14 @@ pub struct QueryConsensusStateRequest {
     #[prost(string, tag = "1")]
     pub client_id: ::prost::alloc::string::String,
     /// consensus state revision number
-    /// uint64 revision_number = 2;
-    /// consensus state revision height
-    /// uint64 revision_height = 3;
-    /// latest_height overrrides the height field and queries the latest stored
-    /// ConsensusState
-    /// bool latest_height = 4;
     #[prost(uint64, tag = "2")]
-    pub height: u64,
+    pub revision_number: u64,
+    /// consensus state revision height
+    #[prost(uint64, tag = "3")]
+    pub revision_height: u64,
+    /// latest_height overrides the height fields and queries the latest stored ConsensusState
+    #[prost(bool, tag = "4")]
+    pub latest_height: bool,
 }
 /// QueryConsensusStateResponse is the response type for the Query/ConsensusState
 /// RPC method

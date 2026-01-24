@@ -5,9 +5,12 @@
 use super::config::CardanoConfig;
 use super::gateway_client::GatewayClient;
 use super::signing_key_pair::CardanoSigningKeyPair;
-use super::types::{CardanoClientState, CardanoConsensusState};
 
 use ibc_relayer_types::clients::ics2000_mithril::header::Header as MithrilHeader;
+use ibc_relayer_types::clients::ics2000_mithril::{
+    client_state::ClientState as MithrilClientState,
+    consensus_state::ConsensusState as MithrilConsensusState,
+};
 
 use std::sync::Arc;
 use crate::account::Balance;
@@ -36,10 +39,13 @@ use crate::event::IbcEventWithHeight;
 use crate::keyring::{KeyRing, SigningKeyPair};
 use crate::misbehaviour::MisbehaviourEvidence;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
-use ibc_relayer_types::core::ics03_connection::connection::{ConnectionEnd, IdentifiedConnectionEnd};
+use ibc_relayer_types::core::ics03_connection::connection::{
+    ConnectionEnd, IdentifiedConnectionEnd,
+};
 use ibc_relayer_types::core::ics04_channel::channel::{ChannelEnd, IdentifiedChannelEnd};
 use ibc_relayer_types::core::ics04_channel::packet::Sequence;
 use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentPrefix;
+use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentRoot;
 use ibc_relayer_types::core::ics23_commitment::merkle::MerkleProof;
 use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ChannelId, ClientId, ConnectionId, PortId};
 use ibc_relayer_types::signer::Signer;
@@ -52,6 +58,8 @@ use tokio::runtime::Runtime as TokioRuntime;
 #[derive(Debug, Clone)]
 pub struct CardanoLightBlock {
     pub header: MithrilHeader,
+    pub host_state_nft_policy_id: Vec<u8>,
+    pub host_state_nft_token_name: Vec<u8>,
 }
 
 // CardanoSigningKeyPair is now defined in signing_key_pair.rs
@@ -118,13 +126,75 @@ impl CardanoChainEndpoint {
         
         Ok(monitor_tx)
     }
+
+    /// Wait until the Gateway's "latest height" has caught up to (or passed) a specific
+    /// Cardano transaction inclusion height.
+    ///
+    /// Why this exists:
+    /// - The Gateway returns a transaction `height` in `submit_signed_tx` based on `db-sync`'s
+    ///   `block_no` for the block that included the transaction.
+    /// - Separately, for Cardano↔Cosmos IBC, the Cosmos-side light client only accepts *Mithril-
+    ///   certified* heights. In this integration, we treat the IBC `Height.revision_height` for
+    ///   Cardano as the Mithril Cardano-transactions snapshot `block_number` (a monotonically
+    ///   increasing block number), not as the raw chain tip.
+    ///
+    /// If Hermes proceeds immediately after inclusion, it may query proofs at a height that the
+    /// Cosmos-side client has not yet been updated to, or worse: it may receive proofs that are
+    /// valid for a newer on-chain HostState root but are being verified against an older certified
+    /// root. That shows up as "proof does not match ibc_state_root".
+    ///
+    /// To avoid this class of race, we treat "commit" for Cardano transactions as "included AND
+    /// covered by the latest Mithril transaction snapshot".
+    async fn wait_for_mithril_certified_height(
+        &self,
+        included_height: ICSHeight,
+    ) -> Result<ICSHeight, Error> {
+        let poll_interval = std::time::Duration::from_secs(5);
+        let timeout = std::time::Duration::from_secs(180);
+        let start = tokio::time::Instant::now();
+
+        loop {
+            let latest = self
+                .gateway_client
+                .query_latest_height()
+                .await
+                .map_err(|e| Error::query(format!("Gateway query_latest_height failed: {e}")))?;
+
+            if latest.revision_number() != included_height.revision_number() {
+                return Err(Error::query(format!(
+                    "gateway returned revision_number={} but expected revision_number={}",
+                    latest.revision_number(),
+                    included_height.revision_number()
+                )));
+            }
+
+            if latest.revision_height() >= included_height.revision_height() {
+                return Ok(latest);
+            }
+
+            if start.elapsed() >= timeout {
+                return Err(Error::send_tx(format!(
+                    "timed out waiting for Mithril-certified height >= {} (latest={})",
+                    included_height, latest
+                )));
+            }
+
+            tracing::debug!(
+                "Waiting for Mithril snapshot: need >= {}, have {}, elapsed={}s",
+                included_height,
+                latest,
+                start.elapsed().as_secs()
+            );
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
 }
 
 impl ChainEndpoint for CardanoChainEndpoint {
     type LightBlock = CardanoLightBlock;
     type Header = MithrilHeader;
-    type ConsensusState = CardanoConsensusState;
-    type ClientState = CardanoClientState;
+    type ConsensusState = MithrilConsensusState;
+    type ClientState = MithrilClientState;
     type Time = i64; // Unix timestamp
     type SigningKeyPair = CardanoSigningKeyPair;
 
@@ -286,10 +356,26 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     .map_err(|e| Error::send_tx(format!("Failed to submit transaction: {}", e)))?;
                 
                 // Step 4: Parse events from transaction result
-                let height = tx_response.height
+                let included_height = tx_response.height
                     .ok_or_else(|| Error::send_tx("No height in transaction response".to_string()))?;
                 
-                tracing::info!("Transaction submitted: {} at height {}", tx_response.tx_hash, height);
+                tracing::info!(
+                    "Transaction submitted: {} at height {}",
+                    tx_response.tx_hash,
+                    included_height
+                );
+
+                // Ensure the transaction is also covered by the latest Mithril transaction snapshot
+                // before we treat it as "committed" from the perspective of IBC relaying.
+                let certified_height = self.wait_for_mithril_certified_height(included_height).await?;
+                if certified_height.revision_height() != included_height.revision_height() {
+                    tracing::info!(
+                        "Transaction {} inclusion height {} is now certified at {}",
+                        tx_response.tx_hash,
+                        included_height,
+                        certified_height
+                    );
+                }
                 
                 // Log all events for debugging
                 for event in &tx_response.events {
@@ -312,7 +398,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     .collect();
                 
                 // Parse Gateway events into Hermes IbcEvent types
-                let parsed_events = super::event_parser::parse_events(proto_events, height)
+                let parsed_events = super::event_parser::parse_events(proto_events, certified_height)
                     .map_err(|e| Error::send_tx(format!("Failed to parse events: {}", e)))?;
                 
                 tracing::info!("Parsed {} IBC events from transaction", parsed_events.len());
@@ -320,7 +406,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 // Wrap events with height
                 let events_with_height: Vec<IbcEventWithHeight> = parsed_events
                     .into_iter()
-                    .map(|event| IbcEventWithHeight::new(event, height))
+                    .map(|event| IbcEventWithHeight::new(event, certified_height))
                     .collect();
                 
                 // Add parsed events to result
@@ -395,13 +481,45 @@ impl ChainEndpoint for CardanoChainEndpoint {
     fn verify_header(
         &mut self,
         _trusted: ICSHeight,
-        _target: ICSHeight,
-        _client_state: &AnyClientState,
+        target: ICSHeight,
+        client_state: &AnyClientState,
     ) -> Result<Self::LightBlock, Error> {
-        Err(Error::query(
-            "Cardano header verification is not implemented; requires canonical decoding of /ibc.lightclients.cardano.v1.Header plus Mithril verification"
-                .to_string(),
-        ))
+        // Hermes uses `verify_header()` as part of its generic client update workflow.
+        //
+        // For Tendermint clients, this verifies signatures and header continuity off-chain.
+        // For Cardano, we rely on on-chain verification in the Cosmos-side Mithril light client
+        // implementation (the chain rejects invalid Mithril headers and proofs).
+        //
+        // To keep Hermes functional without coupling it to the full Mithril verification stack
+        // (which is already implemented in the on-chain client), we treat this as a best-effort
+        // fetch + structural validation step:
+        // - fetch the MithrilHeader for `target` from the Gateway
+        // - return it as a CardanoLightBlock so the relayer can proceed
+        //
+        // TODO: Implement optional off-chain verification to avoid broadcasting invalid headers and
+        // wasting fees, and to enable richer relayer-side diagnostics.
+        let header = self
+            .rt
+            .block_on(self.gateway_client.query_header(target))
+            .map_err(|e| Error::query(format!("failed to query Cardano header from Gateway: {e}")))?;
+
+        let (host_state_nft_policy_id, host_state_nft_token_name) = match client_state {
+            AnyClientState::Mithril(state) => (
+                state.host_state_nft_policy_id.clone(),
+                state.host_state_nft_token_name.clone(),
+            ),
+            _ => {
+                return Err(Error::query(
+                    "Cardano verify_header requires a Mithril client state".to_string(),
+                ))
+            }
+        };
+
+        Ok(CardanoLightBlock {
+            header,
+            host_state_nft_policy_id,
+            host_state_nft_token_name,
+        })
     }
 
     fn check_misbehaviour(
@@ -539,26 +657,13 @@ impl ChainEndpoint for CardanoChainEndpoint {
             .client_state
             .ok_or_else(|| Error::query("No client_state in response".to_string()))?;
 
-        let any_client_state: AnyClientState = match AnyClientState::try_from(client_state_any.clone()) {
-            Ok(cs) => cs,
-            Err(_e) if client_state_any.type_url == "/ibc.lightclients.cardano.v1.ClientState" => {
-                let prost_any = prost_types::Any {
-                    type_url: client_state_any.type_url,
-                    value: client_state_any.value,
-                };
-
-                let cs = super::proto_parser::parse_client_state_from_any(prost_any)
-                    .map_err(|e| Error::query(format!("Failed to parse Cardano client state: {e}")))?;
-
-                cs.into()
-            }
-            Err(e) => {
-                return Err(Error::query(format!(
-                    "Unsupported client state type_url {}: {e}",
+        let any_client_state: AnyClientState =
+            AnyClientState::try_from(client_state_any.clone()).map_err(|e| {
+                Error::query(format!(
+                    "Failed to decode client state {}: {e}",
                     client_state_any.type_url
-                )))
-            }
-        };
+                ))
+            })?;
 
         let proof = if include_proof == IncludeProof::Yes && !response.proof.is_empty() {
             use ibc_proto::ibc::core::commitment::v1::MerkleProof as RawMerkleProof;
@@ -600,26 +705,13 @@ impl ChainEndpoint for CardanoChainEndpoint {
             .consensus_state
             .ok_or_else(|| Error::query("No consensus_state in response".to_string()))?;
 
-        let any_consensus_state: AnyConsensusState = match AnyConsensusState::try_from(consensus_state_any.clone()) {
-            Ok(cs) => cs,
-            Err(_e) if consensus_state_any.type_url == "/ibc.lightclients.cardano.v1.ConsensusState" => {
-                let prost_any = prost_types::Any {
-                    type_url: consensus_state_any.type_url,
-                    value: consensus_state_any.value,
-                };
-
-                let cs = super::proto_parser::parse_consensus_state_from_any(prost_any)
-                    .map_err(|e| Error::query(format!("Failed to parse Cardano consensus state: {e}")))?;
-
-                cs.into()
-            }
-            Err(e) => {
-                return Err(Error::query(format!(
-                    "Unsupported consensus state type_url {}: {e}",
+        let any_consensus_state: AnyConsensusState =
+            AnyConsensusState::try_from(consensus_state_any.clone()).map_err(|e| {
+                Error::query(format!(
+                    "Failed to decode consensus state {}: {e}",
                     consensus_state_any.type_url
-                )))
-            }
-        };
+                ))
+            })?;
 
         let proof = if include_proof == IncludeProof::Yes && !response.proof.is_empty() {
             use ibc_proto::ibc::core::commitment::v1::MerkleProof as RawMerkleProof;
@@ -1594,40 +1686,45 @@ impl ChainEndpoint for CardanoChainEndpoint {
         height: ICSHeight,
         _settings: ClientSettings,
     ) -> Result<Self::ClientState, Error> {
-        tracing::info!("Building Cardano client state at height {:?}", height);
-        
-        // Extract trusting period from settings or use defaults
-        // TODO: Extract from settings when structure is available
-        let trusting_period = 86400; // Default: 1 day
-        
-        // Cardano unbonding period - typically much longer
-        let unbonding_period = 1814400; // 21 days
-        
-        // TODO: Fetch Mithril genesis verification key from config or Gateway
-        // For now, use a placeholder
-        let mithril_genesis_vkey = vec![0u8; 32];
-        
-        let client_state = CardanoClientState::new(
-            self.config.id.to_string(),
-            height,
-            trusting_period,
-            unbonding_period,
-            mithril_genesis_vkey,
-        );
-        
-        tracing::info!("Built Cardano client state: chain_id={}, height={:?}", 
-            client_state.chain_id, client_state.latest_height);
-        
-        Ok(client_state)
+        tracing::info!("Building Mithril client state for Cardano at height {:?}", height);
+
+        let response = self
+            .rt
+            .block_on(self.gateway_client.query_new_client(height.revision_height()))
+            .map_err(|e| Error::query(format!("Gateway query_new_client failed: {e}")))?;
+
+        let raw_any = response
+            .client_state
+            .ok_or_else(|| Error::query("No client_state in NewClient response".to_string()))?;
+
+        let any = ibc_proto::google::protobuf::Any {
+            type_url: raw_any.type_url,
+            value: raw_any.value,
+        };
+
+        any.try_into()
+            .map_err(|e: ibc_relayer_types::core::ics02_client::error::Error| {
+                Error::query(format!("Failed to decode Mithril client state: {e}"))
+            })
     }
 
     fn build_consensus_state(
         &self,
-        _light_block: Self::LightBlock,
+        light_block: Self::LightBlock,
     ) -> Result<Self::ConsensusState, Error> {
-        Err(Error::query(
-            "Cardano consensus state construction is not implemented for Mithril headers"
-                .to_string(),
+        let ibc_state_root = extract_ibc_state_root_from_host_state_tx(
+            &light_block.header,
+            &light_block.host_state_nft_policy_id,
+            &light_block.host_state_nft_token_name,
+        )?;
+
+        let header = light_block.header;
+
+        Ok(MithrilConsensusState::new(
+            CommitmentRoot::from_bytes(&ibc_state_root),
+            header.timestamp.nanoseconds(),
+            header.mithril_stake_distribution_certificate,
+            header.transaction_snapshot_certificate.hash,
         ))
     }
 
@@ -1637,12 +1734,52 @@ impl ChainEndpoint for CardanoChainEndpoint {
         target_height: ICSHeight,
         _client_state: &AnyClientState,
     ) -> Result<(Self::Header, Vec<Self::Header>), Error> {
-        let header = self
-            .rt
-            .block_on(self.gateway_client.query_header(target_height))
-            .map_err(|e| Error::query(format!("Gateway query_header failed: {e}")))?;
+        // NOTE: Hermes core logic often requests a client update at `proofs_height + 1`.
+        //
+        // On Tendermint chains this is fine because heights are contiguous and the Tendermint
+        // header builder can return intermediate "support" headers (including the proof height).
+        //
+        // For Cardano/Mithril, however, headers only exist at Mithril-certified transaction snapshot
+        // heights (e.g. every ~15 blocks in our devnet setup). That means a height like `H + 1`
+        // may not exist at all even if the chain has advanced well beyond it.
+        //
+        // If the exact `target_height` is not available, we still want to:
+        // - install a consensus state at `target_height - 1` (the proof height), so proofs verify, and
+        // - also advance the client to the latest available snapshot height.
+        //
+        // We do this by returning:
+        // - `support` header at `target_height - 1`, and
+        // - a final header at the latest snapshot height.
+        match self.rt.block_on(self.gateway_client.query_header(target_height)) {
+            Ok(header) => Ok((header, vec![])),
+            Err(e) => {
+                let err_str = e.to_string();
+                if !err_str.contains("Not found") || !err_str.contains("height") {
+                    return Err(Error::query(format!("Gateway query_header failed: {e}")));
+                }
 
-        Ok((header, vec![]))
+                let proof_height = target_height
+                    .decrement()
+                    .map_err(|_| Error::query(format!("invalid target height {target_height}")))?;
+
+                let proof_header = self
+                    .rt
+                    .block_on(self.gateway_client.query_header(proof_height))
+                    .map_err(|e| Error::query(format!("Gateway query_header failed at proof height {proof_height}: {e}")))?;
+
+                let latest_height = self
+                    .rt
+                    .block_on(self.gateway_client.query_latest_height())
+                    .map_err(|e| Error::query(format!("Gateway query_latest_height failed: {e}")))?;
+
+                let latest_header = self
+                    .rt
+                    .block_on(self.gateway_client.query_header(latest_height))
+                    .map_err(|e| Error::query(format!("Gateway query_header failed at latest height {latest_height}: {e}")))?;
+
+                Ok((latest_header, vec![proof_header]))
+            }
+        }
     }
 
     fn maybe_register_counterparty_payee(
@@ -1776,6 +1913,315 @@ fn filter_packet_events_from_block_results(
     Ok(filtered)
 }
 
-// Mithril header is decoded from Gateway as `google.protobuf.Any`.
-// in ibc-relayer-types/src/clients/ics08_cardano/header.rs and
-// ibc-relayer-types/src/core/ics02_client/header.rs respectively
+// Mithril header is decoded from the Gateway as `google.protobuf.Any`.
+// See `ibc-relayer-types/src/clients/ics2000_mithril/header.rs` and
+// `ibc-relayer-types/src/core/ics02_client/header.rs`.
+
+fn extract_ibc_state_root_from_host_state_tx(
+    header: &MithrilHeader,
+    host_state_nft_policy_id: &[u8],
+    host_state_nft_token_name: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let tx_hash = header.host_state_tx_hash.trim();
+    if tx_hash.is_empty() {
+        return Err(Error::query(
+            "missing host_state_tx_hash in Mithril header".to_string(),
+        ));
+    }
+
+    if host_state_nft_policy_id.len() != 28 {
+        return Err(Error::query(format!(
+            "invalid host_state_nft_policy_id length: expected 28 bytes, got {}",
+            host_state_nft_policy_id.len()
+        )));
+    }
+
+    let tx_body_cbor = header.host_state_tx_body_cbor.as_slice();
+    if tx_body_cbor.is_empty() {
+        return Err(Error::query(
+            "missing host_state_tx_body_cbor in Mithril header".to_string(),
+        ));
+    }
+
+    let computed = blake2b_256(tx_body_cbor);
+    let computed_hex = hex::encode(computed);
+    if !computed_hex.eq_ignore_ascii_case(tx_hash) {
+        return Err(Error::query(format!(
+            "HostState tx body hash mismatch: expected {tx_hash}, got {computed_hex}"
+        )));
+    }
+
+    use pallas_codec::minicbor;
+    use pallas_codec::utils::KeepRaw;
+    use pallas_primitives::{babbage, conway};
+
+    let conway_body: Result<KeepRaw<'_, conway::MintedTransactionBody<'_>>, _> =
+        minicbor::decode(tx_body_cbor);
+    if let Ok(body) = conway_body {
+        return extract_root_from_conway_tx_body(
+            &body,
+            header.host_state_tx_output_index,
+            host_state_nft_policy_id,
+            host_state_nft_token_name,
+        );
+    }
+
+    let babbage_body: Result<KeepRaw<'_, babbage::MintedTransactionBody<'_>>, _> =
+        minicbor::decode(tx_body_cbor);
+    if let Ok(body) = babbage_body {
+        return extract_root_from_babbage_tx_body(
+            &body,
+            header.host_state_tx_output_index,
+            host_state_nft_policy_id,
+            host_state_nft_token_name,
+        );
+    }
+
+    Err(Error::query(
+        "unsupported HostState transaction body CBOR".to_string(),
+    ))
+}
+
+fn blake2b_256(data: &[u8]) -> [u8; 32] {
+    use blake2::digest::consts::U32;
+    use blake2::{Blake2b, Digest};
+
+    let mut hasher = Blake2b::<U32>::new();
+    hasher.update(data);
+    let digest = hasher.finalize();
+
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+fn extract_root_from_conway_tx_body<'a>(
+    body: &pallas_codec::utils::KeepRaw<'a, pallas_primitives::conway::MintedTransactionBody<'a>>,
+    output_index: u32,
+    host_state_nft_policy_id: &[u8],
+    host_state_nft_token_name: &[u8],
+) -> Result<Vec<u8>, Error> {
+    use pallas_primitives::conway::{MintedTransactionOutput, PseudoTransactionOutput};
+
+    let idx: usize = output_index
+        .try_into()
+        .map_err(|_| Error::query("host_state_tx_output_index out of range".to_string()))?;
+
+    let output: &MintedTransactionOutput<'a> = body
+        .outputs
+        .get(idx)
+        .ok_or_else(|| Error::query("host_state_tx_output_index out of range".to_string()))?;
+
+    let out = match output {
+        PseudoTransactionOutput::PostAlonzo(out) => out,
+        _ => {
+            return Err(Error::query(
+                "HostState output is not a post-Alonzo output".to_string(),
+            ))
+        }
+    };
+
+    ensure_value_contains_host_state_nft_conway(&out.value, host_state_nft_policy_id, host_state_nft_token_name)?;
+
+    let datum_option = out.datum_option.as_ref().ok_or_else(|| {
+        Error::query("HostState output has no datum option (expected inline datum)".to_string())
+    })?;
+
+    let plutus_data = match datum_option {
+        pallas_primitives::babbage::PseudoDatumOption::Data(cbor_wrap) => {
+            std::ops::Deref::deref(std::ops::Deref::deref(cbor_wrap))
+        }
+        _ => {
+            return Err(Error::query(
+                "HostState output does not contain an inline datum".to_string(),
+            ))
+        }
+    };
+
+    extract_ibc_state_root_from_host_state_datum(plutus_data, host_state_nft_policy_id)
+}
+
+fn extract_root_from_babbage_tx_body<'a>(
+    body: &pallas_codec::utils::KeepRaw<'a, pallas_primitives::babbage::MintedTransactionBody<'a>>,
+    output_index: u32,
+    host_state_nft_policy_id: &[u8],
+    host_state_nft_token_name: &[u8],
+) -> Result<Vec<u8>, Error> {
+    use pallas_primitives::babbage::{MintedTransactionOutput, PseudoTransactionOutput};
+
+    let idx: usize = output_index
+        .try_into()
+        .map_err(|_| Error::query("host_state_tx_output_index out of range".to_string()))?;
+
+    let output: &MintedTransactionOutput<'a> = body
+        .outputs
+        .get(idx)
+        .ok_or_else(|| Error::query("host_state_tx_output_index out of range".to_string()))?;
+
+    let out = match output {
+        PseudoTransactionOutput::PostAlonzo(out) => out,
+        _ => {
+            return Err(Error::query(
+                "HostState output is not a post-Alonzo output".to_string(),
+            ))
+        }
+    };
+
+    ensure_value_contains_host_state_nft_alonzo(&out.value, host_state_nft_policy_id, host_state_nft_token_name)?;
+
+    let datum_option = out.datum_option.as_ref().ok_or_else(|| {
+        Error::query("HostState output has no datum option (expected inline datum)".to_string())
+    })?;
+
+    let plutus_data = match datum_option {
+        pallas_primitives::babbage::PseudoDatumOption::Data(cbor_wrap) => {
+            std::ops::Deref::deref(std::ops::Deref::deref(cbor_wrap))
+        }
+        _ => {
+            return Err(Error::query(
+                "HostState output does not contain an inline datum".to_string(),
+            ))
+        }
+    };
+
+    extract_ibc_state_root_from_host_state_datum(plutus_data, host_state_nft_policy_id)
+}
+
+fn ensure_value_contains_host_state_nft_conway(
+    value: &pallas_primitives::conway::Value,
+    host_state_nft_policy_id: &[u8],
+    host_state_nft_token_name: &[u8],
+) -> Result<(), Error> {
+    match value {
+        pallas_primitives::conway::Value::Multiasset(_, multiasset) => {
+            for (policy, assets) in multiasset.iter() {
+                if policy.as_ref() != host_state_nft_policy_id {
+                    continue;
+                }
+
+                for (asset, amount) in assets.iter() {
+                    if asset.as_slice() == host_state_nft_token_name {
+                        let amount_u64: u64 = amount.into();
+                        if amount_u64 == 1 {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            Err(Error::query(
+                "HostState output does not contain the expected HostState NFT".to_string(),
+            ))
+        }
+        _ => Err(Error::query(
+            "HostState output has no multi-assets (expected HostState NFT)".to_string(),
+        )),
+    }
+}
+
+fn ensure_value_contains_host_state_nft_alonzo(
+    value: &pallas_primitives::alonzo::Value,
+    host_state_nft_policy_id: &[u8],
+    host_state_nft_token_name: &[u8],
+) -> Result<(), Error> {
+    match value {
+        pallas_primitives::alonzo::Value::Multiasset(_, multiasset) => {
+            for (policy, assets) in multiasset.iter() {
+                if policy.as_ref() != host_state_nft_policy_id {
+                    continue;
+                }
+
+                for (asset, amount) in assets.iter() {
+                    if asset.as_slice() == host_state_nft_token_name {
+                        if *amount == 1 {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            Err(Error::query(
+                "HostState output does not contain the expected HostState NFT".to_string(),
+            ))
+        }
+        _ => Err(Error::query(
+            "HostState output has no multi-assets (expected HostState NFT)".to_string(),
+        )),
+    }
+}
+
+fn extract_ibc_state_root_from_host_state_datum(
+    datum: &pallas_primitives::alonzo::PlutusData,
+    expected_nft_policy_id: &[u8],
+) -> Result<Vec<u8>, Error> {
+    use pallas_primitives::alonzo::PlutusData;
+
+    let outer = match datum {
+        PlutusData::Constr(c) => c,
+        _ => {
+            return Err(Error::query(
+                "HostState datum is not a constructor PlutusData".to_string(),
+            ))
+        }
+    };
+
+    if plutus_constructor_index(outer) != Some(0) || outer.fields.len() < 2 {
+        return Err(Error::query(
+            "HostState datum does not match expected constructor shape".to_string(),
+        ));
+    }
+
+    let state = &outer.fields[0];
+    let nft_policy = &outer.fields[1];
+
+    if !expected_nft_policy_id.is_empty() {
+        let nft_policy_bytes: &[u8] = match nft_policy {
+            PlutusData::BoundedBytes(bytes) => bytes.as_slice(),
+            _ => {
+                return Err(Error::query(
+                    "HostState datum nft_policy is not a byte string".to_string(),
+                ))
+            }
+        };
+
+        if nft_policy_bytes != expected_nft_policy_id {
+            return Err(Error::query(
+                "unexpected HostState nft_policy in datum".to_string(),
+            ));
+        }
+    }
+
+    let state = match state {
+        PlutusData::Constr(c) => c,
+        _ => return Err(Error::query("HostState state is not a constructor".to_string())),
+    };
+
+    if plutus_constructor_index(state) != Some(0) || state.fields.len() < 2 {
+        return Err(Error::query(
+            "HostState state does not match expected constructor shape".to_string(),
+        ));
+    }
+
+    let root: &[u8] = match &state.fields[1] {
+        PlutusData::BoundedBytes(bytes) => bytes.as_slice(),
+        _ => return Err(Error::query("ibc_state_root is not a byte string".to_string())),
+    };
+
+    if root.len() != 32 {
+        return Err(Error::query(format!(
+            "invalid ibc_state_root length: expected 32 bytes, got {}",
+            root.len()
+        )));
+    }
+
+    Ok(root.to_vec())
+}
+
+fn plutus_constructor_index(constr: &pallas_primitives::alonzo::Constr<pallas_primitives::alonzo::PlutusData>) -> Option<u64> {
+    match constr.tag {
+        102 => constr.any_constructor,
+        121..=127 => Some(constr.tag - 121),
+        1280..=1400 => Some(constr.tag - 1280 + 7),
+        _ => None,
+    }
+}

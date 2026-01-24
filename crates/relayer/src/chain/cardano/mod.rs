@@ -12,10 +12,8 @@ pub mod event_source;
 pub mod gateway_client;
 pub mod generated;
 pub mod keyring;
-pub mod proto_parser;
 pub mod signer;
 pub mod signing_key_pair;
-pub mod types;
 
 // Re-export key types for convenience
 pub use config::CardanoConfig;

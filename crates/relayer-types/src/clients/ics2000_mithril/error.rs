@@ -10,6 +10,10 @@ define_error! {
             { field: &'static str }
             |e| { format_args!("missing required field: {}", e.field) },
 
+        InvalidField
+            { field: &'static str, reason: String }
+            |e| { format_args!("invalid field {}: {}", e.field, e.reason) },
+
         InvalidHeight
             { height: u64 }
             |e| { format_args!("invalid Mithril header height: {}", e.height) },

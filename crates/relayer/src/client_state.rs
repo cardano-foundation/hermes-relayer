@@ -13,9 +13,6 @@ use ibc_relayer_types::clients::ics2000_mithril::client_state::{
     ClientState as MithrilClientState, MITHRIL_CLIENT_STATE_TYPE_URL,
 };
 
-use crate::chain::cardano::types::client_state::CardanoClientState;
-
-const CARDANO_CLIENT_STATE_TYPE_URL: &str = "/ibc.lightclients.cardano.v1.ClientState";
 use ibc_relayer_types::core::ics02_client::client_state::ClientState;
 use ibc_relayer_types::core::ics02_client::client_type::ClientType;
 use ibc_relayer_types::core::ics02_client::error::Error;
@@ -28,7 +25,7 @@ use ibc_relayer_types::Height;
 #[serde(tag = "type")]
 pub enum AnyClientState {
     Tendermint(TmClientState),
-    Cardano(CardanoClientState),
+    /// Cardano-tracking client state (`08-cardano`), encoded as `ibc.clients.mithril.v1.ClientState`.
     Mithril(MithrilClientState),
 }
 
@@ -36,7 +33,6 @@ impl AnyClientState {
     pub fn chain_id(&self) -> ChainId {
         match self {
             AnyClientState::Tendermint(tm_state) => tm_state.chain_id(),
-            AnyClientState::Cardano(cardano_state) => cardano_state.chain_id(),
             AnyClientState::Mithril(mithril_state) => mithril_state.chain_id(),
         }
     }
@@ -44,7 +40,6 @@ impl AnyClientState {
     pub fn latest_height(&self) -> Height {
         match self {
             Self::Tendermint(tm_state) => tm_state.latest_height(),
-            Self::Cardano(cardano_state) => cardano_state.latest_height(),
             Self::Mithril(mithril_state) => mithril_state.latest_height(),
         }
     }
@@ -52,7 +47,6 @@ impl AnyClientState {
     pub fn frozen_height(&self) -> Option<Height> {
         match self {
             Self::Tendermint(tm_state) => tm_state.frozen_height(),
-            Self::Cardano(cardano_state) => cardano_state.frozen_height(),
             Self::Mithril(mithril_state) => mithril_state.frozen_height(),
         }
     }
@@ -60,7 +54,6 @@ impl AnyClientState {
     pub fn trust_threshold(&self) -> Option<TrustThreshold> {
         match self {
             AnyClientState::Tendermint(state) => Some(state.trust_threshold),
-            AnyClientState::Cardano(_) => None, // Cardano doesn't use trust threshold
             AnyClientState::Mithril(_) => None, // Mithril client doesn't use trust threshold
         }
     }
@@ -68,7 +61,6 @@ impl AnyClientState {
     pub fn trusting_period(&self) -> Duration {
         match self {
             AnyClientState::Tendermint(state) => state.trusting_period,
-            AnyClientState::Cardano(state) => Duration::from_secs(state.trusting_period),
             AnyClientState::Mithril(state) => state.trusting_period,
         }
     }
@@ -76,7 +68,6 @@ impl AnyClientState {
     pub fn max_clock_drift(&self) -> Duration {
         match self {
             AnyClientState::Tendermint(state) => state.max_clock_drift,
-            AnyClientState::Cardano(_) => Duration::from_secs(300), // 5 minutes default
             AnyClientState::Mithril(_) => Duration::from_secs(300), // 5 minutes default
         }
     }
@@ -84,7 +75,6 @@ impl AnyClientState {
     pub fn client_type(&self) -> ClientType {
         match self {
             Self::Tendermint(state) => state.client_type(),
-            Self::Cardano(state) => state.client_type(),
             Self::Mithril(state) => state.client_type(),
         }
     }
@@ -92,7 +82,6 @@ impl AnyClientState {
     pub fn expired(&self, elapsed: Duration) -> bool {
         match self {
             Self::Tendermint(state) => state.expired(elapsed),
-            Self::Cardano(state) => state.expired(elapsed),
             Self::Mithril(state) => state.expired(elapsed),
         }
     }
@@ -112,12 +101,6 @@ impl TryFrom<Any> for AnyClientState {
                     .map_err(Error::decode_raw_client_state)?,
             )),
 
-            CARDANO_CLIENT_STATE_TYPE_URL => {
-                Err(Error::unknown_client_state_type(format!(
-                    "{CARDANO_CLIENT_STATE_TYPE_URL} (Cardano client state decoding is not implemented)"
-                )))
-            }
-
             MITHRIL_CLIENT_STATE_TYPE_URL => Ok(AnyClientState::Mithril(raw.try_into()?)),
 
             _ => Err(Error::unknown_client_state_type(raw.type_url)),
@@ -131,11 +114,6 @@ impl From<AnyClientState> for Any {
             AnyClientState::Tendermint(value) => Any {
                 type_url: TENDERMINT_CLIENT_STATE_TYPE_URL.to_string(),
                 value: Protobuf::<RawTmClientState>::encode_vec(value),
-            },
-            AnyClientState::Cardano(value) => Any {
-                type_url: CARDANO_CLIENT_STATE_TYPE_URL.to_string(),
-                // Placeholder encoding: do not rely on this for on-chain messages.
-                value: serde_json::to_vec(&value).unwrap_or_default(),
             },
             AnyClientState::Mithril(value) => value.into(),
         }
@@ -167,12 +145,6 @@ impl ClientState for AnyClientState {
 impl From<TmClientState> for AnyClientState {
     fn from(cs: TmClientState) -> Self {
         Self::Tendermint(cs)
-    }
-}
-
-impl From<CardanoClientState> for AnyClientState {
-    fn from(cs: CardanoClientState) -> Self {
-        Self::Cardano(cs)
     }
 }
 
