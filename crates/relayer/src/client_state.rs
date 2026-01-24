@@ -9,7 +9,7 @@ use ibc_proto::Protobuf;
 use ibc_relayer_types::clients::ics07_tendermint::client_state::{
     ClientState as TmClientState, TENDERMINT_CLIENT_STATE_TYPE_URL,
 };
-use ibc_relayer_types::clients::ics2000_mithril::client_state::{
+use ibc_relayer_types::clients::ics08_cardano::client_state::{
     ClientState as MithrilClientState, MITHRIL_CLIENT_STATE_TYPE_URL,
 };
 

@@ -7,7 +7,7 @@ use ibc_proto::Protobuf;
 use ibc_relayer_types::clients::ics07_tendermint::consensus_state::{
     ConsensusState as TmConsensusState, TENDERMINT_CONSENSUS_STATE_TYPE_URL,
 };
-use ibc_relayer_types::clients::ics2000_mithril::consensus_state::{
+use ibc_relayer_types::clients::ics08_cardano::consensus_state::{
     ConsensusState as MithrilConsensusState, MITHRIL_CONSENSUS_STATE_TYPE_URL,
 };
 

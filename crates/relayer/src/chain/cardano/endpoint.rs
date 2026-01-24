@@ -6,8 +6,8 @@ use super::config::CardanoConfig;
 use super::gateway_client::GatewayClient;
 use super::signing_key_pair::CardanoSigningKeyPair;
 
-use ibc_relayer_types::clients::ics2000_mithril::header::Header as MithrilHeader;
-use ibc_relayer_types::clients::ics2000_mithril::{
+use ibc_relayer_types::clients::ics08_cardano::header::Header as MithrilHeader;
+use ibc_relayer_types::clients::ics08_cardano::{
     client_state::ClientState as MithrilClientState,
     consensus_state::ConsensusState as MithrilConsensusState,
 };
@@ -1926,7 +1926,7 @@ fn filter_packet_events_from_block_results(
 }
 
 // Mithril header is decoded from the Gateway as `google.protobuf.Any`.
-// See `ibc-relayer-types/src/clients/ics2000_mithril/header.rs` and
+        // See `ibc-relayer-types/src/clients/ics08_cardano/header.rs` and
 // `ibc-relayer-types/src/core/ics02_client/header.rs`.
 
 fn extract_ibc_state_root_from_host_state_tx(

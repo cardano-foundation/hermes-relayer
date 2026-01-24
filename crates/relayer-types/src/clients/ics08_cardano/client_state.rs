@@ -6,8 +6,8 @@ use serde_derive::{Deserialize, Serialize};
 use ibc_proto::google::protobuf::Any;
 use ibc_proto::Protobuf;
 
-use crate::clients::ics2000_mithril::error::Error;
-use crate::clients::ics2000_mithril::raw as raw;
+use crate::clients::ics08_cardano::error::Error;
+use crate::clients::ics08_cardano::raw as raw;
 use crate::core::ics02_client::client_state::ClientState as Ics2ClientState;
 use crate::core::ics02_client::client_type::ClientType;
 use crate::core::ics02_client::error::Error as Ics02Error;

@@ -9,7 +9,7 @@ use prost::Message;
 use crate::clients::ics07_tendermint::header::{
     decode_header as tm_decode_header, Header as TendermintHeader, TENDERMINT_HEADER_TYPE_URL,
 };
-use crate::clients::ics2000_mithril::header::{
+use crate::clients::ics08_cardano::header::{
     Header as MithrilHeader, MITHRIL_HEADER_TYPE_URL,
 };
 use crate::core::ics02_client::client_type::ClientType;

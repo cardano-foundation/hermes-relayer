@@ -26,7 +26,7 @@ use ibc_proto::ibc::core::channel::v1::{
     QueryNextSequenceReceiveRequest,
 };
 use ibc_proto::google::protobuf::Any as ProtoAny;
-use ibc_relayer_types::clients::ics2000_mithril::header::Header as MithrilHeader;
+use ibc_relayer_types::clients::ics08_cardano::header::Header as MithrilHeader;
 use ibc_relayer_types::Height;
 use tonic::transport::Channel;
 
