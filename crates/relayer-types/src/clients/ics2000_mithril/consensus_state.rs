@@ -12,7 +12,7 @@ use crate::core::ics02_client::error::Error as Ics02Error;
 use crate::core::ics23_commitment::commitment::CommitmentRoot;
 use crate::timestamp::Timestamp;
 
-pub const MITHRIL_CONSENSUS_STATE_TYPE_URL: &str = "/ibc.clients.mithril.v1.ConsensusState";
+pub const MITHRIL_CONSENSUS_STATE_TYPE_URL: &str = "/ibc.lightclients.mithril.v1.ConsensusState";
 
 type RawConsensusState = raw::ConsensusState;
 

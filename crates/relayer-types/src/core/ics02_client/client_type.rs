@@ -13,7 +13,7 @@ pub enum ClientType {
 impl ClientType {
     const TENDERMINT_STR: &'static str = "07-tendermint";
     // Cardano tracking client type. The corresponding protobuf messages are currently under
-    // `ibc.clients.mithril.v1.*` (Mithril).
+    // `ibc.lightclients.mithril.v1.*` (Mithril).
     const CARDANO_STR: &'static str = "08-cardano";
 
     /// Yields the identifier of this client type as a string

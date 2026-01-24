@@ -25,7 +25,7 @@ use ibc_relayer_types::Height;
 #[serde(tag = "type")]
 pub enum AnyClientState {
     Tendermint(TmClientState),
-    /// Cardano-tracking client state (`08-cardano`), encoded as `ibc.clients.mithril.v1.ClientState`.
+    /// Cardano-tracking client state (`08-cardano`), encoded as `ibc.lightclients.mithril.v1.ClientState`.
     Mithril(MithrilClientState),
 }
 

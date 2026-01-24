@@ -1,6 +1,6 @@
-//! Raw protobuf types for `ibc.clients.mithril.v1`.
+//! Raw protobuf types for `ibc.lightclients.mithril.v1`.
 //!
-//! These message definitions mirror `cosmos/sidechain/proto/ibc/clients/mithril/v1/mithril.proto`.
+//! These message definitions mirror `cosmos/sidechain/proto/ibc/lightclients/mithril/v1/mithril.proto`.
 //! They are intentionally kept local to `ibc-relayer-types` to enable encoding/decoding from
 //! `google.protobuf.Any` without requiring upstream `ibc-proto` support.
 

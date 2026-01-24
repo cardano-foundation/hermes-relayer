@@ -11,7 +11,7 @@ use crate::core::ics02_client::error::Error as Ics02Error;
 use crate::timestamp::Timestamp;
 use crate::Height;
 
-pub const MITHRIL_HEADER_TYPE_URL: &str = "/ibc.clients.mithril.v1.MithrilHeader";
+pub const MITHRIL_HEADER_TYPE_URL: &str = "/ibc.lightclients.mithril.v1.MithrilHeader";
 
 type RawHeader = raw::MithrilHeader;
 

@@ -22,7 +22,7 @@ use ibc_relayer_types::Height;
 #[serde(tag = "type")]
 pub enum AnyConsensusState {
     Tendermint(TmConsensusState),
-    /// Cardano-tracking consensus state (`08-cardano`), encoded as `ibc.clients.mithril.v1.ConsensusState`.
+    /// Cardano-tracking consensus state (`08-cardano`), encoded as `ibc.lightclients.mithril.v1.ConsensusState`.
     Mithril(MithrilConsensusState),
 }
 

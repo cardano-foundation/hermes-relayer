@@ -14,7 +14,7 @@ use crate::core::ics02_client::error::Error as Ics02Error;
 use crate::core::ics24_host::identifier::ChainId;
 use crate::Height;
 
-pub const MITHRIL_CLIENT_STATE_TYPE_URL: &str = "/ibc.clients.mithril.v1.ClientState";
+pub const MITHRIL_CLIENT_STATE_TYPE_URL: &str = "/ibc.lightclients.mithril.v1.ClientState";
 
 type RawClientState = raw::ClientState;
 type RawHeight = raw::Height;
