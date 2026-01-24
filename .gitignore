@@ -28,6 +28,10 @@ mc.log
 # Ignore OSX .DS_Store file
 .DS_Store
 
+# Ignore accidentally-committed local Hermes state
+/.hermes/
+/~/
+
 # Ignore tooling Cargo.lock
 tools/check-guide/Cargo.lock
 

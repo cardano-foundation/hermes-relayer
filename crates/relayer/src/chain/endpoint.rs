@@ -484,7 +484,7 @@ pub trait ChainEndpoint: Sized {
         // Hermes historically uses `query_height + 1` as `proof_height` for Tendermint/Cosmos SDK
         // chains. For Cardano (Mithril snapshot heights), the consensus state at height H commits to
         // the IBC root at height H directly, so the proof height must be exactly `query_height`.
-        let proof_height = if self.id().as_str().starts_with("cardano") {
+        let proof_height = if matches!(self.config(), ChainConfig::Cardano(_)) {
             height
         } else {
             height.increment()
@@ -528,7 +528,7 @@ pub trait ChainEndpoint: Sized {
         let channel_proof_bytes =
             CommitmentProofBytes::try_from(channel_proof).map_err(Error::malformed_proof)?;
 
-        let proof_height = if self.id().as_str().starts_with("cardano") {
+        let proof_height = if matches!(self.config(), ChainConfig::Cardano(_)) {
             height
         } else {
             height.increment()
@@ -676,7 +676,7 @@ pub trait ChainEndpoint: Sized {
             return Err(Error::queried_proof_not_found());
         };
 
-        let proof_height = if self.id().as_str().starts_with("cardano") {
+        let proof_height = if matches!(self.config(), ChainConfig::Cardano(_)) {
             height
         } else {
             height.increment()

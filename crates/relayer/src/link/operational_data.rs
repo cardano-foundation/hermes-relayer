@@ -15,6 +15,7 @@ use crate::chain::requests::QueryHeight;
 use crate::chain::tracking::TrackedMsgs;
 use crate::chain::tracking::TrackingId;
 use crate::event::IbcEventWithHeight;
+use crate::config::ChainConfig;
 use crate::link::error::LinkError;
 use crate::link::RelayPath;
 
@@ -170,8 +171,20 @@ impl OperationalData {
             //
             // Therefore, when we are updating a Cardano-tracking client (i.e. the counterparty
             // chain in this relay path is Cardano), we update to `proof_height` directly.
-            let src_chain_is_cardano = relay_path.src_chain().id().to_string().starts_with("cardano");
-            let dst_chain_is_cardano = relay_path.dst_chain().id().to_string().starts_with("cardano");
+            let src_chain_is_cardano = matches!(
+                relay_path
+                    .src_chain()
+                    .config()
+                    .map_err(LinkError::relayer)?,
+                ChainConfig::Cardano(_)
+            );
+            let dst_chain_is_cardano = matches!(
+                relay_path
+                    .dst_chain()
+                    .config()
+                    .map_err(LinkError::relayer)?,
+                ChainConfig::Cardano(_)
+            );
             let update_height =
                 if (matches!(self.target, OperationalDataTarget::Destination) && src_chain_is_cardano)
                     || (matches!(self.target, OperationalDataTarget::Source) && dst_chain_is_cardano)

@@ -138,9 +138,10 @@ Unless required by applicable law or agreed to in writing, software distributed 
 
 ## Note on Cardano Integration
 
-The Cosmos SDK Chains follow a standard pattern:
+The Cosmos SDK chains follow a standard pattern:
 
-```go // How Cosmos chains work:
+```rust
+// How Cosmos chains work:
 impl SigningKeyPair for Secp256k1KeyPair {
     // Creates key from mnemonic
     fn from_mnemonic(
@@ -153,7 +154,7 @@ impl SigningKeyPair for Secp256k1KeyPair {
         let public_key = Xpub::from_priv(&Secp256k1::signing_only(), &private_key);
         let address = get_address(&public_key.public_key, address_type);
         let account = encode_address(account_prefix, &address)?;
-        
+
         Ok(Self {
             private_key,
             public_key,
@@ -161,7 +162,7 @@ impl SigningKeyPair for Secp256k1KeyPair {
             account,
         })
     }
-    
+
     // Must be Serialize + Deserialize for storage
     fn account(&self) -> String { self.account.clone() }
     fn sign(&self, message: &[u8]) -> Vec<u8> { /* ... */ }
@@ -175,11 +176,12 @@ Where keys are stored in `~/.hermes/keys/{chain-id}/keyring-test/{key-name}.json
 
 Penumbra does not use the standard Hermes keyring, instead:
 
-```go // From config.rs:
+```rust
+// From config.rs:
 pub struct PenumbraConfig {
     // NO key_name field
     // NO key_store_type field
-    
+
     // Uses Penumbra's own KMS:
     pub kms_config: soft_kms::Config,
 }

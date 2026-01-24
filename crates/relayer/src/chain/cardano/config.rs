@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::config::PacketFilter;
+use crate::config::{default, PacketFilter, RefreshRate};
 use crate::keyring::Store;
 
 /// Minimal configuration for Cardano chain integration
@@ -58,6 +58,11 @@ pub struct CardanoConfig {
     #[serde(default = "default_clock_drift", with = "humantime_serde")]
     pub clock_drift: Duration,
 
+    /// The rate at which to refresh the client referencing this chain,
+    /// expressed as a fraction of the trusting period.
+    #[serde(default = "default::client_refresh_rate")]
+    pub client_refresh_rate: RefreshRate,
+
     /// Event polling interval for monitoring IBC events
     #[serde(default = "default_event_poll_interval", with = "humantime_serde")]
     pub event_poll_interval: Option<Duration>,
@@ -95,6 +100,7 @@ impl Default for CardanoConfig {
             query_packets_chunk_size: default_query_packets_chunk_size(),
             clear_interval: None,
             clock_drift: default_clock_drift(),
+            client_refresh_rate: default::client_refresh_rate(),
             event_poll_interval: default_event_poll_interval(),
         }
     }

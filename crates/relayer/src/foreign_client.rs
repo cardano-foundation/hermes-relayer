@@ -910,10 +910,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 config.client_refresh_rate
             }
             ChainConfig::Penumbra(config) => config.client_refresh_rate,
-            ChainConfig::Cardano(_config) => {
-                // TODO: Add client_refresh_rate to CardanoConfig
-                crate::config::default::client_refresh_rate()
-            }
+            ChainConfig::Cardano(config) => config.client_refresh_rate,
         };
 
         let refresh_period = client_state

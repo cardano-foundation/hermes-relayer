@@ -99,9 +99,6 @@ blake2                           = "0.10"
 pallas-primitives                = "0.30"
 pallas-codec                     = "0.30"
 
-[build-dependencies]
-tonic-build = "0.12"
-
 [dev-dependencies]
 ibc-relayer-types = { workspace = true }
 serial_test       = { workspace = true }

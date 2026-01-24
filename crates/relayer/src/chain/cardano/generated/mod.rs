@@ -1,4 +1,6 @@
 //! Generated protobuf code for Cardano-specific gRPC services
+//!
+//! These files are checked in and should not be edited by hand.
 
 // Allow clippy warnings for generated code
 #![allow(clippy::all)]

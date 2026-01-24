@@ -273,14 +273,15 @@ impl ChainEndpoint for CardanoChainEndpoint {
     }
 
     fn subscribe(&mut self) -> Result<Subscription, Error> {
-        let event_source_cmd = match &self.event_source_cmd {
-            Some(cmd) => cmd,
-            None => {
-                let cmd = self.init_event_source()?;
-                self.event_source_cmd = Some(cmd);
-                self.event_source_cmd.as_ref().unwrap()
-            }
-        };
+        if self.event_source_cmd.is_none() {
+            self.event_source_cmd = Some(self.init_event_source()?);
+        }
+
+        let event_source_cmd = self.event_source_cmd.as_ref().ok_or_else(|| {
+            Error::event_source(crate::event::source::Error::collect_events_failed(
+                "Cardano event source command missing after initialization".to_string(),
+            ))
+        })?;
 
         let subscription = event_source_cmd
             .subscribe()
@@ -297,14 +298,19 @@ impl ChainEndpoint for CardanoChainEndpoint {
     }
 
     fn get_signer(&self) -> Result<Signer, Error> {
-        // Get the key from keyring and return its address as signer
-        let key = self.keyring.get_key(&self.config.key_name)
+        let key = self
+            .keyring
+            .get_key(&self.config.key_name)
             .map_err(Error::key_base)?;
-        
-        // Use the account (Cardano address) as the signer
-        // Signer must be created from a string using FromStr
-        Signer::from_str(&key.account())
-            .map_err(|e| Error::key_base(crate::keyring::errors::Error::invalid_mnemonic(anyhow::anyhow!("Invalid signer address: {}", e))))
+
+        let cardano_keyring = key.get_cardano_keyring().map_err(Error::key_base)?;
+        let address = cardano_keyring.address(self.config.network_id);
+
+        Signer::from_str(&address).map_err(|e| {
+            Error::key_base(crate::keyring::errors::Error::invalid_mnemonic(anyhow::anyhow!(
+                "Invalid signer address: {e}"
+            )))
+        })
     }
 
     fn get_key(&self) -> Result<Self::SigningKeyPair, Error> {
@@ -1521,12 +1527,17 @@ impl ChainEndpoint for CardanoChainEndpoint {
                                 .block_results
                                 .ok_or_else(|| Error::query("No block_results in response".to_string()))?;
 
-                            let height = block_results
-                                .height
-                                .map(|h| ICSHeight::new(h.revision_number, h.revision_height))
-                                .transpose()
-                                .map_err(|e| Error::query(format!("Invalid height in block results: {e}")))?
-                                .unwrap_or_else(|| ICSHeight::new(0, target_height_u64).expect("valid height"));
+                            let height = match block_results.height {
+                                Some(h) => ICSHeight::new(h.revision_number, h.revision_height)
+                                    .map_err(|e| {
+                                        Error::query(format!("Invalid height in block results: {e}"))
+                                    })?,
+                                None => ICSHeight::new(0, target_height_u64).map_err(|e| {
+                                    Error::query(format!(
+                                        "Invalid fallback height {target_height_u64} in block results: {e}"
+                                    ))
+                                })?,
+                            };
 
                             let proto_events: Vec<super::generated::ibc::cardano::v1::Event> = block_results
                                 .txs_results
@@ -1861,12 +1872,13 @@ fn filter_packet_events_from_block_results(
         None => return Ok(vec![]),
     };
 
-    let height = block_results
-        .height
-        .map(|h| ICSHeight::new(h.revision_number, h.revision_height))
-        .transpose()
-        .map_err(|e| Error::query(format!("Invalid height in block results: {e}")))?
-        .unwrap_or_else(|| ICSHeight::new(0, fallback_height).expect("valid height"));
+    let height = match block_results.height {
+        Some(h) => ICSHeight::new(h.revision_number, h.revision_height)
+            .map_err(|e| Error::query(format!("Invalid height in block results: {e}")))?,
+        None => ICSHeight::new(0, fallback_height).map_err(|e| {
+            Error::query(format!("Invalid fallback height {fallback_height}: {e}"))
+        })?,
+    };
 
     let proto_events: Vec<super::generated::ibc::cardano::v1::Event> = block_results
         .txs_results
