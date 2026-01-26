@@ -66,6 +66,39 @@ pub struct CardanoConfig {
     /// Event polling interval for monitoring IBC events
     #[serde(default = "default_event_poll_interval", with = "humantime_serde")]
     pub event_poll_interval: Option<Duration>,
+
+    /// Maximum amount of time Hermes will wait after a Cardano transaction is included
+    /// until it is also "Mithril-certified".
+    ///
+    /// Important nuance about "height":
+    /// In this Cardano↔Cosmos integration, `Height.revision_height` is treated as a Cardano
+    /// *block number* (as surfaced by `db-sync` and by Mithril's `cardano-transactions`
+    /// snapshots). It is not a Cardano *slot number*.
+    ///
+    /// When Hermes submits a transaction on Cardano, the Gateway returns the inclusion
+    /// block number. Hermes then waits until the Gateway reports a Mithril snapshot
+    /// whose `block_number` is >= that inclusion block number, before proceeding to the
+    /// next IBC step. Without this, Hermes can race ahead and build proofs at a height
+    /// that the Cosmos-side Mithril light client cannot yet verify.
+    #[serde(
+        default = "default_mithril_certification_timeout",
+        with = "humantime_serde"
+    )]
+    pub mithril_certification_timeout: Duration,
+
+    /// Polling interval while waiting for Mithril snapshots to catch up.
+    #[serde(default = "default_mithril_poll_interval", with = "humantime_serde")]
+    pub mithril_poll_interval: Duration,
+
+    /// How often to log progress while waiting for Mithril snapshot catch-up.
+    ///
+    /// This is intentionally an `INFO`-level log, because in many environments the default
+    /// log level is `info` (so `debug` would be invisible and the process would look hung).
+    #[serde(
+        default = "default_mithril_wait_log_interval",
+        with = "humantime_serde"
+    )]
+    pub mithril_wait_log_interval: Duration,
 }
 
 fn default_max_block_time() -> Duration {
@@ -82,6 +115,18 @@ fn default_clock_drift() -> Duration {
 
 fn default_event_poll_interval() -> Option<Duration> {
     Some(Duration::from_secs(5))
+}
+
+fn default_mithril_certification_timeout() -> Duration {
+    Duration::from_secs(10 * 60)
+}
+
+fn default_mithril_poll_interval() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_mithril_wait_log_interval() -> Duration {
+    Duration::from_secs(30)
 }
 
 impl Default for CardanoConfig {
@@ -102,6 +147,9 @@ impl Default for CardanoConfig {
             clock_drift: default_clock_drift(),
             client_refresh_rate: default::client_refresh_rate(),
             event_poll_interval: default_event_poll_interval(),
+            mithril_certification_timeout: default_mithril_certification_timeout(),
+            mithril_poll_interval: default_mithril_poll_interval(),
+            mithril_wait_log_interval: default_mithril_wait_log_interval(),
         }
     }
 }

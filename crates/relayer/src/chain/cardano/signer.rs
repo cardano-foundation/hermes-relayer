@@ -148,32 +148,179 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_transaction_signing_structure() {
-        // This test verifies the signing workflow structure
-        // Actual transaction signing requires valid CBOR from Gateway
-        
+    fn sign_transaction_adds_vkey_witness_and_signature_verifies() {
+        fn unsigned_tx_fixture(existing_vkey_witnesses: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut out);
+
+            // Conway transaction: [transaction_body, transaction_witness_set, is_valid, auxiliary_data]
+            enc.array(4).unwrap();
+
+            // transaction_body is a CBOR map with numeric keys. We include only the minimum set of
+            // fields required for decoding: inputs (0), outputs (1), fee (2).
+            enc.map(3).unwrap();
+
+            // inputs: Set<TransactionInput> (we omit the optional tag and encode as a plain array)
+            enc.u8(0).unwrap();
+            enc.array(1).unwrap();
+            enc.array(2).unwrap();
+            enc.bytes(&[0u8; 32]).unwrap(); // transaction_id hash bytes
+            enc.u64(0).unwrap(); // output index
+
+            // outputs: Vec<TransactionOutput> (we use the legacy/array form)
+            enc.u8(1).unwrap();
+            enc.array(1).unwrap();
+            enc.array(3).unwrap();
+            enc.bytes(&[1u8; 32]).unwrap(); // address bytes (opaque for this test)
+            enc.u64(1).unwrap(); // amount (Value::Coin)
+            enc.null().unwrap(); // datum_hash = None
+
+            // fee
+            enc.u8(2).unwrap();
+            enc.u64(0).unwrap();
+
+            // transaction_witness_set: CBOR map with numeric keys. Start with either empty map or one
+            // containing dummy vkey witnesses.
+            if existing_vkey_witnesses == 0 {
+                enc.map(0).unwrap();
+            } else {
+                enc.map(1).unwrap();
+                enc.u8(0).unwrap();
+                enc.array(existing_vkey_witnesses as u64).unwrap();
+                for _ in 0..existing_vkey_witnesses {
+                    enc.array(2).unwrap();
+                    enc.bytes(&[2u8; 32]).unwrap();
+                    enc.bytes(&[3u8; 64]).unwrap();
+                }
+            }
+
+            // is_valid
+            enc.bool(true).unwrap();
+
+            // auxiliary_data = null
+            enc.null().unwrap();
+
+            out
+        }
+
         let keyring = CardanoKeyring::new_for_testing().unwrap();
-        
-        // Test that we can create a signature
-        let test_message = b"test transaction hash";
-        let signature = keyring.sign(test_message);
-        
-        assert_eq!(signature.to_bytes().len(), 64); // Ed25519 signature is 64 bytes
+
+        let unsigned = unsigned_tx_fixture(0);
+        let unsigned_tx: MintedTx<'_> = minicbor::decode(&unsigned).unwrap();
+
+        let signed = sign_transaction(&unsigned, &keyring).unwrap();
+        let signed_tx: MintedTx<'_> = minicbor::decode(&signed).unwrap();
+
+        // Signing must not mutate the transaction body bytes (the hash is over the body).
+        assert_eq!(
+            signed_tx.transaction_body.raw_cbor(),
+            unsigned_tx.transaction_body.raw_cbor()
+        );
+
+        // The signing must preserve the success flag and auxiliary data field.
+        assert_eq!(signed_tx.success, unsigned_tx.success);
+        assert!(matches!(
+            signed_tx.auxiliary_data,
+            pallas_codec::utils::Nullable::Null
+        ));
+
+        // Verify that a vkey witness was added and that it verifies against the tx hash.
+        let witnesses = signed_tx
+            .transaction_witness_set
+            .vkeywitness
+            .clone()
+            .expect("expected vkey witness set")
+            .to_vec();
+
+        let added_witness = witnesses
+            .iter()
+            .find(|w| w.vkey.as_slice() == keyring.verifying_key().as_bytes())
+            .expect("expected witness with the keyring verifying key");
+
+        assert_eq!(added_witness.signature.len(), 64);
+
+        let tx_body_cbor = signed_tx.transaction_body.raw_cbor();
+
+        use blake2::Blake2b;
+        use blake2::digest::consts::U32;
+        let mut hasher = Blake2b::<U32>::new();
+        hasher.update(tx_body_cbor);
+        let tx_hash = hasher.finalize();
+
+        use ed25519_dalek::Verifier;
+        let signature = {
+            let mut sig_bytes = [0u8; 64];
+            sig_bytes.copy_from_slice(&added_witness.signature);
+            ed25519_dalek::Signature::from_bytes(&sig_bytes)
+        };
+
+        keyring
+            .verifying_key()
+            .verify(tx_hash.as_slice(), &signature)
+            .unwrap();
     }
 
     #[test]
-    fn test_keyring_signing() {
+    fn sign_transaction_appends_to_existing_witnesses() {
+        fn unsigned_tx_fixture(existing_vkey_witnesses: usize) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut enc = minicbor::Encoder::new(&mut out);
+
+            enc.array(4).unwrap();
+            enc.map(3).unwrap();
+
+            enc.u8(0).unwrap();
+            enc.array(1).unwrap();
+            enc.array(2).unwrap();
+            enc.bytes(&[0u8; 32]).unwrap();
+            enc.u64(0).unwrap();
+
+            enc.u8(1).unwrap();
+            enc.array(1).unwrap();
+            enc.array(3).unwrap();
+            enc.bytes(&[1u8; 32]).unwrap();
+            enc.u64(1).unwrap();
+            enc.null().unwrap();
+
+            enc.u8(2).unwrap();
+            enc.u64(0).unwrap();
+
+            enc.map(1).unwrap();
+            enc.u8(0).unwrap();
+            enc.array(existing_vkey_witnesses as u64).unwrap();
+            for _ in 0..existing_vkey_witnesses {
+                enc.array(2).unwrap();
+                enc.bytes(&[2u8; 32]).unwrap();
+                enc.bytes(&[3u8; 64]).unwrap();
+            }
+
+            enc.bool(true).unwrap();
+            enc.null().unwrap();
+
+            out
+        }
+
         let keyring = CardanoKeyring::new_for_testing().unwrap();
-        let message = b"test message";
-        
-        let signature = keyring.sign(message);
-        
-        // Verify signature format
-        assert_eq!(signature.to_bytes().len(), 64);
-        
-        // Verify the public key is valid
-        let vkey = keyring.verifying_key();
-        assert_eq!(vkey.as_bytes().len(), 32);
+
+        let unsigned = unsigned_tx_fixture(1);
+        let signed = sign_transaction(&unsigned, &keyring).unwrap();
+        let signed_tx: MintedTx<'_> = minicbor::decode(&signed).unwrap();
+
+        let witnesses = signed_tx
+            .transaction_witness_set
+            .vkeywitness
+            .clone()
+            .expect("expected vkey witness set")
+            .to_vec();
+
+        assert_eq!(witnesses.len(), 2);
+    }
+
+    #[test]
+    fn sign_transaction_rejects_invalid_cbor() {
+        let keyring = CardanoKeyring::new_for_testing().unwrap();
+
+        let err = sign_transaction(&[0xff], &keyring).unwrap_err();
+        assert!(matches!(err, Error::CborDecode(_)));
     }
 }
-

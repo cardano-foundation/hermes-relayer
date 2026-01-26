@@ -149,9 +149,12 @@ impl CardanoChainEndpoint {
         &self,
         included_height: ICSHeight,
     ) -> Result<ICSHeight, Error> {
-        let poll_interval = std::time::Duration::from_secs(5);
-        let timeout = std::time::Duration::from_secs(180);
+        let poll_interval = self.config.mithril_poll_interval;
+        let timeout = self.config.mithril_certification_timeout;
+        let log_interval = self.config.mithril_wait_log_interval;
         let start = tokio::time::Instant::now();
+        let mut last_logged_elapsed = std::time::Duration::from_secs(0);
+        let mut last_latest_height: Option<u64> = None;
 
         loop {
             let latest = self
@@ -172,19 +175,45 @@ impl CardanoChainEndpoint {
                 return Ok(latest);
             }
 
-            if start.elapsed() >= timeout {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
                 return Err(Error::send_tx(format!(
-                    "timed out waiting for Mithril-certified height >= {} (latest={})",
-                    included_height, latest
+                    "timed out waiting for Mithril-certified height >= {} (latest={}). \
+                     Note: for Cardano, Height.revision_height is a Mithril snapshot block_number (not a slot).",
+                    included_height, latest,
                 )));
             }
 
-            tracing::debug!(
-                "Waiting for Mithril snapshot: need >= {}, have {}, elapsed={}s",
-                included_height,
-                latest,
-                start.elapsed().as_secs()
-            );
+            let latest_height = latest.revision_height();
+            let required_height = included_height.revision_height();
+            let missing_blocks = required_height.saturating_sub(latest_height);
+
+            let latest_changed = last_latest_height
+                .map(|prev| prev != latest_height)
+                .unwrap_or(true);
+            let should_log = latest_changed || elapsed.saturating_sub(last_logged_elapsed) >= log_interval;
+
+            if should_log {
+                let remaining = timeout.saturating_sub(elapsed);
+                let log_msg = format!(
+                    "Waiting for Mithril snapshot: need >= {} (missing {} blocks), have {}, elapsed={}s, remaining={}s",
+                    included_height,
+                    missing_blocks,
+                    latest,
+                    elapsed.as_secs(),
+                    remaining.as_secs(),
+                );
+
+                if remaining <= log_interval {
+                    tracing::warn!("{log_msg}");
+                } else {
+                    tracing::info!("{log_msg}");
+                }
+
+                last_logged_elapsed = elapsed;
+            }
+
+            last_latest_height = Some(latest_height);
             tokio::time::sleep(poll_interval).await;
         }
     }

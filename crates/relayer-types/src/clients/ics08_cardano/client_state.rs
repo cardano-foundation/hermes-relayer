@@ -201,3 +201,56 @@ impl From<ClientState> for Any {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use test_log::test;
+
+    fn raw_protocol_parameters() -> raw::MithrilProtocolParameters {
+        raw::MithrilProtocolParameters { k: 1, m: 2, phi_f: None }
+    }
+
+    fn raw_client_state() -> raw::ClientState {
+        raw::ClientState {
+            chain_id: "chain-1".to_string(),
+            latest_height: Some(raw::Height {
+                revision_number: 0,
+                revision_height: 10,
+            }),
+            frozen_height: None,
+            current_epoch: 0,
+            trusting_period: Some(ibc_proto::google::protobuf::Duration {
+                seconds: 3600,
+                nanos: 0,
+            }),
+            protocol_parameters: Some(raw_protocol_parameters()),
+            upgrade_path: vec![],
+            host_state_nft_policy_id: vec![0; 28],
+            host_state_nft_token_name: b"host_state_nft".to_vec(),
+        }
+    }
+
+    #[test]
+    fn mithril_client_state_any_roundtrip() {
+        let state = ClientState::try_from(raw_client_state()).unwrap();
+        let any: Any = state.clone().into();
+        let decoded = ClientState::try_from(any).unwrap();
+
+        assert_eq!(decoded, state);
+        assert_eq!(decoded.latest_height.revision_number(), 0);
+        assert_eq!(decoded.latest_height.revision_height(), 10);
+    }
+
+    #[test]
+    fn mithril_client_state_invalid_policy_id_length_fails() {
+        let mut raw = raw_client_state();
+        raw.host_state_nft_policy_id = vec![0; 27];
+
+        let err = ClientState::try_from(raw).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid field host_state_nft_policy_id: expected 28 bytes, got 27"));
+    }
+}

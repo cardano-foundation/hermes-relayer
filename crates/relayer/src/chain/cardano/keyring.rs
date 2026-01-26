@@ -165,7 +165,6 @@ mod tests {
     fn test_from_bech32_key() {
         let key = "ed25519_sk1rvgjxs8sddhl46uqtv862s53vu4jf6lnk63rcn7f0qwzyq85wnlqgrsx42";
         let result = CardanoKeyring::from_bech32_key(key);
-        println!("Result: {:?}", result);
         assert!(result.is_ok(), "Failed to load from bech32 key: {:?}", result.err());
     }
 }

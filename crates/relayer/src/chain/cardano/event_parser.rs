@@ -1,9 +1,9 @@
-// Event parsing for Cardano Gateway events -> Hermes IbcEvent conversion
-//
-// The Gateway returns events in the format:
-// Event { type: "create_client", attributes: [{ key: "client_id", value: "08-cardano-0" }, ...] }
-//
-// We need to convert these to Hermes's IbcEvent enum variants.
+//! Event parsing for Cardano Gateway events -> Hermes `IbcEvent` conversion.
+//!
+//! The Gateway returns events in the format:
+//! `Event { type: "create_client", attributes: [{ key: "client_id", value: "08-cardano-0" }, ...] }`
+//!
+//! This module converts them into Hermes' `IbcEvent` enum variants.
 
 use ibc_relayer_types::{
     core::{

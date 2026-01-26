@@ -132,3 +132,55 @@ impl From<ConsensusState> for Any {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use test_log::test;
+
+    fn raw_certificate() -> raw::MithrilCertificate {
+        raw::MithrilCertificate {
+            hash: "cert_hash".to_string(),
+            previous_hash: "".to_string(),
+            epoch: 0,
+            signed_entity_type: None,
+            metadata: None,
+            protocol_message: None,
+            signed_message: "".to_string(),
+            aggregate_verification_key: "".to_string(),
+            multi_signature: "".to_string(),
+            genesis_signature: "".to_string(),
+        }
+    }
+
+    fn raw_consensus_state() -> raw::ConsensusState {
+        raw::ConsensusState {
+            timestamp: 1,
+            first_cert_hash_latest_epoch: Some(raw_certificate()),
+            latest_cert_hash_tx_snapshot: "latest".to_string(),
+            ibc_state_root: vec![0u8; 32],
+        }
+    }
+
+    #[test]
+    fn mithril_consensus_state_any_roundtrip() {
+        let state = ConsensusState::try_from(raw_consensus_state()).unwrap();
+        let any: Any = state.clone().into();
+        let decoded = ConsensusState::try_from(any).unwrap();
+
+        assert_eq!(decoded, state);
+        assert_eq!(decoded.root.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn mithril_consensus_state_invalid_root_length_fails() {
+        let mut raw = raw_consensus_state();
+        raw.ibc_state_root = vec![0u8; 31];
+
+        let err = ConsensusState::try_from(raw).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid field ibc_state_root: expected 32 bytes, got 31"));
+    }
+}

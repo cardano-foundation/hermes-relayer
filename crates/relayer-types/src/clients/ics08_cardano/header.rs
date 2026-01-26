@@ -179,3 +179,90 @@ impl From<Header> for Any {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use test_log::test;
+
+    fn raw_protocol_parameters() -> raw::MithrilProtocolParameters {
+        raw::MithrilProtocolParameters { k: 1, m: 2, phi_f: None }
+    }
+
+    fn raw_certificate(sealed_at: &str) -> raw::MithrilCertificate {
+        raw::MithrilCertificate {
+            hash: "cert_hash".to_string(),
+            previous_hash: "".to_string(),
+            epoch: 0,
+            signed_entity_type: None,
+            metadata: Some(raw::CertificateMetadata {
+                network: "testnet".to_string(),
+                protocol_version: "v1".to_string(),
+                protocol_parameters: Some(raw_protocol_parameters()),
+                initiated_at: "2024-01-01T00:00:00Z".to_string(),
+                sealed_at: sealed_at.to_string(),
+                signers: vec![],
+            }),
+            protocol_message: None,
+            signed_message: "".to_string(),
+            aggregate_verification_key: "".to_string(),
+            multi_signature: "".to_string(),
+            genesis_signature: "".to_string(),
+        }
+    }
+
+    fn raw_stake_distribution() -> raw::MithrilStakeDistribution {
+        raw::MithrilStakeDistribution {
+            epoch: 0,
+            signers_with_stake: vec![],
+            hash: "stake_dist_hash".to_string(),
+            certificate_hash: "stake_dist_cert_hash".to_string(),
+            created_at: 0,
+            protocol_parameter: Some(raw_protocol_parameters()),
+        }
+    }
+
+    fn raw_header(block_number: u64) -> raw::MithrilHeader {
+        raw::MithrilHeader {
+            mithril_stake_distribution: Some(raw_stake_distribution()),
+            mithril_stake_distribution_certificate: Some(raw_certificate("2024-01-01T00:00:00Z")),
+            transaction_snapshot: Some(raw::CardanoTransactionSnapshot {
+                merkle_root: "merkle_root".to_string(),
+                epoch: 0,
+                block_number,
+                hash: "tx_snapshot_hash".to_string(),
+                certificate_hash: "tx_snapshot_cert_hash".to_string(),
+                created_at: "2024-01-01T00:00:00Z".to_string(),
+            }),
+            transaction_snapshot_certificate: Some(raw_certificate("2024-01-01T00:00:00Z")),
+            previous_mithril_stake_distribution_certificates: vec![],
+            host_state_tx_hash: "host_state_tx_hash".to_string(),
+            host_state_tx_body_cbor: vec![0x01],
+            host_state_tx_output_index: 0,
+            host_state_tx_proof: vec![0x02],
+        }
+    }
+
+    #[test]
+    fn mithril_header_any_roundtrip() {
+        let header = Header::try_from(raw_header(10)).unwrap();
+        let any: Any = header.clone().into();
+        let decoded = Header::try_from(any).unwrap();
+
+        assert_eq!(decoded, header);
+        assert_eq!(decoded.height.revision_number(), 0);
+        assert_eq!(decoded.height.revision_height(), 10);
+    }
+
+    #[test]
+    fn mithril_header_missing_transaction_snapshot_fails() {
+        let mut raw = raw_header(10);
+        raw.transaction_snapshot = None;
+
+        let err = Header::try_from(raw).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("missing required field: transaction_snapshot"));
+    }
+}
