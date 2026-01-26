@@ -10,10 +10,7 @@ use abscissa_core::{Command, Runnable};
 use eyre::eyre;
 use hdpath::StandardHDPath;
 use ibc_relayer::{
-    chain::{
-        cardano::signing_key_pair::CardanoSigningKeyPair,
-        namada::wallet::CliWalletUtils,
-    },
+    chain::{cardano::signing_key_pair::CardanoSigningKeyPair, namada::wallet::CliWalletUtils},
     config::{ChainConfig, Config},
     keyring::{
         AnySigningKeyPair, KeyRing, NamadaKeyPair, Secp256k1KeyPair, SigningKeyPair,
@@ -329,7 +326,7 @@ pub fn restore_key(
                 &mnemonic_content,
                 hdpath,
                 &ibc_relayer::config::AddressType::Cosmos, // Not used for Cardano
-                "cardano", // Not used for Cardano
+                "cardano",                                 // Not used for Cardano
             )?;
 
             keyring.add_key(key_name, key_pair.clone())?;

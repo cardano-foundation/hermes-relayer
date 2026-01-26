@@ -7,8 +7,8 @@ use ibc_relayer_types::core::ics24_host::identifier::ChainId;
 
 use crate::{
     chain::{
-        cardano::CardanoChain, cosmos::CosmosSdkChain, handle::ChainHandle,
-        namada::NamadaChain, penumbra::PenumbraChain, runtime::ChainRuntime,
+        cardano::CardanoChain, cosmos::CosmosSdkChain, handle::ChainHandle, namada::NamadaChain,
+        penumbra::PenumbraChain, runtime::ChainRuntime,
     },
     config::{ChainConfig, Config},
     error::Error as RelayerError,

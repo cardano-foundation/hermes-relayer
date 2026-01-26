@@ -7,7 +7,7 @@ use ibc_proto::google::protobuf::Any;
 use ibc_proto::Protobuf;
 
 use crate::clients::ics08_cardano::error::Error;
-use crate::clients::ics08_cardano::raw as raw;
+use crate::clients::ics08_cardano::raw;
 use crate::core::ics02_client::client_state::ClientState as Ics2ClientState;
 use crate::core::ics02_client::client_type::ClientType;
 use crate::core::ics02_client::error::Error as Ics02Error;
@@ -86,8 +86,8 @@ impl TryFrom<RawClientState> for ClientState {
             .and_then(|d| duration_from_proto(d).ok())
             .ok_or_else(|| Error::missing_field("trusting_period"))?;
 
-        let protocol_parameters = protocol_parameters
-            .ok_or_else(|| Error::missing_field("protocol_parameters"))?;
+        let protocol_parameters =
+            protocol_parameters.ok_or_else(|| Error::missing_field("protocol_parameters"))?;
 
         if host_state_nft_policy_id.is_empty() {
             return Err(Error::missing_field("host_state_nft_policy_id"));
@@ -96,10 +96,7 @@ impl TryFrom<RawClientState> for ClientState {
         if host_state_nft_policy_id.len() != 28 {
             return Err(Error::invalid_field(
                 "host_state_nft_policy_id",
-                format!(
-                    "expected 28 bytes, got {}",
-                    host_state_nft_policy_id.len()
-                ),
+                format!("expected 28 bytes, got {}", host_state_nft_policy_id.len()),
             ));
         }
 
@@ -156,13 +153,11 @@ impl From<Height> for RawHeight {
 }
 
 fn duration_from_proto(d: ibc_proto::google::protobuf::Duration) -> Result<Duration, Error> {
-    let secs = u64::try_from(d.seconds).map_err(|_| {
-        Error::timestamp_conversion("negative duration seconds".to_string())
-    })?;
+    let secs = u64::try_from(d.seconds)
+        .map_err(|_| Error::timestamp_conversion("negative duration seconds".to_string()))?;
 
-    let nanos = u32::try_from(d.nanos).map_err(|_| {
-        Error::timestamp_conversion("negative duration nanos".to_string())
-    })?;
+    let nanos = u32::try_from(d.nanos)
+        .map_err(|_| Error::timestamp_conversion("negative duration nanos".to_string()))?;
 
     Ok(Duration::new(secs, nanos))
 }
@@ -183,11 +178,15 @@ impl TryFrom<Any> for ClientState {
         use core::ops::Deref;
 
         fn decode_state(bytes: &[u8]) -> Result<ClientState, Error> {
-            RawClientState::decode(bytes).map_err(Error::decode)?.try_into()
+            RawClientState::decode(bytes)
+                .map_err(Error::decode)?
+                .try_into()
         }
 
         match raw_any.type_url.as_str() {
-            MITHRIL_CLIENT_STATE_TYPE_URL => decode_state(raw_any.value.deref()).map_err(Into::into),
+            MITHRIL_CLIENT_STATE_TYPE_URL => {
+                decode_state(raw_any.value.deref()).map_err(Into::into)
+            }
             _ => Err(Ics02Error::unknown_client_state_type(raw_any.type_url)),
         }
     }
@@ -209,7 +208,11 @@ mod tests {
     use test_log::test;
 
     fn raw_protocol_parameters() -> raw::MithrilProtocolParameters {
-        raw::MithrilProtocolParameters { k: 1, m: 2, phi_f: None }
+        raw::MithrilProtocolParameters {
+            k: 1,
+            m: 2,
+            phi_f: None,
+        }
     }
 
     fn raw_client_state() -> raw::ClientState {

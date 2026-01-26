@@ -12,23 +12,24 @@ use ibc_relayer_types::clients::ics08_cardano::{
     consensus_state::ConsensusState as MithrilConsensusState,
 };
 
-use std::sync::Arc;
 use crate::account::Balance;
 use crate::chain::client::ClientSettings;
+use crate::chain::cosmos::version::Specs as CosmosSpecs;
 use crate::chain::endpoint::{ChainEndpoint, ChainStatus, HealthCheck};
 use crate::chain::handle::Subscription;
 use crate::chain::requests::{
-    CrossChainQueryRequest, IncludeProof, QueryChannelClientStateRequest,
-    QueryChannelRequest, QueryChannelsRequest, QueryClientConnectionsRequest, QueryClientStateRequest,
-    QueryClientStatesRequest, QueryConnectionChannelsRequest, QueryConnectionRequest, QueryConnectionsRequest,
-    QueryConsensusStateHeightsRequest, QueryConsensusStateRequest, QueryHostConsensusStateRequest,
-    QueryNextSequenceReceiveRequest, QueryPacketAcknowledgementRequest, QueryPacketAcknowledgementsRequest,
+    CrossChainQueryRequest, IncludeProof, QueryChannelClientStateRequest, QueryChannelRequest,
+    QueryChannelsRequest, QueryClientConnectionsRequest, QueryClientStateRequest,
+    QueryClientStatesRequest, QueryConnectionChannelsRequest, QueryConnectionRequest,
+    QueryConnectionsRequest, QueryConsensusStateHeightsRequest, QueryConsensusStateRequest,
+    QueryHostConsensusStateRequest, QueryNextSequenceReceiveRequest,
+    QueryPacketAcknowledgementRequest, QueryPacketAcknowledgementsRequest,
     QueryPacketCommitmentRequest, QueryPacketCommitmentsRequest, QueryPacketEventDataRequest,
-    QueryPacketReceiptRequest, QueryTxRequest, QueryUnreceivedAcksRequest, QueryUnreceivedPacketsRequest,
-    QueryUpgradedClientStateRequest, QueryUpgradedConsensusStateRequest,
+    QueryPacketReceiptRequest, QueryTxRequest, QueryUnreceivedAcksRequest,
+    QueryUnreceivedPacketsRequest, QueryUpgradedClientStateRequest,
+    QueryUpgradedConsensusStateRequest,
 };
 use crate::chain::tracking::TrackedMsgs;
-use crate::chain::cosmos::version::Specs as CosmosSpecs;
 use crate::chain::version::Specs;
 use crate::client_state::{AnyClientState, IdentifiedAnyClientState};
 use crate::config::{ChainConfig, Error as ConfigError};
@@ -47,10 +48,13 @@ use ibc_relayer_types::core::ics04_channel::packet::Sequence;
 use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentPrefix;
 use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentRoot;
 use ibc_relayer_types::core::ics23_commitment::merkle::MerkleProof;
-use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ChannelId, ClientId, ConnectionId, PortId};
+use ibc_relayer_types::core::ics24_host::identifier::{
+    ChainId, ChannelId, ClientId, ConnectionId, PortId,
+};
 use ibc_relayer_types::signer::Signer;
-use std::str::FromStr;
 use ibc_relayer_types::Height as ICSHeight;
+use std::str::FromStr;
+use std::sync::Arc;
 use tendermint_rpc::endpoint::broadcast::tx_sync::Response as TxResponse;
 use tokio::runtime::Runtime as TokioRuntime;
 
@@ -78,25 +82,32 @@ impl CardanoChainEndpoint {
     /// Sign a transaction using the keyring (private helper method)
     fn sign_transaction_helper(&self, unsigned_cbor_hex: &str) -> Result<String, Error> {
         use super::signer;
-        
+
         // Convert hex to bytes
         let unsigned_tx_bytes = hex::decode(unsigned_cbor_hex)
             .map_err(|e| Error::send_tx(format!("Failed to decode unsigned tx hex: {}", e)))?;
-        
+
         // Get signing key from keyring
-        let key = self.keyring.get_key(&self.config.key_name)
+        let key = self
+            .keyring
+            .get_key(&self.config.key_name)
             .map_err(|e| Error::key_base(e))?;
-        
+
         // Get the CardanoSigningKeyPair and extract the CardanoKeyring
-        let signing_key_pair = key.as_any().downcast_ref::<CardanoSigningKeyPair>()
-            .ok_or_else(|| Error::send_tx("Failed to downcast to CardanoSigningKeyPair".to_string()))?;
-        let cardano_keyring = signing_key_pair.get_cardano_keyring()
+        let signing_key_pair = key
+            .as_any()
+            .downcast_ref::<CardanoSigningKeyPair>()
+            .ok_or_else(|| {
+                Error::send_tx("Failed to downcast to CardanoSigningKeyPair".to_string())
+            })?;
+        let cardano_keyring = signing_key_pair
+            .get_cardano_keyring()
             .map_err(|e| Error::send_tx(format!("Failed to get CardanoKeyring: {}", e)))?;
-        
+
         // Sign the transaction
         let signed_tx_bytes = signer::sign_transaction(&unsigned_tx_bytes, &cardano_keyring)
             .map_err(|e| Error::send_tx(format!("Failed to sign transaction: {}", e)))?;
-        
+
         // Convert back to hex
         Ok(hex::encode(signed_tx_bytes))
     }
@@ -106,24 +117,30 @@ impl CardanoChainEndpoint {
         use super::event_source::CardanoEventSource;
         use std::thread;
         use std::time::Duration;
-        
+
         tracing::info!("Initializing Cardano event source with polling");
-        
+
         // Get poll interval from config (default 5 seconds)
-        let poll_interval = self.config.event_poll_interval
+        let poll_interval = self
+            .config
+            .event_poll_interval
             .unwrap_or_else(|| Duration::from_secs(5));
-        
+
         let (event_source, monitor_tx) = CardanoEventSource::new(
             self.config.id.clone(),
             self.gateway_client.clone(),
             poll_interval,
             self.rt.clone(),
-        ).map_err(Error::event_source)?;
-        
+        )
+        .map_err(Error::event_source)?;
+
         thread::spawn(move || event_source.run());
-        
-        tracing::info!("Event source initialized, polling every {:?}", poll_interval);
-        
+
+        tracing::info!(
+            "Event source initialized, polling every {:?}",
+            poll_interval
+        );
+
         Ok(monitor_tx)
     }
 
@@ -191,7 +208,8 @@ impl CardanoChainEndpoint {
             let latest_changed = last_latest_height
                 .map(|prev| prev != latest_height)
                 .unwrap_or(true);
-            let should_log = latest_changed || elapsed.saturating_sub(last_logged_elapsed) >= log_interval;
+            let should_log =
+                latest_changed || elapsed.saturating_sub(last_logged_elapsed) >= log_interval;
 
             if should_log {
                 let remaining = timeout.saturating_sub(elapsed);
@@ -237,7 +255,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn bootstrap(config: ChainConfig, rt: Arc<TokioRuntime>) -> Result<Self, Error> {
         tracing::info!("Bootstrapping Cardano chain endpoint");
-        
+
         // Extract Cardano-specific config
         let cardano_config: CardanoConfig = match config {
             ChainConfig::Cardano(config) => config,
@@ -312,9 +330,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             ))
         })?;
 
-        let subscription = event_source_cmd
-            .subscribe()
-            .map_err(Error::event_source)?;
+        let subscription = event_source_cmd.subscribe().map_err(Error::event_source)?;
         Ok(subscription)
     }
 
@@ -336,15 +352,16 @@ impl ChainEndpoint for CardanoChainEndpoint {
         let address = cardano_keyring.address(self.config.network_id);
 
         Signer::from_str(&address).map_err(|e| {
-            Error::key_base(crate::keyring::errors::Error::invalid_mnemonic(anyhow::anyhow!(
-                "Invalid signer address: {e}"
-            )))
+            Error::key_base(crate::keyring::errors::Error::invalid_mnemonic(
+                anyhow::anyhow!("Invalid signer address: {e}"),
+            ))
         })
     }
 
     fn get_key(&self) -> Result<Self::SigningKeyPair, Error> {
         // Get the signing key pair from keyring
-        self.keyring.get_key(&self.config.key_name)
+        self.keyring
+            .get_key(&self.config.key_name)
             .map_err(Error::key_base)
     }
 
@@ -362,38 +379,44 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &mut self,
         tracked_msgs: TrackedMsgs,
     ) -> Result<Vec<IbcEventWithHeight>, Error> {
-        tracing::info!("send_messages_and_wait_commit: processing {} messages", tracked_msgs.msgs.len());
-        
+        tracing::info!(
+            "send_messages_and_wait_commit: processing {} messages",
+            tracked_msgs.msgs.len()
+        );
+
         // Block on async operations using the runtime
         self.rt.block_on(async {
             let mut all_events = Vec::new();
-            
+
             for msg in tracked_msgs.msgs.iter() {
                 tracing::debug!("Processing message type: {:?}", msg.type_url);
-                
+
                 // Step 1: Build unsigned transaction via Gateway
-                let unsigned_tx = self.gateway_client
+                let unsigned_tx = self
+                    .gateway_client
                     .build_ibc_tx(&msg.type_url, msg.value.clone())
                     .await
                     .map_err(|e| Error::send_tx(format!("Failed to build transaction: {}", e)))?;
-                
+
                 tracing::debug!("Built unsigned tx: {}", unsigned_tx.description);
-                
+
                 // Step 2: Sign transaction with keyring
                 let signed_cbor_hex = self.sign_transaction_helper(&unsigned_tx.cbor_hex)?;
-                
+
                 tracing::debug!("Signed transaction, CBOR length: {}", signed_cbor_hex.len());
-                
+
                 // Step 3: Submit signed transaction via Gateway
-                let tx_response = self.gateway_client
+                let tx_response = self
+                    .gateway_client
                     .submit_signed_tx(&signed_cbor_hex)
                     .await
                     .map_err(|e| Error::send_tx(format!("Failed to submit transaction: {}", e)))?;
-                
+
                 // Step 4: Parse events from transaction result
-                let included_height = tx_response.height
-                    .ok_or_else(|| Error::send_tx("No height in transaction response".to_string()))?;
-                
+                let included_height = tx_response.height.ok_or_else(|| {
+                    Error::send_tx("No height in transaction response".to_string())
+                })?;
+
                 tracing::info!(
                     "Transaction submitted: {} at height {}",
                     tx_response.tx_hash,
@@ -402,7 +425,9 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
                 // Ensure the transaction is also covered by the latest Mithril transaction snapshot
                 // before we treat it as "committed" from the perspective of IBC relaying.
-                let certified_height = self.wait_for_mithril_certified_height(included_height).await?;
+                let certified_height = self
+                    .wait_for_mithril_certified_height(included_height)
+                    .await?;
                 if certified_height.revision_height() != included_height.revision_height() {
                     tracing::info!(
                         "Transaction {} inclusion height {} is now certified at {}",
@@ -411,43 +436,52 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         certified_height
                     );
                 }
-                
+
                 // Log all events for debugging
                 for event in &tx_response.events {
-                    tracing::debug!("Gateway event: type={} attributes={:?}", event.event_type, event.attributes);
+                    tracing::debug!(
+                        "Gateway event: type={} attributes={:?}",
+                        event.event_type,
+                        event.attributes
+                    );
                 }
-                
+
                 // Convert custom IbcEvent to proto Event format for parsing
-                let proto_events: Vec<super::generated::ibc::cardano::v1::Event> = tx_response.events
+                let proto_events: Vec<super::generated::ibc::cardano::v1::Event> = tx_response
+                    .events
                     .into_iter()
                     .map(|e| super::generated::ibc::cardano::v1::Event {
                         r#type: e.event_type,
-                        attributes: e.attributes
+                        attributes: e
+                            .attributes
                             .into_iter()
-                            .map(|(k, v)| super::generated::ibc::cardano::v1::EventAttribute {
-                                key: k,
-                                value: v,
-                            })
+                            .map(
+                                |(k, v)| super::generated::ibc::cardano::v1::EventAttribute {
+                                    key: k,
+                                    value: v,
+                                },
+                            )
                             .collect(),
                     })
                     .collect();
-                
+
                 // Parse Gateway events into Hermes IbcEvent types
-                let parsed_events = super::event_parser::parse_events(proto_events, certified_height)
-                    .map_err(|e| Error::send_tx(format!("Failed to parse events: {}", e)))?;
-                
+                let parsed_events =
+                    super::event_parser::parse_events(proto_events, certified_height)
+                        .map_err(|e| Error::send_tx(format!("Failed to parse events: {}", e)))?;
+
                 tracing::info!("Parsed {} IBC events from transaction", parsed_events.len());
-                
+
                 // Wrap events with height
                 let events_with_height: Vec<IbcEventWithHeight> = parsed_events
                     .into_iter()
                     .map(|event| IbcEventWithHeight::new(event, certified_height))
                     .collect();
-                
+
                 // Add parsed events to result
                 all_events.extend(events_with_height);
             }
-            
+
             Ok(all_events)
         })
     }
@@ -536,7 +570,9 @@ impl ChainEndpoint for CardanoChainEndpoint {
         let header = self
             .rt
             .block_on(self.gateway_client.query_header(target))
-            .map_err(|e| Error::query(format!("failed to query Cardano header from Gateway: {e}")))?;
+            .map_err(|e| {
+                Error::query(format!("failed to query Cardano header from Gateway: {e}"))
+            })?;
 
         let (host_state_nft_policy_id, host_state_nft_token_name) = match client_state {
             AnyClientState::Mithril(state) => (
@@ -597,14 +633,16 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
         tracing::debug!("Querying Cardano application status via Gateway");
-        
+
         // Query latest height from Gateway
-        let height = self.rt.block_on(self.gateway_client.query_latest_height())
+        let height = self
+            .rt
+            .block_on(self.gateway_client.query_latest_height())
             .map_err(|e| {
                 tracing::error!("Failed to query latest height: {}", e);
                 Error::query(format!("Gateway query_latest_height failed: {}", e))
             })?;
-        
+
         tracing::info!("Cardano chain at height: {}", height);
 
         let timestamp = match self.rt.block_on(self.gateway_client.query_header(height)) {
@@ -616,11 +654,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 tendermint::Time::now().into()
             }
         };
-        
-        Ok(ChainStatus {
-            height,
-            timestamp,
-        })
+
+        Ok(ChainStatus { height, timestamp })
     }
 
     fn query_clients(
@@ -628,7 +663,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         _request: QueryClientStatesRequest,
     ) -> Result<Vec<IdentifiedAnyClientState>, Error> {
         tracing::debug!("Querying all clients");
-        
+
         // Block on async operation
         self.rt.block_on(async {
             // Query clients from Gateway
@@ -636,14 +671,14 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 .query_clients()
                 .await
                 .map_err(|e| Error::query(format!("Failed to query clients: {}", e)))?;
-            
+
             // Decode the response
             use prost::Message;
             use ibc_proto::ibc::core::client::v1::QueryClientStatesResponse;
-            
+
             let response = QueryClientStatesResponse::decode(&response_bytes[..])
                 .map_err(|e| Error::query(format!("Failed to decode clients response: {}", e)))?;
-            
+
             // Convert proto client states to domain types, filtering out unsupported types
             let clients: Vec<IdentifiedAnyClientState> = response
                 .client_states
@@ -668,7 +703,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         .ok()
                 })
                 .collect();
-            
+
             Ok(clients)
         })
     }
@@ -679,10 +714,13 @@ impl ChainEndpoint for CardanoChainEndpoint {
         include_proof: IncludeProof,
     ) -> Result<(AnyClientState, Option<MerkleProof>), Error> {
         tracing::debug!("Querying client state for: {}", request.client_id);
-        
+
         let response = self
             .rt
-            .block_on(self.gateway_client.query_client_state(request.client_id.as_str()))
+            .block_on(
+                self.gateway_client
+                    .query_client_state(request.client_id.as_str()),
+            )
             .map_err(|e| {
                 tracing::error!("Failed to query client state: {}", e);
                 Error::query(format!("Gateway query_client_state failed: {}", e))
@@ -692,13 +730,13 @@ impl ChainEndpoint for CardanoChainEndpoint {
             .client_state
             .ok_or_else(|| Error::query("No client_state in response".to_string()))?;
 
-        let any_client_state: AnyClientState =
-            AnyClientState::try_from(client_state_any.clone()).map_err(|e| {
-                Error::query(format!(
-                    "Failed to decode client state {}: {e}",
-                    client_state_any.type_url
-                ))
-            })?;
+        let any_client_state: AnyClientState = AnyClientState::try_from(client_state_any.clone())
+            .map_err(|e| {
+            Error::query(format!(
+                "Failed to decode client state {}: {e}",
+                client_state_any.type_url
+            ))
+        })?;
 
         let proof = if include_proof == IncludeProof::Yes && !response.proof.is_empty() {
             use ibc_proto::ibc::core::commitment::v1::MerkleProof as RawMerkleProof;
@@ -710,7 +748,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         } else {
             None
         };
-        
+
         Ok((any_client_state, proof))
     }
 
@@ -724,13 +762,13 @@ impl ChainEndpoint for CardanoChainEndpoint {
             request.client_id,
             request.consensus_height
         );
-        
+
         let response = self
             .rt
-            .block_on(self.gateway_client.query_consensus_state(
-                request.client_id.as_str(),
-                request.consensus_height,
-            ))
+            .block_on(
+                self.gateway_client
+                    .query_consensus_state(request.client_id.as_str(), request.consensus_height),
+            )
             .map_err(|e| {
                 tracing::error!("Failed to query consensus state: {}", e);
                 Error::query(format!("Gateway query_consensus_state failed: {}", e))
@@ -758,7 +796,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         } else {
             None
         };
-        
+
         Ok((any_consensus_state, proof))
     }
 
@@ -854,22 +892,24 @@ impl ChainEndpoint for CardanoChainEndpoint {
         _request: QueryConnectionsRequest,
     ) -> Result<Vec<IdentifiedConnectionEnd>, Error> {
         tracing::debug!("Querying all connections");
-        
+
         // Block on async operation
         self.rt.block_on(async {
             // Query connections from Gateway
-            let response_bytes = self.gateway_client
+            let response_bytes = self
+                .gateway_client
                 .query_connections()
                 .await
                 .map_err(|e| Error::query(format!("Failed to query connections: {}", e)))?;
-            
+
             // Decode the response
-            use prost::Message;
             use ibc_proto::ibc::core::connection::v1::QueryConnectionsResponse;
-            
-            let response = QueryConnectionsResponse::decode(&response_bytes[..])
-                .map_err(|e| Error::query(format!("Failed to decode connections response: {}", e)))?;
-            
+            use prost::Message;
+
+            let response = QueryConnectionsResponse::decode(&response_bytes[..]).map_err(|e| {
+                Error::query(format!("Failed to decode connections response: {}", e))
+            })?;
+
             // Convert proto connections to domain types, filtering out parsing errors
             let connections: Vec<IdentifiedConnectionEnd> = response
                 .connections
@@ -879,13 +919,14 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         .map_err(|e| {
                             tracing::warn!(
                                 "Connection with ID {} failed parsing. Error: {}",
-                                co.id, e
+                                co.id,
+                                e
                             );
                         })
                         .ok()
                 })
                 .collect();
-            
+
             Ok(connections)
         })
     }
@@ -895,11 +936,12 @@ impl ChainEndpoint for CardanoChainEndpoint {
         request: QueryClientConnectionsRequest,
     ) -> Result<Vec<ConnectionId>, Error> {
         tracing::debug!("Querying connections for client: {}", request.client_id);
-        
+
         // Block on async operation
         self.rt.block_on(async {
             // Query client connections from Gateway
-            let response_bytes = self.gateway_client
+            let response_bytes = self
+                .gateway_client
                 .query_client_connections(&request.client_id.to_string())
                 .await
                 .map_err(|e| {
@@ -909,15 +951,20 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     }
                     Error::query(format!("Failed to query client connections: {}", e))
                 })?;
-            
+
             // Decode the response
-            use prost::Message;
             use ibc_proto::ibc::core::connection::v1::QueryClientConnectionsResponse;
+            use prost::Message;
             use std::str::FromStr;
-            
-            let response = QueryClientConnectionsResponse::decode(&response_bytes[..])
-                .map_err(|e| Error::query(format!("Failed to decode client connections response: {}", e)))?;
-            
+
+            let response =
+                QueryClientConnectionsResponse::decode(&response_bytes[..]).map_err(|e| {
+                    Error::query(format!(
+                        "Failed to decode client connections response: {}",
+                        e
+                    ))
+                })?;
+
             // Parse connection_paths strings into ConnectionId instances
             let connection_ids: Vec<ConnectionId> = response
                 .connection_paths
@@ -927,13 +974,14 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         .map_err(|e| {
                             tracing::warn!(
                                 "Connection with ID {} failed parsing. Error: {}",
-                                id, e
+                                id,
+                                e
                             );
                         })
                         .ok()
                 })
                 .collect();
-            
+
             Ok(connection_ids)
         })
     }
@@ -944,29 +992,32 @@ impl ChainEndpoint for CardanoChainEndpoint {
         include_proof: IncludeProof,
     ) -> Result<(ConnectionEnd, Option<MerkleProof>), Error> {
         tracing::info!("Querying connection: {:?}", request.connection_id);
-        
+
         // Block on async operation
         self.rt.block_on(async {
             // Query connection from Gateway
-            let response_bytes = self.gateway_client
+            let response_bytes = self
+                .gateway_client
                 .query_connection(&request.connection_id.to_string())
                 .await
                 .map_err(|e| Error::query(format!("Failed to query connection: {}", e)))?;
-            
+
             // Decode the response
-            use prost::Message;
             use ibc_proto::ibc::core::connection::v1::QueryConnectionResponse;
-            
-            let response = QueryConnectionResponse::decode(&response_bytes[..])
-                .map_err(|e| Error::query(format!("Failed to decode connection response: {}", e)))?;
-            
-            let connection_end = response.connection
+            use prost::Message;
+
+            let response = QueryConnectionResponse::decode(&response_bytes[..]).map_err(|e| {
+                Error::query(format!("Failed to decode connection response: {}", e))
+            })?;
+
+            let connection_end = response
+                .connection
                 .ok_or_else(|| Error::query("No connection in response".to_string()))?;
-            
+
             // Convert proto ConnectionEnd to domain ConnectionEnd
             let connection = ConnectionEnd::try_from(connection_end)
                 .map_err(|e| Error::query(format!("Failed to parse ConnectionEnd: {}", e)))?;
-            
+
             // Parse proof if requested
             let proof = if matches!(include_proof, IncludeProof::Yes) {
                 if !response.proof.is_empty() {
@@ -980,7 +1031,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             } else {
                 None
             };
-            
+
             Ok((connection, proof))
         })
     }
@@ -989,23 +1040,32 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &self,
         request: QueryConnectionChannelsRequest,
     ) -> Result<Vec<IdentifiedChannelEnd>, Error> {
-        tracing::debug!("Querying channels for connection: {}", request.connection_id);
-        
+        tracing::debug!(
+            "Querying channels for connection: {}",
+            request.connection_id
+        );
+
         // Block on async operation
         self.rt.block_on(async {
             // Query connection channels from Gateway
-            let response_bytes = self.gateway_client
+            let response_bytes = self
+                .gateway_client
                 .query_connection_channels(&request.connection_id.to_string())
                 .await
                 .map_err(|e| Error::query(format!("Failed to query connection channels: {}", e)))?;
-            
+
             // Decode the response
-            use prost::Message;
             use ibc_proto::ibc::core::channel::v1::QueryConnectionChannelsResponse;
-            
-            let response = QueryConnectionChannelsResponse::decode(&response_bytes[..])
-                .map_err(|e| Error::query(format!("Failed to decode connection channels response: {}", e)))?;
-            
+            use prost::Message;
+
+            let response =
+                QueryConnectionChannelsResponse::decode(&response_bytes[..]).map_err(|e| {
+                    Error::query(format!(
+                        "Failed to decode connection channels response: {}",
+                        e
+                    ))
+                })?;
+
             // Convert proto channels to domain types, filtering out parsing errors
             let channels: Vec<IdentifiedChannelEnd> = response
                 .channels
@@ -1015,13 +1075,15 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         .map_err(|e| {
                             tracing::warn!(
                                 "Channel with port {} and ID {} failed parsing. Error: {}",
-                                ch.port_id, ch.channel_id, e
+                                ch.port_id,
+                                ch.channel_id,
+                                e
                             );
                         })
                         .ok()
                 })
                 .collect();
-            
+
             Ok(channels)
         })
     }
@@ -1031,22 +1093,23 @@ impl ChainEndpoint for CardanoChainEndpoint {
         _request: QueryChannelsRequest,
     ) -> Result<Vec<IdentifiedChannelEnd>, Error> {
         tracing::debug!("Querying all channels");
-        
+
         // Block on async operation
         self.rt.block_on(async {
             // Query channels from Gateway
-            let response_bytes = self.gateway_client
+            let response_bytes = self
+                .gateway_client
                 .query_channels()
                 .await
                 .map_err(|e| Error::query(format!("Failed to query channels: {}", e)))?;
-            
+
             // Decode the response
-            use prost::Message;
             use ibc_proto::ibc::core::channel::v1::QueryChannelsResponse;
-            
+            use prost::Message;
+
             let response = QueryChannelsResponse::decode(&response_bytes[..])
                 .map_err(|e| Error::query(format!("Failed to decode channels response: {}", e)))?;
-            
+
             // Convert proto channels to domain types, filtering out parsing errors
             let channels: Vec<IdentifiedChannelEnd> = response
                 .channels
@@ -1056,13 +1119,15 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         .map_err(|e| {
                             tracing::warn!(
                                 "Channel with port {} and ID {} failed parsing. Error: {}",
-                                ch.port_id, ch.channel_id, e
+                                ch.port_id,
+                                ch.channel_id,
+                                e
                             );
                         })
                         .ok()
                 })
                 .collect();
-            
+
             Ok(channels)
         })
     }
@@ -1072,30 +1137,39 @@ impl ChainEndpoint for CardanoChainEndpoint {
         request: QueryChannelRequest,
         include_proof: IncludeProof,
     ) -> Result<(ChannelEnd, Option<MerkleProof>), Error> {
-        tracing::info!("Querying channel: port={}, channel={}", request.port_id, request.channel_id);
-        
+        tracing::info!(
+            "Querying channel: port={}, channel={}",
+            request.port_id,
+            request.channel_id
+        );
+
         // Block on async operation
         self.rt.block_on(async {
             // Query channel from Gateway
-            let response_bytes = self.gateway_client
-                .query_channel(&request.port_id.to_string(), &request.channel_id.to_string())
+            let response_bytes = self
+                .gateway_client
+                .query_channel(
+                    &request.port_id.to_string(),
+                    &request.channel_id.to_string(),
+                )
                 .await
                 .map_err(|e| Error::query(format!("Failed to query channel: {}", e)))?;
-            
+
             // Decode the response
-            use prost::Message;
             use ibc_proto::ibc::core::channel::v1::QueryChannelResponse;
-            
+            use prost::Message;
+
             let response = QueryChannelResponse::decode(&response_bytes[..])
                 .map_err(|e| Error::query(format!("Failed to decode channel response: {}", e)))?;
-            
-            let channel_proto = response.channel
+
+            let channel_proto = response
+                .channel
                 .ok_or_else(|| Error::query("No channel in response".to_string()))?;
-            
+
             // Convert proto Channel to domain ChannelEnd
             let channel = ChannelEnd::try_from(channel_proto)
                 .map_err(|e| Error::query(format!("Failed to parse ChannelEnd: {}", e)))?;
-            
+
             // Parse proof if requested
             let proof = if matches!(include_proof, IncludeProof::Yes) {
                 if !response.proof.is_empty() {
@@ -1109,7 +1183,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             } else {
                 None
             };
-            
+
             Ok((channel, proof))
         })
     }
@@ -1134,11 +1208,15 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 .await
                 .map_err(|e| Error::query(format!("Failed to query channel client state: {e}")))?;
 
-            use prost::Message;
             use ibc_proto::ibc::core::channel::v1::QueryChannelClientStateResponse;
+            use prost::Message;
 
-            let response = QueryChannelClientStateResponse::decode(&response_bytes[..])
-                .map_err(|e| Error::query(format!("Failed to decode channel client state response: {e}")))?;
+            let response =
+                QueryChannelClientStateResponse::decode(&response_bytes[..]).map_err(|e| {
+                    Error::query(format!(
+                        "Failed to decode channel client state response: {e}"
+                    ))
+                })?;
 
             let identified = response
                 .identified_client_state
@@ -1153,24 +1231,38 @@ impl ChainEndpoint for CardanoChainEndpoint {
         request: QueryPacketCommitmentRequest,
         include_proof: IncludeProof,
     ) -> Result<(Vec<u8>, Option<MerkleProof>), Error> {
-        tracing::info!("Querying packet commitment: port={}, channel={}, sequence={}", 
-            request.port_id, request.channel_id, request.sequence);
-        
+        tracing::info!(
+            "Querying packet commitment: port={}, channel={}, sequence={}",
+            request.port_id,
+            request.channel_id,
+            request.sequence
+        );
+
         // Block on async operation
         self.rt.block_on(async {
             // Query packet commitment from Gateway
-            let response_bytes = self.gateway_client
-                .query_packet_commitment(&request.port_id.to_string(), &request.channel_id.to_string(), request.sequence.into())
+            let response_bytes = self
+                .gateway_client
+                .query_packet_commitment(
+                    &request.port_id.to_string(),
+                    &request.channel_id.to_string(),
+                    request.sequence.into(),
+                )
                 .await
                 .map_err(|e| Error::query(format!("Failed to query packet commitment: {}", e)))?;
-            
+
             // Decode the response
-            use prost::Message;
             use ibc_proto::ibc::core::channel::v1::QueryPacketCommitmentResponse;
-            
-            let response = QueryPacketCommitmentResponse::decode(&response_bytes[..])
-                .map_err(|e| Error::query(format!("Failed to decode packet commitment response: {}", e)))?;
-            
+            use prost::Message;
+
+            let response =
+                QueryPacketCommitmentResponse::decode(&response_bytes[..]).map_err(|e| {
+                    Error::query(format!(
+                        "Failed to decode packet commitment response: {}",
+                        e
+                    ))
+                })?;
+
             // Parse proof if requested
             let proof = if matches!(include_proof, IncludeProof::Yes) {
                 if !response.proof.is_empty() {
@@ -1184,7 +1276,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             } else {
                 None
             };
-            
+
             Ok((response.commitment, proof))
         })
     }
@@ -1193,37 +1285,51 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &self,
         request: QueryPacketCommitmentsRequest,
     ) -> Result<(Vec<Sequence>, ICSHeight), Error> {
-        tracing::info!("Querying packet commitments: port={}, channel={}", 
-            request.port_id, request.channel_id);
-        
+        tracing::info!(
+            "Querying packet commitments: port={}, channel={}",
+            request.port_id,
+            request.channel_id
+        );
+
         // Block on async operation
         self.rt.block_on(async {
             // Query packet commitments from Gateway
-            let response_bytes = self.gateway_client
-                .query_packet_commitments(&request.port_id.to_string(), &request.channel_id.to_string())
+            let response_bytes = self
+                .gateway_client
+                .query_packet_commitments(
+                    &request.port_id.to_string(),
+                    &request.channel_id.to_string(),
+                )
                 .await
                 .map_err(|e| Error::query(format!("Failed to query packet commitments: {}", e)))?;
-            
+
             // Decode the response
-            use prost::Message;
             use ibc_proto::ibc::core::channel::v1::QueryPacketCommitmentsResponse;
-            
-            let response = QueryPacketCommitmentsResponse::decode(&response_bytes[..])
-                .map_err(|e| Error::query(format!("Failed to decode packet commitments response: {}", e)))?;
-            
+            use prost::Message;
+
+            let response =
+                QueryPacketCommitmentsResponse::decode(&response_bytes[..]).map_err(|e| {
+                    Error::query(format!(
+                        "Failed to decode packet commitments response: {}",
+                        e
+                    ))
+                })?;
+
             // Extract sequences from packet_states
-            let sequences: Vec<Sequence> = response.commitments
+            let sequences: Vec<Sequence> = response
+                .commitments
                 .iter()
                 .map(|state| Sequence::from(state.sequence))
                 .collect();
-            
+
             // Extract height from response
-            let height = response.height
-                .ok_or_else(|| Error::query("No height in packet commitments response".to_string()))?;
-            
+            let height = response.height.ok_or_else(|| {
+                Error::query("No height in packet commitments response".to_string())
+            })?;
+
             let ics_height = ICSHeight::new(height.revision_number, height.revision_height)
                 .map_err(|e| Error::query(format!("Invalid height: {}", e)))?;
-            
+
             Ok((sequences, ics_height))
         })
     }
@@ -1233,31 +1339,42 @@ impl ChainEndpoint for CardanoChainEndpoint {
         request: QueryPacketReceiptRequest,
         include_proof: IncludeProof,
     ) -> Result<(Vec<u8>, Option<MerkleProof>), Error> {
-        tracing::info!("Querying packet receipt: port={}, channel={}, sequence={}", 
-            request.port_id, request.channel_id, request.sequence);
-        
+        tracing::info!(
+            "Querying packet receipt: port={}, channel={}, sequence={}",
+            request.port_id,
+            request.channel_id,
+            request.sequence
+        );
+
         // Block on async operation
         self.rt.block_on(async {
             // Query packet receipt from Gateway
-            let response_bytes = self.gateway_client
-                .query_packet_receipt(&request.port_id.to_string(), &request.channel_id.to_string(), request.sequence.into())
+            let response_bytes = self
+                .gateway_client
+                .query_packet_receipt(
+                    &request.port_id.to_string(),
+                    &request.channel_id.to_string(),
+                    request.sequence.into(),
+                )
                 .await
                 .map_err(|e| Error::query(format!("Failed to query packet receipt: {}", e)))?;
-            
+
             // Decode the response
-            use prost::Message;
             use ibc_proto::ibc::core::channel::v1::QueryPacketReceiptResponse;
-            
-            let response = QueryPacketReceiptResponse::decode(&response_bytes[..])
-                .map_err(|e| Error::query(format!("Failed to decode packet receipt response: {}", e)))?;
-            
+            use prost::Message;
+
+            let response =
+                QueryPacketReceiptResponse::decode(&response_bytes[..]).map_err(|e| {
+                    Error::query(format!("Failed to decode packet receipt response: {}", e))
+                })?;
+
             // The receipt is a boolean - convert to bytes
             let receipt_bytes = if response.received {
                 vec![1u8]
             } else {
                 vec![0u8]
             };
-            
+
             // Parse proof if requested
             let proof = if matches!(include_proof, IncludeProof::Yes) {
                 if !response.proof.is_empty() {
@@ -1271,7 +1388,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             } else {
                 None
             };
-            
+
             Ok((receipt_bytes, proof))
         })
     }
@@ -1280,34 +1397,48 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &self,
         request: QueryUnreceivedPacketsRequest,
     ) -> Result<Vec<Sequence>, Error> {
-        tracing::info!("Querying unreceived packets: port={}, channel={}", 
-            request.port_id, request.channel_id);
-        
+        tracing::info!(
+            "Querying unreceived packets: port={}, channel={}",
+            request.port_id,
+            request.channel_id
+        );
+
         // Block on async operation
         self.rt.block_on(async {
             // Query unreceived packets from Gateway
-            let response_bytes = self.gateway_client
+            let response_bytes = self
+                .gateway_client
                 .query_unreceived_packets(
-                    &request.port_id.to_string(), 
+                    &request.port_id.to_string(),
                     &request.channel_id.to_string(),
-                    request.packet_commitment_sequences.iter().map(|s| (*s).into()).collect()
+                    request
+                        .packet_commitment_sequences
+                        .iter()
+                        .map(|s| (*s).into())
+                        .collect(),
                 )
                 .await
                 .map_err(|e| Error::query(format!("Failed to query unreceived packets: {}", e)))?;
-            
+
             // Decode the response
-            use prost::Message;
             use ibc_proto::ibc::core::channel::v1::QueryUnreceivedPacketsResponse;
-            
-            let response = QueryUnreceivedPacketsResponse::decode(&response_bytes[..])
-                .map_err(|e| Error::query(format!("Failed to decode unreceived packets response: {}", e)))?;
-            
+            use prost::Message;
+
+            let response =
+                QueryUnreceivedPacketsResponse::decode(&response_bytes[..]).map_err(|e| {
+                    Error::query(format!(
+                        "Failed to decode unreceived packets response: {}",
+                        e
+                    ))
+                })?;
+
             // Extract sequences from response
-            let sequences: Vec<Sequence> = response.sequences
+            let sequences: Vec<Sequence> = response
+                .sequences
                 .iter()
                 .map(|s| Sequence::from(*s))
                 .collect();
-            
+
             Ok(sequences)
         })
     }
@@ -1317,24 +1448,40 @@ impl ChainEndpoint for CardanoChainEndpoint {
         request: QueryPacketAcknowledgementRequest,
         include_proof: IncludeProof,
     ) -> Result<(Vec<u8>, Option<MerkleProof>), Error> {
-        tracing::info!("Querying packet acknowledgement: port={}, channel={}, sequence={}", 
-            request.port_id, request.channel_id, request.sequence);
-        
+        tracing::info!(
+            "Querying packet acknowledgement: port={}, channel={}, sequence={}",
+            request.port_id,
+            request.channel_id,
+            request.sequence
+        );
+
         // Block on async operation
         self.rt.block_on(async {
             // Query packet acknowledgement from Gateway
-            let response_bytes = self.gateway_client
-                .query_packet_acknowledgement(&request.port_id.to_string(), &request.channel_id.to_string(), request.sequence.into())
+            let response_bytes = self
+                .gateway_client
+                .query_packet_acknowledgement(
+                    &request.port_id.to_string(),
+                    &request.channel_id.to_string(),
+                    request.sequence.into(),
+                )
                 .await
-                .map_err(|e| Error::query(format!("Failed to query packet acknowledgement: {}", e)))?;
-            
+                .map_err(|e| {
+                    Error::query(format!("Failed to query packet acknowledgement: {}", e))
+                })?;
+
             // Decode the response
-            use prost::Message;
             use ibc_proto::ibc::core::channel::v1::QueryPacketAcknowledgementResponse;
-            
+            use prost::Message;
+
             let response = QueryPacketAcknowledgementResponse::decode(&response_bytes[..])
-                .map_err(|e| Error::query(format!("Failed to decode packet acknowledgement response: {}", e)))?;
-            
+                .map_err(|e| {
+                    Error::query(format!(
+                        "Failed to decode packet acknowledgement response: {}",
+                        e
+                    ))
+                })?;
+
             // Parse proof if requested
             let proof = if matches!(include_proof, IncludeProof::Yes) {
                 if !response.proof.is_empty() {
@@ -1348,7 +1495,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             } else {
                 None
             };
-            
+
             Ok((response.acknowledgement, proof))
         })
     }
@@ -1357,37 +1504,53 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &self,
         request: QueryPacketAcknowledgementsRequest,
     ) -> Result<(Vec<Sequence>, ICSHeight), Error> {
-        tracing::info!("Querying packet acknowledgements: port={}, channel={}", 
-            request.port_id, request.channel_id);
-        
+        tracing::info!(
+            "Querying packet acknowledgements: port={}, channel={}",
+            request.port_id,
+            request.channel_id
+        );
+
         // Block on async operation
         self.rt.block_on(async {
             // Query packet acknowledgements from Gateway
-            let response_bytes = self.gateway_client
-                .query_packet_acknowledgements(&request.port_id.to_string(), &request.channel_id.to_string())
+            let response_bytes = self
+                .gateway_client
+                .query_packet_acknowledgements(
+                    &request.port_id.to_string(),
+                    &request.channel_id.to_string(),
+                )
                 .await
-                .map_err(|e| Error::query(format!("Failed to query packet acknowledgements: {}", e)))?;
-            
+                .map_err(|e| {
+                    Error::query(format!("Failed to query packet acknowledgements: {}", e))
+                })?;
+
             // Decode the response
-            use prost::Message;
             use ibc_proto::ibc::core::channel::v1::QueryPacketAcknowledgementsResponse;
-            
+            use prost::Message;
+
             let response = QueryPacketAcknowledgementsResponse::decode(&response_bytes[..])
-                .map_err(|e| Error::query(format!("Failed to decode packet acknowledgements response: {}", e)))?;
-            
+                .map_err(|e| {
+                    Error::query(format!(
+                        "Failed to decode packet acknowledgements response: {}",
+                        e
+                    ))
+                })?;
+
             // Extract sequences from acknowledgements
-            let sequences: Vec<Sequence> = response.acknowledgements
+            let sequences: Vec<Sequence> = response
+                .acknowledgements
                 .iter()
                 .map(|ack| Sequence::from(ack.sequence))
                 .collect();
-            
+
             // Extract height from response
-            let height = response.height
-                .ok_or_else(|| Error::query("No height in packet acknowledgements response".to_string()))?;
-            
+            let height = response.height.ok_or_else(|| {
+                Error::query("No height in packet acknowledgements response".to_string())
+            })?;
+
             let ics_height = ICSHeight::new(height.revision_number, height.revision_height)
                 .map_err(|e| Error::query(format!("Invalid height: {}", e)))?;
-            
+
             Ok((sequences, ics_height))
         })
     }
@@ -1396,34 +1559,50 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &self,
         request: QueryUnreceivedAcksRequest,
     ) -> Result<Vec<Sequence>, Error> {
-        tracing::info!("Querying unreceived acknowledgements: port={}, channel={}", 
-            request.port_id, request.channel_id);
-        
+        tracing::info!(
+            "Querying unreceived acknowledgements: port={}, channel={}",
+            request.port_id,
+            request.channel_id
+        );
+
         // Block on async operation
         self.rt.block_on(async {
             // Query unreceived acknowledgements from Gateway
-            let response_bytes = self.gateway_client
+            let response_bytes = self
+                .gateway_client
                 .query_unreceived_acknowledgements(
-                    &request.port_id.to_string(), 
+                    &request.port_id.to_string(),
                     &request.channel_id.to_string(),
-                    request.packet_ack_sequences.iter().map(|s| (*s).into()).collect()
+                    request
+                        .packet_ack_sequences
+                        .iter()
+                        .map(|s| (*s).into())
+                        .collect(),
                 )
                 .await
-                .map_err(|e| Error::query(format!("Failed to query unreceived acknowledgements: {}", e)))?;
-            
+                .map_err(|e| {
+                    Error::query(format!(
+                        "Failed to query unreceived acknowledgements: {}",
+                        e
+                    ))
+                })?;
+
             // Decode the response
-            use prost::Message;
             use ibc_proto::ibc::core::channel::v1::QueryUnreceivedAcksResponse;
-            
-            let response = QueryUnreceivedAcksResponse::decode(&response_bytes[..])
-                .map_err(|e| Error::query(format!("Failed to decode unreceived acks response: {}", e)))?;
-            
+            use prost::Message;
+
+            let response =
+                QueryUnreceivedAcksResponse::decode(&response_bytes[..]).map_err(|e| {
+                    Error::query(format!("Failed to decode unreceived acks response: {}", e))
+                })?;
+
             // Extract sequences from response
-            let sequences: Vec<Sequence> = response.sequences
+            let sequences: Vec<Sequence> = response
+                .sequences
                 .iter()
                 .map(|s| Sequence::from(*s))
                 .collect();
-            
+
             Ok(sequences)
         })
     }
@@ -1433,26 +1612,40 @@ impl ChainEndpoint for CardanoChainEndpoint {
         request: QueryNextSequenceReceiveRequest,
         include_proof: IncludeProof,
     ) -> Result<(Sequence, Option<MerkleProof>), Error> {
-        tracing::info!("Querying next sequence receive: port={}, channel={}", 
-            request.port_id, request.channel_id);
-        
+        tracing::info!(
+            "Querying next sequence receive: port={}, channel={}",
+            request.port_id,
+            request.channel_id
+        );
+
         // Block on async operation
         self.rt.block_on(async {
             // Query next sequence receive from Gateway
-            let response_bytes = self.gateway_client
-                .query_next_sequence_receive(&request.port_id.to_string(), &request.channel_id.to_string())
+            let response_bytes = self
+                .gateway_client
+                .query_next_sequence_receive(
+                    &request.port_id.to_string(),
+                    &request.channel_id.to_string(),
+                )
                 .await
-                .map_err(|e| Error::query(format!("Failed to query next sequence receive: {}", e)))?;
-            
+                .map_err(|e| {
+                    Error::query(format!("Failed to query next sequence receive: {}", e))
+                })?;
+
             // Decode the response
-            use prost::Message;
             use ibc_proto::ibc::core::channel::v1::QueryNextSequenceReceiveResponse;
-            
-            let response = QueryNextSequenceReceiveResponse::decode(&response_bytes[..])
-                .map_err(|e| Error::query(format!("Failed to decode next sequence receive response: {}", e)))?;
-            
+            use prost::Message;
+
+            let response =
+                QueryNextSequenceReceiveResponse::decode(&response_bytes[..]).map_err(|e| {
+                    Error::query(format!(
+                        "Failed to decode next sequence receive response: {}",
+                        e
+                    ))
+                })?;
+
             let sequence = Sequence::from(response.next_sequence_receive);
-            
+
             // Parse proof if requested
             let proof = if matches!(include_proof, IncludeProof::Yes) {
                 if !response.proof.is_empty() {
@@ -1466,7 +1659,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             } else {
                 None
             };
-            
+
             Ok((sequence, proof))
         })
     }
@@ -1667,19 +1860,23 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     .await
                     .map_err(|e| Error::query(format!("Failed to query block results: {e}")))?;
 
-                out.extend(filter_packet_events_from_block_results(&request, response.block_results, h)?);
+                out.extend(filter_packet_events_from_block_results(
+                    &request,
+                    response.block_results,
+                    h,
+                )?);
                 return Ok(out);
             }
 
-                for seq in &request.sequences {
-                    let search = self
-                        .gateway_client
-                        .query_block_search_all(
-                            request.source_channel_id.to_string(),
-                            request.destination_channel_id.to_string(),
-                            seq.to_string(),
-                            50,
-                        )
+            for seq in &request.sequences {
+                let search = self
+                    .gateway_client
+                    .query_block_search_all(
+                        request.source_channel_id.to_string(),
+                        request.destination_channel_id.to_string(),
+                        seq.to_string(),
+                        50,
+                    )
                     .await
                     .map_err(|e| Error::query(format!("Failed to search blocks: {e}")))?;
 
@@ -1704,7 +1901,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         .await
                         .map_err(|e| Error::query(format!("Failed to query block results: {e}")))?;
 
-                    out.extend(filter_packet_events_from_block_results(&request, response.block_results, h)?);
+                    out.extend(filter_packet_events_from_block_results(
+                        &request,
+                        response.block_results,
+                        h,
+                    )?);
                 }
             }
 
@@ -1726,11 +1927,17 @@ impl ChainEndpoint for CardanoChainEndpoint {
         height: ICSHeight,
         _settings: ClientSettings,
     ) -> Result<Self::ClientState, Error> {
-        tracing::info!("Building Mithril client state for Cardano at height {:?}", height);
+        tracing::info!(
+            "Building Mithril client state for Cardano at height {:?}",
+            height
+        );
 
         let response = self
             .rt
-            .block_on(self.gateway_client.query_new_client(height.revision_height()))
+            .block_on(
+                self.gateway_client
+                    .query_new_client(height.revision_height()),
+            )
             .map_err(|e| Error::query(format!("Gateway query_new_client failed: {e}")))?;
 
         let raw_any = response
@@ -1790,7 +1997,10 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // We do this by returning:
         // - `support` header at `target_height - 1`, and
         // - a final header at the latest snapshot height.
-        match self.rt.block_on(self.gateway_client.query_header(target_height)) {
+        match self
+            .rt
+            .block_on(self.gateway_client.query_header(target_height))
+        {
             Ok(header) => Ok((header, vec![])),
             Err(e) => {
                 let err_str = e.to_string();
@@ -1805,17 +2015,27 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 let proof_header = self
                     .rt
                     .block_on(self.gateway_client.query_header(proof_height))
-                    .map_err(|e| Error::query(format!("Gateway query_header failed at proof height {proof_height}: {e}")))?;
+                    .map_err(|e| {
+                        Error::query(format!(
+                            "Gateway query_header failed at proof height {proof_height}: {e}"
+                        ))
+                    })?;
 
                 let latest_height = self
                     .rt
                     .block_on(self.gateway_client.query_latest_height())
-                    .map_err(|e| Error::query(format!("Gateway query_latest_height failed: {e}")))?;
+                    .map_err(|e| {
+                        Error::query(format!("Gateway query_latest_height failed: {e}"))
+                    })?;
 
                 let latest_header = self
                     .rt
                     .block_on(self.gateway_client.query_header(latest_height))
-                    .map_err(|e| Error::query(format!("Gateway query_header failed at latest height {latest_height}: {e}")))?;
+                    .map_err(|e| {
+                        Error::query(format!(
+                            "Gateway query_header failed at latest height {latest_height}: {e}"
+                        ))
+                    })?;
 
                 Ok((latest_header, vec![proof_header]))
             }
@@ -1836,7 +2056,10 @@ impl ChainEndpoint for CardanoChainEndpoint {
     fn cross_chain_query(
         &self,
         _requests: Vec<CrossChainQueryRequest>,
-    ) -> Result<Vec<ibc_relayer_types::applications::ics31_icq::response::CrossChainQueryResponse>, Error> {
+    ) -> Result<
+        Vec<ibc_relayer_types::applications::ics31_icq::response::CrossChainQueryResponse>,
+        Error,
+    > {
         Err(Error::query(
             "ICS-31 cross-chain queries are not supported for Cardano".to_string(),
         ))
@@ -1851,7 +2074,9 @@ impl ChainEndpoint for CardanoChainEndpoint {
         ))
     }
 
-    fn query_consumer_chains(&self) -> Result<Vec<ibc_relayer_types::applications::ics28_ccv::msgs::ConsumerChain>, Error> {
+    fn query_consumer_chains(
+        &self,
+    ) -> Result<Vec<ibc_relayer_types::applications::ics28_ccv::msgs::ConsumerChain>, Error> {
         Err(Error::query(
             "ICS-28 CCV (Cross-Chain Validation) is not applicable to Cardano".to_string(),
         ))
@@ -1862,7 +2087,13 @@ impl ChainEndpoint for CardanoChainEndpoint {
         _request: ibc_proto::ibc::core::channel::v1::QueryUpgradeRequest,
         _height: ibc_relayer_types::Height,
         _include_proof: IncludeProof,
-    ) -> Result<(ibc_relayer_types::core::ics04_channel::upgrade::Upgrade, Option<MerkleProof>), Error> {
+    ) -> Result<
+        (
+            ibc_relayer_types::core::ics04_channel::upgrade::Upgrade,
+            Option<MerkleProof>,
+        ),
+        Error,
+    > {
         Err(Error::query(
             "IBC channel upgrades are not implemented for Cardano".to_string(),
         ))
@@ -1873,7 +2104,13 @@ impl ChainEndpoint for CardanoChainEndpoint {
         _request: ibc_proto::ibc::core::channel::v1::QueryUpgradeErrorRequest,
         _height: ibc_relayer_types::Height,
         _include_proof: IncludeProof,
-    ) -> Result<(ibc_relayer_types::core::ics04_channel::upgrade::ErrorReceipt, Option<MerkleProof>), Error> {
+    ) -> Result<
+        (
+            ibc_relayer_types::core::ics04_channel::upgrade::ErrorReceipt,
+            Option<MerkleProof>,
+        ),
+        Error,
+    > {
         Err(Error::query(
             "IBC channel upgrades are not implemented for Cardano".to_string(),
         ))
@@ -1904,9 +2141,8 @@ fn filter_packet_events_from_block_results(
     let height = match block_results.height {
         Some(h) => ICSHeight::new(h.revision_number, h.revision_height)
             .map_err(|e| Error::query(format!("Invalid height in block results: {e}")))?,
-        None => ICSHeight::new(0, fallback_height).map_err(|e| {
-            Error::query(format!("Invalid fallback height {fallback_height}: {e}"))
-        })?,
+        None => ICSHeight::new(0, fallback_height)
+            .map_err(|e| Error::query(format!("Invalid fallback height {fallback_height}: {e}")))?,
     };
 
     let proto_events: Vec<super::generated::ibc::cardano::v1::Event> = block_results
@@ -1955,7 +2191,7 @@ fn filter_packet_events_from_block_results(
 }
 
 // Mithril header is decoded from the Gateway as `google.protobuf.Any`.
-        // See `ibc-relayer-types/src/clients/ics08_cardano/header.rs` and
+// See `ibc-relayer-types/src/clients/ics08_cardano/header.rs` and
 // `ibc-relayer-types/src/core/ics02_client/header.rs`.
 
 fn extract_ibc_state_root_from_host_state_tx(
@@ -2062,7 +2298,11 @@ fn extract_root_from_conway_tx_body<'a>(
         }
     };
 
-    ensure_value_contains_host_state_nft_conway(&out.value, host_state_nft_policy_id, host_state_nft_token_name)?;
+    ensure_value_contains_host_state_nft_conway(
+        &out.value,
+        host_state_nft_policy_id,
+        host_state_nft_token_name,
+    )?;
 
     let datum_option = out.datum_option.as_ref().ok_or_else(|| {
         Error::query("HostState output has no datum option (expected inline datum)".to_string())
@@ -2108,7 +2348,11 @@ fn extract_root_from_babbage_tx_body<'a>(
         }
     };
 
-    ensure_value_contains_host_state_nft_alonzo(&out.value, host_state_nft_policy_id, host_state_nft_token_name)?;
+    ensure_value_contains_host_state_nft_alonzo(
+        &out.value,
+        host_state_nft_policy_id,
+        host_state_nft_token_name,
+    )?;
 
     let datum_option = out.datum_option.as_ref().ok_or_else(|| {
         Error::query("HostState output has no datum option (expected inline datum)".to_string())
@@ -2234,7 +2478,11 @@ fn extract_ibc_state_root_from_host_state_datum(
 
     let state = match state {
         PlutusData::Constr(c) => c,
-        _ => return Err(Error::query("HostState state is not a constructor".to_string())),
+        _ => {
+            return Err(Error::query(
+                "HostState state is not a constructor".to_string(),
+            ))
+        }
     };
 
     if plutus_constructor_index(state) != Some(0) || state.fields.len() < 2 {
@@ -2245,7 +2493,11 @@ fn extract_ibc_state_root_from_host_state_datum(
 
     let root: &[u8] = match &state.fields[1] {
         PlutusData::BoundedBytes(bytes) => bytes.as_slice(),
-        _ => return Err(Error::query("ibc_state_root is not a byte string".to_string())),
+        _ => {
+            return Err(Error::query(
+                "ibc_state_root is not a byte string".to_string(),
+            ))
+        }
     };
 
     if root.len() != 32 {
@@ -2258,7 +2510,9 @@ fn extract_ibc_state_root_from_host_state_datum(
     Ok(root.to_vec())
 }
 
-fn plutus_constructor_index(constr: &pallas_primitives::alonzo::Constr<pallas_primitives::alonzo::PlutusData>) -> Option<u64> {
+fn plutus_constructor_index(
+    constr: &pallas_primitives::alonzo::Constr<pallas_primitives::alonzo::PlutusData>,
+) -> Option<u64> {
     match constr.tag {
         102 => constr.any_constructor,
         121..=127 => Some(constr.tag - 121),

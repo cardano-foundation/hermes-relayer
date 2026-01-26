@@ -534,15 +534,8 @@ pub trait ChainEndpoint: Sized {
             height.increment()
         };
 
-        Proofs::new(
-            channel_proof_bytes,
-            None,
-            None,
-            None,
-            None,
-            proof_height,
-        )
-        .map_err(Error::malformed_proof)
+        Proofs::new(channel_proof_bytes, None, None, None, None, proof_height)
+            .map_err(Error::malformed_proof)
     }
 
     /// Builds the proof for packet messages.

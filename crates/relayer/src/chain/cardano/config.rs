@@ -45,7 +45,8 @@ pub struct CardanoConfig {
 
     /// Optional trust threshold (not used by Cardano but required by config interface)
     #[serde(default)]
-    pub trust_threshold: Option<ibc_relayer_types::core::ics02_client::trust_threshold::TrustThreshold>,
+    pub trust_threshold:
+        Option<ibc_relayer_types::core::ics02_client::trust_threshold::TrustThreshold>,
 
     /// How many packets to fetch at once from the chain when clearing packets
     #[serde(default = "default_query_packets_chunk_size")]

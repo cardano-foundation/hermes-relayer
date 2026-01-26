@@ -5,7 +5,7 @@ use prost::Message;
 use serde_derive::{Deserialize, Serialize};
 
 use crate::clients::ics08_cardano::error::Error;
-use crate::clients::ics08_cardano::raw as raw;
+use crate::clients::ics08_cardano::raw;
 use crate::core::ics02_client::client_type::ClientType;
 use crate::core::ics02_client::error::Error as Ics02Error;
 use crate::timestamp::Timestamp;
@@ -63,11 +63,12 @@ impl TryFrom<RawHeader> for Header {
             host_state_tx_proof,
         } = raw;
 
-        let transaction_snapshot: raw::CardanoTransactionSnapshot = transaction_snapshot
-            .ok_or_else(|| Error::missing_field("transaction_snapshot"))?;
+        let transaction_snapshot: raw::CardanoTransactionSnapshot =
+            transaction_snapshot.ok_or_else(|| Error::missing_field("transaction_snapshot"))?;
 
-        let transaction_snapshot_certificate: raw::MithrilCertificate = transaction_snapshot_certificate
-            .ok_or_else(|| Error::missing_field("transaction_snapshot_certificate"))?;
+        let transaction_snapshot_certificate: raw::MithrilCertificate =
+            transaction_snapshot_certificate
+                .ok_or_else(|| Error::missing_field("transaction_snapshot_certificate"))?;
 
         // IBC heights are `(revision_number, revision_height)`.
         // For Cardano we use `revision_number = 0` and interpret `revision_height` as the
@@ -140,10 +141,13 @@ impl From<Header> for RawHeader {
     fn from(value: Header) -> Self {
         RawHeader {
             mithril_stake_distribution: Some(value.mithril_stake_distribution),
-            mithril_stake_distribution_certificate: Some(value.mithril_stake_distribution_certificate),
+            mithril_stake_distribution_certificate: Some(
+                value.mithril_stake_distribution_certificate,
+            ),
             transaction_snapshot: Some(value.transaction_snapshot),
             transaction_snapshot_certificate: Some(value.transaction_snapshot_certificate),
-            previous_mithril_stake_distribution_certificates: value.previous_mithril_stake_distribution_certificates,
+            previous_mithril_stake_distribution_certificates: value
+                .previous_mithril_stake_distribution_certificates,
             host_state_tx_hash: value.host_state_tx_hash,
             host_state_tx_body_cbor: value.host_state_tx_body_cbor,
             host_state_tx_output_index: value.host_state_tx_output_index,
@@ -187,7 +191,11 @@ mod tests {
     use test_log::test;
 
     fn raw_protocol_parameters() -> raw::MithrilProtocolParameters {
-        raw::MithrilProtocolParameters { k: 1, m: 2, phi_f: None }
+        raw::MithrilProtocolParameters {
+            k: 1,
+            m: 2,
+            phi_f: None,
+        }
     }
 
     fn raw_certificate(sealed_at: &str) -> raw::MithrilCertificate {

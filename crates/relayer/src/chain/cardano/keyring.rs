@@ -2,7 +2,7 @@
 
 use super::error::Error;
 use blake2::{Blake2b512, Digest as Blake2Digest};
-use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use slip10::BIP32Path;
 use std::str::FromStr;
 
@@ -17,22 +17,22 @@ impl CardanoKeyring {
     /// Create a keyring from a bech32-encoded private key (ed25519_sk...)
     pub fn from_bech32_key(bech32_key: &str) -> Result<Self, Error> {
         use bech32::FromBase32;
-        
+
         // Decode bech32 key
         let (hrp, data, _variant) = bech32::decode(bech32_key)
             .map_err(|e| Error::Keyring(format!("Invalid bech32 key: {:?}", e)))?;
-        
+
         if hrp != "ed25519_sk" {
             return Err(Error::Keyring(format!(
                 "Expected ed25519_sk prefix, got: {}",
                 hrp
             )));
         }
-        
+
         // Convert from base32 (u5) to bytes
         let bytes = Vec::<u8>::from_base32(&data)
             .map_err(|e| Error::Keyring(format!("Failed to decode base32: {:?}", e)))?;
-        
+
         // Data should be 32 bytes for Ed25519 private key
         if bytes.len() != 32 {
             return Err(Error::Keyring(format!(
@@ -40,13 +40,13 @@ impl CardanoKeyring {
                 bytes.len()
             )));
         }
-        
+
         let mut key_bytes = [0u8; 32];
         key_bytes.copy_from_slice(&bytes);
-        
+
         let signing_key = SigningKey::from_bytes(&key_bytes);
         let verifying_key = signing_key.verifying_key();
-        
+
         Ok(Self {
             signing_key,
             verifying_key,
@@ -97,21 +97,21 @@ impl CardanoKeyring {
     /// Enterprise address = 0x61 | Blake2b-224(verifying_key)
     pub fn address(&self, network_id: u8) -> String {
         let vkey_bytes = self.verifying_key.as_bytes();
-        
+
         // Hash the public key with Blake2b-224 (28 bytes)
         let mut hasher = Blake2b512::new();
         hasher.update(vkey_bytes);
         let hash = hasher.finalize();
         let payment_hash = &hash[..28];
-        
+
         // Construct enterprise address: header | payment_hash
         // Header = 0x61 for enterprise address on testnet (0b0110_0001)
         // Header = 0x71 for enterprise address on mainnet (0b0111_0001)
         let header = if network_id == 1 { 0x71 } else { 0x61 };
-        
+
         let mut address_bytes = vec![header];
         address_bytes.extend_from_slice(payment_hash);
-        
+
         // Encode as hex
         hex::encode(address_bytes)
     }
@@ -132,7 +132,7 @@ mod tests {
     fn test_keyring_derivation() {
         let mnemonic = "test walk nut penalty hip pave soap entry language right filter choice";
         let keyring = CardanoKeyring::from_mnemonic(mnemonic, 0).unwrap();
-        
+
         // Should generate consistent keys
         let address = keyring.address(0);
         assert!(!address.is_empty());
@@ -143,9 +143,9 @@ mod tests {
     fn test_signing() {
         let keyring = CardanoKeyring::new_for_testing().unwrap();
         let message = b"test message";
-        
+
         let signature = keyring.sign(message);
-        
+
         // Verify the signature
         use ed25519_dalek::Verifier;
         assert!(keyring.verifying_key.verify(message, &signature).is_ok());
@@ -156,7 +156,7 @@ mod tests {
         let mnemonic = "test walk nut penalty hip pave soap entry language right filter choice";
         let keyring1 = CardanoKeyring::from_mnemonic(mnemonic, 0).unwrap();
         let keyring2 = CardanoKeyring::from_mnemonic(mnemonic, 1).unwrap();
-        
+
         // Different accounts should produce different addresses
         assert_ne!(keyring1.address(0), keyring2.address(0));
     }
@@ -165,6 +165,10 @@ mod tests {
     fn test_from_bech32_key() {
         let key = "ed25519_sk1rvgjxs8sddhl46uqtv862s53vu4jf6lnk63rcn7f0qwzyq85wnlqgrsx42";
         let result = CardanoKeyring::from_bech32_key(key);
-        assert!(result.is_ok(), "Failed to load from bech32 key: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to load from bech32 key: {:?}",
+            result.err()
+        );
     }
 }

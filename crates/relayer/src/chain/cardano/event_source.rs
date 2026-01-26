@@ -11,12 +11,7 @@ use tokio::{
 };
 use tracing::{debug, error, error_span, trace};
 
-use ibc_relayer_types::{
-    core::{
-        ics02_client::height::Height,
-        ics24_host::identifier::ChainId,
-    },
-};
+use ibc_relayer_types::core::{ics02_client::height::Height, ics24_host::identifier::ChainId};
 
 use crate::{
     chain::tracking::TrackingId,
@@ -24,10 +19,7 @@ use crate::{
     telemetry,
 };
 
-use super::{
-    event_parser,
-    gateway_client::GatewayClient,
-};
+use super::{event_parser, gateway_client::GatewayClient};
 
 use crate::event::source::{EventBatch, EventSourceCmd, TxEventSourceCmd};
 
@@ -145,10 +137,13 @@ impl CardanoEventSource {
             .gateway_client
             .query_events(self.last_fetched_height)
             .await
-            .map_err(|e| Error::collect_events_failed(format!("Failed to query Gateway events: {}", e)))?;
+            .map_err(|e| {
+                Error::collect_events_failed(format!("Failed to query Gateway events: {}", e))
+            })?;
 
-        let current_height = Height::new(0, response.current_height)
-            .map_err(|e| Error::collect_events_failed(format!("Invalid height from Gateway: {}", e)))?;
+        let current_height = Height::new(0, response.current_height).map_err(|e| {
+            Error::collect_events_failed(format!("Invalid height from Gateway: {}", e))
+        })?;
 
         // Process events if we have new blocks
         if !response.events.is_empty() {
@@ -161,7 +156,7 @@ impl CardanoEventSource {
 
             for block_events in response.events {
                 let batch = self.process_block_events(block_events)?;
-                
+
                 // Check for commands before broadcasting
                 if let Next::Abort = self.try_process_cmd() {
                     return Ok(Next::Abort);
@@ -215,19 +210,22 @@ impl CardanoEventSource {
         }
 
         // Flatten all events from all ResponseDeliverTx items and convert to cardano Event type
-        let gateway_events: Vec<_> = block_events.events
+        let gateway_events: Vec<_> = block_events
+            .events
             .into_iter()
             .flat_map(|tx_result| {
                 tx_result.events.into_iter().map(|core_event| {
                     // Convert ibc.core.types.v1.Event to ibc.cardano.v1.Event
                     super::generated::ibc::cardano::v1::Event {
                         r#type: core_event.r#type,
-                        attributes: core_event.event_attribute.into_iter().map(|attr| {
-                            super::generated::ibc::cardano::v1::EventAttribute {
+                        attributes: core_event
+                            .event_attribute
+                            .into_iter()
+                            .map(|attr| super::generated::ibc::cardano::v1::EventAttribute {
                                 key: attr.key,
                                 value: attr.value,
-                            }
-                        }).collect(),
+                            })
+                            .collect(),
                     }
                 })
             })
@@ -291,6 +289,8 @@ impl CardanoEventSource {
         self.gateway_client
             .query_latest_height()
             .await
-            .map_err(|e| Error::collect_events_failed(format!("Failed to fetch latest height: {}", e)))
+            .map_err(|e| {
+                Error::collect_events_failed(format!("Failed to fetch latest height: {}", e))
+            })
     }
 }

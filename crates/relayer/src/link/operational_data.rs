@@ -14,8 +14,8 @@ use crate::chain::requests::QueryClientStateRequest;
 use crate::chain::requests::QueryHeight;
 use crate::chain::tracking::TrackedMsgs;
 use crate::chain::tracking::TrackingId;
-use crate::event::IbcEventWithHeight;
 use crate::config::ChainConfig;
+use crate::event::IbcEventWithHeight;
 use crate::link::error::LinkError;
 use crate::link::RelayPath;
 
@@ -185,14 +185,14 @@ impl OperationalData {
                     .map_err(LinkError::relayer)?,
                 ChainConfig::Cardano(_)
             );
-            let update_height =
-                if (matches!(self.target, OperationalDataTarget::Destination) && src_chain_is_cardano)
-                    || (matches!(self.target, OperationalDataTarget::Source) && dst_chain_is_cardano)
-                {
-                    self.proofs_height
-                } else {
-                    self.proofs_height.increment()
-                };
+            let update_height = if (matches!(self.target, OperationalDataTarget::Destination)
+                && src_chain_is_cardano)
+                || (matches!(self.target, OperationalDataTarget::Source) && dst_chain_is_cardano)
+            {
+                self.proofs_height
+            } else {
+                self.proofs_height.increment()
+            };
 
             debug!(
                 "prepending {} client update at height {}",

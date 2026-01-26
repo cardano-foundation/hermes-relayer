@@ -5,7 +5,7 @@ use ibc_proto::google::protobuf::Any;
 use ibc_proto::Protobuf;
 
 use crate::clients::ics08_cardano::error::Error;
-use crate::clients::ics08_cardano::raw as raw;
+use crate::clients::ics08_cardano::raw;
 use crate::core::ics02_client::client_type::ClientType;
 use crate::core::ics02_client::consensus_state::ConsensusState as Ics2ConsensusState;
 use crate::core::ics02_client::error::Error as Ics02Error;
@@ -112,7 +112,9 @@ impl TryFrom<Any> for ConsensusState {
         use core::ops::Deref;
 
         fn decode_state(bytes: &[u8]) -> Result<ConsensusState, Error> {
-            RawConsensusState::decode(bytes).map_err(Error::decode)?.try_into()
+            RawConsensusState::decode(bytes)
+                .map_err(Error::decode)?
+                .try_into()
         }
 
         match raw_any.type_url.as_str() {

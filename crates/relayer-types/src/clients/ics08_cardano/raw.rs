@@ -69,7 +69,8 @@ pub struct MithrilHeader {
     #[prost(message, optional, tag = "4")]
     pub transaction_snapshot_certificate: ::core::option::Option<MithrilCertificate>,
     #[prost(message, repeated, tag = "9")]
-    pub previous_mithril_stake_distribution_certificates: ::prost::alloc::vec::Vec<MithrilCertificate>,
+    pub previous_mithril_stake_distribution_certificates:
+        ::prost::alloc::vec::Vec<MithrilCertificate>,
     #[prost(string, tag = "5")]
     pub host_state_tx_hash: ::prost::alloc::string::String,
     #[prost(bytes = "vec", tag = "6")]
@@ -184,7 +185,19 @@ pub struct MithrilProtocolParameters {
     pub phi_f: ::core::option::Option<Fraction>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    ::prost::Enumeration,
+    Serialize,
+    Deserialize,
+)]
 #[repr(i32)]
 pub enum ProtocolMessagePartKey {
     Unspecified = 0,

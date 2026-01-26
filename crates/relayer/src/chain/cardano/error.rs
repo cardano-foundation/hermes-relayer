@@ -59,4 +59,3 @@ impl From<serde_json::Error> for Error {
         Error::Generic(err.to_string())
     }
 }
-
