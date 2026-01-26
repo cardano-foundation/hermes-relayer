@@ -432,8 +432,8 @@ fn parse_height(attrs: &HashMap<String, String>, key: &str) -> Result<Height, Er
         Error::EventAttribute(format!("Invalid revision height '{}': {}", parts[1], e))
     })?;
 
-    Ok(Height::new(revision_number, revision_height)
-        .map_err(|e| Error::EventAttribute(format!("Invalid height: {}", e)))?)
+    Height::new(revision_number, revision_height)
+        .map_err(|e| Error::EventAttribute(format!("Invalid height: {}", e)))
 }
 
 fn parse_connection_id(attrs: &HashMap<String, String>, key: &str) -> Result<ConnectionId, Error> {

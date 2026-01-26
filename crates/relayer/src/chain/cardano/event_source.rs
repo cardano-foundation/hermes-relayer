@@ -281,7 +281,7 @@ impl CardanoEventSource {
             batch.height
         );
 
-        let _ = self.event_bus.broadcast(Arc::new(Ok(batch)));
+        self.event_bus.broadcast(Arc::new(Ok(batch)));
     }
 
     /// Fetch the current chain height from Gateway

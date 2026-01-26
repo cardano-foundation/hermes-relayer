@@ -91,7 +91,7 @@ impl CardanoChainEndpoint {
         let key = self
             .keyring
             .get_key(&self.config.key_name)
-            .map_err(|e| Error::key_base(e))?;
+            .map_err(Error::key_base)?;
 
         // Get the CardanoSigningKeyPair and extract the CardanoKeyring
         let signing_key_pair = key
@@ -1148,10 +1148,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             // Query channel from Gateway
             let response_bytes = self
                 .gateway_client
-                .query_channel(
-                    &request.port_id.to_string(),
-                    &request.channel_id.to_string(),
-                )
+                .query_channel(request.port_id.as_ref(), request.channel_id.as_ref())
                 .await
                 .map_err(|e| Error::query(format!("Failed to query channel: {}", e)))?;
 
@@ -1201,10 +1198,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         self.rt.block_on(async {
             let response_bytes = self
                 .gateway_client
-                .query_channel_client_state(
-                    &request.port_id.to_string(),
-                    &request.channel_id.to_string(),
-                )
+                .query_channel_client_state(request.port_id.as_ref(), request.channel_id.as_ref())
                 .await
                 .map_err(|e| Error::query(format!("Failed to query channel client state: {e}")))?;
 
@@ -1244,8 +1238,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
             let response_bytes = self
                 .gateway_client
                 .query_packet_commitment(
-                    &request.port_id.to_string(),
-                    &request.channel_id.to_string(),
+                    request.port_id.as_ref(),
+                    request.channel_id.as_ref(),
                     request.sequence.into(),
                 )
                 .await
@@ -1296,10 +1290,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             // Query packet commitments from Gateway
             let response_bytes = self
                 .gateway_client
-                .query_packet_commitments(
-                    &request.port_id.to_string(),
-                    &request.channel_id.to_string(),
-                )
+                .query_packet_commitments(request.port_id.as_ref(), request.channel_id.as_ref())
                 .await
                 .map_err(|e| Error::query(format!("Failed to query packet commitments: {}", e)))?;
 
@@ -1352,8 +1343,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
             let response_bytes = self
                 .gateway_client
                 .query_packet_receipt(
-                    &request.port_id.to_string(),
-                    &request.channel_id.to_string(),
+                    request.port_id.as_ref(),
+                    request.channel_id.as_ref(),
                     request.sequence.into(),
                 )
                 .await
@@ -1409,8 +1400,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
             let response_bytes = self
                 .gateway_client
                 .query_unreceived_packets(
-                    &request.port_id.to_string(),
-                    &request.channel_id.to_string(),
+                    request.port_id.as_ref(),
+                    request.channel_id.as_ref(),
                     request
                         .packet_commitment_sequences
                         .iter()
@@ -1461,8 +1452,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
             let response_bytes = self
                 .gateway_client
                 .query_packet_acknowledgement(
-                    &request.port_id.to_string(),
-                    &request.channel_id.to_string(),
+                    request.port_id.as_ref(),
+                    request.channel_id.as_ref(),
                     request.sequence.into(),
                 )
                 .await
@@ -1516,8 +1507,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
             let response_bytes = self
                 .gateway_client
                 .query_packet_acknowledgements(
-                    &request.port_id.to_string(),
-                    &request.channel_id.to_string(),
+                    request.port_id.as_ref(),
+                    request.channel_id.as_ref(),
                 )
                 .await
                 .map_err(|e| {
@@ -1571,8 +1562,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
             let response_bytes = self
                 .gateway_client
                 .query_unreceived_acknowledgements(
-                    &request.port_id.to_string(),
-                    &request.channel_id.to_string(),
+                    request.port_id.as_ref(),
+                    request.channel_id.as_ref(),
                     request
                         .packet_ack_sequences
                         .iter()
@@ -1623,10 +1614,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             // Query next sequence receive from Gateway
             let response_bytes = self
                 .gateway_client
-                .query_next_sequence_receive(
-                    &request.port_id.to_string(),
-                    &request.channel_id.to_string(),
-                )
+                .query_next_sequence_receive(request.port_id.as_ref(), request.channel_id.as_ref())
                 .await
                 .map_err(|e| {
                     Error::query(format!("Failed to query next sequence receive: {}", e))
@@ -2417,10 +2405,8 @@ fn ensure_value_contains_host_state_nft_alonzo(
                 }
 
                 for (asset, amount) in assets.iter() {
-                    if asset.as_slice() == host_state_nft_token_name {
-                        if *amount == 1 {
-                            return Ok(());
-                        }
+                    if asset.as_slice() == host_state_nft_token_name && *amount == 1 {
+                        return Ok(());
                     }
                 }
             }

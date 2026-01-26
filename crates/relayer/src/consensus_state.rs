@@ -20,6 +20,7 @@ use ibc_relayer_types::Height;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
 pub enum AnyConsensusState {
     Tendermint(TmConsensusState),
     /// Cardano-tracking consensus state (`08-cardano`), encoded as `ibc.lightclients.mithril.v1.ConsensusState`.

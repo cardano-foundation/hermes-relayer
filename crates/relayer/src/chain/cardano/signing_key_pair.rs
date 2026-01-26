@@ -85,7 +85,7 @@ impl CardanoSigningKeyPair {
         self.ensure_keyring()?;
         self.keyring
             .as_ref()
-            .ok_or_else(|| KeyringError::key_not_found())
+            .ok_or_else(KeyringError::key_not_found)
     }
 
     /// Get a mutable reference to the keyring, initializing if needed
@@ -93,7 +93,7 @@ impl CardanoSigningKeyPair {
         self.ensure_keyring()?;
         self.keyring
             .as_mut()
-            .ok_or_else(|| KeyringError::key_not_found())
+            .ok_or_else(KeyringError::key_not_found)
     }
 
     /// Get a clone of the CardanoKeyring (public method for external signing)
@@ -101,9 +101,7 @@ impl CardanoSigningKeyPair {
     pub fn get_cardano_keyring(&self) -> Result<CardanoKeyring, KeyringError> {
         let mut mutable_self = self.clone();
         mutable_self.ensure_keyring()?;
-        mutable_self
-            .keyring
-            .ok_or_else(|| KeyringError::key_not_found())
+        mutable_self.keyring.ok_or_else(KeyringError::key_not_found)
     }
 }
 

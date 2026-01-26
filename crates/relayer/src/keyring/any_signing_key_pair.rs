@@ -5,6 +5,7 @@ use crate::chain::cardano::CardanoSigningKeyPair;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum AnySigningKeyPair {
     Secp256k1(Secp256k1KeyPair),
     Ed25519(Ed25519KeyPair),
