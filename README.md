@@ -191,12 +191,8 @@ i.e, Penumbra appears to be an exception in terms of keyring integration, not th
 
 ### Cardano Light Client Model
 
-IBC light clients are responsible for both:
-1) consensus verification / header updates (to advance the tracked height), and
-2) state verification (membership / non-membership proof verification against a commitment root).
+On the Cosmos side, Cardano is tracked using a single client type, `08-cardano`, with headers encoded as `/ibc.lightclients.mithril.v1.MithrilHeader`. The header carries Mithril-certified evidence for a HostState update transaction, which allows the verifier to extract the committed 32-byte `ibc_state_root` and store it in consensus state. Membership and non-membership then use standard ICS-23 proofs (protobuf `ibc.core.commitment.v1.MerkleProof` bytes) against that `ibc_state_root`.
 
-The Cosmos-side Cardano light client is the Mithril client (client type `08-cardano`, header type URL `/ibc.lightclients.mithril.v1.MithrilHeader`). In the current design, the consensus state carries the 32-byte `ibc_state_root` extracted from the certified HostState transaction evidence in the Mithril header, and membership/non-membership verification checks standard ICS-23 proofs against that root. The remaining open question is the long-term “finality and attestation” story for Cardano state: Cardano does not expose a consensus-signed application state root in block headers the way Tendermint does, so we rely on Mithril’s certification model (transaction snapshots + certificates) to anchor HostState updates over time.
+Height semantics follow Mithril transaction snapshots: `Height.revision_height` is treated as a Cardano block number (as surfaced by db-sync and the Mithril snapshot `block_number`), not a Cardano slot. Because Mithril certificates are checkpoint-based, Hermes may need to wait after a Cardano transaction is included until that inclusion is covered by a certified snapshot before it can safely build or use proofs at that height.
 
-We considered whether we could “split” responsibilities across two different light clients (e.g. Mithril for consensus and a second client for state proof verification). While this can sound attractive, it is not a canonical IBC design: the core IBC connection/channel machinery references a single `client_id`, and proof verification is performed by that one client. Having two separate clients jointly represent one counterparty would require non-standard wiring and makes the security/invariant story significantly harder.
-
-The intended long-term direction is therefore to converge on a single Cardano-tracking client type that can do both header updates and state proof verification (whether by extending the Mithril client to carry/verify the required commitment root + proofs, or by implementing a unified Cardano client that incorporates Mithril-based consensus).
+This design intentionally keeps header progression and state proof verification under a single IBC client identifier, matching the core IBC connection and channel machinery.
