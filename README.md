@@ -174,21 +174,6 @@ Where keys are stored in `~/.hermes/keys/{chain-id}/keyring-test/{key-name}.json
 `hermes keys list --chain cosmos-hub`
 `hermes keys delete --chain cosmos-hub --key-name my-key`
 
-Penumbra does not use the standard Hermes keyring, instead:
-
-```rust
-// From config.rs:
-pub struct PenumbraConfig {
-    // NO key_name field
-    // NO key_store_type field
-
-    // Uses Penumbra's own KMS:
-    pub kms_config: soft_kms::Config,
-}
-```
-
-i.e, Penumbra appears to be an exception in terms of keyring integration, not the standard. For Cardano we've implemented the standard pattern like Cosmos SDK.
-
 ### Cardano Light Client Model
 
 On the Cosmos side, Cardano is tracked using a single client type, `08-cardano`, with headers encoded as `/ibc.lightclients.mithril.v1.MithrilHeader`. The header carries Mithril-certified evidence for a HostState update transaction, which allows the verifier to extract the committed 32-byte `ibc_state_root` and store it in consensus state. Membership and non-membership then use standard ICS-23 proofs (protobuf `ibc.core.commitment.v1.MerkleProof` bytes) against that `ibc_state_root`.
