@@ -659,6 +659,11 @@ impl GatewayClient {
                 self.build_timeout_on_close_tx(message_data).await
             }
 
+            // IBC Transfer messages
+            "/ibc.applications.transfer.v1.MsgTransfer" => {
+                self.build_transfer_tx(message_data).await
+            }
+
             // Unknown message type
             _ => {
                 tracing::error!("Unsupported message type: {}", type_url);
@@ -1193,6 +1198,76 @@ impl GatewayClient {
         Ok(UnsignedTx {
             cbor_hex,
             description: format!("MsgAcknowledgement (sequence: {})", sequence),
+        })
+    }
+
+    async fn build_transfer_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use ibc_proto::ibc::applications::transfer::v1::MsgTransfer;
+        use prost::Message;
+
+        let msg = MsgTransfer::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgTransfer: {}", e)))?;
+
+        let token = match msg.token {
+            Some(coin) => {
+                let amount: u64 = coin.amount.parse().map_err(|e| {
+                    Error::Transaction(format!(
+                        "Invalid token amount in MsgTransfer (expected u64): {}",
+                        e
+                    ))
+                })?;
+                Some(super::generated::ibc::core::channel::v1::Coin {
+                    denom: coin.denom,
+                    amount,
+                })
+            }
+            None => None,
+        };
+
+        let timeout_height = msg.timeout_height.map(|height| {
+            super::generated::ibc::core::client::v1::Height {
+                revision_number: height.revision_number,
+                revision_height: height.revision_height,
+            }
+        });
+
+        // The Gateway expects MsgTransfer under `ibc.core.channel.v1` and includes a `signer`
+        // field. In canonical IBC, the sender is the signer for MsgTransfer.
+        let sender = msg.sender;
+
+        let gateway_msg = super::generated::ibc::core::channel::v1::MsgTransfer {
+            source_port: msg.source_port,
+            source_channel: msg.source_channel.clone(),
+            token,
+            sender: sender.clone(),
+            receiver: msg.receiver,
+            timeout_height,
+            timeout_timestamp: msg.timeout_timestamp,
+            memo: msg.memo,
+            signer: sender,
+        };
+
+        let mut client = GenChannelMsgClient::new(self.channel.clone());
+        let request = tonic::Request::new(gateway_msg);
+
+        let response = client.transfer(request).await?.into_inner();
+
+        let unsigned_tx_any = response.unsigned_tx.ok_or_else(|| {
+            Error::Transaction("No unsigned_tx in Transfer response".to_string())
+        })?;
+
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+
+        tracing::info!(
+            "Transfer: received unsigned CBOR (length: {}), source_channel: {}",
+            cbor_hex.len(),
+            msg.source_channel
+        );
+
+        Ok(UnsignedTx {
+            cbor_hex,
+            description: format!("MsgTransfer (channel: {})", msg.source_channel),
         })
     }
 
