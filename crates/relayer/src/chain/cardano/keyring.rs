@@ -1,7 +1,8 @@
 //! Cardano keyring implementation with CIP-1852 derivation
 
 use super::error::Error;
-use blake2::{Blake2b512, Digest as Blake2Digest};
+use blake2::digest::{Update, VariableOutput};
+use blake2::Blake2bVar;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use slip10::BIP32Path;
 use std::str::FromStr;
@@ -94,23 +95,27 @@ impl CardanoKeyring {
     }
 
     /// Get the Cardano payment address (enterprise address for simplicity)
-    /// Enterprise address = 0x61 | Blake2b-224(verifying_key)
+    /// Enterprise address = (0x60 | network_id) | Blake2b-224(verifying_key)
     pub fn address(&self, network_id: u8) -> String {
         let vkey_bytes = self.verifying_key.as_bytes();
 
         // Hash the public key with Blake2b-224 (28 bytes)
-        let mut hasher = Blake2b512::new();
+        let mut hasher = Blake2bVar::new(28).expect("Blake2b-224 initialization must succeed");
         hasher.update(vkey_bytes);
-        let hash = hasher.finalize();
-        let payment_hash = &hash[..28];
+        let mut payment_hash = [0u8; 28];
+        hasher
+            .finalize_variable(&mut payment_hash)
+            .expect("Blake2b-224 finalize must succeed");
 
         // Construct enterprise address: header | payment_hash
-        // Header = 0x61 for enterprise address on testnet (0b0110_0001)
-        // Header = 0x71 for enterprise address on mainnet (0b0111_0001)
-        let header = if network_id == 1 { 0x71 } else { 0x61 };
+        //
+        // Address header encoding:
+        // - High nibble = address type (enterprise keyhash = 0b0110 = 6)
+        // - Low nibble  = network id (testnet = 0, mainnet = 1)
+        let header = 0x60 | (network_id & 0x0f);
 
         let mut address_bytes = vec![header];
-        address_bytes.extend_from_slice(payment_hash);
+        address_bytes.extend_from_slice(&payment_hash);
 
         // Encode as hex
         hex::encode(address_bytes)
@@ -136,7 +141,7 @@ mod tests {
         // Should generate consistent keys
         let address = keyring.address(0);
         assert!(!address.is_empty());
-        assert!(address.starts_with("61")); // Enterprise testnet address
+        assert!(address.starts_with("60")); // Enterprise testnet address
     }
 
     #[test]

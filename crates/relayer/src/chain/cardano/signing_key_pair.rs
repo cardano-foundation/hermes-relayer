@@ -173,7 +173,7 @@ mod tests {
 
         let account = key_pair.account();
         assert!(!account.is_empty());
-        assert!(account.starts_with("61")); // Cardano enterprise testnet address
+        assert!(account.starts_with("60")); // Cardano enterprise testnet address
     }
 
     #[test]
