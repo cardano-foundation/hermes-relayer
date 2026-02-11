@@ -489,9 +489,11 @@ fn parse_bytes(attrs: &HashMap<String, String>, key: &str) -> Result<Vec<u8>, Er
         .get(key)
         .ok_or_else(|| Error::EventAttribute(format!("Missing attribute: {}", key)))?;
 
-    // Assume hex encoding
-    hex::decode(value)
-        .map_err(|e| Error::EventAttribute(format!("Invalid hex bytes '{}': {}", value, e)))
+    let value_trimmed = value.strip_prefix("0x").unwrap_or(value);
+    match hex::decode(value_trimmed) {
+        Ok(bytes) => Ok(bytes),
+        Err(_) => Ok(value.as_bytes().to_vec()),
+    }
 }
 
 fn parse_packet(attrs: &HashMap<String, String>) -> Result<Packet, Error> {
@@ -588,6 +590,35 @@ mod tests {
         match err {
             Error::EventAttribute(msg) => assert!(msg.contains("Missing attribute: packet_data")),
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_timeout_on_close_packet_event_raw_json_data_ok() {
+        let payload = r#"{"amount":"1000000","denom":"stake","receiver":"abc","sender":"def"}"#;
+        let gateway_event = Event {
+            r#type: "timeout_on_close_packet".to_string(),
+            attributes: attrs(&[
+                ("packet_sequence", "7"),
+                ("packet_src_port", "transfer"),
+                ("packet_src_channel", "channel-0"),
+                ("packet_dst_port", "transfer"),
+                ("packet_dst_channel", "channel-1"),
+                ("packet_data", payload),
+                ("packet_timeout_height", "0-10"),
+                ("packet_timeout_timestamp", "1000"),
+            ]),
+        };
+
+        let height = Height::new(0, 1).unwrap();
+        let events = parse_events(vec![gateway_event], height).unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            RelayerIbcEvent::TimeoutOnClosePacket(ev) => {
+                assert_eq!(ev.packet.data, payload.as_bytes().to_vec());
+            }
+            other => panic!("unexpected event: {other:?}"),
         }
     }
 }
