@@ -7,9 +7,12 @@
 
 use ibc_relayer_types::{
     core::{
-        ics02_client::{events as ClientEvents, height::Height},
+        ics02_client::{
+            events as ClientEvents,
+            height::{Height, HeightErrorDetail},
+        },
         ics03_connection::events as ConnectionEvents,
-        ics04_channel::{events as ChannelEvents, packet::Packet},
+        ics04_channel::{events as ChannelEvents, packet::Packet, timeout::TimeoutHeight},
         ics24_host::identifier::{ChannelId, ClientId, ConnectionId, PortId},
     },
     events::IbcEvent,
@@ -436,6 +439,29 @@ fn parse_height(attrs: &HashMap<String, String>, key: &str) -> Result<Height, Er
         .map_err(|e| Error::EventAttribute(format!("Invalid height: {}", e)))
 }
 
+fn parse_timeout_height(
+    attrs: &HashMap<String, String>,
+    key: &str,
+) -> Result<TimeoutHeight, Error> {
+    let value = attrs
+        .get(key)
+        .ok_or_else(|| Error::EventAttribute(format!("Missing attribute: {}", key)))?;
+
+    match Height::from_str(value) {
+        Ok(height) => Ok(TimeoutHeight::from(height)),
+        Err(e) => {
+            let error_message = e.to_string();
+            match e.into_detail() {
+                HeightErrorDetail::ZeroHeight(_) => Ok(TimeoutHeight::no_timeout()),
+                _ => Err(Error::EventAttribute(format!(
+                    "Invalid height: {}",
+                    error_message
+                ))),
+            }
+        }
+    }
+}
+
 fn parse_connection_id(attrs: &HashMap<String, String>, key: &str) -> Result<ConnectionId, Error> {
     let value = attrs
         .get(key)
@@ -503,7 +529,7 @@ fn parse_packet(attrs: &HashMap<String, String>) -> Result<Packet, Error> {
     let destination_port = parse_port_id(attrs, "packet_dst_port")?;
     let destination_channel = parse_channel_id(attrs, "packet_dst_channel")?;
     let data = parse_bytes(attrs, "packet_data")?;
-    let timeout_height = parse_height(attrs, "packet_timeout_height")?;
+    let timeout_height = parse_timeout_height(attrs, "packet_timeout_height")?;
     let timeout_timestamp_nanos = parse_u64(attrs, "packet_timeout_timestamp")?;
     let timeout_timestamp = Timestamp::from_nanoseconds(timeout_timestamp_nanos)
         .map_err(|e| Error::EventAttribute(format!("Invalid timestamp: {}", e)))?;
@@ -515,7 +541,7 @@ fn parse_packet(attrs: &HashMap<String, String>) -> Result<Packet, Error> {
         destination_port,
         destination_channel,
         data,
-        timeout_height: timeout_height.into(),
+        timeout_height,
         timeout_timestamp,
     })
 }
@@ -524,6 +550,7 @@ fn parse_packet(attrs: &HashMap<String, String>) -> Result<Packet, Error> {
 mod tests {
     use super::*;
     use ibc_relayer_types::core::ics02_client::height::Height;
+    use ibc_relayer_types::core::ics04_channel::timeout::TimeoutHeight;
     use ibc_relayer_types::events::IbcEvent as RelayerIbcEvent;
 
     fn attrs(kvs: &[(&str, &str)]) -> Vec<EventAttribute> {
@@ -617,6 +644,34 @@ mod tests {
         match &events[0] {
             RelayerIbcEvent::TimeoutOnClosePacket(ev) => {
                 assert_eq!(ev.packet.data, payload.as_bytes().to_vec());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_send_packet_event_zero_timeout_height_maps_to_no_timeout() {
+        let gateway_event = Event {
+            r#type: "send_packet".to_string(),
+            attributes: attrs(&[
+                ("packet_sequence", "9"),
+                ("packet_src_port", "transfer"),
+                ("packet_src_channel", "channel-0"),
+                ("packet_dst_port", "transfer"),
+                ("packet_dst_channel", "channel-1"),
+                ("packet_data", "deadbeef"),
+                ("packet_timeout_height", "0-0"),
+                ("packet_timeout_timestamp", "1000"),
+            ]),
+        };
+
+        let height = Height::new(0, 1).unwrap();
+        let events = parse_events(vec![gateway_event], height).unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            RelayerIbcEvent::SendPacket(ev) => {
+                assert_eq!(ev.packet.timeout_height, TimeoutHeight::no_timeout());
             }
             other => panic!("unexpected event: {other:?}"),
         }
