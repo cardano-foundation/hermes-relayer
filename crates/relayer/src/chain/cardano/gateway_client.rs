@@ -1208,7 +1208,15 @@ impl GatewayClient {
         let msg = MsgTransfer::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgTransfer: {}", e)))?;
 
-        let token = match msg.token {
+        if msg.token.is_none() {
+            tracing::warn!(
+                "MsgTransfer has no token payload from Hermes: source_port={} source_channel={} receiver={}",
+                msg.source_port, msg.source_channel, msg.receiver
+            );
+        }
+
+        let token_info = msg.token;
+        let token = match token_info.as_ref() {
             Some(coin) => {
                 let amount: u64 = coin.amount.parse().map_err(|e| {
                     Error::Transaction(format!(
@@ -1217,7 +1225,7 @@ impl GatewayClient {
                     ))
                 })?;
                 Some(super::generated::ibc::core::channel::v1::Coin {
-                    denom: coin.denom,
+                    denom: coin.denom.clone(),
                     amount,
                 })
             }
@@ -1234,6 +1242,23 @@ impl GatewayClient {
         // The Gateway expects MsgTransfer under `ibc.core.channel.v1` and includes a `signer`
         // field. In canonical IBC, the sender is the signer for MsgTransfer.
         let sender = msg.sender;
+
+        tracing::info!(
+            "Preparing transfer request for gateway: source_port={} source_channel={} receiver={} sender={} token={:?} amount={:?} timeout_height={:?} timeout_timestamp={} memo_len={}",
+            msg.source_port,
+            msg.source_channel,
+            msg.receiver,
+            sender,
+            token_info.as_ref().map(|coin| coin.denom.as_str()),
+            token_info
+                .as_ref()
+                .and_then(|coin| coin.amount.parse::<u64>().ok()),
+            timeout_height
+                .as_ref()
+                .map(|height| format!("{}-{}", height.revision_number, height.revision_height)),
+            msg.timeout_timestamp,
+            msg.memo.len(),
+        );
 
         let gateway_msg = super::generated::ibc::core::channel::v1::MsgTransfer {
             source_port: msg.source_port,

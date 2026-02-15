@@ -26,55 +26,173 @@ use super::generated::ibc::cardano::v1::{Event, EventAttribute};
 
 /// Parse a list of Gateway events into Hermes IbcEvent types
 pub fn parse_events(gateway_events: Vec<Event>, _height: Height) -> Result<Vec<IbcEvent>, Error> {
+    let event_count = gateway_events.len();
+    tracing::debug!("Parsing {} gateway events", event_count);
+
     let mut ibc_events = Vec::new();
+    let mut parsed_type_counts: HashMap<String, usize> = HashMap::new();
+    let mut unknown_event_count = 0usize;
 
     for event in gateway_events {
-        tracing::debug!("Parsing event type: {}", event.r#type);
-
-        // Convert attributes to a HashMap for easier lookup
+        let event_type = event.r#type.clone();
+        let attribute_count = event.attributes.len();
+        let attributes = event.attributes.clone();
         let attrs = attributes_to_map(event.attributes);
 
+        tracing::debug!(
+            "Parsing event type: {} ({} attributes)",
+            event_type,
+            attribute_count
+        );
+
         // Parse event based on type
-        let ibc_event = match event.r#type.as_str() {
+        let ibc_event = match event_type.as_str() {
             // Client events
-            "create_client" => parse_create_client_event(attrs)?,
-            "update_client" => parse_update_client_event(attrs)?,
-            "upgrade_client" => parse_upgrade_client_event(attrs)?,
-            "client_misbehaviour" => parse_client_misbehaviour_event(attrs)?,
+            "create_client" => {
+                parse_event_with_context("create_client", &attributes, attrs, parse_create_client_event)?
+            }
+            "update_client" => {
+                parse_event_with_context("update_client", &attributes, attrs, parse_update_client_event)?
+            }
+            "upgrade_client" => {
+                parse_event_with_context("upgrade_client", &attributes, attrs, parse_upgrade_client_event)?
+            }
+            "client_misbehaviour" => parse_event_with_context(
+                "client_misbehaviour",
+                &attributes,
+                attrs,
+                parse_client_misbehaviour_event,
+            )?,
 
             // Connection events
-            "connection_open_init" => parse_connection_open_init_event(attrs)?,
-            "connection_open_try" => parse_connection_open_try_event(attrs)?,
-            "connection_open_ack" => parse_connection_open_ack_event(attrs)?,
-            "connection_open_confirm" => parse_connection_open_confirm_event(attrs)?,
+            "connection_open_init" => {
+                parse_event_with_context("connection_open_init", &attributes, attrs, parse_connection_open_init_event)?
+            }
+            "connection_open_try" => {
+                parse_event_with_context("connection_open_try", &attributes, attrs, parse_connection_open_try_event)?
+            }
+            "connection_open_ack" => {
+                parse_event_with_context("connection_open_ack", &attributes, attrs, parse_connection_open_ack_event)?
+            }
+            "connection_open_confirm" => {
+                parse_event_with_context("connection_open_confirm", &attributes, attrs, parse_connection_open_confirm_event)?
+            }
 
             // Channel events
-            "channel_open_init" => parse_channel_open_init_event(attrs)?,
-            "channel_open_try" => parse_channel_open_try_event(attrs)?,
-            "channel_open_ack" => parse_channel_open_ack_event(attrs)?,
-            "channel_open_confirm" => parse_channel_open_confirm_event(attrs)?,
-            "channel_close_init" => parse_channel_close_init_event(attrs)?,
-            "channel_close_confirm" => parse_channel_close_confirm_event(attrs)?,
+            "channel_open_init" => {
+                parse_event_with_context("channel_open_init", &attributes, attrs, parse_channel_open_init_event)?
+            }
+            "channel_open_try" => {
+                parse_event_with_context("channel_open_try", &attributes, attrs, parse_channel_open_try_event)?
+            }
+            "channel_open_ack" => {
+                parse_event_with_context("channel_open_ack", &attributes, attrs, parse_channel_open_ack_event)?
+            }
+            "channel_open_confirm" => {
+                parse_event_with_context("channel_open_confirm", &attributes, attrs, parse_channel_open_confirm_event)?
+            }
+            "channel_close_init" => {
+                parse_event_with_context("channel_close_init", &attributes, attrs, parse_channel_close_init_event)?
+            }
+            "channel_close_confirm" => {
+                parse_event_with_context("channel_close_confirm", &attributes, attrs, parse_channel_close_confirm_event)?
+            }
 
             // Packet events
-            "send_packet" => parse_send_packet_event(attrs)?,
-            "recv_packet" => parse_recv_packet_event(attrs)?,
-            "write_acknowledgement" => parse_write_acknowledgement_event(attrs)?,
-            "acknowledge_packet" => parse_acknowledge_packet_event(attrs)?,
-            "timeout_packet" => parse_timeout_packet_event(attrs)?,
-            "timeout_on_close_packet" => parse_timeout_on_close_packet_event(attrs)?,
+            "send_packet" => {
+                parse_event_with_context("send_packet", &attributes, attrs, parse_send_packet_event)?
+            }
+            "recv_packet" => {
+                parse_event_with_context("recv_packet", &attributes, attrs, parse_recv_packet_event)?
+            }
+            "write_acknowledgement" => parse_event_with_context(
+                "write_acknowledgement",
+                &attributes,
+                attrs,
+                parse_write_acknowledgement_event,
+            )?,
+            "acknowledge_packet" => parse_event_with_context(
+                "acknowledge_packet",
+                &attributes,
+                attrs,
+                parse_acknowledge_packet_event,
+            )?,
+            "timeout_packet" => {
+                parse_event_with_context("timeout_packet", &attributes, attrs, parse_timeout_packet_event)?
+            }
+            "timeout_on_close_packet" => parse_event_with_context(
+                "timeout_on_close_packet",
+                &attributes,
+                attrs,
+                parse_timeout_on_close_packet_event,
+            )?,
 
             // Unknown event type - log warning and skip
             _ => {
-                tracing::warn!("Unknown event type: {}", event.r#type);
+                let keys = attributes.iter().map(|attr| attr.key.as_str()).collect::<Vec<_>>();
+                tracing::warn!(
+                    "Unknown event type: {}; attribute keys: {:?}",
+                    event_type,
+                    keys
+                );
+                unknown_event_count += 1;
                 continue;
             }
         };
 
         ibc_events.push(ibc_event);
+        *parsed_type_counts.entry(event_type.clone()).or_default() += 1;
+        tracing::debug!("Parsed event type: {}", event_type);
+    }
+
+    tracing::debug!(
+        "Parsed {} of {} gateway events into IBC events",
+        ibc_events.len(),
+        event_count
+    );
+
+    if ibc_events.is_empty() && event_count > 0 {
+        tracing::warn!("No events could be parsed from gateway response");
+    }
+
+    if !parsed_type_counts.is_empty() {
+        tracing::debug!("Parsed event counts by gateway type: {:?}", parsed_type_counts);
+    }
+
+    if unknown_event_count > 0 {
+        tracing::warn!(
+            "{} gateway events were ignored because event type was unknown",
+            unknown_event_count
+        );
     }
 
     Ok(ibc_events)
+}
+
+fn parse_event_with_context(
+    event_type: &str,
+    raw_attributes: &[EventAttribute],
+    attrs: HashMap<String, String>,
+    parser: impl FnOnce(HashMap<String, String>) -> Result<IbcEvent, Error>,
+) -> Result<IbcEvent, Error> {
+    match parser(attrs) {
+        Ok(event) => Ok(event),
+        Err(error) => {
+            let keys = raw_attributes
+                .iter()
+                .map(|attribute| attribute.key.as_str())
+                .collect::<Vec<_>>();
+
+            tracing::warn!(
+                "Failed to parse gateway event '{}'; attribute keys {:?}; error: {}",
+                event_type,
+                keys,
+                error
+            );
+
+            Err(error)
+        }
+    }
 }
 
 /// Convert event attributes to a HashMap for easier lookup

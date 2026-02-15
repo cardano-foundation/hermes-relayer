@@ -412,6 +412,24 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     .await
                     .map_err(|e| Error::send_tx(format!("Failed to submit transaction: {}", e)))?;
 
+                let tx_hash = tx_response.tx_hash.clone();
+                let event_count = tx_response.events.len();
+
+                if event_count == 0 {
+                    tracing::warn!("Transaction {} produced no gateway events", tx_hash);
+                } else {
+                    tracing::info!("Transaction {} produced {} gateway events", tx_hash, event_count);
+                    tracing::debug!(
+                        "Gateway events for {}: {:?}",
+                        tx_hash,
+                        tx_response
+                            .events
+                            .iter()
+                            .map(|event| event.event_type.as_str())
+                            .collect::<Vec<_>>()
+                    );
+                }
+
                 // Step 4: Parse events from transaction result
                 let included_height = tx_response.height.ok_or_else(|| {
                     Error::send_tx("No height in transaction response".to_string())
@@ -468,9 +486,21 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 // Parse Gateway events into Hermes IbcEvent types
                 let parsed_events =
                     super::event_parser::parse_events(proto_events, certified_height)
-                        .map_err(|e| Error::send_tx(format!("Failed to parse events: {}", e)))?;
+                        .map_err(|e| {
+                            tracing::warn!(
+                                "Failed to parse IBC events from transaction {} at {}: {}",
+                                tx_hash,
+                                certified_height,
+                                e
+                            );
+                            Error::send_tx(format!("Failed to parse events: {}", e))
+                        })?;
 
-                tracing::info!("Parsed {} IBC events from transaction", parsed_events.len());
+                if parsed_events.is_empty() {
+                    tracing::warn!("Parsed 0 IBC events from transaction {} at {}", tx_hash, certified_height);
+                } else {
+                    tracing::info!("Parsed {} IBC events from transaction {}", parsed_events.len(), tx_hash);
+                }
 
                 // Wrap events with height
                 let events_with_height: Vec<IbcEventWithHeight> = parsed_events
