@@ -15,6 +15,7 @@ use crate::core::ics24_host::identifier::ChainId;
 use crate::Height;
 
 pub const MITHRIL_CLIENT_STATE_TYPE_URL: &str = "/ibc.lightclients.mithril.v1.ClientState";
+pub const LEGACY_MITHRIL_CLIENT_STATE_TYPE_URL: &str = "/ibc.clients.mithril.v1.ClientState";
 
 type RawClientState = raw::ClientState;
 type RawHeight = raw::Height;
@@ -184,7 +185,7 @@ impl TryFrom<Any> for ClientState {
         }
 
         match raw_any.type_url.as_str() {
-            MITHRIL_CLIENT_STATE_TYPE_URL => {
+            MITHRIL_CLIENT_STATE_TYPE_URL | LEGACY_MITHRIL_CLIENT_STATE_TYPE_URL => {
                 decode_state(raw_any.value.deref()).map_err(Into::into)
             }
             _ => Err(Ics02Error::unknown_client_state_type(raw_any.type_url)),

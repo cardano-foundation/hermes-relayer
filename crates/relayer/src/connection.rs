@@ -939,7 +939,9 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
             }
         );
         let dst_chain_is_cardano = matches!(
-            self.dst_chain().config().map_err(ConnectionError::relayer)?,
+            self.dst_chain()
+                .config()
+                .map_err(ConnectionError::relayer)?,
             ChainConfig::Cardano(_)
         );
 

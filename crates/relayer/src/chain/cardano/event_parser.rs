@@ -48,15 +48,24 @@ pub fn parse_events(gateway_events: Vec<Event>, _height: Height) -> Result<Vec<I
         // Parse event based on type
         let ibc_event = match event_type.as_str() {
             // Client events
-            "create_client" => {
-                parse_event_with_context("create_client", &attributes, attrs, parse_create_client_event)?
-            }
-            "update_client" => {
-                parse_event_with_context("update_client", &attributes, attrs, parse_update_client_event)?
-            }
-            "upgrade_client" => {
-                parse_event_with_context("upgrade_client", &attributes, attrs, parse_upgrade_client_event)?
-            }
+            "create_client" => parse_event_with_context(
+                "create_client",
+                &attributes,
+                attrs,
+                parse_create_client_event,
+            )?,
+            "update_client" => parse_event_with_context(
+                "update_client",
+                &attributes,
+                attrs,
+                parse_update_client_event,
+            )?,
+            "upgrade_client" => parse_event_with_context(
+                "upgrade_client",
+                &attributes,
+                attrs,
+                parse_upgrade_client_event,
+            )?,
             "client_misbehaviour" => parse_event_with_context(
                 "client_misbehaviour",
                 &attributes,
@@ -65,46 +74,82 @@ pub fn parse_events(gateway_events: Vec<Event>, _height: Height) -> Result<Vec<I
             )?,
 
             // Connection events
-            "connection_open_init" => {
-                parse_event_with_context("connection_open_init", &attributes, attrs, parse_connection_open_init_event)?
-            }
-            "connection_open_try" => {
-                parse_event_with_context("connection_open_try", &attributes, attrs, parse_connection_open_try_event)?
-            }
-            "connection_open_ack" => {
-                parse_event_with_context("connection_open_ack", &attributes, attrs, parse_connection_open_ack_event)?
-            }
-            "connection_open_confirm" => {
-                parse_event_with_context("connection_open_confirm", &attributes, attrs, parse_connection_open_confirm_event)?
-            }
+            "connection_open_init" => parse_event_with_context(
+                "connection_open_init",
+                &attributes,
+                attrs,
+                parse_connection_open_init_event,
+            )?,
+            "connection_open_try" => parse_event_with_context(
+                "connection_open_try",
+                &attributes,
+                attrs,
+                parse_connection_open_try_event,
+            )?,
+            "connection_open_ack" => parse_event_with_context(
+                "connection_open_ack",
+                &attributes,
+                attrs,
+                parse_connection_open_ack_event,
+            )?,
+            "connection_open_confirm" => parse_event_with_context(
+                "connection_open_confirm",
+                &attributes,
+                attrs,
+                parse_connection_open_confirm_event,
+            )?,
 
             // Channel events
-            "channel_open_init" => {
-                parse_event_with_context("channel_open_init", &attributes, attrs, parse_channel_open_init_event)?
-            }
-            "channel_open_try" => {
-                parse_event_with_context("channel_open_try", &attributes, attrs, parse_channel_open_try_event)?
-            }
-            "channel_open_ack" => {
-                parse_event_with_context("channel_open_ack", &attributes, attrs, parse_channel_open_ack_event)?
-            }
-            "channel_open_confirm" => {
-                parse_event_with_context("channel_open_confirm", &attributes, attrs, parse_channel_open_confirm_event)?
-            }
-            "channel_close_init" => {
-                parse_event_with_context("channel_close_init", &attributes, attrs, parse_channel_close_init_event)?
-            }
-            "channel_close_confirm" => {
-                parse_event_with_context("channel_close_confirm", &attributes, attrs, parse_channel_close_confirm_event)?
-            }
+            "channel_open_init" => parse_event_with_context(
+                "channel_open_init",
+                &attributes,
+                attrs,
+                parse_channel_open_init_event,
+            )?,
+            "channel_open_try" => parse_event_with_context(
+                "channel_open_try",
+                &attributes,
+                attrs,
+                parse_channel_open_try_event,
+            )?,
+            "channel_open_ack" => parse_event_with_context(
+                "channel_open_ack",
+                &attributes,
+                attrs,
+                parse_channel_open_ack_event,
+            )?,
+            "channel_open_confirm" => parse_event_with_context(
+                "channel_open_confirm",
+                &attributes,
+                attrs,
+                parse_channel_open_confirm_event,
+            )?,
+            "channel_close_init" => parse_event_with_context(
+                "channel_close_init",
+                &attributes,
+                attrs,
+                parse_channel_close_init_event,
+            )?,
+            "channel_close_confirm" => parse_event_with_context(
+                "channel_close_confirm",
+                &attributes,
+                attrs,
+                parse_channel_close_confirm_event,
+            )?,
 
             // Packet events
-            "send_packet" => {
-                parse_event_with_context("send_packet", &attributes, attrs, parse_send_packet_event)?
-            }
-            "recv_packet" => {
-                parse_event_with_context("recv_packet", &attributes, attrs, parse_recv_packet_event)?
-            }
+            "send_packet" => parse_event_with_context(
+                "send_packet",
+                &attributes,
+                attrs,
+                parse_send_packet_event,
+            )?,
+            "recv_packet" => parse_event_with_context(
+                "recv_packet",
+                &attributes,
+                attrs,
+                parse_recv_packet_event,
+            )?,
             "write_acknowledgement" => parse_event_with_context(
                 "write_acknowledgement",
                 &attributes,
@@ -117,9 +162,12 @@ pub fn parse_events(gateway_events: Vec<Event>, _height: Height) -> Result<Vec<I
                 attrs,
                 parse_acknowledge_packet_event,
             )?,
-            "timeout_packet" => {
-                parse_event_with_context("timeout_packet", &attributes, attrs, parse_timeout_packet_event)?
-            }
+            "timeout_packet" => parse_event_with_context(
+                "timeout_packet",
+                &attributes,
+                attrs,
+                parse_timeout_packet_event,
+            )?,
             "timeout_on_close_packet" => parse_event_with_context(
                 "timeout_on_close_packet",
                 &attributes,
@@ -129,7 +177,10 @@ pub fn parse_events(gateway_events: Vec<Event>, _height: Height) -> Result<Vec<I
 
             // Unknown event type - log warning and skip
             _ => {
-                let keys = attributes.iter().map(|attr| attr.key.as_str()).collect::<Vec<_>>();
+                let keys = attributes
+                    .iter()
+                    .map(|attr| attr.key.as_str())
+                    .collect::<Vec<_>>();
                 tracing::warn!(
                     "Unknown event type: {}; attribute keys: {:?}",
                     event_type,
@@ -156,7 +207,10 @@ pub fn parse_events(gateway_events: Vec<Event>, _height: Height) -> Result<Vec<I
     }
 
     if !parsed_type_counts.is_empty() {
-        tracing::debug!("Parsed event counts by gateway type: {:?}", parsed_type_counts);
+        tracing::debug!(
+            "Parsed event counts by gateway type: {:?}",
+            parsed_type_counts
+        );
     }
 
     if unknown_event_count > 0 {

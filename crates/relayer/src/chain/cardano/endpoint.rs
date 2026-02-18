@@ -418,7 +418,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 if event_count == 0 {
                     tracing::warn!("Transaction {} produced no gateway events", tx_hash);
                 } else {
-                    tracing::info!("Transaction {} produced {} gateway events", tx_hash, event_count);
+                    tracing::info!(
+                        "Transaction {} produced {} gateway events",
+                        tx_hash,
+                        event_count
+                    );
                     tracing::debug!(
                         "Gateway events for {}: {:?}",
                         tx_hash,
@@ -485,8 +489,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
                 // Parse Gateway events into Hermes IbcEvent types
                 let parsed_events =
-                    super::event_parser::parse_events(proto_events, certified_height)
-                        .map_err(|e| {
+                    super::event_parser::parse_events(proto_events, certified_height).map_err(
+                        |e| {
                             tracing::warn!(
                                 "Failed to parse IBC events from transaction {} at {}: {}",
                                 tx_hash,
@@ -494,12 +498,21 @@ impl ChainEndpoint for CardanoChainEndpoint {
                                 e
                             );
                             Error::send_tx(format!("Failed to parse events: {}", e))
-                        })?;
+                        },
+                    )?;
 
                 if parsed_events.is_empty() {
-                    tracing::warn!("Parsed 0 IBC events from transaction {} at {}", tx_hash, certified_height);
+                    tracing::warn!(
+                        "Parsed 0 IBC events from transaction {} at {}",
+                        tx_hash,
+                        certified_height
+                    );
                 } else {
-                    tracing::info!("Parsed {} IBC events from transaction {}", parsed_events.len(), tx_hash);
+                    tracing::info!(
+                        "Parsed {} IBC events from transaction {}",
+                        parsed_events.len(),
+                        tx_hash
+                    );
                 }
 
                 // Wrap events with height
@@ -2046,16 +2059,55 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         Error::query(format!("Gateway query_latest_height failed: {e}"))
                     })?;
 
-                let latest_header = self
-                    .rt
-                    .block_on(self.gateway_client.query_header(latest_height))
-                    .map_err(|e| {
-                        Error::query(format!(
-                            "Gateway query_header failed at latest height {latest_height}: {e}"
-                        ))
-                    })?;
+                let mut selected_header = None;
+                let mut candidate_height = target_height.revision_height();
+                let latest_revision_height = latest_height.revision_height();
 
-                Ok((latest_header, vec![proof_header]))
+                while candidate_height <= latest_revision_height {
+                    let candidate_ics_height =
+                        ICSHeight::new(target_height.revision_number(), candidate_height)
+                            .map_err(|_| {
+                                Error::query(format!(
+                                    "invalid candidate height while searching Cardano header: {candidate_height}"
+                                ))
+                            })?;
+
+                    match self
+                        .rt
+                        .block_on(self.gateway_client.query_header(candidate_ics_height))
+                    {
+                        Ok(header) => {
+                            selected_header = Some(header);
+                            break;
+                        }
+                        Err(search_error) => {
+                            let search_error_text = search_error.to_string();
+                            if !search_error_text.contains("Not found")
+                                || !search_error_text.contains("height")
+                            {
+                                return Err(Error::query(format!(
+                                    "Gateway query_header failed while searching for a certified height at/after {target_height} (candidate {candidate_ics_height}): {search_error}"
+                                )));
+                            }
+                        }
+                    }
+
+                    candidate_height = candidate_height.saturating_add(1);
+                }
+
+                let selected_header = if let Some(header) = selected_header {
+                    header
+                } else {
+                    self.rt
+                        .block_on(self.gateway_client.query_header(latest_height))
+                        .map_err(|e| {
+                            Error::query(format!(
+                                "Gateway query_header failed at latest height {latest_height}: {e}"
+                            ))
+                        })?
+                };
+
+                Ok((selected_header, vec![proof_header]))
             }
         }
     }

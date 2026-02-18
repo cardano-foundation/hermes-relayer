@@ -13,6 +13,7 @@ use crate::core::ics23_commitment::commitment::CommitmentRoot;
 use crate::timestamp::Timestamp;
 
 pub const MITHRIL_CONSENSUS_STATE_TYPE_URL: &str = "/ibc.lightclients.mithril.v1.ConsensusState";
+pub const LEGACY_MITHRIL_CONSENSUS_STATE_TYPE_URL: &str = "/ibc.clients.mithril.v1.ConsensusState";
 
 type RawConsensusState = raw::ConsensusState;
 
@@ -70,18 +71,28 @@ impl TryFrom<RawConsensusState> for ConsensusState {
         let first = first_cert_hash_latest_epoch
             .ok_or_else(|| Error::missing_field("first_cert_hash_latest_epoch"))?;
 
-        if ibc_state_root.is_empty() {
-            return Err(Error::missing_field("ibc_state_root"));
-        }
+        // Legacy Cosmos demo chains may omit `ibc_state_root` from stored consensus states.
+        // Keep decode compatibility by deriving a stable 32-byte placeholder from the latest
+        // transaction snapshot hash when possible, and fall back to zero bytes otherwise.
+        let normalized_root = if ibc_state_root.is_empty() {
+            if latest_cert_hash_tx_snapshot.len() == 64 {
+                decode_hex_to_bytes(&latest_cert_hash_tx_snapshot)
+                    .unwrap_or_else(|| vec![0u8; 32])
+            } else {
+                vec![0u8; 32]
+            }
+        } else {
+            ibc_state_root
+        };
 
-        if ibc_state_root.len() != 32 {
+        if normalized_root.len() != 32 {
             return Err(Error::invalid_field(
                 "ibc_state_root",
-                format!("expected 32 bytes, got {}", ibc_state_root.len()),
+                format!("expected 32 bytes, got {}", normalized_root.len()),
             ));
         }
 
-        let root = CommitmentRoot::from_bytes(&ibc_state_root);
+        let root = CommitmentRoot::from_bytes(&normalized_root);
 
         Ok(Self::new(
             root,
@@ -103,6 +114,20 @@ impl From<ConsensusState> for RawConsensusState {
     }
 }
 
+fn decode_hex_to_bytes(input: &str) -> Option<Vec<u8>> {
+    if input.len() % 2 != 0 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(input.len() / 2);
+    for index in (0..input.len()).step_by(2) {
+        let pair = &input[index..index + 2];
+        let value = u8::from_str_radix(pair, 16).ok()?;
+        out.push(value);
+    }
+    Some(out)
+}
+
 impl Protobuf<Any> for ConsensusState {}
 
 impl TryFrom<Any> for ConsensusState {
@@ -118,7 +143,7 @@ impl TryFrom<Any> for ConsensusState {
         }
 
         match raw_any.type_url.as_str() {
-            MITHRIL_CONSENSUS_STATE_TYPE_URL => {
+            MITHRIL_CONSENSUS_STATE_TYPE_URL | LEGACY_MITHRIL_CONSENSUS_STATE_TYPE_URL => {
                 decode_state(raw_any.value.deref()).map_err(Into::into)
             }
             _ => Err(Ics02Error::unknown_consensus_state_type(raw_any.type_url)),

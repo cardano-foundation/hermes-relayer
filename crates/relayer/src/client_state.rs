@@ -10,7 +10,8 @@ use ibc_relayer_types::clients::ics07_tendermint::client_state::{
     ClientState as TmClientState, TENDERMINT_CLIENT_STATE_TYPE_URL,
 };
 use ibc_relayer_types::clients::ics08_cardano::client_state::{
-    ClientState as MithrilClientState, MITHRIL_CLIENT_STATE_TYPE_URL,
+    ClientState as MithrilClientState, LEGACY_MITHRIL_CLIENT_STATE_TYPE_URL,
+    MITHRIL_CLIENT_STATE_TYPE_URL,
 };
 
 use ibc_relayer_types::core::ics02_client::client_state::ClientState;
@@ -101,7 +102,9 @@ impl TryFrom<Any> for AnyClientState {
                     .map_err(Error::decode_raw_client_state)?,
             )),
 
-            MITHRIL_CLIENT_STATE_TYPE_URL => Ok(AnyClientState::Mithril(raw.try_into()?)),
+            MITHRIL_CLIENT_STATE_TYPE_URL | LEGACY_MITHRIL_CLIENT_STATE_TYPE_URL => {
+                Ok(AnyClientState::Mithril(raw.try_into()?))
+            }
 
             _ => Err(Error::unknown_client_state_type(raw.type_url)),
         }

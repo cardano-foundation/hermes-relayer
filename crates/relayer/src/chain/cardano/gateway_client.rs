@@ -1232,12 +1232,12 @@ impl GatewayClient {
             None => None,
         };
 
-        let timeout_height = msg.timeout_height.map(|height| {
-            super::generated::ibc::core::client::v1::Height {
-                revision_number: height.revision_number,
-                revision_height: height.revision_height,
-            }
-        });
+        let timeout_height =
+            msg.timeout_height
+                .map(|height| super::generated::ibc::core::client::v1::Height {
+                    revision_number: height.revision_number,
+                    revision_height: height.revision_height,
+                });
 
         // The Gateway expects MsgTransfer under `ibc.core.channel.v1` and includes a `signer`
         // field. In canonical IBC, the sender is the signer for MsgTransfer.
@@ -1277,9 +1277,9 @@ impl GatewayClient {
 
         let response = client.transfer(request).await?.into_inner();
 
-        let unsigned_tx_any = response.unsigned_tx.ok_or_else(|| {
-            Error::Transaction("No unsigned_tx in Transfer response".to_string())
-        })?;
+        let unsigned_tx_any = response
+            .unsigned_tx
+            .ok_or_else(|| Error::Transaction("No unsigned_tx in Transfer response".to_string()))?;
 
         let cbor_hex = String::from_utf8(unsigned_tx_any.value)
             .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
