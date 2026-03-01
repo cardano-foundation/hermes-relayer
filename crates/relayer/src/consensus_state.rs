@@ -8,8 +8,7 @@ use ibc_relayer_types::clients::ics07_tendermint::consensus_state::{
     ConsensusState as TmConsensusState, TENDERMINT_CONSENSUS_STATE_TYPE_URL,
 };
 use ibc_relayer_types::clients::ics08_cardano::consensus_state::{
-    ConsensusState as MithrilConsensusState, LEGACY_MITHRIL_CONSENSUS_STATE_TYPE_URL,
-    MITHRIL_CONSENSUS_STATE_TYPE_URL,
+    ConsensusState as MithrilConsensusState, MITHRIL_CONSENSUS_STATE_TYPE_URL,
 };
 
 use ibc_relayer_types::core::ics02_client::client_type::ClientType;
@@ -58,9 +57,7 @@ impl TryFrom<Any> for AnyConsensusState {
                     .map_err(Error::decode_raw_client_state)?,
             )),
 
-            MITHRIL_CONSENSUS_STATE_TYPE_URL | LEGACY_MITHRIL_CONSENSUS_STATE_TYPE_URL => {
-                Ok(AnyConsensusState::Mithril(value.try_into()?))
-            }
+            MITHRIL_CONSENSUS_STATE_TYPE_URL => Ok(AnyConsensusState::Mithril(value.try_into()?)),
 
             _ => Err(Error::unknown_consensus_state_type(value.type_url)),
         }

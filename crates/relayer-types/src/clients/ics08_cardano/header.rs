@@ -12,7 +12,6 @@ use crate::timestamp::Timestamp;
 use crate::Height;
 
 pub const MITHRIL_HEADER_TYPE_URL: &str = "/ibc.lightclients.mithril.v1.MithrilHeader";
-pub const LEGACY_MITHRIL_HEADER_TYPE_URL: &str = "/ibc.clients.mithril.v1.MithrilHeader";
 
 type RawHeader = raw::MithrilHeader;
 
@@ -170,9 +169,7 @@ impl TryFrom<Any> for Header {
         }
 
         match raw_any.type_url.as_str() {
-            MITHRIL_HEADER_TYPE_URL | LEGACY_MITHRIL_HEADER_TYPE_URL => {
-                decode_header(raw_any.value.deref()).map_err(Into::into)
-            }
+            MITHRIL_HEADER_TYPE_URL => decode_header(raw_any.value.deref()).map_err(Into::into),
             _ => Err(Ics02Error::unknown_header_type(raw_any.type_url)),
         }
     }
