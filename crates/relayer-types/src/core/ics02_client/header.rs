@@ -10,6 +10,9 @@ use crate::clients::ics07_tendermint::header::{
     decode_header as tm_decode_header, Header as TendermintHeader, TENDERMINT_HEADER_TYPE_URL,
 };
 use crate::clients::ics08_cardano::header::{Header as MithrilHeader, MITHRIL_HEADER_TYPE_URL};
+use crate::clients::ics08_cardano_stability::header::{
+    Header as StabilityHeader, STABILITY_HEADER_TYPE_URL,
+};
 use crate::core::ics02_client::client_type::ClientType;
 use crate::core::ics02_client::error::Error;
 use crate::timestamp::Timestamp;
@@ -39,6 +42,7 @@ pub fn decode_header(header_bytes: &[u8]) -> Result<AnyHeader, Error> {
 pub enum AnyHeader {
     Tendermint(TendermintHeader),
     Mithril(MithrilHeader),
+    Stability(StabilityHeader),
 }
 
 impl Header for AnyHeader {
@@ -46,6 +50,7 @@ impl Header for AnyHeader {
         match self {
             Self::Tendermint(header) => header.client_type(),
             Self::Mithril(header) => header.client_type(),
+            Self::Stability(header) => header.client_type(),
         }
     }
 
@@ -53,6 +58,7 @@ impl Header for AnyHeader {
         match self {
             Self::Tendermint(header) => header.height(),
             Self::Mithril(header) => header.height(),
+            Self::Stability(header) => header.height(),
         }
     }
 
@@ -60,6 +66,7 @@ impl Header for AnyHeader {
         match self {
             Self::Tendermint(header) => header.timestamp(),
             Self::Mithril(header) => header.timestamp(),
+            Self::Stability(header) => header.timestamp(),
         }
     }
 }
@@ -79,6 +86,10 @@ impl TryFrom<Any> for AnyHeader {
                 let val: MithrilHeader = raw.try_into()?;
                 Ok(AnyHeader::Mithril(val))
             }
+            STABILITY_HEADER_TYPE_URL => {
+                let val: StabilityHeader = raw.try_into()?;
+                Ok(AnyHeader::Stability(val))
+            }
 
             _ => Err(Error::unknown_header_type(raw.type_url)),
         }
@@ -95,6 +106,7 @@ impl From<AnyHeader> for Any {
                 value: Protobuf::<RawHeader>::encode_vec(header),
             },
             AnyHeader::Mithril(header) => header.into(),
+            AnyHeader::Stability(header) => header.into(),
         }
     }
 }
@@ -108,5 +120,11 @@ impl From<TendermintHeader> for AnyHeader {
 impl From<MithrilHeader> for AnyHeader {
     fn from(header: MithrilHeader) -> Self {
         Self::Mithril(header)
+    }
+}
+
+impl From<StabilityHeader> for AnyHeader {
+    fn from(header: StabilityHeader) -> Self {
+        Self::Stability(header)
     }
 }

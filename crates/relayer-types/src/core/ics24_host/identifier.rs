@@ -191,6 +191,7 @@ impl ClientId {
         match client_type {
             ClientType::Tendermint => ClientType::Tendermint.as_str(),
             ClientType::Cardano => ClientType::Cardano.as_str(),
+            ClientType::CardanoStability => ClientType::CardanoStability.as_str(),
         }
     }
 

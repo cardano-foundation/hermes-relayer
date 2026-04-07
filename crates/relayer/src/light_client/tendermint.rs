@@ -160,12 +160,19 @@ impl super::LightClient<CosmosSdkChain> for LightClient {
                 "received Mithril header in Tendermint light client for chain {}",
                 self.chain_id
             ))),
+            AnyHeader::Stability(_) => Err(Error::misbehaviour(format!(
+                "received stability header in Tendermint light client for chain {}",
+                self.chain_id
+            ))),
         }?;
 
         let client_state = match client_state {
             AnyClientState::Tendermint(client_state) => Ok::<_, Error>(client_state),
             AnyClientState::Mithril(_) => Err(Error::client_state_type(
                 "received Mithril client state in Tendermint light client".to_string(),
+            )),
+            AnyClientState::Stability(_) => Err(Error::client_state_type(
+                "received stability client state in Tendermint light client".to_string(),
             )),
         }?;
 
@@ -367,6 +374,9 @@ impl LightClient {
             AnyClientState::Tendermint(client_state) => Ok::<_, Error>(client_state),
             AnyClientState::Mithril(_) => Err(Error::client_state_type(
                 "received Mithril client state in Tendermint light client".to_string(),
+            )),
+            AnyClientState::Stability(_) => Err(Error::client_state_type(
+                "received stability client state in Tendermint light client".to_string(),
             )),
         }?;
 

@@ -6,11 +6,8 @@ use super::config::CardanoConfig;
 use super::gateway_client::GatewayClient;
 use super::signing_key_pair::CardanoSigningKeyPair;
 
-use ibc_relayer_types::clients::ics08_cardano::header::Header as MithrilHeader;
-use ibc_relayer_types::clients::ics08_cardano::{
-    client_state::ClientState as MithrilClientState,
-    consensus_state::ConsensusState as MithrilConsensusState,
-};
+use ibc_relayer_types::clients::ics08_cardano::consensus_state::ConsensusState as MithrilConsensusState;
+use ibc_relayer_types::clients::ics08_cardano_stability::consensus_state::ConsensusState as StabilityConsensusState;
 
 use crate::account::Balance;
 use crate::chain::client::ClientSettings;
@@ -39,6 +36,7 @@ use crate::error::Error;
 use crate::event::IbcEventWithHeight;
 use crate::keyring::{KeyRing, SigningKeyPair};
 use crate::misbehaviour::MisbehaviourEvidence;
+use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header as IbcHeader};
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
 use ibc_relayer_types::core::ics03_connection::connection::{
     ConnectionEnd, IdentifiedConnectionEnd,
@@ -61,7 +59,7 @@ use tokio::runtime::Runtime as TokioRuntime;
 /// Cardano light block (placeholder)
 #[derive(Debug, Clone)]
 pub struct CardanoLightBlock {
-    pub header: MithrilHeader,
+    pub header: AnyHeader,
     pub host_state_nft_policy_id: Vec<u8>,
     pub host_state_nft_token_name: Vec<u8>,
 }
@@ -150,19 +148,19 @@ impl CardanoChainEndpoint {
     /// Why this exists:
     /// - The Gateway returns a transaction `height` in `submit_signed_tx` based on `db-sync`'s
     ///   `block_no` for the block that included the transaction.
-    /// - Separately, for Cardano↔Cosmos IBC, the Cosmos-side light client only accepts *Mithril-
-    ///   certified* heights. In this integration, we treat the IBC `Height.revision_height` for
-    ///   Cardano as the Mithril Cardano-transactions snapshot `block_number` (a monotonically
-    ///   increasing block number), not as the raw chain tip.
+    /// - Separately, for Cardano↔Cosmos IBC, the Cosmos-side light client only accepts heights
+    ///   that satisfy the active Gateway light-client mode. In Mithril mode this is a certified
+    ///   transaction snapshot block number; in stability mode it is a heuristically accepted
+    ///   Cardano block number.
     ///
     /// If Hermes proceeds immediately after inclusion, it may query proofs at a height that the
     /// Cosmos-side client has not yet been updated to, or worse: it may receive proofs that are
-    /// valid for a newer on-chain HostState root but are being verified against an older certified
+    /// valid for a newer on-chain HostState root but are being verified against an older accepted
     /// root. That shows up as "proof does not match ibc_state_root".
     ///
     /// To avoid this class of race, we treat "commit" for Cardano transactions as "included AND
-    /// covered by the latest Mithril transaction snapshot".
-    async fn wait_for_mithril_certified_height(
+    /// accepted by the Gateway's current light-client mode".
+    async fn wait_for_gateway_accepted_height(
         &self,
         included_height: ICSHeight,
     ) -> Result<ICSHeight, Error> {
@@ -195,8 +193,8 @@ impl CardanoChainEndpoint {
             let elapsed = start.elapsed();
             if elapsed >= timeout {
                 return Err(Error::send_tx(format!(
-                    "timed out waiting for Mithril-certified height >= {} (latest={}). \
-                     Note: for Cardano, Height.revision_height is a Mithril snapshot block_number (not a slot).",
+                    "timed out waiting for Gateway-accepted height >= {} (latest={}). \
+                     Note: for Cardano, Height.revision_height is a block-number based height in both Mithril and stability modes.",
                     included_height, latest,
                 )));
             }
@@ -214,7 +212,7 @@ impl CardanoChainEndpoint {
             if should_log {
                 let remaining = timeout.saturating_sub(elapsed);
                 let log_msg = format!(
-                    "Waiting for Mithril snapshot: need >= {} (missing {} blocks), have {}, elapsed={}s, remaining={}s",
+                    "Waiting for Gateway accepted height: need >= {} (missing {} blocks), have {}, elapsed={}s, remaining={}s",
                     included_height,
                     missing_blocks,
                     latest,
@@ -239,9 +237,9 @@ impl CardanoChainEndpoint {
 
 impl ChainEndpoint for CardanoChainEndpoint {
     type LightBlock = CardanoLightBlock;
-    type Header = MithrilHeader;
-    type ConsensusState = MithrilConsensusState;
-    type ClientState = MithrilClientState;
+    type Header = AnyHeader;
+    type ConsensusState = AnyConsensusState;
+    type ClientState = AnyClientState;
     type Time = i64; // Unix timestamp
     type SigningKeyPair = CardanoSigningKeyPair;
 
@@ -445,10 +443,10 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     included_height
                 );
 
-                // Ensure the transaction is also covered by the latest Mithril transaction snapshot
+                // Ensure the transaction is also accepted by the active Cardano light-client mode
                 // before we treat it as "committed" from the perspective of IBC relaying.
                 let certified_height = self
-                    .wait_for_mithril_certified_height(included_height)
+                    .wait_for_gateway_accepted_height(included_height)
                     .await?;
                 if certified_height.revision_height() != included_height.revision_height() {
                     tracing::info!(
@@ -599,13 +597,13 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // Hermes uses `verify_header()` as part of its generic client update workflow.
         //
         // For Tendermint clients, this verifies signatures and header continuity off-chain.
-        // For Cardano, we rely on on-chain verification in the Cosmos-side Mithril light client
-        // implementation (the chain rejects invalid Mithril headers and proofs).
+        // For Cardano, we rely on on-chain verification in the Cosmos-side Cardano light client
+        // implementation (the chain rejects invalid headers and proofs for the active client type).
         //
         // To keep Hermes functional without coupling it to the full Mithril verification stack
         // (which is already implemented in the on-chain client), we treat this as a best-effort
         // fetch + structural validation step:
-        // - fetch the MithrilHeader for `target` from the Gateway
+        // - fetch the Cardano header for `target` from the Gateway
         // - return it as a CardanoLightBlock so the relayer can proceed
         //
         // TODO: Implement optional off-chain verification to avoid broadcasting invalid headers and
@@ -622,9 +620,13 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 state.host_state_nft_policy_id.clone(),
                 state.host_state_nft_token_name.clone(),
             ),
+            AnyClientState::Stability(state) => (
+                state.host_state_nft_policy_id.clone(),
+                state.host_state_nft_token_name.clone(),
+            ),
             _ => {
                 return Err(Error::query(
-                    "Cardano verify_header requires a Mithril client state".to_string(),
+                    "Cardano verify_header requires a Cardano client state".to_string(),
                 ))
             }
         };
@@ -689,7 +691,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         tracing::info!("Cardano chain at height: {}", height);
 
         let timestamp = match self.rt.block_on(self.gateway_client.query_header(height)) {
-            Ok(header) => header.timestamp,
+            Ok(header) => header.timestamp(),
             Err(e) => {
                 tracing::warn!(
                     "Failed to query header at height {height} for timestamp (falling back to local time): {e}"
@@ -1959,7 +1961,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         _settings: ClientSettings,
     ) -> Result<Self::ClientState, Error> {
         tracing::info!(
-            "Building Mithril client state for Cardano at height {:?}",
+            "Building Cardano client state at height {:?}",
             height
         );
 
@@ -1982,7 +1984,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
         any.try_into()
             .map_err(|e: ibc_relayer_types::core::ics02_client::error::Error| {
-                Error::query(format!("Failed to decode Mithril client state: {e}"))
+                Error::query(format!("Failed to decode Cardano client state: {e}"))
             })
     }
 
@@ -1996,14 +1998,26 @@ impl ChainEndpoint for CardanoChainEndpoint {
             &light_block.host_state_nft_token_name,
         )?;
 
-        let header = light_block.header;
-
-        Ok(MithrilConsensusState::new(
-            CommitmentRoot::from_bytes(&ibc_state_root),
-            header.timestamp.nanoseconds(),
-            header.mithril_stake_distribution_certificate,
-            header.transaction_snapshot_certificate.hash,
-        ))
+        match light_block.header {
+            AnyHeader::Mithril(header) => Ok(AnyConsensusState::from(MithrilConsensusState::new(
+                CommitmentRoot::from_bytes(&ibc_state_root),
+                header.timestamp.nanoseconds(),
+                header.mithril_stake_distribution_certificate,
+                header.transaction_snapshot_certificate.hash,
+            ))),
+            AnyHeader::Stability(header) => Ok(AnyConsensusState::from(StabilityConsensusState {
+                root: CommitmentRoot::from_bytes(&ibc_state_root),
+                timestamp: header.timestamp.nanoseconds(),
+                accepted_block_hash: header.anchor_block.hash,
+                accepted_epoch: header.anchor_block.epoch,
+                unique_pools_count: header.unique_pools_count,
+                unique_stake_bps: header.unique_stake_bps,
+                security_score_bps: header.security_score_bps,
+            })),
+            AnyHeader::Tendermint(_) => Err(Error::query(
+                "Cardano build_consensus_state received a Tendermint header".to_string(),
+            )),
+        }
     }
 
     fn build_header(
@@ -2265,14 +2279,33 @@ fn filter_packet_events_from_block_results(
 // `ibc-relayer-types/src/core/ics02_client/header.rs`.
 
 fn extract_ibc_state_root_from_host_state_tx(
-    header: &MithrilHeader,
+    header: &AnyHeader,
     host_state_nft_policy_id: &[u8],
     host_state_nft_token_name: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    let tx_hash = header.host_state_tx_hash.trim();
+    let (header_kind, tx_hash, tx_body_cbor, output_index) = match header {
+        AnyHeader::Mithril(header) => (
+            "Mithril",
+            header.host_state_tx_hash.trim(),
+            header.host_state_tx_body_cbor.as_slice(),
+            header.host_state_tx_output_index,
+        ),
+        AnyHeader::Stability(header) => (
+            "stability",
+            header.host_state_tx_hash.trim(),
+            header.host_state_tx_body_cbor.as_slice(),
+            header.host_state_tx_output_index,
+        ),
+        AnyHeader::Tendermint(_) => {
+            return Err(Error::query(
+                "unexpected Tendermint header in Cardano host state extraction".to_string(),
+            ))
+        }
+    };
+
     if tx_hash.is_empty() {
         return Err(Error::query(
-            "missing host_state_tx_hash in Mithril header".to_string(),
+            format!("missing host_state_tx_hash in {header_kind} header"),
         ));
     }
 
@@ -2283,10 +2316,9 @@ fn extract_ibc_state_root_from_host_state_tx(
         )));
     }
 
-    let tx_body_cbor = header.host_state_tx_body_cbor.as_slice();
     if tx_body_cbor.is_empty() {
         return Err(Error::query(
-            "missing host_state_tx_body_cbor in Mithril header".to_string(),
+            format!("missing host_state_tx_body_cbor in {header_kind} header"),
         ));
     }
 
@@ -2307,7 +2339,7 @@ fn extract_ibc_state_root_from_host_state_tx(
     if let Ok(body) = conway_body {
         return extract_root_from_conway_tx_body(
             &body,
-            header.host_state_tx_output_index,
+            output_index,
             host_state_nft_policy_id,
             host_state_nft_token_name,
         );
@@ -2318,7 +2350,7 @@ fn extract_ibc_state_root_from_host_state_tx(
     if let Ok(body) = babbage_body {
         return extract_root_from_babbage_tx_body(
             &body,
-            header.host_state_tx_output_index,
+            output_index,
             host_state_nft_policy_id,
             host_state_nft_token_name,
         );

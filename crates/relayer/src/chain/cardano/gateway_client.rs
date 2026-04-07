@@ -30,7 +30,7 @@ use ibc_proto::ibc::core::connection::v1::query_client::QueryClient as Connectio
 use ibc_proto::ibc::core::connection::v1::{
     QueryClientConnectionsRequest, QueryConnectionRequest, QueryConnectionsRequest,
 };
-use ibc_relayer_types::clients::ics08_cardano::header::Header as MithrilHeader;
+use ibc_relayer_types::core::ics02_client::header::AnyHeader;
 use ibc_relayer_types::Height;
 use tonic::transport::Channel;
 
@@ -96,7 +96,7 @@ impl GatewayClient {
             .map_err(|e| Error::Query(format!("Invalid height {}: {}", response.height, e)))
     }
 
-    /// Query the canonical Mithril client state/consensus state for creating a new client.
+    /// Query the canonical Cardano client state/consensus state for creating a new client.
     pub async fn query_new_client(
         &self,
         height: u64,
@@ -173,7 +173,7 @@ impl GatewayClient {
     /// Query header at a specific height
     ///
     /// This is required for building headers used in `MsgUpdateClient`.
-    pub async fn query_header(&self, height: Height) -> Result<MithrilHeader, Error> {
+    pub async fn query_header(&self, height: Height) -> Result<AnyHeader, Error> {
         use super::generated::ibc::core::types::v1::query_client::QueryClient as TypesQueryClient;
         use super::generated::ibc::core::types::v1::QueryIbcHeaderRequest;
 

@@ -10,6 +10,9 @@ use ibc_relayer_types::clients::ics07_tendermint::consensus_state::{
 use ibc_relayer_types::clients::ics08_cardano::consensus_state::{
     ConsensusState as MithrilConsensusState, MITHRIL_CONSENSUS_STATE_TYPE_URL,
 };
+use ibc_relayer_types::clients::ics08_cardano_stability::consensus_state::{
+    ConsensusState as StabilityConsensusState, STABILITY_CONSENSUS_STATE_TYPE_URL,
+};
 
 use ibc_relayer_types::core::ics02_client::client_type::ClientType;
 use ibc_relayer_types::core::ics02_client::consensus_state::ConsensusState;
@@ -25,6 +28,8 @@ pub enum AnyConsensusState {
     Tendermint(TmConsensusState),
     /// Cardano-tracking consensus state (`08-cardano`), encoded as `ibc.lightclients.mithril.v1.ConsensusState`.
     Mithril(MithrilConsensusState),
+    /// Stability-scored Cardano consensus state (`08-cardano-stability`), encoded as `ibc.lightclients.stability.v1.ConsensusState`.
+    Stability(StabilityConsensusState),
 }
 
 impl AnyConsensusState {
@@ -32,6 +37,7 @@ impl AnyConsensusState {
         match self {
             Self::Tendermint(cs_state) => cs_state.timestamp.into(),
             Self::Mithril(cs_state) => ConsensusState::timestamp(cs_state),
+            Self::Stability(cs_state) => ConsensusState::timestamp(cs_state),
         }
     }
 
@@ -39,6 +45,7 @@ impl AnyConsensusState {
         match self {
             AnyConsensusState::Tendermint(_cs) => ClientType::Tendermint,
             AnyConsensusState::Mithril(_cs) => ClientType::Cardano,
+            AnyConsensusState::Stability(_cs) => ClientType::CardanoStability,
         }
     }
 }
@@ -58,6 +65,7 @@ impl TryFrom<Any> for AnyConsensusState {
             )),
 
             MITHRIL_CONSENSUS_STATE_TYPE_URL => Ok(AnyConsensusState::Mithril(value.try_into()?)),
+            STABILITY_CONSENSUS_STATE_TYPE_URL => Ok(AnyConsensusState::Stability(value.try_into()?)),
 
             _ => Err(Error::unknown_consensus_state_type(value.type_url)),
         }
@@ -72,6 +80,7 @@ impl From<AnyConsensusState> for Any {
                 value: Protobuf::<RawConsensusState>::encode_vec(value),
             },
             AnyConsensusState::Mithril(value) => value.into(),
+            AnyConsensusState::Stability(value) => value.into(),
         }
     }
 }
@@ -85,6 +94,12 @@ impl From<TmConsensusState> for AnyConsensusState {
 impl From<MithrilConsensusState> for AnyConsensusState {
     fn from(cs: MithrilConsensusState) -> Self {
         Self::Mithril(cs)
+    }
+}
+
+impl From<StabilityConsensusState> for AnyConsensusState {
+    fn from(cs: StabilityConsensusState) -> Self {
+        Self::Stability(cs)
     }
 }
 
@@ -134,6 +149,7 @@ impl ConsensusState for AnyConsensusState {
         match self {
             Self::Tendermint(cs_state) => cs_state.root(),
             Self::Mithril(cs_state) => ConsensusState::root(cs_state),
+            Self::Stability(cs_state) => ConsensusState::root(cs_state),
         }
     }
 

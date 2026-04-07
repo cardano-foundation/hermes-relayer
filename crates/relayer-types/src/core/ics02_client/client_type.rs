@@ -8,6 +8,7 @@ use super::error::Error;
 pub enum ClientType {
     Tendermint = 1,
     Cardano = 2,
+    CardanoStability = 3,
 }
 
 impl ClientType {
@@ -15,12 +16,14 @@ impl ClientType {
     // Cardano tracking client type. The corresponding protobuf messages are currently under
     // `ibc.lightclients.mithril.v1.*` (Mithril).
     const CARDANO_STR: &'static str = "08-cardano";
+    const CARDANO_STABILITY_STR: &'static str = "08-cardano-stability";
 
     /// Yields the identifier of this client type as a string
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Tendermint => Self::TENDERMINT_STR,
             Self::Cardano => Self::CARDANO_STR,
+            Self::CardanoStability => Self::CARDANO_STABILITY_STR,
         }
     }
 }
@@ -38,6 +41,7 @@ impl core::str::FromStr for ClientType {
         match s {
             Self::TENDERMINT_STR => Ok(Self::Tendermint),
             Self::CARDANO_STR => Ok(Self::Cardano),
+            Self::CARDANO_STABILITY_STR => Ok(Self::CardanoStability),
 
             _ => Err(Error::unknown_client_type(s.to_string())),
         }
