@@ -12,18 +12,12 @@ pub struct Height {
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 pub struct HeuristicParams {
-    #[prost(uint64, tag = "1")]
-    pub min_depth: u64,
-    #[prost(uint64, tag = "2")]
-    pub min_unique_pools: u64,
-    #[prost(uint64, tag = "3")]
-    pub min_unique_stake_bps: u64,
     #[prost(uint64, tag = "4")]
-    pub target_depth: u64,
+    pub threshold_depth: u64,
     #[prost(uint64, tag = "5")]
-    pub target_unique_pools: u64,
+    pub threshold_unique_pools: u64,
     #[prost(uint64, tag = "6")]
-    pub target_unique_stake_bps: u64,
+    pub threshold_unique_stake_bps: u64,
     #[prost(uint64, tag = "7")]
     pub depth_weight_bps: u64,
     #[prost(uint64, tag = "8")]
