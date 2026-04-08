@@ -102,6 +102,8 @@ pub struct QueryTransactionByHashResponse {
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct QueryIbcHeaderRequest {
+    #[prost(uint64, tag = "1")]
+    pub trusted_height: u64,
     #[prost(uint64, tag = "2")]
     pub height: u64,
 }

@@ -590,7 +590,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn verify_header(
         &mut self,
-        _trusted: ICSHeight,
+        trusted: ICSHeight,
         target: ICSHeight,
         client_state: &AnyClientState,
     ) -> Result<Self::LightBlock, Error> {
@@ -610,7 +610,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // wasting fees, and to enable richer relayer-side diagnostics.
         let header = self
             .rt
-            .block_on(self.gateway_client.query_header(target))
+            .block_on(self.gateway_client.query_header(trusted, target))
             .map_err(|e| {
                 Error::query(format!("failed to query Cardano header from Gateway: {e}"))
             })?;
@@ -690,7 +690,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
         tracing::info!("Cardano chain at height: {}", height);
 
-        let timestamp = match self.rt.block_on(self.gateway_client.query_header(height)) {
+        let trusted_height = height.decrement().unwrap_or(height);
+        let timestamp = match self
+            .rt
+            .block_on(self.gateway_client.query_header(trusted_height, height))
+        {
             Ok(header) => header.timestamp(),
             Err(e) => {
                 tracing::warn!(
@@ -2022,7 +2026,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn build_header(
         &mut self,
-        _trusted_height: ICSHeight,
+        trusted_height: ICSHeight,
         target_height: ICSHeight,
         _client_state: &AnyClientState,
     ) -> Result<(Self::Header, Vec<Self::Header>), Error> {
@@ -2044,7 +2048,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // - a final header at the latest snapshot height.
         match self
             .rt
-            .block_on(self.gateway_client.query_header(target_height))
+            .block_on(self.gateway_client.query_header(trusted_height, target_height))
         {
             Ok(header) => Ok((header, vec![])),
             Err(e) => {
@@ -2059,7 +2063,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
                 let proof_header = self
                     .rt
-                    .block_on(self.gateway_client.query_header(proof_height))
+                    .block_on(self.gateway_client.query_header(trusted_height, proof_height))
                     .map_err(|e| {
                         Error::query(format!(
                             "Gateway query_header failed at proof height {proof_height}: {e}"
@@ -2088,7 +2092,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
                     match self
                         .rt
-                        .block_on(self.gateway_client.query_header(candidate_ics_height))
+                        .block_on(self.gateway_client.query_header(proof_height, candidate_ics_height))
                     {
                         Ok(header) => {
                             selected_header = Some(header);
@@ -2113,7 +2117,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     header
                 } else {
                     self.rt
-                        .block_on(self.gateway_client.query_header(latest_height))
+                        .block_on(self.gateway_client.query_header(proof_height, latest_height))
                         .map_err(|e| {
                             Error::query(format!(
                                 "Gateway query_header failed at latest height {latest_height}: {e}"

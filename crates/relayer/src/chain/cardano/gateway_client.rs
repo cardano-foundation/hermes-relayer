@@ -173,13 +173,18 @@ impl GatewayClient {
     /// Query header at a specific height
     ///
     /// This is required for building headers used in `MsgUpdateClient`.
-    pub async fn query_header(&self, height: Height) -> Result<AnyHeader, Error> {
+    pub async fn query_header(
+        &self,
+        trusted_height: Height,
+        height: Height,
+    ) -> Result<AnyHeader, Error> {
         use super::generated::ibc::core::types::v1::query_client::QueryClient as TypesQueryClient;
         use super::generated::ibc::core::types::v1::QueryIbcHeaderRequest;
 
         let mut client = TypesQueryClient::new(self.channel.clone());
 
         let request = tonic::Request::new(QueryIbcHeaderRequest {
+            trusted_height: trusted_height.revision_height(),
             height: height.revision_height(),
         });
 

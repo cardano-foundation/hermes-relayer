@@ -21,6 +21,7 @@ pub struct Header {
     pub height: Height,
     pub timestamp: Timestamp,
     pub anchor_block: raw::StabilityBlock,
+    pub bridge_blocks: Vec<raw::StabilityBlock>,
     pub descendant_blocks: Vec<raw::StabilityBlock>,
     pub host_state_tx_hash: String,
     pub host_state_tx_body_cbor: Vec<u8>,
@@ -77,6 +78,7 @@ impl TryFrom<RawHeader> for Header {
             height: anchor_height,
             timestamp,
             anchor_block,
+            bridge_blocks: raw.bridge_blocks,
             descendant_blocks: raw.descendant_blocks,
             host_state_tx_hash: raw.host_state_tx_hash,
             host_state_tx_body_cbor: raw.host_state_tx_body_cbor,
@@ -93,6 +95,7 @@ impl From<Header> for RawHeader {
         RawHeader {
             trusted_height: Some(value.trusted_height.into()),
             anchor_block: Some(value.anchor_block),
+            bridge_blocks: value.bridge_blocks,
             descendant_blocks: value.descendant_blocks,
             host_state_tx_hash: value.host_state_tx_hash,
             host_state_tx_body_cbor: value.host_state_tx_body_cbor,

@@ -116,4 +116,6 @@ pub struct StabilityHeader {
     pub unique_stake_bps: u64,
     #[prost(uint64, tag = "9")]
     pub security_score_bps: u64,
+    #[prost(message, repeated, tag = "10")]
+    pub bridge_blocks: ::prost::alloc::vec::Vec<StabilityBlock>,
 }
