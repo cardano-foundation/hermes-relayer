@@ -94,6 +94,8 @@ pub struct StabilityBlock {
     pub slot_leader: ::prost::alloc::string::String,
     #[prost(uint64, tag = "8")]
     pub stake_bps: u64,
+    #[prost(bytes = "vec", tag = "9")]
+    pub block_cbor: ::prost::alloc::vec::Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
