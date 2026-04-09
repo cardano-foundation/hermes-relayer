@@ -2290,26 +2290,36 @@ fn extract_ibc_state_root_from_host_state_tx(
     host_state_nft_policy_id: &[u8],
     host_state_nft_token_name: &[u8],
 ) -> Result<Vec<u8>, Error> {
-    let (header_kind, tx_hash, tx_body_cbor, output_index) = match header {
-        AnyHeader::Mithril(header) => (
+    match header {
+        AnyHeader::Mithril(header) => extract_ibc_state_root_from_host_state_tx_body(
             "Mithril",
             header.host_state_tx_hash.trim(),
             header.host_state_tx_body_cbor.as_slice(),
             header.host_state_tx_output_index,
+            host_state_nft_policy_id,
+            host_state_nft_token_name,
         ),
-        AnyHeader::Stability(header) => (
-            "stability",
+        AnyHeader::Stability(header) => extract_ibc_state_root_from_stability_anchor_block(
             header.host_state_tx_hash.trim(),
-            header.host_state_tx_body_cbor.as_slice(),
+            header.anchor_block.block_cbor.as_slice(),
             header.host_state_tx_output_index,
+            host_state_nft_policy_id,
+            host_state_nft_token_name,
         ),
-        AnyHeader::Tendermint(_) => {
-            return Err(Error::query(
-                "unexpected Tendermint header in Cardano host state extraction".to_string(),
-            ))
-        }
-    };
+        AnyHeader::Tendermint(_) => Err(Error::query(
+            "unexpected Tendermint header in Cardano host state extraction".to_string(),
+        )),
+    }
+}
 
+fn extract_ibc_state_root_from_host_state_tx_body(
+    header_kind: &str,
+    tx_hash: &str,
+    tx_body_cbor: &[u8],
+    output_index: u32,
+    host_state_nft_policy_id: &[u8],
+    host_state_nft_token_name: &[u8],
+) -> Result<Vec<u8>, Error> {
     if tx_hash.is_empty() {
         return Err(Error::query(format!(
             "missing host_state_tx_hash in {header_kind} header"
@@ -2368,6 +2378,65 @@ fn extract_ibc_state_root_from_host_state_tx(
     ))
 }
 
+fn extract_ibc_state_root_from_stability_anchor_block(
+    tx_hash: &str,
+    anchor_block_cbor: &[u8],
+    output_index: u32,
+    host_state_nft_policy_id: &[u8],
+    host_state_nft_token_name: &[u8],
+) -> Result<Vec<u8>, Error> {
+    use pallas_codec::minicbor;
+    use pallas_codec::utils::KeepRaw;
+    use pallas_primitives::{babbage, conway};
+
+    if tx_hash.is_empty() {
+        return Err(Error::query(
+            "missing host_state_tx_hash in stability header".to_string(),
+        ));
+    }
+
+    if host_state_nft_policy_id.len() != 28 {
+        return Err(Error::query(format!(
+            "invalid host_state_nft_policy_id length: expected 28 bytes, got {}",
+            host_state_nft_policy_id.len()
+        )));
+    }
+
+    if anchor_block_cbor.is_empty() {
+        return Err(Error::query(
+            "missing anchor block_cbor in stability header".to_string(),
+        ));
+    }
+
+    let conway_block: Result<KeepRaw<'_, conway::MintedBlock<'_>>, _> =
+        minicbor::decode(anchor_block_cbor);
+    if let Ok(block) = conway_block {
+        return extract_root_from_conway_block(
+            &block,
+            tx_hash,
+            output_index,
+            host_state_nft_policy_id,
+            host_state_nft_token_name,
+        );
+    }
+
+    let babbage_block: Result<KeepRaw<'_, babbage::MintedBlock<'_>>, _> =
+        minicbor::decode(anchor_block_cbor);
+    if let Ok(block) = babbage_block {
+        return extract_root_from_babbage_block(
+            &block,
+            tx_hash,
+            output_index,
+            host_state_nft_policy_id,
+            host_state_nft_token_name,
+        );
+    }
+
+    Err(Error::query(
+        "unsupported stability anchor block CBOR".to_string(),
+    ))
+}
+
 fn blake2b_256(data: &[u8]) -> [u8; 32] {
     use blake2::digest::consts::U32;
     use blake2::{Blake2b, Digest};
@@ -2379,6 +2448,54 @@ fn blake2b_256(data: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     out
+}
+
+fn extract_root_from_conway_block<'a>(
+    block: &pallas_codec::utils::KeepRaw<'a, pallas_primitives::conway::MintedBlock<'a>>,
+    tx_hash: &str,
+    output_index: u32,
+    host_state_nft_policy_id: &[u8],
+    host_state_nft_token_name: &[u8],
+) -> Result<Vec<u8>, Error> {
+    for tx_body in block.transaction_bodies.iter() {
+        let computed_hex = hex::encode(blake2b_256(tx_body.raw_cbor()));
+        if computed_hex.eq_ignore_ascii_case(tx_hash) {
+            return extract_root_from_conway_tx_body(
+                tx_body,
+                output_index,
+                host_state_nft_policy_id,
+                host_state_nft_token_name,
+            );
+        }
+    }
+
+    Err(Error::query(format!(
+        "HostState tx {tx_hash} not found in stability anchor block"
+    )))
+}
+
+fn extract_root_from_babbage_block<'a>(
+    block: &pallas_codec::utils::KeepRaw<'a, pallas_primitives::babbage::MintedBlock<'a>>,
+    tx_hash: &str,
+    output_index: u32,
+    host_state_nft_policy_id: &[u8],
+    host_state_nft_token_name: &[u8],
+) -> Result<Vec<u8>, Error> {
+    for tx_body in block.transaction_bodies.iter() {
+        let computed_hex = hex::encode(blake2b_256(tx_body.raw_cbor()));
+        if computed_hex.eq_ignore_ascii_case(tx_hash) {
+            return extract_root_from_babbage_tx_body(
+                tx_body,
+                output_index,
+                host_state_nft_policy_id,
+                host_state_nft_token_name,
+            );
+        }
+    }
+
+    Err(Error::query(format!(
+        "HostState tx {tx_hash} not found in stability anchor block"
+    )))
 }
 
 fn extract_root_from_conway_tx_body<'a>(

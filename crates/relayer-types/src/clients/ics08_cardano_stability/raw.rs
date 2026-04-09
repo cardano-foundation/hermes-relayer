@@ -116,8 +116,6 @@ pub struct StabilityHeader {
     pub descendant_blocks: ::prost::alloc::vec::Vec<StabilityBlock>,
     #[prost(string, tag = "4")]
     pub host_state_tx_hash: ::prost::alloc::string::String,
-    #[prost(bytes = "vec", tag = "5")]
-    pub host_state_tx_body_cbor: ::prost::alloc::vec::Vec<u8>,
     #[prost(uint32, tag = "6")]
     pub host_state_tx_output_index: u32,
     #[prost(message, repeated, tag = "10")]

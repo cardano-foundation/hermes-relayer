@@ -24,7 +24,6 @@ pub struct Header {
     pub bridge_blocks: Vec<raw::StabilityBlock>,
     pub descendant_blocks: Vec<raw::StabilityBlock>,
     pub host_state_tx_hash: String,
-    pub host_state_tx_body_cbor: Vec<u8>,
     pub host_state_tx_output_index: u32,
 }
 
@@ -63,10 +62,6 @@ impl TryFrom<RawHeader> for Header {
             .ok_or_else(|| Error::missing_field("anchor_block.height"))?
             .try_into()?;
 
-        if raw.host_state_tx_body_cbor.is_empty() {
-            return Err(Error::missing_field("host_state_tx_body_cbor"));
-        }
-
         let timestamp = Timestamp::from_nanoseconds(anchor_block.timestamp)
             .map_err(|e| Error::timestamp_conversion(e.to_string()))?;
 
@@ -78,7 +73,6 @@ impl TryFrom<RawHeader> for Header {
             bridge_blocks: raw.bridge_blocks,
             descendant_blocks: raw.descendant_blocks,
             host_state_tx_hash: raw.host_state_tx_hash,
-            host_state_tx_body_cbor: raw.host_state_tx_body_cbor,
             host_state_tx_output_index: raw.host_state_tx_output_index,
         })
     }
@@ -92,7 +86,6 @@ impl From<Header> for RawHeader {
             bridge_blocks: value.bridge_blocks,
             descendant_blocks: value.descendant_blocks,
             host_state_tx_hash: value.host_state_tx_hash,
-            host_state_tx_body_cbor: value.host_state_tx_body_cbor,
             host_state_tx_output_index: value.host_state_tx_output_index,
         }
     }
