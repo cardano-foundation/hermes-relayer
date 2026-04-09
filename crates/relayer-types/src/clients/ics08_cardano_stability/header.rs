@@ -26,9 +26,6 @@ pub struct Header {
     pub host_state_tx_hash: String,
     pub host_state_tx_body_cbor: Vec<u8>,
     pub host_state_tx_output_index: u32,
-    pub unique_pools_count: u64,
-    pub unique_stake_bps: u64,
-    pub security_score_bps: u64,
 }
 
 impl crate::core::ics02_client::header::Header for Header {
@@ -83,9 +80,6 @@ impl TryFrom<RawHeader> for Header {
             host_state_tx_hash: raw.host_state_tx_hash,
             host_state_tx_body_cbor: raw.host_state_tx_body_cbor,
             host_state_tx_output_index: raw.host_state_tx_output_index,
-            unique_pools_count: raw.unique_pools_count,
-            unique_stake_bps: raw.unique_stake_bps,
-            security_score_bps: raw.security_score_bps,
         })
     }
 }
@@ -100,9 +94,6 @@ impl From<Header> for RawHeader {
             host_state_tx_hash: value.host_state_tx_hash,
             host_state_tx_body_cbor: value.host_state_tx_body_cbor,
             host_state_tx_output_index: value.host_state_tx_output_index,
-            unique_pools_count: value.unique_pools_count,
-            unique_stake_bps: value.unique_stake_bps,
-            security_score_bps: value.security_score_bps,
         }
     }
 }

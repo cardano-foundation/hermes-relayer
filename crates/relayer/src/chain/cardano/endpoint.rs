@@ -36,8 +36,8 @@ use crate::error::Error;
 use crate::event::IbcEventWithHeight;
 use crate::keyring::{KeyRing, SigningKeyPair};
 use crate::misbehaviour::MisbehaviourEvidence;
-use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header as IbcHeader};
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
+use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header as IbcHeader};
 use ibc_relayer_types::core::ics03_connection::connection::{
     ConnectionEnd, IdentifiedConnectionEnd,
 };
@@ -1964,10 +1964,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         height: ICSHeight,
         _settings: ClientSettings,
     ) -> Result<Self::ClientState, Error> {
-        tracing::info!(
-            "Building Cardano client state at height {:?}",
-            height
-        );
+        tracing::info!("Building Cardano client state at height {:?}", height);
 
         let response = self
             .rt
@@ -2014,9 +2011,9 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 timestamp: header.timestamp.nanoseconds(),
                 accepted_block_hash: header.anchor_block.hash,
                 accepted_epoch: header.anchor_block.epoch,
-                unique_pools_count: header.unique_pools_count,
-                unique_stake_bps: header.unique_stake_bps,
-                security_score_bps: header.security_score_bps,
+                unique_pools_count: 0,
+                unique_stake_bps: 0,
+                security_score_bps: 0,
             })),
             AnyHeader::Tendermint(_) => Err(Error::query(
                 "Cardano build_consensus_state received a Tendermint header".to_string(),
@@ -2046,10 +2043,10 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // We do this by returning:
         // - `support` header at `target_height - 1`, and
         // - a final header at the latest snapshot height.
-        match self
-            .rt
-            .block_on(self.gateway_client.query_header(trusted_height, target_height))
-        {
+        match self.rt.block_on(
+            self.gateway_client
+                .query_header(trusted_height, target_height),
+        ) {
             Ok(header) => Ok((header, vec![])),
             Err(e) => {
                 let err_str = e.to_string();
@@ -2063,7 +2060,10 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
                 let proof_header = self
                     .rt
-                    .block_on(self.gateway_client.query_header(trusted_height, proof_height))
+                    .block_on(
+                        self.gateway_client
+                            .query_header(trusted_height, proof_height),
+                    )
                     .map_err(|e| {
                         Error::query(format!(
                             "Gateway query_header failed at proof height {proof_height}: {e}"
@@ -2090,10 +2090,10 @@ impl ChainEndpoint for CardanoChainEndpoint {
                                 ))
                             })?;
 
-                    match self
-                        .rt
-                        .block_on(self.gateway_client.query_header(proof_height, candidate_ics_height))
-                    {
+                    match self.rt.block_on(
+                        self.gateway_client
+                            .query_header(proof_height, candidate_ics_height),
+                    ) {
                         Ok(header) => {
                             selected_header = Some(header);
                             break;
@@ -2117,7 +2117,10 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     header
                 } else {
                     self.rt
-                        .block_on(self.gateway_client.query_header(proof_height, latest_height))
+                        .block_on(
+                            self.gateway_client
+                                .query_header(proof_height, latest_height),
+                        )
                         .map_err(|e| {
                             Error::query(format!(
                                 "Gateway query_header failed at latest height {latest_height}: {e}"
@@ -2308,9 +2311,9 @@ fn extract_ibc_state_root_from_host_state_tx(
     };
 
     if tx_hash.is_empty() {
-        return Err(Error::query(
-            format!("missing host_state_tx_hash in {header_kind} header"),
-        ));
+        return Err(Error::query(format!(
+            "missing host_state_tx_hash in {header_kind} header"
+        )));
     }
 
     if host_state_nft_policy_id.len() != 28 {
@@ -2321,9 +2324,9 @@ fn extract_ibc_state_root_from_host_state_tx(
     }
 
     if tx_body_cbor.is_empty() {
-        return Err(Error::query(
-            format!("missing host_state_tx_body_cbor in {header_kind} header"),
-        ));
+        return Err(Error::query(format!(
+            "missing host_state_tx_body_cbor in {header_kind} header"
+        )));
     }
 
     let computed = blake2b_256(tx_body_cbor);

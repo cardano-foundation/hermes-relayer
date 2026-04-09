@@ -98,14 +98,10 @@ pub struct StabilityBlock {
     pub slot: u64,
     #[prost(string, tag = "3")]
     pub hash: ::prost::alloc::string::String,
-    #[prost(string, tag = "4")]
-    pub prev_hash: ::prost::alloc::string::String,
     #[prost(uint64, tag = "5")]
     pub epoch: u64,
     #[prost(uint64, tag = "6")]
     pub timestamp: u64,
-    #[prost(string, tag = "7")]
-    pub slot_leader: ::prost::alloc::string::String,
     #[prost(bytes = "vec", tag = "9")]
     pub block_cbor: ::prost::alloc::vec::Vec<u8>,
 }
@@ -124,12 +120,6 @@ pub struct StabilityHeader {
     pub host_state_tx_body_cbor: ::prost::alloc::vec::Vec<u8>,
     #[prost(uint32, tag = "6")]
     pub host_state_tx_output_index: u32,
-    #[prost(uint64, tag = "7")]
-    pub unique_pools_count: u64,
-    #[prost(uint64, tag = "8")]
-    pub unique_stake_bps: u64,
-    #[prost(uint64, tag = "9")]
-    pub security_score_bps: u64,
     #[prost(message, repeated, tag = "10")]
     pub bridge_blocks: ::prost::alloc::vec::Vec<StabilityBlock>,
 }
