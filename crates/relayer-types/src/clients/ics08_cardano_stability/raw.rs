@@ -106,8 +106,6 @@ pub struct StabilityBlock {
     pub timestamp: u64,
     #[prost(string, tag = "7")]
     pub slot_leader: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "8")]
-    pub stake_bps: u64,
     #[prost(bytes = "vec", tag = "9")]
     pub block_cbor: ::prost::alloc::vec::Vec<u8>,
 }
