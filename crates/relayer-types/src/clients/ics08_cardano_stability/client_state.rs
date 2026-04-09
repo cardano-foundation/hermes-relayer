@@ -31,6 +31,10 @@ pub struct ClientState {
     pub host_state_nft_policy_id: Vec<u8>,
     pub host_state_nft_token_name: Vec<u8>,
     pub epoch_stake_distribution: Vec<raw::StakeDistributionEntry>,
+    pub epoch_nonce: Vec<u8>,
+    pub slots_per_kes_period: u64,
+    pub current_epoch_start_slot: u64,
+    pub current_epoch_end_slot_exclusive: u64,
 }
 
 impl Ics2ClientState for ClientState {
@@ -72,6 +76,10 @@ impl TryFrom<RawClientState> for ClientState {
             host_state_nft_policy_id,
             host_state_nft_token_name,
             epoch_stake_distribution,
+            epoch_nonce,
+            slots_per_kes_period,
+            current_epoch_start_slot,
+            current_epoch_end_slot_exclusive,
         } = raw;
 
         let chain_id = ChainId::from_string(&raw_chain_id);
@@ -99,6 +107,24 @@ impl TryFrom<RawClientState> for ClientState {
                 format!("expected 28 bytes, got {}", host_state_nft_policy_id.len()),
             ));
         }
+        if epoch_nonce.len() != 32 {
+            return Err(Error::invalid_field(
+                "epoch_nonce",
+                format!("expected 32 bytes, got {}", epoch_nonce.len()),
+            ));
+        }
+        if slots_per_kes_period == 0 {
+            return Err(Error::invalid_field(
+                "slots_per_kes_period",
+                "must be greater than zero".to_string(),
+            ));
+        }
+        if current_epoch_end_slot_exclusive <= current_epoch_start_slot {
+            return Err(Error::invalid_field(
+                "current_epoch_end_slot_exclusive",
+                "must be greater than current_epoch_start_slot".to_string(),
+            ));
+        }
 
         Ok(Self {
             chain_id,
@@ -111,6 +137,10 @@ impl TryFrom<RawClientState> for ClientState {
             host_state_nft_policy_id,
             host_state_nft_token_name,
             epoch_stake_distribution,
+            epoch_nonce,
+            slots_per_kes_period,
+            current_epoch_start_slot,
+            current_epoch_end_slot_exclusive,
         })
     }
 }
@@ -128,6 +158,10 @@ impl From<ClientState> for RawClientState {
             host_state_nft_policy_id: value.host_state_nft_policy_id,
             host_state_nft_token_name: value.host_state_nft_token_name,
             epoch_stake_distribution: value.epoch_stake_distribution,
+            epoch_nonce: value.epoch_nonce,
+            slots_per_kes_period: value.slots_per_kes_period,
+            current_epoch_start_slot: value.current_epoch_start_slot,
+            current_epoch_end_slot_exclusive: value.current_epoch_end_slot_exclusive,
         }
     }
 }

@@ -32,6 +32,8 @@ pub struct StakeDistributionEntry {
     pub pool_id: ::prost::alloc::string::String,
     #[prost(uint64, tag = "2")]
     pub stake: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub vrf_key_hash: ::prost::alloc::vec::Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
@@ -56,6 +58,14 @@ pub struct ClientState {
     pub host_state_nft_token_name: ::prost::alloc::vec::Vec<u8>,
     #[prost(message, repeated, tag = "10")]
     pub epoch_stake_distribution: ::prost::alloc::vec::Vec<StakeDistributionEntry>,
+    #[prost(bytes = "vec", tag = "11")]
+    pub epoch_nonce: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "12")]
+    pub slots_per_kes_period: u64,
+    #[prost(uint64, tag = "13")]
+    pub current_epoch_start_slot: u64,
+    #[prost(uint64, tag = "14")]
+    pub current_epoch_end_slot_exclusive: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
