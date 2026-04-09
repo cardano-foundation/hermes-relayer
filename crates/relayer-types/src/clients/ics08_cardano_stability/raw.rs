@@ -66,6 +66,10 @@ pub struct ClientState {
     pub current_epoch_start_slot: u64,
     #[prost(uint64, tag = "14")]
     pub current_epoch_end_slot_exclusive: u64,
+    #[prost(uint64, tag = "15")]
+    pub system_start_unix_ns: u64,
+    #[prost(uint64, tag = "16")]
+    pub slot_length_ns: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]

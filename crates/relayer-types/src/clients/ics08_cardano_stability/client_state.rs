@@ -35,6 +35,8 @@ pub struct ClientState {
     pub slots_per_kes_period: u64,
     pub current_epoch_start_slot: u64,
     pub current_epoch_end_slot_exclusive: u64,
+    pub system_start_unix_ns: u64,
+    pub slot_length_ns: u64,
 }
 
 impl Ics2ClientState for ClientState {
@@ -80,6 +82,8 @@ impl TryFrom<RawClientState> for ClientState {
             slots_per_kes_period,
             current_epoch_start_slot,
             current_epoch_end_slot_exclusive,
+            system_start_unix_ns,
+            slot_length_ns,
         } = raw;
 
         let chain_id = ChainId::from_string(&raw_chain_id);
@@ -125,6 +129,18 @@ impl TryFrom<RawClientState> for ClientState {
                 "must be greater than current_epoch_start_slot".to_string(),
             ));
         }
+        if system_start_unix_ns == 0 {
+            return Err(Error::invalid_field(
+                "system_start_unix_ns",
+                "must be greater than zero".to_string(),
+            ));
+        }
+        if slot_length_ns == 0 {
+            return Err(Error::invalid_field(
+                "slot_length_ns",
+                "must be greater than zero".to_string(),
+            ));
+        }
 
         Ok(Self {
             chain_id,
@@ -141,6 +157,8 @@ impl TryFrom<RawClientState> for ClientState {
             slots_per_kes_period,
             current_epoch_start_slot,
             current_epoch_end_slot_exclusive,
+            system_start_unix_ns,
+            slot_length_ns,
         })
     }
 }
@@ -162,6 +180,8 @@ impl From<ClientState> for RawClientState {
             slots_per_kes_period: value.slots_per_kes_period,
             current_epoch_start_slot: value.current_epoch_start_slot,
             current_epoch_end_slot_exclusive: value.current_epoch_end_slot_exclusive,
+            system_start_unix_ns: value.system_start_unix_ns,
+            slot_length_ns: value.slot_length_ns,
         }
     }
 }
