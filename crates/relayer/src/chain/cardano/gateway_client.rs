@@ -183,8 +183,21 @@ impl GatewayClient {
 
         let mut client = TypesQueryClient::new(self.channel.clone());
 
+        let effective_trusted_height = if trusted_height < height {
+            trusted_height
+        } else {
+            height
+                .decrement()
+                .map_err(|_| {
+                    Error::Query(format!(
+                        "invalid Cardano header query heights: trusted height {} must be less than target height {}",
+                        trusted_height, height
+                    ))
+                })?
+        };
+
         let request = tonic::Request::new(QueryIbcHeaderRequest {
-            trusted_height: trusted_height.revision_height(),
+            trusted_height: effective_trusted_height.revision_height(),
             height: height.revision_height(),
         });
 

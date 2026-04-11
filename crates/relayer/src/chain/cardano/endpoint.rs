@@ -51,15 +51,17 @@ use ibc_relayer_types::core::ics24_host::identifier::{
 };
 use ibc_relayer_types::signer::Signer;
 use ibc_relayer_types::Height as ICSHeight;
+use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tendermint_rpc::endpoint::broadcast::tx_sync::Response as TxResponse;
 use tokio::runtime::Runtime as TokioRuntime;
 
 /// Cardano light block (placeholder)
 #[derive(Debug, Clone)]
 pub struct CardanoLightBlock {
-    pub header: AnyHeader,
+    pub header: Option<AnyHeader>,
+    pub height: ICSHeight,
     pub host_state_nft_policy_id: Vec<u8>,
     pub host_state_nft_token_name: Vec<u8>,
 }
@@ -74,6 +76,7 @@ pub struct CardanoChainEndpoint {
     gateway_client: GatewayClient,
     keyring: KeyRing<CardanoSigningKeyPair>,
     event_source_cmd: Option<crate::event::source::TxEventSourceCmd>,
+    pending_new_client_consensus_states: Mutex<HashMap<u64, AnyConsensusState>>,
 }
 
 impl CardanoChainEndpoint {
@@ -172,11 +175,37 @@ impl CardanoChainEndpoint {
         let mut last_latest_height: Option<u64> = None;
 
         loop {
-            let latest = self
-                .gateway_client
-                .query_latest_height()
-                .await
-                .map_err(|e| Error::query(format!("Gateway query_latest_height failed: {e}")))?;
+            let latest = match self.gateway_client.query_latest_height().await {
+                Ok(latest) => latest,
+                Err(e) => {
+                    let elapsed = start.elapsed();
+                    if elapsed >= timeout {
+                        return Err(Error::query(format!(
+                            "timed out waiting for Gateway accepted height >= {} because \
+                             query_latest_height kept failing: {}",
+                            included_height, e,
+                        )));
+                    }
+
+                    let should_log =
+                        elapsed.saturating_sub(last_logged_elapsed) >= log_interval;
+                    if should_log {
+                        let remaining = timeout.saturating_sub(elapsed);
+                        tracing::warn!(
+                            "Waiting for Gateway accepted height: latest-height query unavailable \
+                             while waiting for >= {}: {}, elapsed={}s, remaining={}s",
+                            included_height,
+                            e,
+                            elapsed.as_secs(),
+                            remaining.as_secs(),
+                        );
+                        last_logged_elapsed = elapsed;
+                    }
+
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
+            };
 
             if latest.revision_number() != included_height.revision_number() {
                 return Err(Error::query(format!(
@@ -297,6 +326,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             gateway_client,
             keyring,
             event_source_cmd: None, // Initialized lazily on first subscribe() call
+            pending_new_client_consensus_states: Mutex::new(HashMap::new()),
         };
 
         tracing::info!("Cardano chain endpoint bootstrap complete");
@@ -311,9 +341,26 @@ impl ChainEndpoint for CardanoChainEndpoint {
     fn health_check(&mut self) -> Result<HealthCheck, Error> {
         match self.rt.block_on(self.gateway_client.query_latest_height()) {
             Ok(_) => Ok(HealthCheck::Healthy),
-            Err(e) => Ok(HealthCheck::Unhealthy(Box::new(Error::query(format!(
-                "Gateway health check failed: {e}"
-            ))))),
+            Err(latest_height_error) => {
+                tracing::warn!(
+                    "Gateway latest-height probe failed during Cardano health-check: {}. Falling back to client-states probe.",
+                    latest_height_error
+                );
+
+                match self.rt.block_on(self.gateway_client.query_clients()) {
+                    Ok(_) => {
+                        tracing::info!(
+                            "Cardano Gateway client-states probe succeeded; treating endpoint as healthy despite latest-height bootstrap failure."
+                        );
+                        Ok(HealthCheck::Healthy)
+                    }
+                    Err(client_states_error) => Ok(HealthCheck::Unhealthy(Box::new(
+                        Error::query(format!(
+                            "Gateway health check failed: latest_height={latest_height_error}; client_states={client_states_error}"
+                        )),
+                    ))),
+                }
+            }
         }
     }
 
@@ -608,9 +655,46 @@ impl ChainEndpoint for CardanoChainEndpoint {
         //
         // TODO: Implement optional off-chain verification to avoid broadcasting invalid headers and
         // wasting fees, and to enable richer relayer-side diagnostics.
+        if self
+            .pending_new_client_consensus_states
+            .lock()
+            .expect("pending_new_client_consensus_states poisoned")
+            .contains_key(&target.revision_height())
+        {
+            let (host_state_nft_policy_id, host_state_nft_token_name) = match client_state {
+                AnyClientState::Mithril(state) => (
+                    state.host_state_nft_policy_id.clone(),
+                    state.host_state_nft_token_name.clone(),
+                ),
+                AnyClientState::Stability(state) => (
+                    state.host_state_nft_policy_id.clone(),
+                    state.host_state_nft_token_name.clone(),
+                ),
+                _ => {
+                    return Err(Error::query(
+                        "Cardano verify_header requires a Cardano client state".to_string(),
+                    ))
+                }
+            };
+
+            return Ok(CardanoLightBlock {
+                header: None,
+                height: target,
+                host_state_nft_policy_id,
+                host_state_nft_token_name,
+            });
+        }
+
+        let effective_trusted = normalize_header_query_trusted_height(trusted, target)?;
+        tracing::info!(
+            "Cardano verify_header querying Gateway header with trusted={} effective_trusted={} target={}",
+            trusted,
+            effective_trusted,
+            target
+        );
         let header = self
             .rt
-            .block_on(self.gateway_client.query_header(trusted, target))
+            .block_on(self.gateway_client.query_header(effective_trusted, target))
             .map_err(|e| {
                 Error::query(format!("failed to query Cardano header from Gateway: {e}"))
             })?;
@@ -632,7 +716,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
         };
 
         Ok(CardanoLightBlock {
-            header,
+            header: Some(header),
+            height: target,
             host_state_nft_policy_id,
             host_state_nft_token_name,
         })
@@ -679,7 +764,9 @@ impl ChainEndpoint for CardanoChainEndpoint {
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
         tracing::debug!("Querying Cardano application status via Gateway");
 
-        // Query latest height from Gateway
+        // Query the latest proof/accepted height from Gateway. In stability mode this is the
+        // latest accepted HostState anchor height, which can legitimately lag the live Cardano
+        // tip when no new HostState update has been produced yet.
         let height = self
             .rt
             .block_on(self.gateway_client.query_latest_height())
@@ -690,19 +777,12 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
         tracing::info!("Cardano chain at height: {}", height);
 
-        let trusted_height = height.decrement().unwrap_or(height);
-        let timestamp = match self
-            .rt
-            .block_on(self.gateway_client.query_header(trusted_height, height))
-        {
-            Ok(header) => header.timestamp(),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to query header at height {height} for timestamp (falling back to local time): {e}"
-                );
-                tendermint::Time::now().into()
-            }
-        };
+        // Do not derive the destination-chain "current time" from the latest proof height.
+        // In stability mode that height advances only when a new HostState anchor is accepted,
+        // but Cardano itself can keep producing blocks in the meantime. If we use the stale
+        // anchor timestamp here, Hermes can block indefinitely on header-validation delay even
+        // though the destination chain is alive and progressing.
+        let timestamp = tendermint::Time::now().into();
 
         Ok(ChainStatus { height, timestamp })
     }
@@ -1974,6 +2054,26 @@ impl ChainEndpoint for CardanoChainEndpoint {
             )
             .map_err(|e| Error::query(format!("Gateway query_new_client failed: {e}")))?;
 
+        if let Some(raw_consensus_state) = response.consensus_state.clone() {
+            let any = ibc_proto::google::protobuf::Any {
+                type_url: raw_consensus_state.type_url,
+                value: raw_consensus_state.value,
+            };
+
+            let consensus_state = AnyConsensusState::try_from(any).map_err(
+                |e: ibc_relayer_types::core::ics02_client::error::Error| {
+                    Error::query(format!(
+                        "Failed to decode Cardano consensus state from query_new_client: {e}"
+                    ))
+                },
+            )?;
+
+            self.pending_new_client_consensus_states
+                .lock()
+                .expect("pending_new_client_consensus_states poisoned")
+                .insert(height.revision_height(), consensus_state);
+        }
+
         let raw_any = response
             .client_state
             .ok_or_else(|| Error::query("No client_state in NewClient response".to_string()))?;
@@ -1993,13 +2093,29 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &self,
         light_block: Self::LightBlock,
     ) -> Result<Self::ConsensusState, Error> {
+        let header_height = light_block.height.revision_height();
+        if let Some(consensus_state) = self
+            .pending_new_client_consensus_states
+            .lock()
+            .expect("pending_new_client_consensus_states poisoned")
+            .remove(&header_height)
+        {
+            return Ok(consensus_state);
+        }
+
+        let header = light_block.header.ok_or_else(|| {
+            Error::query(
+                "missing Cardano header while building consensus state".to_string(),
+            )
+        })?;
+
         let ibc_state_root = extract_ibc_state_root_from_host_state_tx(
-            &light_block.header,
+            &header,
             &light_block.host_state_nft_policy_id,
             &light_block.host_state_nft_token_name,
         )?;
 
-        match light_block.header {
+        match header {
             AnyHeader::Mithril(header) => Ok(AnyConsensusState::from(MithrilConsensusState::new(
                 CommitmentRoot::from_bytes(&ibc_state_root),
                 header.timestamp.nanoseconds(),
@@ -2043,9 +2159,17 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // We do this by returning:
         // - `support` header at `target_height - 1`, and
         // - a final header at the latest snapshot height.
+        let effective_trusted_height =
+            normalize_header_query_trusted_height(trusted_height, target_height)?;
+        tracing::info!(
+            "Cardano build_header querying Gateway header with trusted={} effective_trusted={} target={}",
+            trusted_height,
+            effective_trusted_height,
+            target_height
+        );
         match self.rt.block_on(
             self.gateway_client
-                .query_header(trusted_height, target_height),
+                .query_header(effective_trusted_height, target_height),
         ) {
             Ok(header) => Ok((header, vec![])),
             Err(e) => {
@@ -2057,12 +2181,14 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 let proof_height = target_height
                     .decrement()
                     .map_err(|_| Error::query(format!("invalid target height {target_height}")))?;
+                let effective_proof_trusted_height =
+                    normalize_header_query_trusted_height(trusted_height, proof_height)?;
 
                 let proof_header = self
                     .rt
                     .block_on(
                         self.gateway_client
-                            .query_header(trusted_height, proof_height),
+                            .query_header(effective_proof_trusted_height, proof_height),
                     )
                     .map_err(|e| {
                         Error::query(format!(
@@ -2732,6 +2858,21 @@ fn extract_ibc_state_root_from_host_state_datum(
     }
 
     Ok(root.to_vec())
+}
+
+fn normalize_header_query_trusted_height(
+    trusted_height: ICSHeight,
+    target_height: ICSHeight,
+) -> Result<ICSHeight, Error> {
+    if trusted_height < target_height {
+        return Ok(trusted_height);
+    }
+
+    target_height.decrement().map_err(|_| {
+        Error::query(format!(
+            "invalid Cardano header query heights: trusted height {trusted_height} must be less than target height {target_height}"
+        ))
+    })
 }
 
 fn plutus_constructor_index(

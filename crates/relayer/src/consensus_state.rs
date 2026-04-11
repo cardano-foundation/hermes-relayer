@@ -65,7 +65,9 @@ impl TryFrom<Any> for AnyConsensusState {
             )),
 
             MITHRIL_CONSENSUS_STATE_TYPE_URL => Ok(AnyConsensusState::Mithril(value.try_into()?)),
-            STABILITY_CONSENSUS_STATE_TYPE_URL => Ok(AnyConsensusState::Stability(value.try_into()?)),
+            STABILITY_CONSENSUS_STATE_TYPE_URL => {
+                Ok(AnyConsensusState::Stability(value.try_into()?))
+            }
 
             _ => Err(Error::unknown_consensus_state_type(value.type_url)),
         }

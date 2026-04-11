@@ -774,7 +774,9 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         Ok(())
     }
 
-    fn query_destination_clients_for_source_chain(&self) -> Result<Vec<ClientId>, ForeignClientError> {
+    fn query_destination_clients_for_source_chain(
+        &self,
+    ) -> Result<Vec<ClientId>, ForeignClientError> {
         let src_chain_id = self.src_chain.id();
         self.dst_chain
             .query_clients(QueryClientStatesRequest { pagination: None })
@@ -1351,6 +1353,24 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         );
         // Get the latest client state on destination.
         let (client_state, _) = self.validated_client_state()?;
+
+        if client_state.latest_height() >= target_height {
+            debug!(
+                latest_height = %client_state.latest_height(),
+                %target_height,
+                "client already at or above target height, skipping update"
+            );
+
+            telemetry!(
+                client_updates_skipped,
+                &self.src_chain.id(),
+                &self.dst_chain.id(),
+                &self.id,
+                1,
+            );
+
+            return Ok(vec![]);
+        }
 
         let trusted_height = match maybe_trusted_height {
             Some(trusted_height) => {

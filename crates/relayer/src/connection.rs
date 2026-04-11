@@ -1020,11 +1020,15 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
             .map_err(|e| ConnectionError::chain_query(self.dst_chain().id(), e))?;
         let client_msgs = self.build_update_client_on_src(src_client_target_height)?;
 
-        let tm =
-            TrackedMsgs::new_static(client_msgs, "update client on source for ConnectionOpenTry");
-        self.src_chain()
-            .send_messages_and_wait_commit(tm)
-            .map_err(|e| ConnectionError::submit(self.src_chain().id(), e))?;
+        if !client_msgs.is_empty() {
+            let tm = TrackedMsgs::new_static(
+                client_msgs,
+                "update client on source for ConnectionOpenTry",
+            );
+            self.src_chain()
+                .send_messages_and_wait_commit(tm)
+                .map_err(|e| ConnectionError::submit(self.src_chain().id(), e))?;
+        }
 
         let query_height = self
             .src_chain()
@@ -1160,12 +1164,16 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
 
         let client_msgs = self.build_update_client_on_src(src_client_target_height)?;
 
-        let tm =
-            TrackedMsgs::new_static(client_msgs, "update client on source for ConnectionOpenAck");
+        if !client_msgs.is_empty() {
+            let tm = TrackedMsgs::new_static(
+                client_msgs,
+                "update client on source for ConnectionOpenAck",
+            );
 
-        self.src_chain()
-            .send_messages_and_wait_commit(tm)
-            .map_err(|e| ConnectionError::submit(self.src_chain().id(), e))?;
+            self.src_chain()
+                .send_messages_and_wait_commit(tm)
+                .map_err(|e| ConnectionError::submit(self.src_chain().id(), e))?;
+        }
 
         let query_height = self
             .src_chain()
