@@ -37,6 +37,22 @@ pub struct StakeDistributionEntry {
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct EpochContext {
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+    #[prost(message, repeated, tag = "2")]
+    pub stake_distribution: ::prost::alloc::vec::Vec<StakeDistributionEntry>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub epoch_nonce: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "4")]
+    pub slots_per_kes_period: u64,
+    #[prost(uint64, tag = "5")]
+    pub epoch_start_slot: u64,
+    #[prost(uint64, tag = "6")]
+    pub epoch_end_slot_exclusive: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 pub struct ClientState {
     #[prost(string, tag = "1")]
     pub chain_id: ::prost::alloc::string::String,
@@ -70,6 +86,8 @@ pub struct ClientState {
     pub system_start_unix_ns: u64,
     #[prost(uint64, tag = "16")]
     pub slot_length_ns: u64,
+    #[prost(message, repeated, tag = "17")]
+    pub epoch_contexts: ::prost::alloc::vec::Vec<EpochContext>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
@@ -120,4 +138,6 @@ pub struct StabilityHeader {
     pub host_state_tx_output_index: u32,
     #[prost(message, repeated, tag = "10")]
     pub bridge_blocks: ::prost::alloc::vec::Vec<StabilityBlock>,
+    #[prost(message, optional, tag = "11")]
+    pub new_epoch_context: ::core::option::Option<EpochContext>,
 }

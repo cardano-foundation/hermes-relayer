@@ -37,6 +37,7 @@ pub struct ClientState {
     pub current_epoch_end_slot_exclusive: u64,
     pub system_start_unix_ns: u64,
     pub slot_length_ns: u64,
+    pub epoch_contexts: Vec<raw::EpochContext>,
 }
 
 impl Ics2ClientState for ClientState {
@@ -84,6 +85,7 @@ impl TryFrom<RawClientState> for ClientState {
             current_epoch_end_slot_exclusive,
             system_start_unix_ns,
             slot_length_ns,
+            epoch_contexts,
         } = raw;
 
         let chain_id = ChainId::from_string(&raw_chain_id);
@@ -159,6 +161,7 @@ impl TryFrom<RawClientState> for ClientState {
             current_epoch_end_slot_exclusive,
             system_start_unix_ns,
             slot_length_ns,
+            epoch_contexts,
         })
     }
 }
@@ -182,6 +185,7 @@ impl From<ClientState> for RawClientState {
             current_epoch_end_slot_exclusive: value.current_epoch_end_slot_exclusive,
             system_start_unix_ns: value.system_start_unix_ns,
             slot_length_ns: value.slot_length_ns,
+            epoch_contexts: value.epoch_contexts,
         }
     }
 }

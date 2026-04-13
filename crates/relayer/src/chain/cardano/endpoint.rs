@@ -37,7 +37,7 @@ use crate::event::IbcEventWithHeight;
 use crate::keyring::{KeyRing, SigningKeyPair};
 use crate::misbehaviour::MisbehaviourEvidence;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
-use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header as IbcHeader};
+use ibc_relayer_types::core::ics02_client::header::AnyHeader;
 use ibc_relayer_types::core::ics03_connection::connection::{
     ConnectionEnd, IdentifiedConnectionEnd,
 };
@@ -187,8 +187,7 @@ impl CardanoChainEndpoint {
                         )));
                     }
 
-                    let should_log =
-                        elapsed.saturating_sub(last_logged_elapsed) >= log_interval;
+                    let should_log = elapsed.saturating_sub(last_logged_elapsed) >= log_interval;
                     if should_log {
                         let remaining = timeout.saturating_sub(elapsed);
                         tracing::warn!(
@@ -2104,9 +2103,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         }
 
         let header = light_block.header.ok_or_else(|| {
-            Error::query(
-                "missing Cardano header while building consensus state".to_string(),
-            )
+            Error::query("missing Cardano header while building consensus state".to_string())
         })?;
 
         let ibc_state_root = extract_ibc_state_root_from_host_state_tx(

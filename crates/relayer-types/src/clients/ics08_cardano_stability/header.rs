@@ -25,6 +25,7 @@ pub struct Header {
     pub descendant_blocks: Vec<raw::StabilityBlock>,
     pub host_state_tx_hash: String,
     pub host_state_tx_output_index: u32,
+    pub new_epoch_context: Option<raw::EpochContext>,
 }
 
 impl crate::core::ics02_client::header::Header for Header {
@@ -74,6 +75,7 @@ impl TryFrom<RawHeader> for Header {
             descendant_blocks: raw.descendant_blocks,
             host_state_tx_hash: raw.host_state_tx_hash,
             host_state_tx_output_index: raw.host_state_tx_output_index,
+            new_epoch_context: raw.new_epoch_context,
         })
     }
 }
@@ -87,6 +89,7 @@ impl From<Header> for RawHeader {
             descendant_blocks: value.descendant_blocks,
             host_state_tx_hash: value.host_state_tx_hash,
             host_state_tx_output_index: value.host_state_tx_output_index,
+            new_epoch_context: value.new_epoch_context,
         }
     }
 }
