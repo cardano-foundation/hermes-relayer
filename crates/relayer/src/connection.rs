@@ -975,6 +975,43 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
         Ok(())
     }
 
+    /// Choose a proof query height on the source chain for connection handshakes.
+    fn proof_query_height_on_src(&self) -> Result<Height, ConnectionError> {
+        let src_latest_height = self
+            .src_chain()
+            .query_latest_height()
+            .map_err(|e| ConnectionError::chain_query(self.src_chain().id(), e))?;
+
+        let dst_client_latest_height = self
+            .restore_dst_client()
+            .validated_client_state()
+            .map_err(|e| {
+                ConnectionError::client_operation(
+                    self.dst_client_id().clone(),
+                    self.dst_chain().id(),
+                    e,
+                )
+            })?
+            .0
+            .latest_height();
+
+        // The proof-bearing handshake message is sent together with any client update
+        // needed on the destination. Capping this to the destination client's old
+        // height can query before the just-submitted handshake event exists.
+        //
+        // This is required for Cardano's accepted HostState view, and it also avoids
+        // "bad connection state" when opening Entrypoint<->Injective connections with
+        // pre-existing clients.
+        let query_height = src_latest_height;
+
+        debug!(
+            "using source proof query height {} (src latest {}, dst client latest {})",
+            query_height, src_latest_height, dst_client_latest_height
+        );
+
+        Ok(query_height)
+    }
+
     /// Attempts to build a MsgConnOpenTry.
     ///
     /// Return the messages and the app height the destination chain must reach
@@ -1014,10 +1051,22 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
 
         // Build add send the message(s) for updating client on source
         // TODO - add check if update client is required
+        // Avoid racing the destination tip for this proactive source-side client update.
+        // The actual ConnectionOpenTry message is built from fresh proofs below; this
+        // source update is only preparatory for later steps, so using the latest
+        // height already stored in the source-side client is sufficient here.
         let src_client_target_height = self
-            .dst_chain()
-            .query_latest_height()
-            .map_err(|e| ConnectionError::chain_query(self.dst_chain().id(), e))?;
+            .restore_src_client()
+            .validated_client_state()
+            .map_err(|e| {
+                ConnectionError::client_operation(
+                    self.src_client_id().clone(),
+                    self.src_chain().id(),
+                    e,
+                )
+            })?
+            .0
+            .latest_height();
         let client_msgs = self.build_update_client_on_src(src_client_target_height)?;
 
         if !client_msgs.is_empty() {
@@ -1030,10 +1079,7 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
                 .map_err(|e| ConnectionError::submit(self.src_chain().id(), e))?;
         }
 
-        let query_height = self
-            .src_chain()
-            .query_latest_height()
-            .map_err(|e| ConnectionError::chain_query(self.src_chain().id(), e))?;
+        let query_height = self.proof_query_height_on_src()?;
         let (client_state, proofs) = self
             .src_chain()
             .build_connection_proofs_and_client_state(
@@ -1157,10 +1203,20 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
 
         // Build add **send** the message(s) for updating client on source.
         // TODO - add check if it is required
+        // Same rationale as ConnectionOpenTry above: this proactive source-side
+        // update should not chase the moving destination tip.
         let src_client_target_height = self
-            .dst_chain()
-            .query_latest_height()
-            .map_err(|e| ConnectionError::chain_query(self.dst_chain().id(), e))?;
+            .restore_src_client()
+            .validated_client_state()
+            .map_err(|e| {
+                ConnectionError::client_operation(
+                    self.src_client_id().clone(),
+                    self.src_chain().id(),
+                    e,
+                )
+            })?
+            .0
+            .latest_height();
 
         let client_msgs = self.build_update_client_on_src(src_client_target_height)?;
 
@@ -1175,10 +1231,7 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
                 .map_err(|e| ConnectionError::submit(self.src_chain().id(), e))?;
         }
 
-        let query_height = self
-            .src_chain()
-            .query_latest_height()
-            .map_err(|e| ConnectionError::chain_query(self.src_chain().id(), e))?;
+        let query_height = self.proof_query_height_on_src()?;
 
         let (client_state, proofs) = self
             .src_chain()
@@ -1258,10 +1311,7 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
         let _expected_dst_connection =
             self.validated_expected_connection(ConnectionMsgType::OpenAck)?;
 
-        let query_height = self
-            .src_chain()
-            .query_latest_height()
-            .map_err(|e| ConnectionError::chain_query(self.src_chain().id(), e))?;
+        let query_height = self.proof_query_height_on_src()?;
 
         let (_src_connection, _) = self
             .src_chain()

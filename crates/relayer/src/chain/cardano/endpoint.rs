@@ -37,7 +37,7 @@ use crate::event::IbcEventWithHeight;
 use crate::keyring::{KeyRing, SigningKeyPair};
 use crate::misbehaviour::MisbehaviourEvidence;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
-use ibc_relayer_types::core::ics02_client::header::AnyHeader;
+use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header as IbcHeader};
 use ibc_relayer_types::core::ics03_connection::connection::{
     ConnectionEnd, IdentifiedConnectionEnd,
 };
@@ -764,8 +764,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         tracing::debug!("Querying Cardano application status via Gateway");
 
         // Query the latest proof/accepted height from Gateway. In stability mode this is the
-        // latest accepted HostState anchor height, which can legitimately lag the live Cardano
-        // tip when no new HostState update has been produced yet.
+        // latest accepted HostState anchor height.
         let height = self
             .rt
             .block_on(self.gateway_client.query_latest_height())
@@ -776,12 +775,25 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
         tracing::info!("Cardano chain at height: {}", height);
 
-        // Do not derive the destination-chain "current time" from the latest proof height.
-        // In stability mode that height advances only when a new HostState anchor is accepted,
-        // but Cardano itself can keep producing blocks in the meantime. If we use the stale
-        // anchor timestamp here, Hermes can block indefinitely on header-validation delay even
-        // though the destination chain is alive and progressing.
-        let timestamp = tendermint::Time::now().into();
+        // The status timestamp must match the accepted Cardano header at `height`.
+        // Hermes uses this timestamp to classify a packet as recv-vs-timeout.
+        // Returning local wall-clock time here can cause Hermes to build a timeout
+        // even when the source chain still sees the destination client timestamp as earlier.
+        let trusted_height = height.decrement().unwrap_or(height);
+        let header = self
+            .rt
+            .block_on(self.gateway_client.query_header(trusted_height, height))
+            .map_err(|e| {
+                tracing::error!(
+                    "Failed to query Cardano header for application status at {}: {}",
+                    height,
+                    e
+                );
+                Error::query(format!(
+                    "Gateway query_header failed for application status at {height}: {e}"
+                ))
+            })?;
+        let timestamp = header.timestamp();
 
         Ok(ChainStatus { height, timestamp })
     }

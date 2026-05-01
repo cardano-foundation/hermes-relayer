@@ -1196,12 +1196,25 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             )
         })?;
 
+        let local_ts_adjusted = || {
+            (Timestamp::now() + client_state.max_clock_drift()).map_err(|e| {
+                ForeignClientError::client_update_timing(
+                    self.dst_chain.id(),
+                    client_state.max_clock_drift(),
+                    "failed to adjust local clock with clock drift".to_string(),
+                    e,
+                )
+            })
+        };
+
         if header.timestamp().after(&ts_adjusted) {
             // Header would be considered in the future, wait for destination chain to
-            // advance to the next height.
+            // advance to the next height. For Cardano/stability mode, the accepted proof height
+            // can legitimately stay flat while wall-clock time keeps advancing, so also allow
+            // the local clock to satisfy the delay bound.
             warn!(
                 "src header {} is after dst latest header {} + client state drift {},\
-                 wait for next height on {}",
+                 wait for next height on {} or for local time to catch up",
                 header.timestamp(),
                 status.timestamp,
                 PrettyDuration(&client_state.max_clock_drift()),
@@ -1210,6 +1223,10 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
 
             let target_dst_height = status.height.increment();
             loop {
+                if !header.timestamp().after(&local_ts_adjusted()?) {
+                    break;
+                }
+
                 thread::sleep(Duration::from_millis(300));
                 status = self.dst_chain().query_application_status().map_err(|e| {
                     ForeignClientError::client_update(
@@ -1235,7 +1252,11 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 )
             })?;
 
-        if header.timestamp().after(&next_ts_adjusted) {
+        let next_local_ts_adjusted = local_ts_adjusted()?;
+
+        if header.timestamp().after(&next_ts_adjusted)
+            && header.timestamp().after(&next_local_ts_adjusted)
+        {
             // The header is still in the future
             Err(ForeignClientError::header_in_the_future(
                 self.src_chain.id(),
