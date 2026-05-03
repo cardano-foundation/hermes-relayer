@@ -175,6 +175,9 @@ pub struct QueryEventsResponse {
     /// Events grouped by block height
     #[prost(message, repeated, tag = "2")]
     pub events: ::prost::alloc::vec::Vec<BlockEvents>,
+    /// Highest block height actually scanned by the gateway for this response
+    #[prost(uint64, tag = "3")]
+    pub scanned_to_height: u64,
 }
 /// BlockEvents contains all IBC events for a specific block
 #[derive(Clone, PartialEq, ::prost::Message)]

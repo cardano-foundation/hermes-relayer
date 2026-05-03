@@ -145,12 +145,24 @@ impl CardanoEventSource {
             Error::collect_events_failed(format!("Invalid height from Gateway: {}", e))
         })?;
 
+        let scanned_to_height = Height::new(0, response.scanned_to_height).map_err(|e| {
+            Error::collect_events_failed(format!("Invalid scanned height from Gateway: {}", e))
+        })?;
+
+        if scanned_to_height < self.last_fetched_height {
+            return Err(Error::collect_events_failed(format!(
+                "Gateway scanned height {} regressed behind last fetched height {}",
+                scanned_to_height, self.last_fetched_height
+            )));
+        }
+
         // Process events if we have new blocks
         if !response.events.is_empty() {
             trace!(
-                "received {} block(s) of events from height {} to {}",
+                "received {} block(s) of events from height {} to {}, gateway current height {}",
                 response.events.len(),
                 self.last_fetched_height,
+                scanned_to_height,
                 current_height
             );
 
@@ -166,16 +178,18 @@ impl CardanoEventSource {
                     self.broadcast_batch(batch);
                 }
             }
-
-            // Update last fetched height
-            self.last_fetched_height = current_height;
         } else {
             trace!(
-                "no new events, current height: {}, last fetched: {}",
+                "no new events, scanned to {}, current height: {}, last fetched: {}",
+                scanned_to_height,
                 current_height,
                 self.last_fetched_height
             );
         }
+
+        // Gateway event queries are windowed; advance to the scanned height even when
+        // the window has no IBC events so polling eventually catches later packets.
+        self.last_fetched_height = scanned_to_height;
 
         Ok(Next::Continue)
     }
