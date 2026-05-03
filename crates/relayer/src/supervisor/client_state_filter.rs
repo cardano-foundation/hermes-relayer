@@ -3,6 +3,7 @@ use alloc::collections::BTreeMap as HashMap;
 use flex_error::define_error;
 use tracing::{debug, trace};
 
+use ibc_relayer_types::core::ics02_client::client_type::ClientType;
 use ibc_relayer_types::core::ics02_client::trust_threshold::TrustThreshold;
 use ibc_relayer_types::core::ics03_connection::connection::ConnectionEnd;
 use ibc_relayer_types::core::ics04_channel::error::Error as ChannelError;
@@ -201,6 +202,15 @@ impl FilterPolicy {
                 } else {
                     Permission::Allow
                 }
+            }
+            // Cardano light clients do not expose a Tendermint trust threshold; their
+            // security parameters are validated by the client implementation itself.
+            None if matches!(
+                state.client_type(),
+                ClientType::Cardano | ClientType::CardanoStability
+            ) =>
+            {
+                Permission::Allow
             }
             None => {
                 trace!(

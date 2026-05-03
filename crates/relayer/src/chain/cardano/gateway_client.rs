@@ -34,6 +34,8 @@ use ibc_relayer_types::core::ics02_client::header::AnyHeader;
 use ibc_relayer_types::Height;
 use tonic::transport::Channel;
 
+const GATEWAY_HEADER_GRPC_MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
+
 /// Unsigned transaction response from Gateway
 #[derive(Debug, Clone)]
 pub struct UnsignedTx {
@@ -181,7 +183,9 @@ impl GatewayClient {
         use super::generated::ibc::core::types::v1::query_client::QueryClient as TypesQueryClient;
         use super::generated::ibc::core::types::v1::QueryIbcHeaderRequest;
 
-        let mut client = TypesQueryClient::new(self.channel.clone());
+        // Cardano headers include proof data and can exceed tonic's 4 MiB default.
+        let mut client = TypesQueryClient::new(self.channel.clone())
+            .max_decoding_message_size(GATEWAY_HEADER_GRPC_MESSAGE_LIMIT);
 
         let effective_trusted_height = if trusted_height < height {
             trusted_height
