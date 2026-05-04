@@ -2,7 +2,7 @@
 //!
 //! Polls the Gateway for IBC events and broadcasts them to subscribers.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crossbeam_channel as channel;
 use tokio::{
@@ -11,7 +11,13 @@ use tokio::{
 };
 use tracing::{debug, error, error_span, trace};
 
-use ibc_relayer_types::core::{ics02_client::height::Height, ics24_host::identifier::ChainId};
+use ibc_relayer_types::{
+    core::{
+        ics02_client::events::NewBlock, ics02_client::height::Height,
+        ics24_host::identifier::ChainId,
+    },
+    events::IbcEvent,
+};
 
 use crate::{
     chain::tracking::TrackingId,
@@ -156,31 +162,39 @@ impl CardanoEventSource {
             )));
         }
 
-        // Process events if we have new blocks
-        if !response.events.is_empty() {
+        let start_height = self.last_fetched_height.revision_height().saturating_add(1);
+        let end_height = scanned_to_height.revision_height();
+
+        if start_height <= end_height {
             trace!(
-                "received {} block(s) of events from height {} to {}, gateway current height {}",
+                "received {} block(s) with IBC events from height {} to {}, gateway current height {}",
                 response.events.len(),
                 self.last_fetched_height,
                 scanned_to_height,
                 current_height
             );
 
-            for block_events in response.events {
-                let batch = self.process_block_events(block_events)?;
+            let mut events_by_height = response
+                .events
+                .into_iter()
+                .map(|block_events| (block_events.height, block_events))
+                .collect::<BTreeMap<_, _>>();
+
+            // Emit NewBlock for every scanned height so clear_interval can recover
+            // packets whose original Cardano event was missed or temporarily unrelayable.
+            for height in start_height..=end_height {
+                let batch = self.process_block_events(height, events_by_height.remove(&height))?;
 
                 // Check for commands before broadcasting
                 if let Next::Abort = self.try_process_cmd() {
                     return Ok(Next::Abort);
                 }
 
-                if let Some(batch) = batch {
-                    self.broadcast_batch(batch);
-                }
+                self.broadcast_batch(batch);
             }
         } else {
             trace!(
-                "no new events, scanned to {}, current height: {}, last fetched: {}",
+                "no new blocks, scanned to {}, current height: {}, last fetched: {}",
                 scanned_to_height,
                 current_height,
                 self.last_fetched_height
@@ -214,60 +228,59 @@ impl CardanoEventSource {
     /// Process events from a single block
     fn process_block_events(
         &self,
-        block_events: super::generated::ibc::cardano::v1::BlockEvents,
-    ) -> Result<Option<EventBatch>> {
-        let height = Height::new(0, block_events.height)
+        raw_height: u64,
+        block_events: Option<super::generated::ibc::cardano::v1::BlockEvents>,
+    ) -> Result<EventBatch> {
+        let height = Height::new(0, raw_height)
             .map_err(|e| Error::collect_events_failed(format!("Invalid block height: {}", e)))?;
 
-        if block_events.events.is_empty() {
-            return Ok(None);
-        }
+        let mut events_with_height = vec![IbcEventWithHeight::new(
+            IbcEvent::NewBlock(NewBlock::new(height)),
+            height,
+        )];
 
-        // Flatten all events from all ResponseDeliverTx items and convert to cardano Event type
-        let gateway_events: Vec<_> = block_events
-            .events
-            .into_iter()
-            .flat_map(|tx_result| {
-                tx_result.events.into_iter().map(|core_event| {
-                    // Convert ibc.core.types.v1.Event to ibc.cardano.v1.Event
-                    super::generated::ibc::cardano::v1::Event {
-                        r#type: core_event.r#type,
-                        attributes: core_event
-                            .event_attribute
-                            .into_iter()
-                            .map(|attr| super::generated::ibc::cardano::v1::EventAttribute {
-                                key: attr.key,
-                                value: attr.value,
-                            })
-                            .collect(),
-                    }
+        if let Some(block_events) = block_events {
+            // Flatten all events from all ResponseDeliverTx items and convert to cardano Event type
+            let gateway_events: Vec<_> = block_events
+                .events
+                .into_iter()
+                .flat_map(|tx_result| {
+                    tx_result.events.into_iter().map(|core_event| {
+                        // Convert ibc.core.types.v1.Event to ibc.cardano.v1.Event
+                        super::generated::ibc::cardano::v1::Event {
+                            r#type: core_event.r#type,
+                            attributes: core_event
+                                .event_attribute
+                                .into_iter()
+                                .map(|attr| super::generated::ibc::cardano::v1::EventAttribute {
+                                    key: attr.key,
+                                    value: attr.value,
+                                })
+                                .collect(),
+                        }
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        if gateway_events.is_empty() {
-            return Ok(None);
+            if !gateway_events.is_empty() {
+                let ibc_events =
+                    event_parser::parse_events(gateway_events, height).map_err(|e| {
+                        Error::collect_events_failed(format!("Failed to parse events: {}", e))
+                    })?;
+
+                events_with_height.extend(
+                    ibc_events
+                        .into_iter()
+                        .map(|event| IbcEventWithHeight::new(event, height)),
+                );
+            }
         }
-
-        // Parse Gateway events into IBC events
-        let ibc_events = event_parser::parse_events(gateway_events, height)
-            .map_err(|e| Error::collect_events_failed(format!("Failed to parse events: {}", e)))?;
-
-        if ibc_events.is_empty() {
-            return Ok(None);
-        }
-
-        // Convert to IbcEventWithHeight
-        let events_with_height: Vec<IbcEventWithHeight> = ibc_events
-            .into_iter()
-            .map(|event| IbcEventWithHeight::new(event, height))
-            .collect();
 
         debug!(
             chain = %self.chain_id,
             height = %height,
             count = events_with_height.len(),
-            "parsed {} IBC events at height {}",
+            "parsed {} Cardano events at height {}",
             events_with_height.len(),
             height
         );
@@ -279,7 +292,7 @@ impl CardanoEventSource {
             events: events_with_height,
         };
 
-        Ok(Some(batch))
+        Ok(batch)
     }
 
     /// Broadcast an event batch to all subscribers
