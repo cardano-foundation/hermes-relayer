@@ -7,8 +7,6 @@ use hdpath::StandardHDPath;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
-const DEFAULT_CARDANO_NETWORK_ID: u8 = 0;
-
 /// Keyfile format for Cardano keys
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CardanoKeyFile {
@@ -35,6 +33,10 @@ pub struct CardanoSigningKeyPair {
 impl CardanoSigningKeyPair {
     /// Create a new CardanoSigningKeyPair from components
     /// Supports both mnemonic phrases and bech32-encoded private keys (ed25519_sk...)
+    ///
+    /// Mnemonic derivation uses Hermes' Cardano-shaped SLIP-0010 Ed25519 path, not
+    /// Cardano wallet Ed25519-BIP32. Operators importing wallet mnemonics should verify
+    /// the derived address before funding or relaying.
     pub fn new(
         mnemonic_or_key: String,
         account: u32,
@@ -154,21 +156,29 @@ impl SigningKeyPair for CardanoSigningKeyPair {
         let network_id = key_file
             .network_id
             .or_else(|| network_id_from_hex_enterprise_address(&key_file.address))
-            .unwrap_or(DEFAULT_CARDANO_NETWORK_ID);
+            .ok_or_else(|| {
+                KeyringError::invalid_mnemonic(anyhow::anyhow!(
+                    "Cardano key files must include network_id or a hex enterprise address; \
+                     use the Cardano chain configuration when importing keys"
+                ))
+            })?;
 
         Self::from_key_file_with_network_id(key_file, hd_path, network_id)
     }
 
     fn from_mnemonic(
-        mnemonic: &str,
-        hd_path: &StandardHDPath,
+        _mnemonic: &str,
+        _hd_path: &StandardHDPath,
         _address_type: &AddressType,
         _account_prefix: &str,
     ) -> Result<Self, KeyringError>
     where
         Self: Sized,
     {
-        Self::from_mnemonic_with_network_id(mnemonic, hd_path, DEFAULT_CARDANO_NETWORK_ID)
+        Err(KeyringError::invalid_mnemonic(anyhow::anyhow!(
+            "Cardano mnemonic restore requires an explicit network_id from the chain \
+             configuration; use CardanoSigningKeyPair::from_mnemonic_with_network_id"
+        )))
     }
 
     fn account(&self) -> String {
@@ -237,6 +247,21 @@ mod tests {
     }
 
     #[test]
+    fn test_cardano_generic_from_mnemonic_requires_explicit_network_id() {
+        let hd_path = StandardHDPath::from_str("m/44'/118'/0'/0/0").unwrap();
+
+        let err = CardanoSigningKeyPair::from_mnemonic(
+            TEST_MNEMONIC,
+            &hd_path,
+            &AddressType::Cosmos,
+            "cardano",
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("requires an explicit network_id"));
+    }
+
+    #[test]
     fn test_cardano_from_seed_file_with_network_id() {
         let hd_path = StandardHDPath::from_str("m/44'/118'/0'/0/0").unwrap();
         let key_file = r#"{
@@ -270,6 +295,43 @@ mod tests {
 
         assert_eq!(key_pair.network_id(), 1);
         assert!(key_pair.account().starts_with("61"));
+    }
+
+    #[test]
+    fn test_cardano_from_key_file_requires_network_id_or_address() {
+        let hd_path = StandardHDPath::from_str("m/44'/118'/0'/0/0").unwrap();
+        let key_file = CardanoKeyFile {
+            name: "test".to_string(),
+            r#type: "local".to_string(),
+            address: String::new(),
+            pubkey: String::new(),
+            mnemonic: TEST_MNEMONIC.to_string(),
+            network_id: None,
+        };
+
+        let err = CardanoSigningKeyPair::from_key_file(key_file, &hd_path).unwrap_err();
+
+        assert!(err.to_string().contains("must include network_id"));
+    }
+
+    #[test]
+    fn test_cardano_from_key_file_infers_network_id_from_enterprise_address() {
+        let hd_path = StandardHDPath::from_str("m/44'/118'/0'/0/0").unwrap();
+        let address = CardanoSigningKeyPair::new(TEST_MNEMONIC.to_string(), 0, 1)
+            .unwrap()
+            .account();
+        let key_file = CardanoKeyFile {
+            name: "test".to_string(),
+            r#type: "local".to_string(),
+            address,
+            pubkey: String::new(),
+            mnemonic: TEST_MNEMONIC.to_string(),
+            network_id: None,
+        };
+
+        let key_pair = CardanoSigningKeyPair::from_key_file(key_file, &hd_path).unwrap();
+
+        assert_eq!(key_pair.network_id(), 1);
     }
 
     #[test]

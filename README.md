@@ -184,6 +184,8 @@ This design intentionally keeps header progression and state proof verification 
 
 On startup, the Cardano event source replays recent Gateway events from `event_replay_window` blocks before the latest Gateway height. The default is 100 blocks; setting it to 0 starts at the latest height. Replayed events can duplicate events observed before restart, so Cardano packet workers require packet clearing through `clear_on_start = true` or an effective `clear_interval > 0` for restart recovery.
 
+Cardano keys restored from mnemonics use Hermes' current Cardano-shaped SLIP-0010 Ed25519 derivation, not normal Cardano wallet Ed25519-BIP32 derivation. Operators importing a mnemonic from a Cardano wallet should verify the derived signer address before funding or relaying. Cardano key import and restore use the chain configuration's `network_id`; generic Cardano mnemonic construction without an explicit network id is rejected.
+
 ### Cardano ICS-20 Amount Range
 
 Canonical ICS-20 transfer amounts are decimal strings and Hermes models them as `U256`. Cardano ICS-20 vouchers are represented as Cardano native asset quantities through the Gateway transfer protobuf, so amounts must fit in `u64` (`0..=18446744073709551615`). Hermes validates this before asking the Gateway to build a Cardano transfer transaction. Transfers with amounts outside this range are rejected with an explicit error instead of failing later during packet creation or transaction construction.
