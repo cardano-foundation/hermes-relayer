@@ -265,7 +265,11 @@ pub fn add_key(
 
             let key_contents =
                 fs::read_to_string(file).map_err(|_| eyre!("error reading the key file"))?;
-            let key_pair = CardanoSigningKeyPair::from_seed_file(&key_contents, hd_path)?;
+            let key_pair = CardanoSigningKeyPair::from_seed_file_with_network_id(
+                &key_contents,
+                hd_path,
+                config.network_id,
+            )?;
 
             keyring.add_key(key_name, key_pair.clone())?;
             key_pair.into()
@@ -322,11 +326,10 @@ pub fn restore_key(
 
             check_key_exists(&keyring, key_name, overwrite);
 
-            let key_pair = CardanoSigningKeyPair::from_mnemonic(
+            let key_pair = CardanoSigningKeyPair::from_mnemonic_with_network_id(
                 &mnemonic_content,
                 hdpath,
-                &ibc_relayer::config::AddressType::Cosmos, // Not used for Cardano
-                "cardano",                                 // Not used for Cardano
+                config.network_id,
             )?;
 
             keyring.add_key(key_name, key_pair.clone())?;

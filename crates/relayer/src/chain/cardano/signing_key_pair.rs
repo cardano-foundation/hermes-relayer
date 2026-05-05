@@ -7,6 +7,8 @@ use hdpath::StandardHDPath;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 
+const DEFAULT_CARDANO_NETWORK_ID: u8 = 0;
+
 /// Keyfile format for Cardano keys
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CardanoKeyFile {
@@ -15,6 +17,8 @@ pub struct CardanoKeyFile {
     pub address: String,
     pub pubkey: String,
     pub mnemonic: String,
+    #[serde(default)]
+    pub network_id: Option<u8>,
 }
 
 /// Cardano signing key pair wrapper for Hermes
@@ -57,6 +61,37 @@ impl CardanoSigningKeyPair {
             account,
             network_id,
         })
+    }
+
+    pub fn from_key_file_with_network_id(
+        key_file: CardanoKeyFile,
+        hd_path: &StandardHDPath,
+        network_id: u8,
+    ) -> Result<Self, KeyringError> {
+        let account = hd_path.account();
+        Self::new(key_file.mnemonic, account, network_id)
+    }
+
+    pub fn from_seed_file_with_network_id(
+        contents: &str,
+        hd_path: &StandardHDPath,
+        network_id: u8,
+    ) -> Result<Self, KeyringError> {
+        let key_file = serde_json::from_str(contents).map_err(KeyringError::encode)?;
+        Self::from_key_file_with_network_id(key_file, hd_path, network_id)
+    }
+
+    pub fn from_mnemonic_with_network_id(
+        mnemonic: &str,
+        hd_path: &StandardHDPath,
+        network_id: u8,
+    ) -> Result<Self, KeyringError> {
+        let account = hd_path.account();
+        Self::new(mnemonic.to_string(), account, network_id)
+    }
+
+    pub fn network_id(&self) -> u8 {
+        self.network_id
     }
 
     /// Ensure the keyring is initialized (for after deserialization)
@@ -116,12 +151,12 @@ impl SigningKeyPair for CardanoSigningKeyPair {
     where
         Self: Sized,
     {
-        // For Cardano, we use the account from the HD path
-        let account = hd_path.account();
-        // Cardano testnet by default (can be overridden in config)
-        let network_id = 0;
+        let network_id = key_file
+            .network_id
+            .or_else(|| network_id_from_hex_enterprise_address(&key_file.address))
+            .unwrap_or(DEFAULT_CARDANO_NETWORK_ID);
 
-        Self::new(key_file.mnemonic, account, network_id)
+        Self::from_key_file_with_network_id(key_file, hd_path, network_id)
     }
 
     fn from_mnemonic(
@@ -133,11 +168,7 @@ impl SigningKeyPair for CardanoSigningKeyPair {
     where
         Self: Sized,
     {
-        let account = hd_path.account();
-        // Cardano testnet by default
-        let network_id = 0;
-
-        Self::new(mnemonic.to_string(), account, network_id)
+        Self::from_mnemonic_with_network_id(mnemonic, hd_path, DEFAULT_CARDANO_NETWORK_ID)
     }
 
     fn account(&self) -> String {
@@ -162,14 +193,22 @@ impl SigningKeyPair for CardanoSigningKeyPair {
     }
 }
 
+fn network_id_from_hex_enterprise_address(address: &str) -> Option<u8> {
+    let header = *hex::decode(address).ok()?.first()?;
+    (header >> 4 == 0x06).then_some(header & 0x0f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+
+    const TEST_MNEMONIC: &str =
+        "test walk nut penalty hip pave soap entry language right filter choice";
 
     #[test]
     fn test_cardano_signing_key_pair_creation() {
-        let mnemonic = "test walk nut penalty hip pave soap entry language right filter choice";
-        let key_pair = CardanoSigningKeyPair::new(mnemonic.to_string(), 0, 0).unwrap();
+        let key_pair = CardanoSigningKeyPair::new(TEST_MNEMONIC.to_string(), 0, 0).unwrap();
 
         let account = key_pair.account();
         assert!(!account.is_empty());
@@ -177,9 +216,65 @@ mod tests {
     }
 
     #[test]
+    fn test_cardano_signing_key_pair_creation_mainnet() {
+        let key_pair = CardanoSigningKeyPair::new(TEST_MNEMONIC.to_string(), 0, 1).unwrap();
+
+        let account = key_pair.account();
+        assert!(!account.is_empty());
+        assert_eq!(key_pair.network_id(), 1);
+        assert!(account.starts_with("61")); // Cardano enterprise mainnet address
+    }
+
+    #[test]
+    fn test_cardano_from_mnemonic_with_network_id() {
+        let hd_path = StandardHDPath::from_str("m/44'/118'/0'/0/0").unwrap();
+        let key_pair =
+            CardanoSigningKeyPair::from_mnemonic_with_network_id(TEST_MNEMONIC, &hd_path, 1)
+                .unwrap();
+
+        assert_eq!(key_pair.network_id(), 1);
+        assert!(key_pair.account().starts_with("61"));
+    }
+
+    #[test]
+    fn test_cardano_from_seed_file_with_network_id() {
+        let hd_path = StandardHDPath::from_str("m/44'/118'/0'/0/0").unwrap();
+        let key_file = r#"{
+            "name": "test",
+            "type": "local",
+            "address": "",
+            "pubkey": "",
+            "mnemonic": "test walk nut penalty hip pave soap entry language right filter choice"
+        }"#;
+
+        let key_pair =
+            CardanoSigningKeyPair::from_seed_file_with_network_id(key_file, &hd_path, 1).unwrap();
+
+        assert_eq!(key_pair.network_id(), 1);
+        assert!(key_pair.account().starts_with("61"));
+    }
+
+    #[test]
+    fn test_cardano_from_key_file_uses_network_id_when_present() {
+        let hd_path = StandardHDPath::from_str("m/44'/118'/0'/0/0").unwrap();
+        let key_file = CardanoKeyFile {
+            name: "test".to_string(),
+            r#type: "local".to_string(),
+            address: String::new(),
+            pubkey: String::new(),
+            mnemonic: TEST_MNEMONIC.to_string(),
+            network_id: Some(1),
+        };
+
+        let key_pair = CardanoSigningKeyPair::from_key_file(key_file, &hd_path).unwrap();
+
+        assert_eq!(key_pair.network_id(), 1);
+        assert!(key_pair.account().starts_with("61"));
+    }
+
+    #[test]
     fn test_cardano_signing() {
-        let mnemonic = "test walk nut penalty hip pave soap entry language right filter choice";
-        let key_pair = CardanoSigningKeyPair::new(mnemonic.to_string(), 0, 0).unwrap();
+        let key_pair = CardanoSigningKeyPair::new(TEST_MNEMONIC.to_string(), 0, 0).unwrap();
 
         let message = b"test message";
         let signature = key_pair.sign(message).unwrap();
@@ -189,8 +284,7 @@ mod tests {
 
     #[test]
     fn test_serialization_roundtrip() {
-        let mnemonic = "test walk nut penalty hip pave soap entry language right filter choice";
-        let key_pair = CardanoSigningKeyPair::new(mnemonic.to_string(), 0, 0).unwrap();
+        let key_pair = CardanoSigningKeyPair::new(TEST_MNEMONIC.to_string(), 0, 0).unwrap();
 
         // Serialize
         let json = serde_json::to_string(&key_pair).unwrap();

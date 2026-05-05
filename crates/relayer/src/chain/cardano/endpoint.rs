@@ -339,26 +339,44 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn health_check(&mut self) -> Result<HealthCheck, Error> {
         match self.rt.block_on(self.gateway_client.query_latest_height()) {
-            Ok(_) => Ok(HealthCheck::Healthy),
+            Ok(height) => {
+                tracing::debug!(
+                    "Cardano Gateway latest-height health probe succeeded at {}",
+                    height
+                );
+                Ok(HealthCheck::Healthy)
+            }
             Err(latest_height_error) => {
                 tracing::warn!(
-                    "Gateway latest-height probe failed during Cardano health-check: {}. Falling back to client-states probe.",
+                    "Gateway latest-height probe failed during Cardano health-check: {}. Latest height is required for Cardano relayer operation.",
                     latest_height_error
                 );
 
-                match self.rt.block_on(self.gateway_client.query_clients()) {
-                    Ok(_) => {
-                        tracing::info!(
-                            "Cardano Gateway client-states probe succeeded; treating endpoint as healthy despite latest-height bootstrap failure."
-                        );
-                        Ok(HealthCheck::Healthy)
+                let client_states_result = self
+                    .rt
+                    .block_on(self.gateway_client.query_clients())
+                    .map(|_| ());
+
+                match &client_states_result {
+                    Ok(()) => {
+                        tracing::warn!(
+                            "Cardano Gateway client-states probe succeeded, but endpoint remains unhealthy because latest-height failed."
+                        )
                     }
-                    Err(client_states_error) => Ok(HealthCheck::Unhealthy(Box::new(
-                        Error::query(format!(
-                            "Gateway health check failed: latest_height={latest_height_error}; client_states={client_states_error}"
-                        )),
-                    ))),
+                    Err(client_states_error) => {
+                        tracing::warn!(
+                            "Cardano Gateway client-states probe also failed during health-check: {}",
+                            client_states_error
+                        )
+                    }
                 }
+
+                Ok(HealthCheck::Unhealthy(Box::new(
+                    cardano_latest_height_unhealthy_error(
+                        &latest_height_error,
+                        client_states_result,
+                    ),
+                )))
             }
         }
     }
@@ -2892,5 +2910,51 @@ fn plutus_constructor_index(
         121..=127 => Some(constr.tag - 121),
         1280..=1400 => Some(constr.tag - 1280 + 7),
         _ => None,
+    }
+}
+
+fn cardano_latest_height_unhealthy_error(
+    latest_height_error: &super::error::Error,
+    client_states_result: Result<(), super::error::Error>,
+) -> Error {
+    match client_states_result {
+        Ok(()) => Error::query(format!(
+            "Cardano Gateway health check failed: latest-height probe is required for relayer operation and failed: {latest_height_error}; client-states probe succeeded, so the Gateway query API is partially reachable but latest-height/proof-serving is not ready"
+        )),
+        Err(client_states_error) => Error::query(format!(
+            "Cardano Gateway health check failed: latest-height probe is required for relayer operation and failed: {latest_height_error}; client-states probe also failed: {client_states_error}"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::cardano::error::Error as CardanoError;
+
+    #[test]
+    fn latest_height_failure_is_unhealthy_even_when_client_states_probe_succeeds() {
+        let error = cardano_latest_height_unhealthy_error(
+            &CardanoError::Query("latest height unavailable".to_string()),
+            Ok(()),
+        );
+
+        let message = error.to_string();
+        assert!(message.contains("latest-height probe is required"));
+        assert!(message.contains("client-states probe succeeded"));
+        assert!(message.contains("latest-height/proof-serving is not ready"));
+    }
+
+    #[test]
+    fn latest_height_failure_reports_client_states_probe_failure() {
+        let error = cardano_latest_height_unhealthy_error(
+            &CardanoError::Query("latest height unavailable".to_string()),
+            Err(CardanoError::Query("client states unavailable".to_string())),
+        );
+
+        let message = error.to_string();
+        assert!(message.contains("latest-height probe is required"));
+        assert!(message.contains("client-states probe also failed"));
+        assert!(message.contains("client states unavailable"));
     }
 }
