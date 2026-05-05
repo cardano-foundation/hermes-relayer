@@ -68,6 +68,13 @@ pub struct CardanoConfig {
     #[serde(default = "default_event_poll_interval", with = "humantime_serde")]
     pub event_poll_interval: Option<Duration>,
 
+    /// Number of recent Cardano blocks to replay from the Gateway event stream on startup.
+    ///
+    /// This may duplicate already-observed events after a restart. Set to 0 to preserve
+    /// the previous behavior of starting from the latest Gateway height.
+    #[serde(default = "default_event_replay_window")]
+    pub event_replay_window: u64,
+
     /// Maximum amount of time Hermes will wait after a Cardano transaction is included
     /// until it is also "Mithril-certified".
     ///
@@ -118,6 +125,10 @@ fn default_event_poll_interval() -> Option<Duration> {
     Some(Duration::from_secs(5))
 }
 
+fn default_event_replay_window() -> u64 {
+    100
+}
+
 fn default_mithril_certification_timeout() -> Duration {
     Duration::from_secs(10 * 60)
 }
@@ -148,9 +159,20 @@ impl Default for CardanoConfig {
             clock_drift: default_clock_drift(),
             client_refresh_rate: default::client_refresh_rate(),
             event_poll_interval: default_event_poll_interval(),
+            event_replay_window: default_event_replay_window(),
             mithril_certification_timeout: default_mithril_certification_timeout(),
             mithril_poll_interval: default_mithril_poll_interval(),
             mithril_wait_log_interval: default_mithril_wait_log_interval(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CardanoConfig;
+
+    #[test]
+    fn default_event_replay_window_is_100_blocks() {
+        assert_eq!(CardanoConfig::default().event_replay_window, 100);
     }
 }

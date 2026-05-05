@@ -131,6 +131,7 @@ impl CardanoChainEndpoint {
             self.config.id.clone(),
             self.gateway_client.clone(),
             poll_interval,
+            self.config.event_replay_window,
             self.rt.clone(),
         )
         .map_err(Error::event_source)?;

@@ -48,6 +48,9 @@ pub struct CardanoEventSource {
     /// Poll interval
     poll_interval: Duration,
 
+    /// Number of recent Gateway-scanned blocks to replay on startup
+    event_replay_window: u64,
+
     /// Event bus for broadcasting events
     event_bus: EventBus<Arc<Result<EventBatch>>>,
 
@@ -66,6 +69,7 @@ impl CardanoEventSource {
         chain_id: ChainId,
         gateway_client: GatewayClient,
         poll_interval: Duration,
+        event_replay_window: u64,
         rt: Arc<TokioRuntime>,
     ) -> Result<(Self, TxEventSourceCmd)> {
         let event_bus = EventBus::new();
@@ -76,10 +80,11 @@ impl CardanoEventSource {
             chain_id,
             gateway_client,
             poll_interval,
+            event_replay_window,
             event_bus,
             rx_cmd,
-            // Start at a valid (non-zero) height; `run()` will immediately reset this
-            // to the latest height if the gateway is reachable.
+            // Start at a valid (non-zero) height; `run()` will initialize this
+            // from the Gateway latest height and configured replay window.
             last_fetched_height: Height::new(0, 1).map_err(|e| {
                 Error::collect_events_failed(format!("Failed to create initial height: {}", e))
             })?,
@@ -98,8 +103,18 @@ impl CardanoEventSource {
         rt.block_on(async {
             // Initialize the latest fetched height
             if let Ok(latest_height) = self.fetch_latest_height().await {
-                self.last_fetched_height = latest_height;
-                debug!("initialized at height: {}", self.last_fetched_height);
+                match startup_replay_height(latest_height, self.event_replay_window) {
+                    Ok(replay_height) => {
+                        self.last_fetched_height = replay_height;
+                        debug!(
+                            latest_height = %latest_height,
+                            event_replay_window = self.event_replay_window,
+                            last_fetched_height = %self.last_fetched_height,
+                            "initialized Cardano event source replay cursor"
+                        );
+                    }
+                    Err(e) => error!("failed to initialize replay height: {e}"),
+                }
             }
 
             // Continuously run the event loop
@@ -319,5 +334,53 @@ impl CardanoEventSource {
             .map_err(|e| {
                 Error::collect_events_failed(format!("Failed to fetch latest height: {}", e))
             })
+    }
+}
+
+fn startup_replay_height(latest_height: Height, event_replay_window: u64) -> Result<Height> {
+    let replay_height = latest_height
+        .revision_height()
+        .saturating_sub(event_replay_window)
+        .max(1);
+
+    Height::new(latest_height.revision_number(), replay_height).map_err(|e| {
+        Error::collect_events_failed(format!("Invalid replay height from Gateway: {}", e))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use ibc_relayer_types::core::ics02_client::height::Height;
+
+    use super::startup_replay_height;
+
+    #[test]
+    fn startup_replay_height_subtracts_window() {
+        let latest = Height::new(0, 1000).unwrap();
+
+        assert_eq!(
+            startup_replay_height(latest, 100).unwrap(),
+            Height::new(0, 900).unwrap()
+        );
+    }
+
+    #[test]
+    fn startup_replay_height_preserves_latest_when_window_is_zero() {
+        let latest = Height::new(0, 1000).unwrap();
+
+        assert_eq!(
+            startup_replay_height(latest, 0).unwrap(),
+            Height::new(0, 1000).unwrap()
+        );
+    }
+
+    #[test]
+    fn startup_replay_height_clamps_to_one() {
+        let latest = Height::new(0, 50).unwrap();
+
+        assert_eq!(
+            startup_replay_height(latest, 100).unwrap(),
+            Height::new(0, 1).unwrap()
+        );
     }
 }

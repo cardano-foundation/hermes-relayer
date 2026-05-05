@@ -182,6 +182,8 @@ Height semantics follow Mithril transaction snapshots: `Height.revision_height` 
 
 This design intentionally keeps header progression and state proof verification under a single IBC client identifier, matching the core IBC connection and channel machinery.
 
+On startup, the Cardano event source replays recent Gateway events from `event_replay_window` blocks before the latest Gateway height. The default is 100 blocks; setting it to 0 starts at the latest height. Replayed events can duplicate events observed before restart, so Cardano packet workers require packet clearing through `clear_on_start = true` or an effective `clear_interval > 0` for restart recovery.
+
 ### Cardano ICS-20 Amount Range
 
 Canonical ICS-20 transfer amounts are decimal strings and Hermes models them as `U256`. Cardano ICS-20 vouchers are represented as Cardano native asset quantities through the Gateway transfer protobuf, so amounts must fit in `u64` (`0..=18446744073709551615`). Hermes validates this before asking the Gateway to build a Cardano transfer transaction. Transfers with amounts outside this range are rejected with an explicit error instead of failing later during packet creation or transaction construction.

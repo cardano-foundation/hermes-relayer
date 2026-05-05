@@ -110,8 +110,10 @@ pub fn spawn_worker_tasks<ChainA: ChainHandle, ChainB: ChainHandle>(
             (Some(cmd_tx), None)
         }
         Object::Packet(path) => {
+            let src_chain_id = chains.a.id();
+            let src_chain_config = config.find_chain(&src_chain_id);
             let exclude_src_sequences = config
-                .find_chain(&chains.a.id())
+                .find_chain(&src_chain_id)
                 .map(|chain_config| chain_config.excluded_sequences(&path.src_channel_id))
                 .unwrap_or_default()
                 .to_vec();
@@ -137,14 +139,6 @@ pub fn spawn_worker_tasks<ChainA: ChainHandle, ChainB: ChainHandle>(
                     let should_clear_on_start =
                         should_clear_on_start(&packets_config, channel_ordering);
 
-                    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
-                    let link = Arc::new(Mutex::new(link));
-
-                    let src_chain_config = config
-                        .chains
-                        .iter()
-                        .find(|chain| *chain.id() == chains.a.id());
-
                     let (fee_filter, clear_interval) = match src_chain_config {
                         Some(chain_config) => {
                             let chain_clear_interval = chain_config
@@ -162,47 +156,58 @@ pub fn spawn_worker_tasks<ChainA: ChainHandle, ChainB: ChainHandle>(
                             (fee_filter, chain_clear_interval)
                         }
                         None => {
-                            error!("configuration for chain {} not found", chains.a.id());
+                            error!("configuration for chain {} not found", src_chain_id);
                             (None, packets_config.clear_interval)
                         }
                     };
 
-                    let resubmit = Resubmit::from_clear_interval(clear_interval);
-
-                    let (clear_cmd_tx, clear_cmd_rx) = crossbeam_channel::unbounded();
-                    let clear_task = packet::spawn_clear_cmd_worker(
-                        cmd_rx,
-                        link.clone(),
+                    if let Err(e) = validate_cardano_packet_clearing(
+                        src_chain_config,
                         should_clear_on_start,
                         clear_interval,
-                        config.mode.packets.clear_limit,
-                        clear_cmd_tx,
-                    );
-                    task_handles.push(clear_task);
+                    ) {
+                        error!("error initializing Cardano packet worker: {}", e);
+                        (None, None)
+                    } else {
+                        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+                        let link = Arc::new(Mutex::new(link));
+                        let resubmit = Resubmit::from_clear_interval(clear_interval);
 
-                    // Only spawn the incentivized worker if a fee filter is specified in the configuration
-                    let packet_task = match fee_filter {
-                        Some(filter) => packet::spawn_incentivized_packet_cmd_worker(
-                            clear_cmd_rx,
-                            link.clone(),
-                            path.clone(),
-                            filter,
-                        ),
-                        None => packet::spawn_packet_cmd_worker(
-                            clear_cmd_rx,
+                        let (clear_cmd_tx, clear_cmd_rx) = crossbeam_channel::unbounded();
+                        let clear_task = packet::spawn_clear_cmd_worker(
+                            cmd_rx,
                             link.clone(),
                             should_clear_on_start,
                             clear_interval,
                             config.mode.packets.clear_limit,
-                            path.clone(),
-                        ),
-                    };
-                    task_handles.push(packet_task);
+                            clear_cmd_tx,
+                        );
+                        task_handles.push(clear_task);
 
-                    let link_task = packet::spawn_packet_worker(path.clone(), link, resubmit);
-                    task_handles.push(link_task);
+                        // Only spawn the incentivized worker if a fee filter is specified in the configuration
+                        let packet_task = match fee_filter {
+                            Some(filter) => packet::spawn_incentivized_packet_cmd_worker(
+                                clear_cmd_rx,
+                                link.clone(),
+                                path.clone(),
+                                filter,
+                            ),
+                            None => packet::spawn_packet_cmd_worker(
+                                clear_cmd_rx,
+                                link.clone(),
+                                should_clear_on_start,
+                                clear_interval,
+                                config.mode.packets.clear_limit,
+                                path.clone(),
+                            ),
+                        };
+                        task_handles.push(packet_task);
 
-                    (Some(cmd_tx), None)
+                        let link_task = packet::spawn_packet_worker(path.clone(), link, resubmit);
+                        task_handles.push(link_task);
+
+                        (Some(cmd_tx), None)
+                    }
                 }
                 Err(e) => {
                     error!("error initializing link object for packet worker: {}", e);
@@ -250,5 +255,59 @@ fn should_clear_on_start(config: &crate::config::Packets, channel_ordering: Orde
         false
     } else {
         config.clear_on_start || channel_ordering == Ordering::Ordered
+    }
+}
+
+fn validate_cardano_packet_clearing(
+    src_chain_config: Option<&crate::config::ChainConfig>,
+    should_clear_on_start: bool,
+    clear_interval: u64,
+) -> Result<(), &'static str> {
+    if matches!(
+        src_chain_config,
+        Some(crate::config::ChainConfig::Cardano(_))
+    ) && !should_clear_on_start
+        && clear_interval == 0
+    {
+        Err(
+            "Cardano event replay is bounded; packet clearing is required for restart recovery. \
+             Set mode.packets.clear_on_start = true or configure a clear_interval > 0 globally \
+             or on the Cardano chain.",
+        )
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{chain::cardano::CardanoConfig, config::ChainConfig};
+
+    use super::validate_cardano_packet_clearing;
+
+    #[test]
+    fn cardano_packet_clearing_disabled_is_rejected() {
+        let chain_config = ChainConfig::Cardano(CardanoConfig::default());
+
+        let error = validate_cardano_packet_clearing(Some(&chain_config), false, 0)
+            .expect_err("disabled Cardano packet clearing should be rejected");
+
+        assert!(error.contains("Cardano event replay is bounded"));
+    }
+
+    #[test]
+    fn cardano_packet_clearing_clear_on_start_is_accepted() {
+        let chain_config = ChainConfig::Cardano(CardanoConfig::default());
+
+        validate_cardano_packet_clearing(Some(&chain_config), true, 0)
+            .expect("clear_on_start should satisfy Cardano packet clearing guard");
+    }
+
+    #[test]
+    fn cardano_packet_clearing_clear_interval_is_accepted() {
+        let chain_config = ChainConfig::Cardano(CardanoConfig::default());
+
+        validate_cardano_packet_clearing(Some(&chain_config), false, 100)
+            .expect("clear_interval should satisfy Cardano packet clearing guard");
     }
 }
