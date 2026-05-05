@@ -32,6 +32,7 @@ use ibc_proto::ibc::core::connection::v1::{
 };
 use ibc_relayer_types::core::ics02_client::header::AnyHeader;
 use ibc_relayer_types::Height;
+use tonic::metadata::AsciiMetadataValue;
 use tonic::transport::Channel;
 
 const GATEWAY_HEADER_GRPC_MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
@@ -79,6 +80,23 @@ impl GatewayClient {
         Ok(Self { endpoint, channel })
     }
 
+    fn request_with_query_height<T>(
+        message: T,
+        query_height: Option<Height>,
+    ) -> Result<tonic::Request<T>, Error> {
+        let mut request = tonic::Request::new(message);
+        if let Some(height) = query_height {
+            let metadata_height: AsciiMetadataValue =
+                height.revision_height().to_string().parse().map_err(|e| {
+                    Error::GatewayClient(format!("invalid query height metadata: {e}"))
+                })?;
+            request
+                .metadata_mut()
+                .insert("x-cosmos-block-height", metadata_height);
+        }
+        Ok(request)
+    }
+
     /// Query the latest block height from the Gateway
     pub async fn query_latest_height(&self) -> Result<Height, Error> {
         use super::generated::ibc::core::client::v1::{
@@ -119,12 +137,16 @@ impl GatewayClient {
     pub async fn query_client_state(
         &self,
         client_id: &str,
+        query_height: Option<Height>,
     ) -> Result<QueryClientStateResponse, Error> {
         let mut client = ClientQueryClient::new(self.channel.clone());
 
-        let request = tonic::Request::new(QueryClientStateRequest {
-            client_id: client_id.to_string(),
-        });
+        let request = Self::request_with_query_height(
+            QueryClientStateRequest {
+                client_id: client_id.to_string(),
+            },
+            query_height,
+        )?;
 
         let response = client.client_state(request).await?.into_inner();
 
@@ -136,15 +158,19 @@ impl GatewayClient {
         &self,
         client_id: &str,
         height: Height,
+        query_height: Option<Height>,
     ) -> Result<QueryConsensusStateResponse, Error> {
         let mut client = ClientQueryClient::new(self.channel.clone());
 
-        let request = tonic::Request::new(QueryConsensusStateRequest {
-            client_id: client_id.to_string(),
-            revision_number: height.revision_number(),
-            revision_height: height.revision_height(),
-            latest_height: false,
-        });
+        let request = Self::request_with_query_height(
+            QueryConsensusStateRequest {
+                client_id: client_id.to_string(),
+                revision_number: height.revision_number(),
+                revision_height: height.revision_height(),
+                latest_height: false,
+            },
+            query_height,
+        )?;
 
         let response = client.consensus_state(request).await?.into_inner();
 
@@ -369,12 +395,19 @@ impl GatewayClient {
     }
 
     /// Query connection state
-    pub async fn query_connection(&self, connection_id: &str) -> Result<Vec<u8>, Error> {
+    pub async fn query_connection(
+        &self,
+        connection_id: &str,
+        query_height: Option<Height>,
+    ) -> Result<Vec<u8>, Error> {
         let mut client = ConnectionQueryClient::new(self.channel.clone());
 
-        let request = tonic::Request::new(QueryConnectionRequest {
-            connection_id: connection_id.to_string(),
-        });
+        let request = Self::request_with_query_height(
+            QueryConnectionRequest {
+                connection_id: connection_id.to_string(),
+            },
+            query_height,
+        )?;
 
         let response = client.connection(request).await?.into_inner();
 
@@ -394,13 +427,21 @@ impl GatewayClient {
     }
 
     /// Query channel state
-    pub async fn query_channel(&self, port_id: &str, channel_id: &str) -> Result<Vec<u8>, Error> {
+    pub async fn query_channel(
+        &self,
+        port_id: &str,
+        channel_id: &str,
+        query_height: Option<Height>,
+    ) -> Result<Vec<u8>, Error> {
         let mut client = ChannelQueryClient::new(self.channel.clone());
 
-        let request = tonic::Request::new(QueryChannelRequest {
-            port_id: port_id.to_string(),
-            channel_id: channel_id.to_string(),
-        });
+        let request = Self::request_with_query_height(
+            QueryChannelRequest {
+                port_id: port_id.to_string(),
+                channel_id: channel_id.to_string(),
+            },
+            query_height,
+        )?;
 
         let response = client.channel(request).await?.into_inner();
 
@@ -462,14 +503,18 @@ impl GatewayClient {
         port_id: &str,
         channel_id: &str,
         sequence: u64,
+        query_height: Option<Height>,
     ) -> Result<Vec<u8>, Error> {
         let mut client = ChannelQueryClient::new(self.channel.clone());
 
-        let request = tonic::Request::new(QueryPacketCommitmentRequest {
-            port_id: port_id.to_string(),
-            channel_id: channel_id.to_string(),
-            sequence,
-        });
+        let request = Self::request_with_query_height(
+            QueryPacketCommitmentRequest {
+                port_id: port_id.to_string(),
+                channel_id: channel_id.to_string(),
+                sequence,
+            },
+            query_height,
+        )?;
 
         let response = client.packet_commitment(request).await?.into_inner();
 
@@ -501,14 +546,18 @@ impl GatewayClient {
         port_id: &str,
         channel_id: &str,
         sequence: u64,
+        query_height: Option<Height>,
     ) -> Result<Vec<u8>, Error> {
         let mut client = ChannelQueryClient::new(self.channel.clone());
 
-        let request = tonic::Request::new(QueryPacketReceiptRequest {
-            port_id: port_id.to_string(),
-            channel_id: channel_id.to_string(),
-            sequence,
-        });
+        let request = Self::request_with_query_height(
+            QueryPacketReceiptRequest {
+                port_id: port_id.to_string(),
+                channel_id: channel_id.to_string(),
+                sequence,
+            },
+            query_height,
+        )?;
 
         let response = client.packet_receipt(request).await?.into_inner();
 
@@ -521,14 +570,18 @@ impl GatewayClient {
         port_id: &str,
         channel_id: &str,
         sequence: u64,
+        query_height: Option<Height>,
     ) -> Result<Vec<u8>, Error> {
         let mut client = ChannelQueryClient::new(self.channel.clone());
 
-        let request = tonic::Request::new(QueryPacketAcknowledgementRequest {
-            port_id: port_id.to_string(),
-            channel_id: channel_id.to_string(),
-            sequence,
-        });
+        let request = Self::request_with_query_height(
+            QueryPacketAcknowledgementRequest {
+                port_id: port_id.to_string(),
+                channel_id: channel_id.to_string(),
+                sequence,
+            },
+            query_height,
+        )?;
 
         let response = client.packet_acknowledgement(request).await?.into_inner();
 
@@ -600,13 +653,17 @@ impl GatewayClient {
         &self,
         port_id: &str,
         channel_id: &str,
+        query_height: Option<Height>,
     ) -> Result<Vec<u8>, Error> {
         let mut client = ChannelQueryClient::new(self.channel.clone());
 
-        let request = tonic::Request::new(QueryNextSequenceReceiveRequest {
-            port_id: port_id.to_string(),
-            channel_id: channel_id.to_string(),
-        });
+        let request = Self::request_with_query_height(
+            QueryNextSequenceReceiveRequest {
+                port_id: port_id.to_string(),
+                channel_id: channel_id.to_string(),
+            },
+            query_height,
+        )?;
 
         let response = client.next_sequence_receive(request).await?.into_inner();
 

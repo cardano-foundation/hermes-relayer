@@ -21,7 +21,7 @@ use crate::chain::requests::{
     QueryChannelsRequest, QueryClientConnectionsRequest, QueryClientStateRequest,
     QueryClientStatesRequest, QueryConnectionChannelsRequest, QueryConnectionRequest,
     QueryConnectionsRequest, QueryConsensusStateHeightsRequest, QueryConsensusStateRequest,
-    QueryHostConsensusStateRequest, QueryNextSequenceReceiveRequest,
+    QueryHeight, QueryHostConsensusStateRequest, QueryNextSequenceReceiveRequest,
     QueryPacketAcknowledgementRequest, QueryPacketAcknowledgementsRequest,
     QueryPacketCommitmentRequest, QueryPacketCommitmentsRequest, QueryPacketEventDataRequest,
     QueryPacketReceiptRequest, QueryTxRequest, QueryUnreceivedAcksRequest,
@@ -79,6 +79,40 @@ pub struct CardanoChainEndpoint {
     keyring: KeyRing<CardanoSigningKeyPair>,
     event_source_cmd: Option<crate::event::source::TxEventSourceCmd>,
     pending_new_client_consensus_states: Mutex<HashMap<u64, AnyConsensusState>>,
+}
+
+fn gateway_query_height(query_height: QueryHeight) -> Option<ICSHeight> {
+    match query_height {
+        QueryHeight::Latest => None,
+        QueryHeight::Specific(height) => Some(height),
+    }
+}
+
+fn assert_gateway_proof_height(
+    context: &str,
+    response_proof_height: Option<ibc_proto::ibc::core::client::v1::Height>,
+    expected_height: Option<ICSHeight>,
+) -> Result<(), Error> {
+    let Some(expected_height) = expected_height else {
+        return Ok(());
+    };
+
+    let proof_height = response_proof_height.ok_or_else(|| {
+        Error::query(format!(
+            "Gateway {context} response missing proof_height for requested height {expected_height}"
+        ))
+    })?;
+
+    if proof_height.revision_number != expected_height.revision_number()
+        || proof_height.revision_height != expected_height.revision_height()
+    {
+        return Err(Error::query(format!(
+            "Gateway {context} proof height mismatch: requested {}, got {}-{}",
+            expected_height, proof_height.revision_number, proof_height.revision_height
+        )));
+    }
+
+    Ok(())
 }
 
 impl CardanoChainEndpoint {
@@ -946,17 +980,24 @@ impl ChainEndpoint for CardanoChainEndpoint {
         include_proof: IncludeProof,
     ) -> Result<(AnyClientState, Option<MerkleProof>), Error> {
         tracing::debug!("Querying client state for: {}", request.client_id);
+        let gateway_height = gateway_query_height(request.height);
 
         let response = self
             .rt
             .block_on(
                 self.gateway_client
-                    .query_client_state(request.client_id.as_str()),
+                    .query_client_state(request.client_id.as_str(), gateway_height),
             )
             .map_err(|e| {
                 tracing::error!("Failed to query client state: {}", e);
                 Error::query(format!("Gateway query_client_state failed: {}", e))
             })?;
+
+        assert_gateway_proof_height(
+            "query_client_state",
+            response.proof_height.clone(),
+            gateway_height,
+        )?;
 
         let client_state_any = response
             .client_state
@@ -994,17 +1035,25 @@ impl ChainEndpoint for CardanoChainEndpoint {
             request.client_id,
             request.consensus_height
         );
+        let gateway_height = gateway_query_height(request.query_height);
 
         let response = self
             .rt
-            .block_on(
-                self.gateway_client
-                    .query_consensus_state(request.client_id.as_str(), request.consensus_height),
-            )
+            .block_on(self.gateway_client.query_consensus_state(
+                request.client_id.as_str(),
+                request.consensus_height,
+                gateway_height,
+            ))
             .map_err(|e| {
                 tracing::error!("Failed to query consensus state: {}", e);
                 Error::query(format!("Gateway query_consensus_state failed: {}", e))
             })?;
+
+        assert_gateway_proof_height(
+            "query_consensus_state",
+            response.proof_height.clone(),
+            gateway_height,
+        )?;
 
         let consensus_state_any = response
             .consensus_state
@@ -1224,13 +1273,14 @@ impl ChainEndpoint for CardanoChainEndpoint {
         include_proof: IncludeProof,
     ) -> Result<(ConnectionEnd, Option<MerkleProof>), Error> {
         tracing::info!("Querying connection: {:?}", request.connection_id);
+        let gateway_height = gateway_query_height(request.height);
 
         // Block on async operation
         self.rt.block_on(async {
             // Query connection from Gateway
             let response_bytes = self
                 .gateway_client
-                .query_connection(&request.connection_id.to_string())
+                .query_connection(&request.connection_id.to_string(), gateway_height)
                 .await
                 .map_err(|e| Error::query(format!("Failed to query connection: {}", e)))?;
 
@@ -1241,6 +1291,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
             let response = QueryConnectionResponse::decode(&response_bytes[..]).map_err(|e| {
                 Error::query(format!("Failed to decode connection response: {}", e))
             })?;
+            assert_gateway_proof_height(
+                "query_connection",
+                response.proof_height.clone(),
+                gateway_height,
+            )?;
 
             let connection_end = response
                 .connection
@@ -1374,13 +1429,18 @@ impl ChainEndpoint for CardanoChainEndpoint {
             request.port_id,
             request.channel_id
         );
+        let gateway_height = gateway_query_height(request.height);
 
         // Block on async operation
         self.rt.block_on(async {
             // Query channel from Gateway
             let response_bytes = self
                 .gateway_client
-                .query_channel(request.port_id.as_ref(), request.channel_id.as_ref())
+                .query_channel(
+                    request.port_id.as_ref(),
+                    request.channel_id.as_ref(),
+                    gateway_height,
+                )
                 .await
                 .map_err(|e| Error::query(format!("Failed to query channel: {}", e)))?;
 
@@ -1390,6 +1450,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
             let response = QueryChannelResponse::decode(&response_bytes[..])
                 .map_err(|e| Error::query(format!("Failed to decode channel response: {}", e)))?;
+            assert_gateway_proof_height(
+                "query_channel",
+                response.proof_height.clone(),
+                gateway_height,
+            )?;
 
             let channel_proto = response
                 .channel
@@ -1463,6 +1528,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             request.channel_id,
             request.sequence
         );
+        let gateway_height = gateway_query_height(request.height);
 
         // Block on async operation
         self.rt.block_on(async {
@@ -1473,6 +1539,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     request.port_id.as_ref(),
                     request.channel_id.as_ref(),
                     request.sequence.into(),
+                    gateway_height,
                 )
                 .await
                 .map_err(|e| Error::query(format!("Failed to query packet commitment: {}", e)))?;
@@ -1488,6 +1555,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         e
                     ))
                 })?;
+            assert_gateway_proof_height(
+                "query_packet_commitment",
+                response.proof_height.clone(),
+                gateway_height,
+            )?;
 
             // Parse proof if requested
             let proof = if matches!(include_proof, IncludeProof::Yes) {
@@ -1568,6 +1640,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             request.channel_id,
             request.sequence
         );
+        let gateway_height = gateway_query_height(request.height);
 
         // Block on async operation
         self.rt.block_on(async {
@@ -1578,6 +1651,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     request.port_id.as_ref(),
                     request.channel_id.as_ref(),
                     request.sequence.into(),
+                    gateway_height,
                 )
                 .await
                 .map_err(|e| Error::query(format!("Failed to query packet receipt: {}", e)))?;
@@ -1590,6 +1664,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 QueryPacketReceiptResponse::decode(&response_bytes[..]).map_err(|e| {
                     Error::query(format!("Failed to decode packet receipt response: {}", e))
                 })?;
+            assert_gateway_proof_height(
+                "query_packet_receipt",
+                response.proof_height.clone(),
+                gateway_height,
+            )?;
 
             // The receipt is a boolean - convert to bytes
             let receipt_bytes = if response.received {
@@ -1677,6 +1756,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             request.channel_id,
             request.sequence
         );
+        let gateway_height = gateway_query_height(request.height);
 
         // Block on async operation
         self.rt.block_on(async {
@@ -1687,6 +1767,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     request.port_id.as_ref(),
                     request.channel_id.as_ref(),
                     request.sequence.into(),
+                    gateway_height,
                 )
                 .await
                 .map_err(|e| {
@@ -1704,6 +1785,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         e
                     ))
                 })?;
+            assert_gateway_proof_height(
+                "query_packet_acknowledgement",
+                response.proof_height.clone(),
+                gateway_height,
+            )?;
 
             // Parse proof if requested
             let proof = if matches!(include_proof, IncludeProof::Yes) {
@@ -1840,13 +1926,18 @@ impl ChainEndpoint for CardanoChainEndpoint {
             request.port_id,
             request.channel_id
         );
+        let gateway_height = gateway_query_height(request.height);
 
         // Block on async operation
         self.rt.block_on(async {
             // Query next sequence receive from Gateway
             let response_bytes = self
                 .gateway_client
-                .query_next_sequence_receive(request.port_id.as_ref(), request.channel_id.as_ref())
+                .query_next_sequence_receive(
+                    request.port_id.as_ref(),
+                    request.channel_id.as_ref(),
+                    gateway_height,
+                )
                 .await
                 .map_err(|e| {
                     Error::query(format!("Failed to query next sequence receive: {}", e))
@@ -1863,6 +1954,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         e
                     ))
                 })?;
+            assert_gateway_proof_height(
+                "query_next_sequence_receive",
+                response.proof_height.clone(),
+                gateway_height,
+            )?;
 
             let sequence = Sequence::from(response.next_sequence_receive);
 
