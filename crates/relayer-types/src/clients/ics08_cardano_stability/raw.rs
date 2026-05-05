@@ -109,6 +109,16 @@ pub struct ConsensusState {
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct Misbehaviour {
+    #[prost(string, tag = "1")]
+    pub client_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub stability_header_1: ::core::option::Option<StabilityHeader>,
+    #[prost(message, optional, tag = "3")]
+    pub stability_header_2: ::core::option::Option<StabilityHeader>,
+}
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 pub struct StabilityBlock {
     #[prost(message, optional, tag = "1")]
     pub height: ::core::option::Option<Height>,

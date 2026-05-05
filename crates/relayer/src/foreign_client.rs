@@ -20,7 +20,6 @@ use ibc_relayer_types::core::ics02_client::error::Error as ClientError;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
 use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header};
 use ibc_relayer_types::core::ics02_client::msgs::create_client::MsgCreateClient;
-use ibc_relayer_types::core::ics02_client::msgs::misbehaviour::MsgSubmitMisbehaviour;
 use ibc_relayer_types::core::ics02_client::msgs::update_client::MsgUpdateClient;
 use ibc_relayer_types::core::ics02_client::msgs::upgrade_client::MsgUpgradeClient;
 use ibc_relayer_types::core::ics02_client::trust_threshold::TrustThreshold;
@@ -1947,42 +1946,39 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             );
         }
 
-        let tm_misbehaviour = match &evidence.misbehaviour {
-            AnyMisbehaviour::Tendermint(tm_misbehaviour) => Some(tm_misbehaviour.clone()),
-        }
-        .ok_or_else(|| {
-            ForeignClientError::misbehaviour_desc(format!(
-                "underlying evidence is not a Tendermint misbehaviour: {:?}",
-                evidence.misbehaviour
-            ))
-        })?;
-
         // If the misbehaving chain is a CCV consumer chain, we need to add
         // the corresponding CCV message for the provider.
         if is_ccv_consumer_chain {
-            match fetch_ccv_consumer_id(&self.dst_chain(), &self.id) {
-                Ok(consumer_id) => {
-                    msgs.push(
-                        MsgSubmitIcsConsumerMisbehaviour {
-                            submitter: signer.clone(),
-                            misbehaviour: tm_misbehaviour,
-                            consumer_id,
-                        }
-                        .to_any(),
-                    );
+            if let AnyMisbehaviour::Tendermint(tm_misbehaviour) = &evidence.misbehaviour {
+                match fetch_ccv_consumer_id(&self.dst_chain(), &self.id) {
+                    Ok(consumer_id) => {
+                        msgs.push(
+                            MsgSubmitIcsConsumerMisbehaviour {
+                                submitter: signer.clone(),
+                                misbehaviour: tm_misbehaviour.clone(),
+                                consumer_id,
+                            }
+                            .to_any(),
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "cannot build CCV misbehaviour evidence: failed to fetch CCV consumer id for client {}: {}",
+                            self.id, e
+                        );
+                    }
                 }
-                Err(e) => {
-                    error!(
-                        "cannot build CCV misbehaviour evidence: failed to fetch CCV consumer id for client {}: {}",
-                        self.id, e
-                    );
-                }
+            } else {
+                warn!(
+                    "skipping CCV misbehaviour evidence for non-Tendermint client message {}",
+                    evidence.misbehaviour
+                );
             }
         }
 
         msgs.push(
-            MsgSubmitMisbehaviour {
-                misbehaviour: evidence.misbehaviour.into(),
+            MsgUpdateClient {
+                header: evidence.misbehaviour.into(),
                 client_id: self.id.clone(),
                 signer,
             }

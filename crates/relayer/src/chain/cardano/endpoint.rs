@@ -7,7 +7,9 @@ use super::gateway_client::GatewayClient;
 use super::signing_key_pair::CardanoSigningKeyPair;
 
 use ibc_relayer_types::clients::ics08_cardano::consensus_state::ConsensusState as MithrilConsensusState;
+use ibc_relayer_types::clients::ics08_cardano::misbehaviour::Misbehaviour as MithrilMisbehaviour;
 use ibc_relayer_types::clients::ics08_cardano_stability::consensus_state::ConsensusState as StabilityConsensusState;
+use ibc_relayer_types::clients::ics08_cardano_stability::misbehaviour::Misbehaviour as StabilityMisbehaviour;
 
 use crate::account::Balance;
 use crate::chain::client::ClientSettings;
@@ -35,7 +37,7 @@ use crate::denom::DenomTrace;
 use crate::error::Error;
 use crate::event::IbcEventWithHeight;
 use crate::keyring::{KeyRing, SigningKeyPair};
-use crate::misbehaviour::MisbehaviourEvidence;
+use crate::misbehaviour::{AnyMisbehaviour, MisbehaviourEvidence};
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
 use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header as IbcHeader};
 use ibc_relayer_types::core::ics03_connection::connection::{
@@ -743,12 +745,83 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn check_misbehaviour(
         &mut self,
-        _update: &UpdateClient,
-        _client_state: &AnyClientState,
+        update: &UpdateClient,
+        client_state: &AnyClientState,
     ) -> Result<Option<MisbehaviourEvidence>, Error> {
-        // TODO: Check for Cardano misbehaviour
-        tracing::warn!("check_misbehaviour: stub implementation");
-        Ok(None)
+        let submitted_header = update.header.as_ref().ok_or_else(|| {
+            Error::query(format!(
+                "Cardano misbehaviour check for client {} requires an update event header",
+                update.client_id()
+            ))
+        })?;
+
+        let target_height = submitted_header.height();
+        if target_height != update.consensus_height() {
+            tracing::warn!(
+                "Cardano misbehaviour check header height {} differs from event consensus height {} for client {}",
+                target_height,
+                update.consensus_height(),
+                update.client_id()
+            );
+        }
+
+        let trusted_height = independent_header_trusted_height(submitted_header)?;
+        let witness_header = self
+            .rt
+            .block_on(
+                self.gateway_client
+                    .query_header(trusted_height, target_height),
+            )
+            .map_err(|e| {
+                Error::query(format!(
+                    "failed to independently query Cardano header at {target_height}: {e}"
+                ))
+            })?;
+
+        if witness_header.height() != target_height {
+            return Err(Error::query(format!(
+                "independent Cardano header height mismatch: expected {target_height}, got {}",
+                witness_header.height()
+            )));
+        }
+
+        if !cardano_headers_conflict(submitted_header, &witness_header, client_state)? {
+            return Ok(None);
+        }
+
+        let misbehaviour = match (submitted_header.clone(), witness_header) {
+            (AnyHeader::Mithril(header1), AnyHeader::Mithril(header2)) => {
+                AnyMisbehaviour::Mithril(MithrilMisbehaviour {
+                    client_id: update.client_id().clone(),
+                    header1,
+                    header2,
+                })
+            }
+            (AnyHeader::Stability(header1), AnyHeader::Stability(header2)) => {
+                AnyMisbehaviour::Stability(StabilityMisbehaviour {
+                    client_id: update.client_id().clone(),
+                    header1,
+                    header2,
+                })
+            }
+            (AnyHeader::Tendermint(_), _) => {
+                return Err(Error::query(
+                    "Cardano misbehaviour check received a Tendermint update header".to_string(),
+                ))
+            }
+            (left, right) => {
+                return Err(Error::query(format!(
+                    "Cardano misbehaviour check cannot compare different header types: submitted={:?}, witness={:?}",
+                    left.client_type(),
+                    right.client_type()
+                )))
+            }
+        };
+
+        Ok(Some(MisbehaviourEvidence {
+            misbehaviour,
+            supporting_headers: vec![],
+        }))
     }
 
     fn query_balance(&self, key_name: Option<&str>, denom: Option<&str>) -> Result<Balance, Error> {
@@ -2438,6 +2511,139 @@ fn filter_packet_events_from_block_results(
 // Mithril header is decoded from the Gateway as `google.protobuf.Any`.
 // See `ibc-relayer-types/src/clients/ics08_cardano/header.rs` and
 // `ibc-relayer-types/src/core/ics02_client/header.rs`.
+
+fn independent_header_trusted_height(header: &AnyHeader) -> Result<ICSHeight, Error> {
+    match header {
+        AnyHeader::Mithril(header) => header.height.decrement().map_err(|_| {
+            Error::query(format!(
+                "cannot independently query Mithril header at {} without a prior trusted height",
+                header.height
+            ))
+        }),
+        AnyHeader::Stability(header) => Ok(header.trusted_height),
+        AnyHeader::Tendermint(_) => Err(Error::query(
+            "Cardano misbehaviour check received a Tendermint header".to_string(),
+        )),
+    }
+}
+
+fn cardano_headers_conflict(
+    submitted: &AnyHeader,
+    witness: &AnyHeader,
+    client_state: &AnyClientState,
+) -> Result<bool, Error> {
+    let (host_state_nft_policy_id, host_state_nft_token_name) =
+        cardano_host_state_nft(client_state)?;
+
+    match (submitted, witness) {
+        (AnyHeader::Mithril(submitted), AnyHeader::Mithril(witness)) => {
+            if submitted.height != witness.height {
+                return Err(Error::query(format!(
+                    "cannot compare Mithril headers at different heights: {} and {}",
+                    submitted.height, witness.height
+                )));
+            }
+
+            let submitted_root = extract_ibc_state_root_from_host_state_tx(
+                &AnyHeader::Mithril(submitted.clone()),
+                host_state_nft_policy_id,
+                host_state_nft_token_name,
+            )?;
+            let witness_root = extract_ibc_state_root_from_host_state_tx(
+                &AnyHeader::Mithril(witness.clone()),
+                host_state_nft_policy_id,
+                host_state_nft_token_name,
+            )?;
+
+            let conflicts = submitted_root != witness_root
+                || submitted.timestamp != witness.timestamp
+                || submitted.mithril_stake_distribution_certificate
+                    != witness.mithril_stake_distribution_certificate
+                || !submitted
+                    .transaction_snapshot_certificate
+                    .hash
+                    .eq_ignore_ascii_case(&witness.transaction_snapshot_certificate.hash);
+
+            if conflicts {
+                tracing::warn!(
+                    "Mithril header conflict detected at {}: submitted_root={}, witness_root={}, submitted_tx_cert={}, witness_tx_cert={}",
+                    submitted.height,
+                    hex::encode(&submitted_root),
+                    hex::encode(&witness_root),
+                    submitted.transaction_snapshot_certificate.hash,
+                    witness.transaction_snapshot_certificate.hash,
+                );
+            }
+
+            Ok(conflicts)
+        }
+        (AnyHeader::Stability(submitted), AnyHeader::Stability(witness)) => {
+            if submitted.height != witness.height {
+                return Err(Error::query(format!(
+                    "cannot compare stability headers at different heights: {} and {}",
+                    submitted.height, witness.height
+                )));
+            }
+
+            let submitted_root = extract_ibc_state_root_from_host_state_tx(
+                &AnyHeader::Stability(submitted.clone()),
+                host_state_nft_policy_id,
+                host_state_nft_token_name,
+            )?;
+            let witness_root = extract_ibc_state_root_from_host_state_tx(
+                &AnyHeader::Stability(witness.clone()),
+                host_state_nft_policy_id,
+                host_state_nft_token_name,
+            )?;
+
+            let conflicts = submitted_root != witness_root
+                || !submitted
+                    .anchor_block
+                    .hash
+                    .eq_ignore_ascii_case(&witness.anchor_block.hash);
+
+            if conflicts {
+                tracing::warn!(
+                    "Stability header conflict detected at {}: submitted_root={}, witness_root={}, submitted_anchor={}, witness_anchor={}",
+                    submitted.height,
+                    hex::encode(&submitted_root),
+                    hex::encode(&witness_root),
+                    submitted.anchor_block.hash,
+                    witness.anchor_block.hash,
+                );
+            }
+
+            Ok(conflicts)
+        }
+        (AnyHeader::Tendermint(_), _) => Err(Error::query(
+            "Cardano misbehaviour check received a Tendermint submitted header".to_string(),
+        )),
+        (_, AnyHeader::Tendermint(_)) => Err(Error::query(
+            "Cardano misbehaviour check independently fetched a Tendermint header".to_string(),
+        )),
+        (submitted, witness) => Err(Error::query(format!(
+            "cannot compare different Cardano header types: submitted={:?}, witness={:?}",
+            submitted.client_type(),
+            witness.client_type()
+        ))),
+    }
+}
+
+fn cardano_host_state_nft(client_state: &AnyClientState) -> Result<(&[u8], &[u8]), Error> {
+    match client_state {
+        AnyClientState::Mithril(state) => Ok((
+            state.host_state_nft_policy_id.as_slice(),
+            state.host_state_nft_token_name.as_slice(),
+        )),
+        AnyClientState::Stability(state) => Ok((
+            state.host_state_nft_policy_id.as_slice(),
+            state.host_state_nft_token_name.as_slice(),
+        )),
+        _ => Err(Error::query(
+            "Cardano misbehaviour check requires a Cardano client state".to_string(),
+        )),
+    }
+}
 
 fn extract_ibc_state_root_from_host_state_tx(
     header: &AnyHeader,
