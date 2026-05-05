@@ -1221,7 +1221,11 @@ impl GatewayClient {
         let msg = MsgRecvPacket::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgRecvPacket: {}", e)))?;
 
-        let sequence = msg.packet.as_ref().map(|p| p.sequence).unwrap_or(0);
+        let sequence = msg
+            .packet
+            .as_ref()
+            .ok_or_else(|| Error::Transaction("MsgRecvPacket missing packet".to_string()))?
+            .sequence;
 
         let mut client = GenChannelMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
@@ -1255,7 +1259,11 @@ impl GatewayClient {
             Error::Transaction(format!("Failed to decode MsgAcknowledgement: {}", e))
         })?;
 
-        let sequence = msg.packet.as_ref().map(|p| p.sequence).unwrap_or(0);
+        let sequence = msg
+            .packet
+            .as_ref()
+            .ok_or_else(|| Error::Transaction("MsgAcknowledgement missing packet".to_string()))?
+            .sequence;
 
         let mut client = GenChannelMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
@@ -1288,18 +1296,11 @@ impl GatewayClient {
         let msg = MsgTransfer::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgTransfer: {}", e)))?;
 
-        if msg.token.is_none() {
-            tracing::warn!(
-                "MsgTransfer has no token payload from Hermes: source_port={} source_channel={} receiver={}",
-                msg.source_port, msg.source_channel, msg.receiver
-            );
-        }
-
-        let token_info = msg.token;
-        let token = token_info
+        let token_info = msg
+            .token
             .as_ref()
-            .map(cardano_transfer_token_from_canonical)
-            .transpose()?;
+            .ok_or_else(|| Error::Transaction("MsgTransfer missing token".to_string()))?;
+        let token = cardano_transfer_token_from_canonical(token_info)?;
 
         let timeout_height =
             msg.timeout_height
@@ -1318,8 +1319,8 @@ impl GatewayClient {
             msg.source_channel,
             msg.receiver,
             sender,
-            token_info.as_ref().map(|coin| coin.denom.as_str()),
-            token.as_ref().map(|coin| coin.amount),
+            token_info.denom.as_str(),
+            token.amount,
             timeout_height
                 .as_ref()
                 .map(|height| format!("{}-{}", height.revision_number, height.revision_height)),
@@ -1330,7 +1331,7 @@ impl GatewayClient {
         let gateway_msg = super::generated::ibc::core::channel::v1::MsgTransfer {
             source_port: msg.source_port,
             source_channel: msg.source_channel.clone(),
-            token,
+            token: Some(token),
             sender: sender.clone(),
             receiver: msg.receiver,
             timeout_height,
@@ -1370,7 +1371,11 @@ impl GatewayClient {
         let msg = MsgTimeout::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgTimeout: {}", e)))?;
 
-        let sequence = msg.packet.as_ref().map(|p| p.sequence).unwrap_or(0);
+        let sequence = msg
+            .packet
+            .as_ref()
+            .ok_or_else(|| Error::Transaction("MsgTimeout missing packet".to_string()))?
+            .sequence;
 
         let mut client = GenChannelMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
@@ -1404,7 +1409,11 @@ impl GatewayClient {
             Error::Transaction(format!("Failed to decode MsgTimeoutOnClose: {}", e))
         })?;
 
-        let sequence = msg.packet.as_ref().map(|p| p.sequence).unwrap_or(0);
+        let sequence = msg
+            .packet
+            .as_ref()
+            .ok_or_else(|| Error::Transaction("MsgTimeoutOnClose missing packet".to_string()))?
+            .sequence;
 
         let mut client = GenChannelMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
