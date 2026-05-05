@@ -1,11 +1,15 @@
 //! Error types for Cardano chain implementation
 
 use thiserror::Error;
+use tonic::Code;
 
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Gateway client error: {0}")]
     GatewayClient(String),
+
+    #[error("Gateway gRPC error ({code}): {message}")]
+    GatewayStatus { code: Code, message: String },
 
     #[error("Configuration error: {0}")]
     Config(String),
@@ -38,7 +42,10 @@ pub enum Error {
 // Conversion from other error types
 impl From<tonic::Status> for Error {
     fn from(err: tonic::Status) -> Self {
-        Error::GatewayClient(err.message().to_string())
+        Error::GatewayStatus {
+            code: err.code(),
+            message: err.message().to_string(),
+        }
     }
 }
 

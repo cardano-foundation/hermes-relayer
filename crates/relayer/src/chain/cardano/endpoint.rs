@@ -2391,8 +2391,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         ) {
             Ok(header) => Ok((header, vec![])),
             Err(e) => {
-                let err_str = e.to_string();
-                if !err_str.contains("Not found") || !err_str.contains("height") {
+                if !is_recoverable_gateway_header_height_error(&e) {
                     return Err(Error::query(format!("Gateway query_header failed: {e}")));
                 }
 
@@ -2443,10 +2442,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                             break;
                         }
                         Err(search_error) => {
-                            let search_error_text = search_error.to_string();
-                            if !search_error_text.contains("Not found")
-                                || !search_error_text.contains("height")
-                            {
+                            if !is_recoverable_gateway_header_height_error(&search_error) {
                                 return Err(Error::query(format!(
                                     "Gateway query_header failed while searching for a certified height at/after {target_height} (candidate {candidate_ics_height}): {search_error}"
                                 )));
@@ -3226,6 +3222,25 @@ fn normalize_header_query_trusted_height(
     })
 }
 
+fn is_recoverable_gateway_header_height_error(error: &super::error::Error) -> bool {
+    match error {
+        super::error::Error::GatewayStatus { code, message } => {
+            matches!(
+                (*code, message.as_str()),
+                (tonic::Code::NotFound, msg) if msg.contains("HEIGHT_NOT_FOUND")
+            ) || matches!(
+                (*code, message.as_str()),
+                (tonic::Code::FailedPrecondition, msg) if msg.contains("HEIGHT_NOT_ACCEPTED")
+            ) || is_legacy_gateway_header_height_not_found(message)
+        }
+        _ => is_legacy_gateway_header_height_not_found(&error.to_string()),
+    }
+}
+
+fn is_legacy_gateway_header_height_not_found(message: &str) -> bool {
+    message.contains("Not found") && message.contains("height")
+}
+
 fn plutus_constructor_index(
     constr: &pallas_primitives::alonzo::Constr<pallas_primitives::alonzo::PlutusData>,
 ) -> Option<u64> {
@@ -3280,5 +3295,46 @@ mod tests {
         assert!(message.contains("latest-height probe is required"));
         assert!(message.contains("client-states probe also failed"));
         assert!(message.contains("client states unavailable"));
+    }
+
+    #[test]
+    fn header_height_errors_accept_typed_recoverable_statuses() {
+        let height_not_found = CardanoError::from(tonic::Status::not_found(
+            "HEIGHT_NOT_FOUND: no header at height 10",
+        ));
+        let height_not_accepted = CardanoError::from(tonic::Status::failed_precondition(
+            "HEIGHT_NOT_ACCEPTED: height 10 is not an accepted Cardano header height",
+        ));
+
+        assert!(is_recoverable_gateway_header_height_error(
+            &height_not_found
+        ));
+        assert!(is_recoverable_gateway_header_height_error(
+            &height_not_accepted
+        ));
+    }
+
+    #[test]
+    fn header_height_errors_reject_typed_fatal_statuses() {
+        let history_not_ready = CardanoError::from(tonic::Status::unavailable(
+            "HISTORY_NOT_READY: Gateway has not indexed the requested range",
+        ));
+        let invalid_trusted_height = CardanoError::from(tonic::Status::invalid_argument(
+            "INVALID_TRUSTED_HEIGHT: trusted height must be lower than target height",
+        ));
+
+        assert!(!is_recoverable_gateway_header_height_error(
+            &history_not_ready
+        ));
+        assert!(!is_recoverable_gateway_header_height_error(
+            &invalid_trusted_height
+        ));
+    }
+
+    #[test]
+    fn header_height_errors_keep_legacy_text_fallback() {
+        let legacy = CardanoError::GatewayClient("Not found: height 10".to_string());
+
+        assert!(is_recoverable_gateway_header_height_error(&legacy));
     }
 }
