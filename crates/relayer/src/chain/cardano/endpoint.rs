@@ -665,6 +665,25 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     .await
                     .map_err(|e| Error::send_tx(format!("Failed to submit transaction: {e}")))?;
 
+                let included_height = tx_response.height.ok_or_else(|| {
+                    Error::send_tx(format!(
+                        "No height in transaction response for {}",
+                        tx_response.tx_hash
+                    ))
+                })?;
+
+                let certified_height = self
+                    .wait_for_gateway_accepted_height(included_height)
+                    .await?;
+                if certified_height.revision_height() != included_height.revision_height() {
+                    tracing::info!(
+                        "Transaction {} inclusion height {} is now certified at {}",
+                        tx_response.tx_hash,
+                        included_height,
+                        certified_height
+                    );
+                }
+
                 let hash = match Hash::from_str(&tx_response.tx_hash.to_ascii_uppercase()) {
                     Ok(h) => h,
                     Err(e) => {
