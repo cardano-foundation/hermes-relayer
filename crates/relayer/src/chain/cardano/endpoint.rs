@@ -782,12 +782,14 @@ impl ChainEndpoint for CardanoChainEndpoint {
         update: &UpdateClient,
         client_state: &AnyClientState,
     ) -> Result<Option<MisbehaviourEvidence>, Error> {
-        let submitted_header = update.header.as_ref().ok_or_else(|| {
-            Error::query(format!(
-                "Cardano misbehaviour check for client {} requires an update event header",
-                update.client_id()
-            ))
-        })?;
+        let Some(submitted_header) = update.header.as_ref() else {
+            tracing::warn!(
+                "skipping Cardano misbehaviour check for client {} at consensus height {}: update-client event does not include the submitted header",
+                update.client_id(),
+                update.consensus_height(),
+            );
+            return Ok(None);
+        };
 
         let target_height = submitted_header.height();
         if target_height != update.consensus_height() {

@@ -16,6 +16,7 @@ use tracing::{debug, error, info, instrument, trace, warn};
 use flex_error::define_error;
 use ibc_relayer_types::applications::ics28_ccv::msgs::ccv_misbehaviour::MsgSubmitIcsConsumerMisbehaviour;
 use ibc_relayer_types::core::ics02_client::client_state::ClientState;
+use ibc_relayer_types::core::ics02_client::client_type::ClientType;
 use ibc_relayer_types::core::ics02_client::error::Error as ClientError;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
 use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header};
@@ -1822,9 +1823,12 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 break;
             }
 
-            // No header in events, cannot run misbehavior.
-            // May happen on chains running older SDKs (e.g., Akash)
-            if update_event.header.is_none() {
+            // No header in events, cannot run misbehavior. Cardano update-client
+            // events do not currently carry the submitted client message, so the
+            // Cardano chain-specific checker is allowed to skip cleanly.
+            if update_event.header.is_none()
+                && !client_type_allows_missing_update_header(update_event.client_type())
+            {
                 return Err(ForeignClientError::misbehaviour_exit(format!(
                     "could not extract header from update client event {:?} emitted by chain {}",
                     update_event,
@@ -2119,6 +2123,31 @@ fn parse_client_counter(client_id: &str) -> u64 {
         .next()
         .and_then(|raw| raw.parse::<u64>().ok())
         .unwrap_or_default()
+}
+
+fn client_type_allows_missing_update_header(client_type: ClientType) -> bool {
+    matches!(
+        client_type,
+        ClientType::Cardano | ClientType::CardanoStability
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{client_type_allows_missing_update_header, ClientType};
+
+    #[test]
+    fn cardano_clients_may_skip_misbehaviour_without_update_header() {
+        assert!(client_type_allows_missing_update_header(
+            ClientType::Cardano
+        ));
+        assert!(client_type_allows_missing_update_header(
+            ClientType::CardanoStability
+        ));
+        assert!(!client_type_allows_missing_update_header(
+            ClientType::Tendermint
+        ));
+    }
 }
 
 pub fn fetch_ccv_consumer_id(
