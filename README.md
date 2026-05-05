@@ -181,3 +181,7 @@ On the Cosmos side, Cardano is tracked using a single client type, `08-cardano`,
 Height semantics follow Mithril transaction snapshots: `Height.revision_height` is treated as a Cardano block number (as surfaced by db-sync and the Mithril snapshot `block_number`), not a Cardano slot. Because Mithril certificates are checkpoint-based, Hermes may need to wait after a Cardano transaction is included until that inclusion is covered by a certified snapshot before it can safely build or use proofs at that height.
 
 This design intentionally keeps header progression and state proof verification under a single IBC client identifier, matching the core IBC connection and channel machinery.
+
+### Cardano ICS-20 Amount Range
+
+Canonical ICS-20 transfer amounts are decimal strings and Hermes models them as `U256`. Cardano ICS-20 vouchers are represented as Cardano native asset quantities through the Gateway transfer protobuf, so amounts must fit in `u64` (`0..=18446744073709551615`). Hermes validates this before asking the Gateway to build a Cardano transfer transaction. Transfers with amounts outside this range are rejected with an explicit error instead of failing later during packet creation or transaction construction.

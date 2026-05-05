@@ -35,6 +35,7 @@ use ibc_relayer_types::Height;
 use tonic::transport::Channel;
 
 const GATEWAY_HEADER_GRPC_MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
+const CARDANO_NATIVE_ASSET_MAX_QUANTITY: u64 = u64::MAX;
 
 /// Unsigned transaction response from Gateway
 #[derive(Debug, Clone)]
@@ -1238,21 +1239,10 @@ impl GatewayClient {
         }
 
         let token_info = msg.token;
-        let token = match token_info.as_ref() {
-            Some(coin) => {
-                let amount: u64 = coin.amount.parse().map_err(|e| {
-                    Error::Transaction(format!(
-                        "Invalid token amount in MsgTransfer (expected u64): {}",
-                        e
-                    ))
-                })?;
-                Some(super::generated::ibc::core::channel::v1::Coin {
-                    denom: coin.denom.clone(),
-                    amount,
-                })
-            }
-            None => None,
-        };
+        let token = token_info
+            .as_ref()
+            .map(cardano_transfer_token_from_canonical)
+            .transpose()?;
 
         let timeout_height =
             msg.timeout_height
@@ -1272,9 +1262,7 @@ impl GatewayClient {
             msg.receiver,
             sender,
             token_info.as_ref().map(|coin| coin.denom.as_str()),
-            token_info
-                .as_ref()
-                .and_then(|coin| coin.amount.parse::<u64>().ok()),
+            token.as_ref().map(|coin| coin.amount),
             timeout_height
                 .as_ref()
                 .map(|height| format!("{}-{}", height.revision_number, height.revision_height)),
@@ -1495,5 +1483,92 @@ impl GatewayClient {
         );
 
         Ok(response)
+    }
+}
+
+/// Convert canonical ICS-20 transfer token data into the Gateway's Cardano transfer token.
+///
+/// Canonical ICS-20 encodes amounts as decimal strings and Hermes models them as `U256`.
+/// The Cardano Gateway transfer protobuf represents voucher quantities as Cardano native
+/// asset quantities, which are bounded to `u64`. Validate that protocol constraint before
+/// asking the Gateway to build a transfer transaction or create the packet.
+fn cardano_transfer_token_from_canonical(
+    coin: &ibc_proto::cosmos::base::v1beta1::Coin,
+) -> Result<super::generated::ibc::core::channel::v1::Coin, Error> {
+    let amount = parse_cardano_native_asset_quantity(&coin.amount, &coin.denom)?;
+
+    Ok(super::generated::ibc::core::channel::v1::Coin {
+        denom: coin.denom.clone(),
+        amount,
+    })
+}
+
+fn parse_cardano_native_asset_quantity(amount: &str, denom: &str) -> Result<u64, Error> {
+    if amount.is_empty() || !amount.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Error::Transaction(format!(
+            "Invalid Cardano MsgTransfer amount '{}' for denom '{}': expected an unsigned base-10 integer string within the Cardano native asset quantity range 0..={} (u64)",
+            amount, denom, CARDANO_NATIVE_ASSET_MAX_QUANTITY
+        )));
+    }
+
+    amount.parse::<u64>().map_err(|_| {
+        Error::Transaction(format!(
+            "Invalid Cardano MsgTransfer amount '{}' for denom '{}': exceeds the Cardano native asset quantity range 0..={} (u64). Canonical ICS-20 amounts may be larger, but Cardano ICS-20 vouchers are limited to this range",
+            amount, denom, CARDANO_NATIVE_ASSET_MAX_QUANTITY
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ibc_proto::cosmos::base::v1beta1::Coin as ProtoCoin;
+
+    fn transfer_coin(amount: &str) -> ProtoCoin {
+        ProtoCoin {
+            denom: "lovelace".to_string(),
+            amount: amount.to_string(),
+        }
+    }
+
+    #[test]
+    fn cardano_transfer_amount_accepts_u64_max() {
+        let coin = transfer_coin(&u64::MAX.to_string());
+
+        let gateway_coin = cardano_transfer_token_from_canonical(&coin).unwrap();
+
+        assert_eq!(gateway_coin.denom, "lovelace");
+        assert_eq!(gateway_coin.amount, u64::MAX);
+    }
+
+    #[test]
+    fn cardano_transfer_amount_rejects_u64_overflow() {
+        let coin = transfer_coin("18446744073709551616");
+
+        let err = cardano_transfer_token_from_canonical(&coin).unwrap_err();
+
+        match err {
+            Error::Transaction(msg) => {
+                assert!(msg.contains("exceeds the Cardano native asset quantity range"));
+                assert!(msg.contains("u64"));
+                assert!(msg.contains("18446744073709551616"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cardano_transfer_amount_rejects_non_integer_string() {
+        let coin = transfer_coin("1.5");
+
+        let err = cardano_transfer_token_from_canonical(&coin).unwrap_err();
+
+        match err {
+            Error::Transaction(msg) => {
+                assert!(msg.contains("expected an unsigned base-10 integer string"));
+                assert!(msg.contains("1.5"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
