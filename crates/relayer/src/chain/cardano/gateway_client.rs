@@ -1389,19 +1389,7 @@ impl GatewayClient {
 
         let response: SubmitSignedTxResponse = client.submit_signed_tx(request).await?.into_inner();
 
-        // Parse height if present
-        let height = if !response.height.is_empty() {
-            let parts: Vec<&str> = response.height.split('-').collect();
-            if parts.len() == 2 {
-                let revision_number: u64 = parts[0].parse().unwrap_or(0);
-                let revision_height: u64 = parts[1].parse().unwrap_or(0);
-                Height::new(revision_number, revision_height).ok()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let height = parse_submit_signed_tx_height(&response.height)?;
 
         // Convert proto events to IbcEvent
         let events = response
@@ -1484,6 +1472,34 @@ impl GatewayClient {
 
         Ok(response)
     }
+}
+
+fn parse_submit_signed_tx_height(raw_height: &str) -> Result<Option<Height>, Error> {
+    if raw_height.is_empty() {
+        return Ok(None);
+    }
+
+    let (revision_number, revision_height) = raw_height
+        .split_once('-')
+        .ok_or_else(|| invalid_submit_signed_tx_height(raw_height))?;
+
+    let revision_number = revision_number
+        .parse::<u64>()
+        .map_err(|_| invalid_submit_signed_tx_height(raw_height))?;
+    let revision_height = revision_height
+        .parse::<u64>()
+        .map_err(|_| invalid_submit_signed_tx_height(raw_height))?;
+
+    Height::new(revision_number, revision_height)
+        .map(Some)
+        .map_err(|_| invalid_submit_signed_tx_height(raw_height))
+}
+
+fn invalid_submit_signed_tx_height(raw_height: &str) -> Error {
+    Error::GatewayClient(format!(
+        "Gateway returned invalid height string: {}",
+        raw_height
+    ))
 }
 
 /// Convert canonical ICS-20 transfer token data into the Gateway's Cardano transfer token.
@@ -1569,6 +1585,34 @@ mod tests {
                 assert!(msg.contains("1.5"));
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submit_signed_tx_height_accepts_empty_height() {
+        assert_eq!(parse_submit_signed_tx_height("").unwrap(), None);
+    }
+
+    #[test]
+    fn submit_signed_tx_height_accepts_valid_revision_height() {
+        assert_eq!(
+            parse_submit_signed_tx_height("0-123").unwrap(),
+            Some(Height::new(0, 123).unwrap())
+        );
+    }
+
+    #[test]
+    fn submit_signed_tx_height_rejects_malformed_height() {
+        for raw_height in ["123", "0-not-a-height", "0-0", "0-1-2"] {
+            let err = parse_submit_signed_tx_height(raw_height).unwrap_err();
+
+            match err {
+                Error::GatewayClient(msg) => {
+                    assert!(msg.contains("Gateway returned invalid height string"));
+                    assert!(msg.contains(raw_height));
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
         }
     }
 }
