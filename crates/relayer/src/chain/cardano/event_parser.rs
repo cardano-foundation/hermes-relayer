@@ -691,10 +691,9 @@ fn parse_bytes(attrs: &HashMap<String, String>, key: &str) -> Result<Vec<u8>, Er
         .ok_or_else(|| Error::EventAttribute(format!("Missing attribute: {}", key)))?;
 
     let value_trimmed = value.strip_prefix("0x").unwrap_or(value);
-    match hex::decode(value_trimmed) {
-        Ok(bytes) => Ok(bytes),
-        Err(_) => Ok(value.as_bytes().to_vec()),
-    }
+    hex::decode(value_trimmed).map_err(|e| {
+        Error::EventAttribute(format!("Invalid hex bytes for {} '{}': {}", key, value, e))
+    })
 }
 
 fn parse_packet(attrs: &HashMap<String, String>) -> Result<Packet, Error> {
@@ -810,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_timeout_on_close_packet_event_raw_json_data_ok() {
+    fn parse_timeout_on_close_packet_event_malformed_packet_data_fails() {
         let payload = r#"{"amount":"1000000","denom":"stake","receiver":"abc","sender":"def"}"#;
         let gateway_event = Event {
             r#type: "timeout_on_close_packet".to_string(),
@@ -827,14 +826,41 @@ mod tests {
         };
 
         let height = Height::new(0, 1).unwrap();
-        let events = parse_events(vec![gateway_event], height).unwrap();
+        let err = parse_events(vec![gateway_event], height).unwrap_err();
 
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            RelayerIbcEvent::TimeoutOnClosePacket(ev) => {
-                assert_eq!(ev.packet.data, payload.as_bytes().to_vec());
+        match err {
+            Error::EventAttribute(msg) => {
+                assert!(msg.contains("Invalid hex bytes for packet_data"))
             }
-            other => panic!("unexpected event: {other:?}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_write_acknowledgement_event_malformed_ack_fails() {
+        let gateway_event = Event {
+            r#type: "write_acknowledgement".to_string(),
+            attributes: attrs(&[
+                ("packet_sequence", "7"),
+                ("packet_src_port", "transfer"),
+                ("packet_src_channel", "channel-0"),
+                ("packet_dst_port", "transfer"),
+                ("packet_dst_channel", "channel-1"),
+                ("packet_data", "deadbeef"),
+                ("packet_ack", "not-hex"),
+                ("packet_timeout_height", "0-10"),
+                ("packet_timeout_timestamp", "1000"),
+            ]),
+        };
+
+        let height = Height::new(0, 1).unwrap();
+        let err = parse_events(vec![gateway_event], height).unwrap_err();
+
+        match err {
+            Error::EventAttribute(msg) => {
+                assert!(msg.contains("Invalid hex bytes for packet_ack"))
+            }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 
