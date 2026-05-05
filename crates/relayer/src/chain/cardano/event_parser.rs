@@ -576,6 +576,9 @@ fn parse_client_type(
         "cardano" | "08-cardano" => {
             Ok(ibc_relayer_types::core::ics02_client::client_type::ClientType::Cardano)
         }
+        "cardano-stability" | "08-cardano-stability" => {
+            Ok(ibc_relayer_types::core::ics02_client::client_type::ClientType::CardanoStability)
+        }
         "tendermint" | "07-tendermint" => {
             Ok(ibc_relayer_types::core::ics02_client::client_type::ClientType::Tendermint)
         }
@@ -721,6 +724,7 @@ fn parse_packet(attrs: &HashMap<String, String>) -> Result<Packet, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ibc_relayer_types::core::ics02_client::client_type::ClientType;
     use ibc_relayer_types::core::ics02_client::height::Height;
     use ibc_relayer_types::core::ics04_channel::timeout::TimeoutHeight;
     use ibc_relayer_types::events::IbcEvent as RelayerIbcEvent;
@@ -732,6 +736,19 @@ mod tests {
                 value: (*v).to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn parse_cardano_stability_client_type_ok() {
+        let attrs = HashMap::from([(
+            "client_type".to_string(),
+            "08-cardano-stability".to_string(),
+        )]);
+
+        assert_eq!(
+            parse_client_type(&attrs, "client_type").unwrap(),
+            ClientType::CardanoStability
+        );
     }
 
     #[test]
