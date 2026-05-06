@@ -30,6 +30,15 @@ use ibc_proto::ibc::core::connection::v1::query_client::QueryClient as Connectio
 use ibc_proto::ibc::core::connection::v1::{
     QueryClientConnectionsRequest, QueryConnectionRequest, QueryConnectionsRequest,
 };
+use ibc_relayer_types::clients::{
+    ics07_tendermint::{
+        header::TENDERMINT_HEADER_TYPE_URL, misbehaviour::TENDERMINT_MISBEHAVIOR_TYPE_URL,
+    },
+    ics08_cardano::{header::MITHRIL_HEADER_TYPE_URL, misbehaviour::MITHRIL_MISBEHAVIOUR_TYPE_URL},
+    ics08_cardano_stability::{
+        header::STABILITY_HEADER_TYPE_URL, misbehaviour::STABILITY_MISBEHAVIOUR_TYPE_URL,
+    },
+};
 use ibc_relayer_types::core::ics02_client::header::AnyHeader;
 use ibc_relayer_types::Height;
 use tonic::metadata::AsciiMetadataValue;
@@ -58,6 +67,23 @@ pub struct TxSubmitResponse {
 pub struct IbcEvent {
     pub event_type: String,
     pub attributes: Vec<(String, String)>,
+}
+
+fn describe_update_client_message(type_url: Option<&str>) -> String {
+    match type_url {
+        Some(TENDERMINT_HEADER_TYPE_URL) => "MsgUpdateClient<TendermintHeader>".to_string(),
+        Some(TENDERMINT_MISBEHAVIOR_TYPE_URL) => {
+            "MsgUpdateClient<TendermintMisbehaviour>".to_string()
+        }
+        Some(MITHRIL_HEADER_TYPE_URL) => "MsgUpdateClient<CardanoHeader>".to_string(),
+        Some(MITHRIL_MISBEHAVIOUR_TYPE_URL) => "MsgUpdateClient<CardanoMisbehaviour>".to_string(),
+        Some(STABILITY_HEADER_TYPE_URL) => "MsgUpdateClient<StabilityHeader>".to_string(),
+        Some(STABILITY_MISBEHAVIOUR_TYPE_URL) => {
+            "MsgUpdateClient<StabilityMisbehaviour>".to_string()
+        }
+        Some(other) => format!("MsgUpdateClient<{}>", other),
+        None => "MsgUpdateClient<missing-client-message>".to_string(),
+    }
 }
 
 /// Client for communicating with Cardano Gateway
@@ -801,6 +827,11 @@ impl GatewayClient {
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgUpdateClient: {}", e)))?;
 
         let client_id = msg.client_id.clone();
+        let message_description = describe_update_client_message(
+            msg.client_message
+                .as_ref()
+                .map(|client_message| client_message.type_url.as_str()),
+        );
 
         let mut client = GenClientMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
@@ -815,14 +846,15 @@ impl GatewayClient {
             .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
 
         tracing::info!(
-            "UpdateClient: received unsigned CBOR (length: {}), client_id: {}",
+            "{}: received unsigned CBOR (length: {}), client_id: {}",
+            message_description,
             cbor_hex.len(),
             client_id
         );
 
         Ok(UnsignedTx {
             cbor_hex,
-            description: format!("MsgUpdateClient (client_id: {})", client_id),
+            description: format!("{message_description} (client_id: {client_id})"),
         })
     }
 

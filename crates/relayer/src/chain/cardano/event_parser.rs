@@ -5,10 +5,23 @@
 //!
 //! This module converts them into Hermes' `IbcEvent` enum variants.
 
+use ibc_proto::google::protobuf::Any as ProtoAny;
 use ibc_relayer_types::{
+    clients::{
+        ics07_tendermint::{
+            header::TENDERMINT_HEADER_TYPE_URL, misbehaviour::TENDERMINT_MISBEHAVIOR_TYPE_URL,
+        },
+        ics08_cardano::{
+            header::MITHRIL_HEADER_TYPE_URL, misbehaviour::MITHRIL_MISBEHAVIOUR_TYPE_URL,
+        },
+        ics08_cardano_stability::{
+            header::STABILITY_HEADER_TYPE_URL, misbehaviour::STABILITY_MISBEHAVIOUR_TYPE_URL,
+        },
+    },
     core::{
         ics02_client::{
             events as ClientEvents,
+            header::AnyHeader,
             height::{Height, HeightErrorDetail},
         },
         ics03_connection::events as ConnectionEvents,
@@ -18,11 +31,15 @@ use ibc_relayer_types::{
     events::IbcEvent,
     timestamp::Timestamp,
 };
+use prost::Message;
 use std::collections::HashMap;
 use std::str::FromStr;
 
 use super::error::Error;
 use super::generated::ibc::cardano::v1::{Event, EventAttribute};
+
+const ATTR_CLIENT_MESSAGE_ANY_HEX: &str = "client_message_any_hex";
+const ATTR_LEGACY_HEADER: &str = "header";
 
 /// Parse a list of Gateway events into Hermes IbcEvent types
 pub fn parse_events(gateway_events: Vec<Event>, _height: Height) -> Result<Vec<IbcEvent>, Error> {
@@ -281,6 +298,7 @@ fn parse_update_client_event(attrs: HashMap<String, String>) -> Result<IbcEvent,
     let client_id = parse_client_id(&attrs, "client_id")?;
     let client_type = parse_client_type(&attrs, "client_type")?;
     let consensus_height = parse_height(&attrs, "consensus_height")?;
+    let header = parse_optional_client_message_header(&attrs)?;
 
     let common = ClientEvents::Attributes {
         client_id,
@@ -290,8 +308,50 @@ fn parse_update_client_event(attrs: HashMap<String, String>) -> Result<IbcEvent,
 
     Ok(IbcEvent::UpdateClient(ClientEvents::UpdateClient {
         common,
-        header: None, // Header is not included in Gateway events
+        header,
     }))
+}
+
+fn parse_optional_client_message_header(
+    attrs: &HashMap<String, String>,
+) -> Result<Option<AnyHeader>, Error> {
+    let Some(encoded_any) = attrs
+        .get(ATTR_CLIENT_MESSAGE_ANY_HEX)
+        .or_else(|| attrs.get(ATTR_LEGACY_HEADER))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let bytes =
+        hex::decode(encoded_any.strip_prefix("0x").unwrap_or(encoded_any)).map_err(|e| {
+            Error::EventAttribute(format!(
+                "Invalid hex bytes for {} '{}': {}",
+                ATTR_CLIENT_MESSAGE_ANY_HEX, encoded_any, e
+            ))
+        })?;
+
+    let client_message = ProtoAny::decode(bytes.as_slice()).map_err(|e| {
+        Error::EventAttribute(format!(
+            "Invalid protobuf Any in {}: {}",
+            ATTR_CLIENT_MESSAGE_ANY_HEX, e
+        ))
+    })?;
+
+    match client_message.type_url.as_str() {
+        TENDERMINT_HEADER_TYPE_URL | MITHRIL_HEADER_TYPE_URL | STABILITY_HEADER_TYPE_URL => {
+            AnyHeader::try_from(client_message)
+                .map(Some)
+                .map_err(|e| Error::EventAttribute(format!("Invalid update-client header: {e}")))
+        }
+        TENDERMINT_MISBEHAVIOR_TYPE_URL
+        | MITHRIL_MISBEHAVIOUR_TYPE_URL
+        | STABILITY_MISBEHAVIOUR_TYPE_URL => Ok(None),
+        other => Err(Error::EventAttribute(format!(
+            "Unknown update-client client message type_url: {other}"
+        ))),
+    }
 }
 
 fn parse_upgrade_client_event(attrs: HashMap<String, String>) -> Result<IbcEvent, Error> {
@@ -723,6 +783,9 @@ fn parse_packet(attrs: &HashMap<String, String>) -> Result<Packet, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ibc_relayer_types::clients::{
+        ics08_cardano::raw as mithril_raw, ics08_cardano_stability::raw as stability_raw,
+    };
     use ibc_relayer_types::core::ics02_client::client_type::ClientType;
     use ibc_relayer_types::core::ics02_client::height::Height;
     use ibc_relayer_types::core::ics04_channel::timeout::TimeoutHeight;
@@ -737,6 +800,105 @@ mod tests {
             .collect()
     }
 
+    fn any_hex(type_url: &str, value: Vec<u8>) -> String {
+        hex::encode(
+            ProtoAny {
+                type_url: type_url.to_string(),
+                value,
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    fn raw_mithril_certificate(sealed_at: &str) -> mithril_raw::MithrilCertificate {
+        mithril_raw::MithrilCertificate {
+            hash: "cert_hash".to_string(),
+            previous_hash: String::new(),
+            epoch: 0,
+            signed_entity_type: None,
+            metadata: Some(mithril_raw::CertificateMetadata {
+                network: "testnet".to_string(),
+                protocol_version: "v1".to_string(),
+                protocol_parameters: Some(mithril_raw::MithrilProtocolParameters {
+                    k: 1,
+                    m: 2,
+                    phi_f: None,
+                }),
+                initiated_at: "2024-01-01T00:00:00Z".to_string(),
+                sealed_at: sealed_at.to_string(),
+                signers: vec![],
+            }),
+            protocol_message: None,
+            signed_message: String::new(),
+            aggregate_verification_key: String::new(),
+            multi_signature: String::new(),
+            genesis_signature: String::new(),
+        }
+    }
+
+    fn raw_mithril_header(block_number: u64) -> mithril_raw::MithrilHeader {
+        mithril_raw::MithrilHeader {
+            mithril_stake_distribution: Some(mithril_raw::MithrilStakeDistribution {
+                epoch: 0,
+                signers_with_stake: vec![],
+                hash: "stake_dist_hash".to_string(),
+                certificate_hash: "stake_dist_cert_hash".to_string(),
+                created_at: 0,
+                protocol_parameter: Some(mithril_raw::MithrilProtocolParameters {
+                    k: 1,
+                    m: 2,
+                    phi_f: None,
+                }),
+            }),
+            mithril_stake_distribution_certificate: Some(raw_mithril_certificate(
+                "2024-01-01T00:00:00Z",
+            )),
+            transaction_snapshot: Some(mithril_raw::CardanoTransactionSnapshot {
+                merkle_root: "merkle_root".to_string(),
+                epoch: 0,
+                block_number,
+                hash: "tx_snapshot_hash".to_string(),
+                certificate_hash: "tx_snapshot_cert_hash".to_string(),
+                created_at: "2024-01-01T00:00:00Z".to_string(),
+            }),
+            transaction_snapshot_certificate: Some(raw_mithril_certificate("2024-01-01T00:00:00Z")),
+            previous_mithril_stake_distribution_certificates: vec![],
+            host_state_tx_hash: "host_state_tx_hash".to_string(),
+            host_state_tx_body_cbor: vec![0x01],
+            host_state_tx_output_index: 0,
+            host_state_tx_proof: vec![0x02],
+        }
+    }
+
+    fn raw_stability_block(revision_height: u64, hash: &str) -> stability_raw::StabilityBlock {
+        stability_raw::StabilityBlock {
+            height: Some(stability_raw::Height {
+                revision_number: 0,
+                revision_height,
+            }),
+            slot: revision_height,
+            hash: hash.to_string(),
+            epoch: 0,
+            timestamp: 1_700_000_000,
+            block_cbor: vec![0x01],
+        }
+    }
+
+    fn raw_stability_header(revision_height: u64) -> stability_raw::StabilityHeader {
+        stability_raw::StabilityHeader {
+            trusted_height: Some(stability_raw::Height {
+                revision_number: 0,
+                revision_height: revision_height.saturating_sub(1),
+            }),
+            anchor_block: Some(raw_stability_block(revision_height, "anchor_hash")),
+            descendant_blocks: vec![],
+            host_state_tx_hash: "host_state_tx_hash".to_string(),
+            host_state_tx_output_index: 0,
+            bridge_blocks: vec![],
+            new_epoch_context: None,
+        }
+    }
+
     #[test]
     fn parse_cardano_stability_client_type_ok() {
         let attrs = HashMap::from([(
@@ -748,6 +910,136 @@ mod tests {
             parse_client_type(&attrs, "client_type").unwrap(),
             ClientType::CardanoStability
         );
+    }
+
+    #[test]
+    fn parse_update_client_event_with_mithril_header_any() {
+        let header_hex = any_hex(
+            MITHRIL_HEADER_TYPE_URL,
+            raw_mithril_header(10).encode_to_vec(),
+        );
+        let gateway_event = Event {
+            r#type: "update_client".to_string(),
+            attributes: attrs(&[
+                ("client_id", "08-cardano-0"),
+                ("client_type", "08-cardano"),
+                ("consensus_height", "0-10"),
+                (ATTR_CLIENT_MESSAGE_ANY_HEX, &header_hex),
+            ]),
+        };
+
+        let events = parse_events(vec![gateway_event], Height::new(0, 10).unwrap()).unwrap();
+
+        match &events[0] {
+            RelayerIbcEvent::UpdateClient(ev) => {
+                assert!(matches!(ev.header, Some(AnyHeader::Mithril(_))));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_client_event_with_stability_header_any() {
+        let header_hex = any_hex(
+            STABILITY_HEADER_TYPE_URL,
+            raw_stability_header(12).encode_to_vec(),
+        );
+        let gateway_event = Event {
+            r#type: "update_client".to_string(),
+            attributes: attrs(&[
+                ("client_id", "08-cardano-stability-0"),
+                ("client_type", "08-cardano-stability"),
+                ("consensus_height", "0-12"),
+                (ATTR_CLIENT_MESSAGE_ANY_HEX, &header_hex),
+            ]),
+        };
+
+        let events = parse_events(vec![gateway_event], Height::new(0, 12).unwrap()).unwrap();
+
+        match &events[0] {
+            RelayerIbcEvent::UpdateClient(ev) => {
+                assert!(matches!(ev.header, Some(AnyHeader::Stability(_))));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_client_event_without_client_message_keeps_header_empty() {
+        let gateway_event = Event {
+            r#type: "update_client".to_string(),
+            attributes: attrs(&[
+                ("client_id", "07-tendermint-0"),
+                ("client_type", "07-tendermint"),
+                ("consensus_height", "0-10"),
+            ]),
+        };
+
+        let events = parse_events(vec![gateway_event], Height::new(0, 10).unwrap()).unwrap();
+
+        match &events[0] {
+            RelayerIbcEvent::UpdateClient(ev) => assert!(ev.header.is_none()),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_client_event_with_misbehaviour_any_keeps_header_empty() {
+        let misbehaviour_hex = any_hex(MITHRIL_MISBEHAVIOUR_TYPE_URL, vec![0x01, 0x02]);
+        let gateway_event = Event {
+            r#type: "update_client".to_string(),
+            attributes: attrs(&[
+                ("client_id", "08-cardano-0"),
+                ("client_type", "08-cardano"),
+                ("consensus_height", "0-10"),
+                (ATTR_CLIENT_MESSAGE_ANY_HEX, &misbehaviour_hex),
+            ]),
+        };
+
+        let events = parse_events(vec![gateway_event], Height::new(0, 10).unwrap()).unwrap();
+
+        match &events[0] {
+            RelayerIbcEvent::UpdateClient(ev) => assert!(ev.header.is_none()),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_client_event_with_malformed_client_message_fails() {
+        let gateway_event = Event {
+            r#type: "update_client".to_string(),
+            attributes: attrs(&[
+                ("client_id", "08-cardano-0"),
+                ("client_type", "08-cardano"),
+                ("consensus_height", "0-10"),
+                (ATTR_CLIENT_MESSAGE_ANY_HEX, "not-hex"),
+            ]),
+        };
+
+        let err = parse_events(vec![gateway_event], Height::new(0, 10).unwrap()).unwrap_err();
+
+        match err {
+            Error::EventAttribute(msg) => {
+                assert!(msg.contains("Invalid hex bytes for client_message_any_hex"))
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_client_misbehaviour_event_ok() {
+        let gateway_event = Event {
+            r#type: "client_misbehaviour".to_string(),
+            attributes: attrs(&[
+                ("client_id", "07-tendermint-0"),
+                ("client_type", "07-tendermint"),
+                ("consensus_height", "0-1"),
+            ]),
+        };
+
+        let events = parse_events(vec![gateway_event], Height::new(0, 1).unwrap()).unwrap();
+
+        assert!(matches!(&events[0], RelayerIbcEvent::ClientMisbehaviour(_)));
     }
 
     #[test]

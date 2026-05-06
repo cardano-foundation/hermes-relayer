@@ -18,6 +18,13 @@ pub struct CardanoConfig {
     /// Gateway gRPC endpoint URL
     pub gateway_url: String,
 
+    /// Optional independent Gateway endpoint used to fetch witness headers for misbehaviour checks.
+    pub misbehaviour_witness_gateway_url: Option<String>,
+
+    /// Require Cardano update-client events to include the submitted header before checking misbehaviour.
+    #[serde(default)]
+    pub require_update_event_headers_for_misbehaviour: bool,
+
     /// Network ID (1 = mainnet, 0 = testnet)
     pub network_id: u8,
 
@@ -146,6 +153,8 @@ impl Default for CardanoConfig {
         Self {
             id: ChainId::from_string("cardano-test"),
             gateway_url: "http://localhost:3001".to_string(),
+            misbehaviour_witness_gateway_url: None,
+            require_update_event_headers_for_misbehaviour: false,
             network_id: 0,
             key_name: "default".to_string(),
             key_store_type: Store::Test,

@@ -76,6 +76,7 @@ pub struct CardanoChainEndpoint {
     config: CardanoConfig,
     rt: Arc<TokioRuntime>,
     gateway_client: GatewayClient,
+    witness_gateway_client: Option<GatewayClient>,
     keyring: KeyRing<CardanoSigningKeyPair>,
     event_source_cmd: Option<crate::event::source::TxEventSourceCmd>,
     pending_new_client_consensus_states: Mutex<HashMap<u64, AnyConsensusState>>,
@@ -344,6 +345,30 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
         tracing::info!("Gateway client initialized successfully");
 
+        let witness_gateway_client =
+            if let Some(witness_url) = cardano_config.misbehaviour_witness_gateway_url.as_ref() {
+                tracing::info!(
+                    "Initializing Cardano misbehaviour witness Gateway: {}",
+                    witness_url
+                );
+                Some(
+                    rt.block_on(GatewayClient::new(witness_url.clone()))
+                        .map_err(|e| {
+                            tracing::error!(
+                                "Failed to initialize Cardano misbehaviour witness Gateway: {}",
+                                e
+                            );
+                            Error::config(ConfigError::wrong_type())
+                        })?,
+                )
+            } else {
+                tracing::warn!(
+                    "Cardano misbehaviour witness Gateway not configured; using primary Gateway. \
+                     This only detects local inconsistencies and is not an independent witness."
+                );
+                None
+            };
+
         // Initialize keyring
         // Note: Cardano uses "addr" as account prefix (similar to how Cosmos uses prefixes)
         let keyring = KeyRing::new(
@@ -360,6 +385,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             config: cardano_config,
             rt,
             gateway_client,
+            witness_gateway_client,
             keyring,
             event_source_cmd: None, // Initialized lazily on first subscribe() call
             pending_new_client_consensus_states: Mutex::new(HashMap::new()),
@@ -802,6 +828,14 @@ impl ChainEndpoint for CardanoChainEndpoint {
         client_state: &AnyClientState,
     ) -> Result<Option<MisbehaviourEvidence>, Error> {
         let Some(submitted_header) = update.header.as_ref() else {
+            if self.config.require_update_event_headers_for_misbehaviour {
+                return Err(Error::query(format!(
+                    "cannot check Cardano misbehaviour for client {} at consensus height {}: update-client event does not include the submitted header",
+                    update.client_id(),
+                    update.consensus_height(),
+                )));
+            }
+
             tracing::warn!(
                 "skipping Cardano misbehaviour check for client {} at consensus height {}: update-client event does not include the submitted header",
                 update.client_id(),
@@ -812,21 +846,31 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
         let target_height = submitted_header.height();
         if target_height != update.consensus_height() {
-            tracing::warn!(
-                "Cardano misbehaviour check header height {} differs from event consensus height {} for client {}",
-                target_height,
+            return Err(Error::query(format!(
+                "update event consensus height {} does not match submitted Cardano header height {} for client {}",
                 update.consensus_height(),
+                target_height,
                 update.client_id()
-            );
+            )));
         }
 
         let trusted_height = independent_header_trusted_height(submitted_header)?;
+        let witness_gateway_client = self
+            .witness_gateway_client
+            .as_ref()
+            .unwrap_or(&self.gateway_client);
+        if self.witness_gateway_client.is_none() {
+            tracing::warn!(
+                "Cardano misbehaviour witness Gateway not configured; using primary Gateway for client {} at height {}. \
+                 This only detects local inconsistencies and is not an independent witness.",
+                update.client_id(),
+                target_height
+            );
+        }
+
         let witness_header = self
             .rt
-            .block_on(
-                self.gateway_client
-                    .query_header(trusted_height, target_height),
-            )
+            .block_on(witness_gateway_client.query_header(trusted_height, target_height))
             .map_err(|e| {
                 Error::query(format!(
                     "failed to independently query Cardano header at {target_height}: {e}"
@@ -2669,20 +2713,31 @@ fn cardano_headers_conflict(
             )?;
 
             let conflicts = submitted_root != witness_root
-                || submitted.timestamp != witness.timestamp
-                || submitted.mithril_stake_distribution_certificate
-                    != witness.mithril_stake_distribution_certificate
+                || !submitted
+                    .host_state_tx_hash
+                    .trim()
+                    .eq_ignore_ascii_case(witness.host_state_tx_hash.trim())
+                || !submitted
+                    .mithril_stake_distribution_certificate
+                    .hash
+                    .trim()
+                    .eq_ignore_ascii_case(
+                        witness.mithril_stake_distribution_certificate.hash.trim(),
+                    )
                 || !submitted
                     .transaction_snapshot_certificate
                     .hash
-                    .eq_ignore_ascii_case(&witness.transaction_snapshot_certificate.hash);
+                    .trim()
+                    .eq_ignore_ascii_case(witness.transaction_snapshot_certificate.hash.trim());
 
             if conflicts {
                 tracing::warn!(
-                    "Mithril header conflict detected at {}: submitted_root={}, witness_root={}, submitted_tx_cert={}, witness_tx_cert={}",
+                    "Mithril header conflict detected at {}: submitted_root={}, witness_root={}, submitted_host_tx={}, witness_host_tx={}, submitted_tx_cert={}, witness_tx_cert={}",
                     submitted.height,
                     hex::encode(&submitted_root),
                     hex::encode(&witness_root),
+                    submitted.host_state_tx_hash,
+                    witness.host_state_tx_hash,
                     submitted.transaction_snapshot_certificate.hash,
                     witness.transaction_snapshot_certificate.hash,
                 );
@@ -2711,16 +2766,24 @@ fn cardano_headers_conflict(
 
             let conflicts = submitted_root != witness_root
                 || !submitted
+                    .host_state_tx_hash
+                    .trim()
+                    .eq_ignore_ascii_case(witness.host_state_tx_hash.trim())
+                || !submitted
                     .anchor_block
                     .hash
-                    .eq_ignore_ascii_case(&witness.anchor_block.hash);
+                    .trim()
+                    .eq_ignore_ascii_case(witness.anchor_block.hash.trim())
+                || stability_windows_conflict_by_block_height(submitted, witness);
 
             if conflicts {
                 tracing::warn!(
-                    "Stability header conflict detected at {}: submitted_root={}, witness_root={}, submitted_anchor={}, witness_anchor={}",
+                    "Stability header conflict detected at {}: submitted_root={}, witness_root={}, submitted_host_tx={}, witness_host_tx={}, submitted_anchor={}, witness_anchor={}",
                     submitted.height,
                     hex::encode(&submitted_root),
                     hex::encode(&witness_root),
+                    submitted.host_state_tx_hash,
+                    witness.host_state_tx_hash,
                     submitted.anchor_block.hash,
                     witness.anchor_block.hash,
                 );
@@ -2740,6 +2803,44 @@ fn cardano_headers_conflict(
             witness.client_type()
         ))),
     }
+}
+
+fn stability_windows_conflict_by_block_height(
+    submitted: &ibc_relayer_types::clients::ics08_cardano_stability::header::Header,
+    witness: &ibc_relayer_types::clients::ics08_cardano_stability::header::Header,
+) -> bool {
+    let submitted_blocks = std::iter::once(&submitted.anchor_block)
+        .chain(submitted.bridge_blocks.iter())
+        .chain(submitted.descendant_blocks.iter());
+    let witness_blocks = std::iter::once(&witness.anchor_block)
+        .chain(witness.bridge_blocks.iter())
+        .chain(witness.descendant_blocks.iter());
+
+    // A shared block height with different hashes proves incompatible stability windows.
+    for submitted_block in submitted_blocks {
+        let Some(submitted_height) = stability_block_revision_height(submitted_block) else {
+            continue;
+        };
+
+        for witness_block in witness_blocks.clone() {
+            if stability_block_revision_height(witness_block) == Some(submitted_height)
+                && !submitted_block
+                    .hash
+                    .trim()
+                    .eq_ignore_ascii_case(witness_block.hash.trim())
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn stability_block_revision_height(
+    block: &ibc_relayer_types::clients::ics08_cardano_stability::raw::StabilityBlock,
+) -> Option<u64> {
+    block.height.as_ref().map(|height| height.revision_height)
 }
 
 fn cardano_host_state_nft(client_state: &AnyClientState) -> Result<(&[u8], &[u8]), Error> {
