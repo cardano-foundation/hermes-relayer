@@ -584,7 +584,7 @@ fn parse_recv_packet_event(attrs: HashMap<String, String>) -> Result<IbcEvent, E
 
 fn parse_write_acknowledgement_event(attrs: HashMap<String, String>) -> Result<IbcEvent, Error> {
     let packet = parse_packet(&attrs)?;
-    let ack = parse_bytes(&attrs, "packet_ack")?;
+    let ack = parse_bytes_preferring_hex_alias(&attrs, "packet_ack", "packet_ack_hex")?;
     Ok(IbcEvent::WriteAcknowledgement(
         ChannelEvents::WriteAcknowledgement { packet, ack },
     ))
@@ -756,13 +756,28 @@ fn parse_bytes(attrs: &HashMap<String, String>, key: &str) -> Result<Vec<u8>, Er
     })
 }
 
+fn parse_bytes_preferring_hex_alias(
+    attrs: &HashMap<String, String>,
+    key: &str,
+    hex_key: &str,
+) -> Result<Vec<u8>, Error> {
+    // Cardano gateway events may include human-readable packet JSON beside the relayable hex field.
+    let selected_key = attrs
+        .get(hex_key)
+        .filter(|value| !value.is_empty())
+        .map(|_| hex_key)
+        .unwrap_or(key);
+
+    parse_bytes(attrs, selected_key)
+}
+
 fn parse_packet(attrs: &HashMap<String, String>) -> Result<Packet, Error> {
     let sequence = parse_u64(attrs, "packet_sequence")?;
     let source_port = parse_port_id(attrs, "packet_src_port")?;
     let source_channel = parse_channel_id(attrs, "packet_src_channel")?;
     let destination_port = parse_port_id(attrs, "packet_dst_port")?;
     let destination_channel = parse_channel_id(attrs, "packet_dst_channel")?;
-    let data = parse_bytes(attrs, "packet_data")?;
+    let data = parse_bytes_preferring_hex_alias(attrs, "packet_data", "packet_data_hex")?;
     let timeout_height = parse_timeout_height(attrs, "packet_timeout_height")?;
     let timeout_timestamp_nanos = parse_u64(attrs, "packet_timeout_timestamp")?;
     let timeout_timestamp = Timestamp::from_nanoseconds(timeout_timestamp_nanos)
@@ -1129,6 +1144,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_send_packet_event_prefers_packet_data_hex_over_json_packet_data() {
+        let json_payload =
+            r#"{"amount":"1000000","denom":"stake","receiver":"abc","sender":"def"}"#;
+        let gateway_event = Event {
+            r#type: "send_packet".to_string(),
+            attributes: attrs(&[
+                ("packet_sequence", "7"),
+                ("packet_src_port", "transfer"),
+                ("packet_src_channel", "channel-0"),
+                ("packet_dst_port", "transfer"),
+                ("packet_dst_channel", "channel-1"),
+                ("packet_data", json_payload),
+                ("packet_data_hex", "deadbeef"),
+                ("packet_timeout_height", "0-10"),
+                ("packet_timeout_timestamp", "1000"),
+            ]),
+        };
+
+        let height = Height::new(0, 1).unwrap();
+        let events = parse_events(vec![gateway_event], height).unwrap();
+
+        match &events[0] {
+            RelayerIbcEvent::SendPacket(ev) => {
+                assert_eq!(ev.packet.data, hex::decode("deadbeef").unwrap());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_write_acknowledgement_event_malformed_ack_fails() {
         let gateway_event = Event {
             r#type: "write_acknowledgement".to_string(),
@@ -1153,6 +1198,35 @@ mod tests {
                 assert!(msg.contains("Invalid hex bytes for packet_ack"))
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_write_acknowledgement_event_prefers_packet_ack_hex() {
+        let gateway_event = Event {
+            r#type: "write_acknowledgement".to_string(),
+            attributes: attrs(&[
+                ("packet_sequence", "7"),
+                ("packet_src_port", "transfer"),
+                ("packet_src_channel", "channel-0"),
+                ("packet_dst_port", "transfer"),
+                ("packet_dst_channel", "channel-1"),
+                ("packet_data", "deadbeef"),
+                ("packet_ack", r#"{"result":"AQ=="}"#),
+                ("packet_ack_hex", "01"),
+                ("packet_timeout_height", "0-10"),
+                ("packet_timeout_timestamp", "1000"),
+            ]),
+        };
+
+        let height = Height::new(0, 1).unwrap();
+        let events = parse_events(vec![gateway_event], height).unwrap();
+
+        match &events[0] {
+            RelayerIbcEvent::WriteAcknowledgement(ev) => {
+                assert_eq!(ev.ack, hex::decode("01").unwrap());
+            }
+            other => panic!("unexpected event: {other:?}"),
         }
     }
 
