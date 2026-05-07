@@ -38,19 +38,26 @@ use crate::error::Error;
 use crate::event::IbcEventWithHeight;
 use crate::keyring::{KeyRing, SigningKeyPair};
 use crate::misbehaviour::{AnyMisbehaviour, MisbehaviourEvidence};
+use ibc_proto::ibc::core::channel::v1::{
+    QueryNextSequenceReceiveResponse, QueryPacketAcknowledgementResponse,
+    QueryPacketCommitmentResponse, QueryPacketReceiptResponse,
+};
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
 use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header as IbcHeader};
 use ibc_relayer_types::core::ics03_connection::connection::{
     ConnectionEnd, IdentifiedConnectionEnd,
 };
 use ibc_relayer_types::core::ics04_channel::channel::{ChannelEnd, IdentifiedChannelEnd};
-use ibc_relayer_types::core::ics04_channel::packet::Sequence;
-use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentPrefix;
+use ibc_relayer_types::core::ics04_channel::packet::{PacketMsgType, Sequence};
 use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentRoot;
+use ibc_relayer_types::core::ics23_commitment::commitment::{
+    CommitmentPrefix, CommitmentProofBytes,
+};
 use ibc_relayer_types::core::ics23_commitment::merkle::MerkleProof;
 use ibc_relayer_types::core::ics24_host::identifier::{
     ChainId, ChannelId, ClientId, ConnectionId, PortId,
 };
+use ibc_relayer_types::proofs::Proofs;
 use ibc_relayer_types::signer::Signer;
 use ibc_relayer_types::Height as ICSHeight;
 use std::collections::HashMap;
@@ -181,6 +188,104 @@ impl CardanoChainEndpoint {
         );
 
         Ok(monitor_tx)
+    }
+
+    fn query_packet_commitment_response(
+        &self,
+        port_id: &PortId,
+        channel_id: &ChannelId,
+        sequence: Sequence,
+    ) -> Result<QueryPacketCommitmentResponse, Error> {
+        self.rt.block_on(async {
+            let response_bytes = self
+                .gateway_client
+                .query_packet_commitment(
+                    port_id.as_ref(),
+                    channel_id.as_ref(),
+                    sequence.into(),
+                    None,
+                )
+                .await
+                .map_err(|e| Error::query(format!("Failed to query packet commitment: {}", e)))?;
+
+            prost::Message::decode(&response_bytes[..]).map_err(|e| {
+                Error::query(format!(
+                    "Failed to decode packet commitment response: {}",
+                    e
+                ))
+            })
+        })
+    }
+
+    fn query_packet_acknowledgement_response(
+        &self,
+        port_id: &PortId,
+        channel_id: &ChannelId,
+        sequence: Sequence,
+    ) -> Result<QueryPacketAcknowledgementResponse, Error> {
+        self.rt.block_on(async {
+            let response_bytes = self
+                .gateway_client
+                .query_packet_acknowledgement(
+                    port_id.as_ref(),
+                    channel_id.as_ref(),
+                    sequence.into(),
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    Error::query(format!("Failed to query packet acknowledgement: {}", e))
+                })?;
+
+            prost::Message::decode(&response_bytes[..]).map_err(|e| {
+                Error::query(format!(
+                    "Failed to decode packet acknowledgement response: {}",
+                    e
+                ))
+            })
+        })
+    }
+
+    fn query_packet_receipt_response(
+        &self,
+        port_id: &PortId,
+        channel_id: &ChannelId,
+        sequence: Sequence,
+    ) -> Result<QueryPacketReceiptResponse, Error> {
+        self.rt.block_on(async {
+            let response_bytes = self
+                .gateway_client
+                .query_packet_receipt(port_id.as_ref(), channel_id.as_ref(), sequence.into(), None)
+                .await
+                .map_err(|e| Error::query(format!("Failed to query packet receipt: {}", e)))?;
+
+            prost::Message::decode(&response_bytes[..]).map_err(|e| {
+                Error::query(format!("Failed to decode packet receipt response: {}", e))
+            })
+        })
+    }
+
+    fn query_next_sequence_receive_response(
+        &self,
+        port_id: &PortId,
+        channel_id: &ChannelId,
+    ) -> Result<QueryNextSequenceReceiveResponse, Error> {
+        self.rt.block_on(async {
+            let response_bytes = self
+                .gateway_client
+                .query_next_sequence_receive(port_id.as_ref(), channel_id.as_ref(), None)
+                .await
+                .map_err(|e| {
+                    Error::query(format!("Failed to query next sequence receive: {}", e))
+                })?;
+
+            prost::Message::decode(&response_bytes[..]).map_err(|e| {
+                Error::query(format!(
+                    "Failed to decode next sequence receive response: {}",
+                    e
+                ))
+            })
+        })
     }
 
     /// Wait until the Gateway's "latest height" has caught up to (or passed) a specific
@@ -2353,6 +2458,128 @@ impl ChainEndpoint for CardanoChainEndpoint {
             })
     }
 
+    fn build_packet_proofs(
+        &self,
+        packet_type: PacketMsgType,
+        port_id: PortId,
+        channel_id: ChannelId,
+        sequence: Sequence,
+        height: ICSHeight,
+    ) -> Result<Proofs, Error> {
+        let (maybe_packet_proof, channel_proof, proof_height) = match packet_type {
+            PacketMsgType::Recv => {
+                let response =
+                    self.query_packet_commitment_response(&port_id, &channel_id, sequence)?;
+                (
+                    decode_optional_merkle_proof(&response.proof, "packet commitment")?,
+                    None,
+                    proof_height_from_response(response.proof_height, height, "packet commitment")?,
+                )
+            }
+            PacketMsgType::Ack => {
+                let response =
+                    self.query_packet_acknowledgement_response(&port_id, &channel_id, sequence)?;
+                (
+                    decode_optional_merkle_proof(&response.proof, "packet acknowledgement")?,
+                    None,
+                    proof_height_from_response(
+                        response.proof_height,
+                        height,
+                        "packet acknowledgement",
+                    )?,
+                )
+            }
+            PacketMsgType::TimeoutUnordered => {
+                let response =
+                    self.query_packet_receipt_response(&port_id, &channel_id, sequence)?;
+                (
+                    decode_optional_merkle_proof(&response.proof, "packet receipt")?,
+                    None,
+                    proof_height_from_response(response.proof_height, height, "packet receipt")?,
+                )
+            }
+            PacketMsgType::TimeoutOrdered => {
+                let response = self.query_next_sequence_receive_response(&port_id, &channel_id)?;
+                (
+                    decode_optional_merkle_proof(&response.proof, "next sequence receive")?,
+                    None,
+                    proof_height_from_response(
+                        response.proof_height,
+                        height,
+                        "next sequence receive",
+                    )?,
+                )
+            }
+            PacketMsgType::TimeoutOnCloseUnordered => {
+                let response =
+                    self.query_packet_receipt_response(&port_id, &channel_id, sequence)?;
+                let proof_height =
+                    proof_height_from_response(response.proof_height, height, "packet receipt")?;
+                let channel_proof = self
+                    .query_channel(
+                        QueryChannelRequest {
+                            port_id: port_id.clone(),
+                            channel_id: channel_id.clone(),
+                            height: QueryHeight::Specific(proof_height),
+                        },
+                        IncludeProof::Yes,
+                    )?
+                    .1
+                    .map(CommitmentProofBytes::try_from)
+                    .transpose()
+                    .map_err(Error::malformed_proof)?;
+
+                (
+                    decode_optional_merkle_proof(&response.proof, "packet receipt")?,
+                    channel_proof,
+                    proof_height,
+                )
+            }
+            PacketMsgType::TimeoutOnCloseOrdered => {
+                let response = self.query_next_sequence_receive_response(&port_id, &channel_id)?;
+                let proof_height = proof_height_from_response(
+                    response.proof_height,
+                    height,
+                    "next sequence receive",
+                )?;
+                let channel_proof = self
+                    .query_channel(
+                        QueryChannelRequest {
+                            port_id: port_id.clone(),
+                            channel_id: channel_id.clone(),
+                            height: QueryHeight::Specific(proof_height),
+                        },
+                        IncludeProof::Yes,
+                    )?
+                    .1
+                    .map(CommitmentProofBytes::try_from)
+                    .transpose()
+                    .map_err(Error::malformed_proof)?;
+
+                (
+                    decode_optional_merkle_proof(&response.proof, "next sequence receive")?,
+                    channel_proof,
+                    proof_height,
+                )
+            }
+        };
+
+        let Some(packet_proof) = maybe_packet_proof else {
+            return Err(Error::queried_proof_not_found());
+        };
+
+        // Cardano Gateway proof heights follow accepted HostState anchors, not packet event heights.
+        Proofs::new(
+            CommitmentProofBytes::try_from(packet_proof).map_err(Error::malformed_proof)?,
+            None,
+            None,
+            None,
+            channel_proof,
+            proof_height,
+        )
+        .map_err(Error::malformed_proof)
+    }
+
     fn build_consensus_state(
         &self,
         light_block: Self::LightBlock,
@@ -3342,6 +3569,40 @@ fn is_legacy_gateway_header_height_not_found(message: &str) -> bool {
     message.contains("Not found") && message.contains("height")
 }
 
+fn decode_optional_merkle_proof(proof: &[u8], context: &str) -> Result<Option<MerkleProof>, Error> {
+    if proof.is_empty() {
+        return Ok(None);
+    }
+
+    let raw_proof =
+        <ibc_proto::ibc::core::commitment::v1::MerkleProof as prost::Message>::decode(proof)
+            .map_err(|e| {
+                Error::query(format!(
+                    "Failed to decode {context} proof from Gateway: {e}"
+                ))
+            })?;
+    Ok(Some(MerkleProof::from(raw_proof)))
+}
+
+fn proof_height_from_response(
+    proof_height: Option<ibc_proto::ibc::core::client::v1::Height>,
+    fallback: ICSHeight,
+    context: &str,
+) -> Result<ICSHeight, Error> {
+    let Some(proof_height) = proof_height else {
+        tracing::warn!(
+            "Cardano Gateway response for {context} omitted proof_height; falling back to query height {fallback}"
+        );
+        return Ok(fallback);
+    };
+
+    ICSHeight::new(proof_height.revision_number, proof_height.revision_height).map_err(|e| {
+        Error::query(format!(
+            "Invalid {context} proof_height from Cardano Gateway: {e}"
+        ))
+    })
+}
+
 fn plutus_constructor_index(
     constr: &pallas_primitives::alonzo::Constr<pallas_primitives::alonzo::PlutusData>,
 ) -> Option<u64> {
@@ -3371,6 +3632,7 @@ fn cardano_latest_height_unhealthy_error(
 mod tests {
     use super::*;
     use crate::chain::cardano::error::Error as CardanoError;
+    use ibc_proto::ibc::core::client::v1::Height as RawHeight;
 
     #[test]
     fn latest_height_failure_is_unhealthy_even_when_client_states_probe_succeeds() {
@@ -3437,5 +3699,35 @@ mod tests {
         let legacy = CardanoError::GatewayClient("Not found: height 10".to_string());
 
         assert!(is_recoverable_gateway_header_height_error(&legacy));
+    }
+
+    #[test]
+    fn proof_height_from_gateway_response_overrides_query_height() {
+        let fallback = ICSHeight::new(0, 10).expect("valid fallback height");
+        let proof_height = proof_height_from_response(
+            Some(RawHeight {
+                revision_number: 0,
+                revision_height: 42,
+            }),
+            fallback,
+            "packet commitment",
+        )
+        .expect("valid proof height");
+
+        assert_eq!(
+            proof_height,
+            ICSHeight::new(0, 42).expect("valid proof height")
+        );
+    }
+
+    #[test]
+    fn proof_height_falls_back_when_gateway_omits_height() {
+        let fallback = ICSHeight::new(0, 10).expect("valid fallback height");
+
+        assert_eq!(
+            proof_height_from_response(None, fallback, "packet commitment")
+                .expect("fallback proof height"),
+            fallback
+        );
     }
 }

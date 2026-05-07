@@ -1180,10 +1180,28 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
         }
 
         // Retain only sequences which should not be filtered out
-        let raw_sequences: Vec<Sequence> = sequences
+        let mut raw_sequences: Vec<Sequence> = sequences
             .into_iter()
             .filter(|sequence| !self.exclude_src_sequences.contains(sequence))
             .collect();
+        raw_sequences.sort();
+
+        let raw_sequences = if self.ordered_channel() && raw_sequences.len() > 1 {
+            let earliest = raw_sequences[0];
+            let blocked = &raw_sequences[1..];
+            warn!(
+                src_chain = %self.src_chain().id(),
+                dst_chain = %self.dst_chain().id(),
+                src_channel = %self.src_channel_id(),
+                dst_channel = %self.dst_channel_id(),
+                earliest_sequence = %earliest,
+                blocked_sequences = %blocked.iter().copied().collated().format(", "),
+                "ordered channel has later unreceived packets blocked behind an earlier packet; attempting to clear the earliest sequence first",
+            );
+            vec![earliest]
+        } else {
+            raw_sequences
+        };
 
         let sequences = &raw_sequences[..raw_sequences.len().min(clear_limit)];
 
@@ -1363,6 +1381,14 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
         } else {
             (PacketMsgType::TimeoutUnordered, packet.sequence)
         };
+        info!(
+            src_chain = %self.src_chain().id(),
+            dst_chain = %self.dst_chain().id(),
+            packet_sequence = %packet.sequence,
+            next_sequence_received = %next_sequence_received,
+            packet_type = ?packet_type,
+            "building packet timeout for pending packet",
+        );
 
         let proofs = self
             .dst_chain()
