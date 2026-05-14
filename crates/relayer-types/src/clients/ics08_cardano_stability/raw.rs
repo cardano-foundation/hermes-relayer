@@ -34,6 +34,8 @@ pub struct StakeDistributionEntry {
     pub stake: u64,
     #[prost(bytes = "vec", tag = "3")]
     pub vrf_key_hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "4")]
+    pub first_registration_slot: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
