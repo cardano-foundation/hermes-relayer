@@ -160,8 +160,8 @@ impl super::LightClient<CosmosSdkChain> for LightClient {
                 "received Mithril header in Tendermint light client for chain {}",
                 self.chain_id
             ))),
-            AnyHeader::Stability(_) => Err(Error::misbehaviour(format!(
-                "received stability header in Tendermint light client for chain {}",
+            AnyHeader::Probabilistic(_) => Err(Error::misbehaviour(format!(
+                "received probabilistic header in Tendermint light client for chain {}",
                 self.chain_id
             ))),
         }?;
@@ -171,8 +171,8 @@ impl super::LightClient<CosmosSdkChain> for LightClient {
             AnyClientState::Mithril(_) => Err(Error::client_state_type(
                 "received Mithril client state in Tendermint light client".to_string(),
             )),
-            AnyClientState::Stability(_) => Err(Error::client_state_type(
-                "received stability client state in Tendermint light client".to_string(),
+            AnyClientState::Probabilistic(_) => Err(Error::client_state_type(
+                "received probabilistic client state in Tendermint light client".to_string(),
             )),
         }?;
 
@@ -375,8 +375,8 @@ impl LightClient {
             AnyClientState::Mithril(_) => Err(Error::client_state_type(
                 "received Mithril client state in Tendermint light client".to_string(),
             )),
-            AnyClientState::Stability(_) => Err(Error::client_state_type(
-                "received stability client state in Tendermint light client".to_string(),
+            AnyClientState::Probabilistic(_) => Err(Error::client_state_type(
+                "received probabilistic client state in Tendermint light client".to_string(),
             )),
         }?;
 

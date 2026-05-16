@@ -33,7 +33,7 @@ pub struct Header {
 
 impl crate::core::ics02_client::header::Header for Header {
     fn client_type(&self) -> ClientType {
-        ClientType::Cardano
+        ClientType::CardanoMithril
     }
 
     fn height(&self) -> Height {

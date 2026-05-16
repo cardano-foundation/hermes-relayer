@@ -1,6 +1,6 @@
-//! Cardano light client types (`08-cardano`)
+//! Cardano Mithril light client types (`08-cardano-mithril`)
 //!
-//! Domain types for the Cosmos-side `08-cardano` light client, implemented using Mithril.
+//! Domain types for the Cosmos-side `08-cardano-mithril` light client.
 //! Protobuf messages live under `ibc.lightclients.mithril.v1.*`.
 
 pub mod client_state;

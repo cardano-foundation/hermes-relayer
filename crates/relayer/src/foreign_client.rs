@@ -1209,7 +1209,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
 
         if header.timestamp().after(&ts_adjusted) {
             // Header would be considered in the future, wait for destination chain to
-            // advance to the next height. For Cardano/stability mode, the accepted proof height
+            // advance to the next height. For Cardano/probabilistic mode, the accepted proof height
             // can legitimately stay flat while wall-clock time keeps advancing, so also allow
             // the local clock to satisfy the delay bound.
             warn!(
@@ -2128,7 +2128,7 @@ fn parse_client_counter(client_id: &str) -> u64 {
 fn client_type_allows_missing_update_header(client_type: ClientType) -> bool {
     matches!(
         client_type,
-        ClientType::Cardano | ClientType::CardanoStability
+        ClientType::CardanoMithril | ClientType::CardanoProbabilistic
     )
 }
 
@@ -2139,10 +2139,10 @@ mod tests {
     #[test]
     fn cardano_clients_may_skip_misbehaviour_without_update_header() {
         assert!(client_type_allows_missing_update_header(
-            ClientType::Cardano
+            ClientType::CardanoMithril
         ));
         assert!(client_type_allows_missing_update_header(
-            ClientType::CardanoStability
+            ClientType::CardanoProbabilistic
         ));
         assert!(!client_type_allows_missing_update_header(
             ClientType::Tendermint

@@ -35,8 +35,8 @@ use ibc_relayer_types::clients::{
         header::TENDERMINT_HEADER_TYPE_URL, misbehaviour::TENDERMINT_MISBEHAVIOR_TYPE_URL,
     },
     ics08_cardano::{header::MITHRIL_HEADER_TYPE_URL, misbehaviour::MITHRIL_MISBEHAVIOUR_TYPE_URL},
-    ics08_cardano_stability::{
-        header::STABILITY_HEADER_TYPE_URL, misbehaviour::STABILITY_MISBEHAVIOUR_TYPE_URL,
+    ics08_cardano_probabilistic::{
+        header::PROBABILISTIC_HEADER_TYPE_URL, misbehaviour::PROBABILISTIC_MISBEHAVIOUR_TYPE_URL,
     },
 };
 use ibc_relayer_types::core::ics02_client::header::AnyHeader;
@@ -77,9 +77,9 @@ fn describe_update_client_message(type_url: Option<&str>) -> String {
         }
         Some(MITHRIL_HEADER_TYPE_URL) => "MsgUpdateClient<CardanoHeader>".to_string(),
         Some(MITHRIL_MISBEHAVIOUR_TYPE_URL) => "MsgUpdateClient<CardanoMisbehaviour>".to_string(),
-        Some(STABILITY_HEADER_TYPE_URL) => "MsgUpdateClient<StabilityHeader>".to_string(),
-        Some(STABILITY_MISBEHAVIOUR_TYPE_URL) => {
-            "MsgUpdateClient<StabilityMisbehaviour>".to_string()
+        Some(PROBABILISTIC_HEADER_TYPE_URL) => "MsgUpdateClient<ProbabilisticHeader>".to_string(),
+        Some(PROBABILISTIC_MISBEHAVIOUR_TYPE_URL) => {
+            "MsgUpdateClient<ProbabilisticMisbehaviour>".to_string()
         }
         Some(other) => format!("MsgUpdateClient<{}>", other),
         None => "MsgUpdateClient<missing-client-message>".to_string(),

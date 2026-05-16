@@ -176,7 +176,7 @@ Where keys are stored in `~/.hermes/keys/{chain-id}/keyring-test/{key-name}.json
 
 ### Cardano Light Client Model
 
-On the Cosmos side, Cardano is tracked using a single client type, `08-cardano`, with headers encoded as `/ibc.lightclients.mithril.v1.MithrilHeader`. The header carries Mithril-certified evidence for a HostState update transaction, which allows the verifier to extract the committed 32-byte `ibc_state_root` and store it in consensus state. Membership and non-membership then use standard ICS-23 proofs (protobuf `ibc.core.commitment.v1.MerkleProof` bytes) against that `ibc_state_root`.
+On the Cosmos side, Cardano is tracked using explicit Cardano client types. The deprecated Mithril-backed client type is `08-cardano-mithril`, with headers encoded as `/ibc.lightclients.mithril.v1.MithrilHeader`. The active probabilistic client type is `08-cardano-probabilistic`, with headers encoded as `/ibc.lightclients.probabilistic.v1.ProbabilisticHeader`. Both authenticate a Cardano HostState update transaction so the verifier can extract the committed 32-byte `ibc_state_root` and store it in consensus state. Membership and non-membership then use standard ICS-23 proofs (protobuf `ibc.core.commitment.v1.MerkleProof` bytes) against that `ibc_state_root`.
 
 Height semantics follow Mithril transaction snapshots: `Height.revision_height` is treated as a Cardano block number (as surfaced by db-sync and the Mithril snapshot `block_number`), not a Cardano slot. Because Mithril certificates are checkpoint-based, Hermes may need to wait after a Cardano transaction is included until that inclusion is covered by a certified snapshot before it can safely build or use proofs at that height.
 

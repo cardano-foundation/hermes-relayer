@@ -38,7 +38,7 @@ impl Ics2ClientState for ClientState {
     }
 
     fn client_type(&self) -> ClientType {
-        ClientType::Cardano
+        ClientType::CardanoMithril
     }
 
     fn latest_height(&self) -> Height {

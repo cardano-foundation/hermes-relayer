@@ -4,16 +4,16 @@ use serde_derive::{Deserialize, Serialize};
 use ibc_proto::google::protobuf::Any;
 use ibc_proto::Protobuf;
 
-use crate::clients::ics08_cardano_stability::error::Error;
-use crate::clients::ics08_cardano_stability::raw;
+use crate::clients::ics08_cardano_probabilistic::error::Error;
+use crate::clients::ics08_cardano_probabilistic::raw;
 use crate::core::ics02_client::client_type::ClientType;
 use crate::core::ics02_client::consensus_state::ConsensusState as Ics2ConsensusState;
 use crate::core::ics02_client::error::Error as Ics02Error;
 use crate::core::ics23_commitment::commitment::CommitmentRoot;
 use crate::timestamp::Timestamp;
 
-pub const STABILITY_CONSENSUS_STATE_TYPE_URL: &str =
-    "/ibc.lightclients.stability.v1.ConsensusState";
+pub const PROBABILISTIC_CONSENSUS_STATE_TYPE_URL: &str =
+    "/ibc.lightclients.probabilistic.v1.ConsensusState";
 
 type RawConsensusState = raw::ConsensusState;
 
@@ -30,7 +30,7 @@ pub struct ConsensusState {
 
 impl Ics2ConsensusState for ConsensusState {
     fn client_type(&self) -> ClientType {
-        ClientType::CardanoStability
+        ClientType::CardanoProbabilistic
     }
 
     fn root(&self) -> &CommitmentRoot {
@@ -100,7 +100,7 @@ impl TryFrom<Any> for ConsensusState {
         }
 
         match raw_any.type_url.as_str() {
-            STABILITY_CONSENSUS_STATE_TYPE_URL => {
+            PROBABILISTIC_CONSENSUS_STATE_TYPE_URL => {
                 decode_state(raw_any.value.deref()).map_err(Into::into)
             }
             _ => Err(Ics02Error::unknown_consensus_state_type(raw_any.type_url)),
@@ -111,7 +111,7 @@ impl TryFrom<Any> for ConsensusState {
 impl From<ConsensusState> for Any {
     fn from(value: ConsensusState) -> Self {
         Any {
-            type_url: STABILITY_CONSENSUS_STATE_TYPE_URL.to_string(),
+            type_url: PROBABILISTIC_CONSENSUS_STATE_TYPE_URL.to_string(),
             value: Protobuf::<RawConsensusState>::encode_vec(value),
         }
     }

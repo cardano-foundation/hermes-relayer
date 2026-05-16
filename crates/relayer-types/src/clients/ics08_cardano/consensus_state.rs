@@ -42,7 +42,7 @@ impl ConsensusState {
 
 impl Ics2ConsensusState for ConsensusState {
     fn client_type(&self) -> ClientType {
-        ClientType::Cardano
+        ClientType::CardanoMithril
     }
 
     fn root(&self) -> &CommitmentRoot {

@@ -1,14 +1,15 @@
 use ibc_proto::Protobuf;
 use serde::{Deserialize, Serialize};
 
-use crate::clients::ics08_cardano_stability::error::Error;
-use crate::clients::ics08_cardano_stability::header::Header;
-use crate::clients::ics08_cardano_stability::raw;
+use crate::clients::ics08_cardano_probabilistic::error::Error;
+use crate::clients::ics08_cardano_probabilistic::header::Header;
+use crate::clients::ics08_cardano_probabilistic::raw;
 use crate::core::ics24_host::identifier::ClientId;
 use crate::tx_msg::Msg;
 use crate::Height;
 
-pub const STABILITY_MISBEHAVIOUR_TYPE_URL: &str = "/ibc.lightclients.stability.v1.Misbehaviour";
+pub const PROBABILISTIC_MISBEHAVIOUR_TYPE_URL: &str =
+    "/ibc.lightclients.probabilistic.v1.Misbehaviour";
 
 type RawMisbehaviour = raw::Misbehaviour;
 
@@ -38,7 +39,7 @@ impl Msg for Misbehaviour {
     }
 
     fn type_url(&self) -> String {
-        STABILITY_MISBEHAVIOUR_TYPE_URL.to_string()
+        PROBABILISTIC_MISBEHAVIOUR_TYPE_URL.to_string()
     }
 }
 
@@ -54,12 +55,12 @@ impl TryFrom<RawMisbehaviour> for Misbehaviour {
                 .parse::<ClientId>()
                 .map_err(|e| Error::invalid_field("client_id", e.to_string()))?,
             header1: raw
-                .stability_header_1
-                .ok_or_else(|| Error::missing_field("stability_header_1"))?
+                .probabilistic_header_1
+                .ok_or_else(|| Error::missing_field("probabilistic_header_1"))?
                 .try_into()?,
             header2: raw
-                .stability_header_2
-                .ok_or_else(|| Error::missing_field("stability_header_2"))?
+                .probabilistic_header_2
+                .ok_or_else(|| Error::missing_field("probabilistic_header_2"))?
                 .try_into()?,
         })
     }
@@ -69,8 +70,8 @@ impl From<Misbehaviour> for RawMisbehaviour {
     fn from(value: Misbehaviour) -> Self {
         RawMisbehaviour {
             client_id: value.client_id.to_string(),
-            stability_header_1: Some(value.header1.into()),
-            stability_header_2: Some(value.header2.into()),
+            probabilistic_header_1: Some(value.header1.into()),
+            probabilistic_header_2: Some(value.header2.into()),
         }
     }
 }

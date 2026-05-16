@@ -12,8 +12,8 @@ use ibc_relayer_types::clients::ics07_tendermint::client_state::{
 use ibc_relayer_types::clients::ics08_cardano::client_state::{
     ClientState as MithrilClientState, MITHRIL_CLIENT_STATE_TYPE_URL,
 };
-use ibc_relayer_types::clients::ics08_cardano_stability::client_state::{
-    ClientState as StabilityClientState, STABILITY_CLIENT_STATE_TYPE_URL,
+use ibc_relayer_types::clients::ics08_cardano_probabilistic::client_state::{
+    ClientState as ProbabilisticClientState, PROBABILISTIC_CLIENT_STATE_TYPE_URL,
 };
 
 use ibc_relayer_types::core::ics02_client::client_state::ClientState;
@@ -28,10 +28,10 @@ use ibc_relayer_types::Height;
 #[serde(tag = "type")]
 pub enum AnyClientState {
     Tendermint(TmClientState),
-    /// Cardano-tracking client state (`08-cardano`), encoded as `ibc.lightclients.mithril.v1.ClientState`.
+    /// Cardano-tracking client state (`08-cardano-mithril`), encoded as `ibc.lightclients.mithril.v1.ClientState`.
     Mithril(MithrilClientState),
-    /// Stability-scored Cardano client state (`08-cardano-stability`), encoded as `ibc.lightclients.stability.v1.ClientState`.
-    Stability(StabilityClientState),
+    /// Probabilistic Cardano client state (`08-cardano-probabilistic`), encoded as `ibc.lightclients.probabilistic.v1.ClientState`.
+    Probabilistic(ProbabilisticClientState),
 }
 
 impl AnyClientState {
@@ -39,7 +39,7 @@ impl AnyClientState {
         match self {
             AnyClientState::Tendermint(tm_state) => tm_state.chain_id(),
             AnyClientState::Mithril(mithril_state) => mithril_state.chain_id(),
-            AnyClientState::Stability(stability_state) => stability_state.chain_id(),
+            AnyClientState::Probabilistic(probabilistic_state) => probabilistic_state.chain_id(),
         }
     }
 
@@ -47,7 +47,7 @@ impl AnyClientState {
         match self {
             Self::Tendermint(tm_state) => tm_state.latest_height(),
             Self::Mithril(mithril_state) => mithril_state.latest_height(),
-            Self::Stability(stability_state) => stability_state.latest_height(),
+            Self::Probabilistic(probabilistic_state) => probabilistic_state.latest_height(),
         }
     }
 
@@ -55,7 +55,7 @@ impl AnyClientState {
         match self {
             Self::Tendermint(tm_state) => tm_state.frozen_height(),
             Self::Mithril(mithril_state) => mithril_state.frozen_height(),
-            Self::Stability(stability_state) => stability_state.frozen_height(),
+            Self::Probabilistic(probabilistic_state) => probabilistic_state.frozen_height(),
         }
     }
 
@@ -63,7 +63,7 @@ impl AnyClientState {
         match self {
             AnyClientState::Tendermint(state) => Some(state.trust_threshold),
             AnyClientState::Mithril(_) => None, // Mithril client doesn't use trust threshold
-            AnyClientState::Stability(_) => None,
+            AnyClientState::Probabilistic(_) => None,
         }
     }
 
@@ -71,7 +71,7 @@ impl AnyClientState {
         match self {
             AnyClientState::Tendermint(state) => state.trusting_period,
             AnyClientState::Mithril(state) => state.trusting_period,
-            AnyClientState::Stability(state) => state.trusting_period,
+            AnyClientState::Probabilistic(state) => state.trusting_period,
         }
     }
 
@@ -79,7 +79,7 @@ impl AnyClientState {
         match self {
             AnyClientState::Tendermint(state) => state.max_clock_drift,
             AnyClientState::Mithril(_) => Duration::from_secs(300), // 5 minutes default
-            AnyClientState::Stability(_) => Duration::from_secs(300),
+            AnyClientState::Probabilistic(_) => Duration::from_secs(300),
         }
     }
 
@@ -87,7 +87,7 @@ impl AnyClientState {
         match self {
             Self::Tendermint(state) => state.client_type(),
             Self::Mithril(state) => state.client_type(),
-            Self::Stability(state) => state.client_type(),
+            Self::Probabilistic(state) => state.client_type(),
         }
     }
 
@@ -95,7 +95,7 @@ impl AnyClientState {
         match self {
             Self::Tendermint(state) => state.expired(elapsed),
             Self::Mithril(state) => state.expired(elapsed),
-            Self::Stability(state) => state.expired(elapsed),
+            Self::Probabilistic(state) => state.expired(elapsed),
         }
     }
 }
@@ -115,7 +115,9 @@ impl TryFrom<Any> for AnyClientState {
             )),
 
             MITHRIL_CLIENT_STATE_TYPE_URL => Ok(AnyClientState::Mithril(raw.try_into()?)),
-            STABILITY_CLIENT_STATE_TYPE_URL => Ok(AnyClientState::Stability(raw.try_into()?)),
+            PROBABILISTIC_CLIENT_STATE_TYPE_URL => {
+                Ok(AnyClientState::Probabilistic(raw.try_into()?))
+            }
 
             _ => Err(Error::unknown_client_state_type(raw.type_url)),
         }
@@ -130,7 +132,7 @@ impl From<AnyClientState> for Any {
                 value: Protobuf::<RawTmClientState>::encode_vec(value),
             },
             AnyClientState::Mithril(value) => value.into(),
-            AnyClientState::Stability(value) => value.into(),
+            AnyClientState::Probabilistic(value) => value.into(),
         }
     }
 }
@@ -169,9 +171,9 @@ impl From<MithrilClientState> for AnyClientState {
     }
 }
 
-impl From<StabilityClientState> for AnyClientState {
-    fn from(cs: StabilityClientState) -> Self {
-        Self::Stability(cs)
+impl From<ProbabilisticClientState> for AnyClientState {
+    fn from(cs: ProbabilisticClientState) -> Self {
+        Self::Probabilistic(cs)
     }
 }
 

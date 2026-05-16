@@ -1,4 +1,4 @@
-//! Raw protobuf types for `ibc.lightclients.stability.v1`.
+//! Raw protobuf types for `ibc.lightclients.probabilistic.v1`.
 
 use serde_derive::{Deserialize, Serialize};
 
@@ -115,13 +115,13 @@ pub struct Misbehaviour {
     #[prost(string, tag = "1")]
     pub client_id: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
-    pub stability_header_1: ::core::option::Option<StabilityHeader>,
+    pub probabilistic_header_1: ::core::option::Option<ProbabilisticHeader>,
     #[prost(message, optional, tag = "3")]
-    pub stability_header_2: ::core::option::Option<StabilityHeader>,
+    pub probabilistic_header_2: ::core::option::Option<ProbabilisticHeader>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
-pub struct StabilityBlock {
+pub struct ProbabilisticBlock {
     #[prost(message, optional, tag = "1")]
     pub height: ::core::option::Option<Height>,
     #[prost(uint64, tag = "2")]
@@ -137,19 +137,19 @@ pub struct StabilityBlock {
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
-pub struct StabilityHeader {
+pub struct ProbabilisticHeader {
     #[prost(message, optional, tag = "1")]
     pub trusted_height: ::core::option::Option<Height>,
     #[prost(message, optional, tag = "2")]
-    pub anchor_block: ::core::option::Option<StabilityBlock>,
+    pub anchor_block: ::core::option::Option<ProbabilisticBlock>,
     #[prost(message, repeated, tag = "3")]
-    pub descendant_blocks: ::prost::alloc::vec::Vec<StabilityBlock>,
+    pub descendant_blocks: ::prost::alloc::vec::Vec<ProbabilisticBlock>,
     #[prost(string, tag = "4")]
     pub host_state_tx_hash: ::prost::alloc::string::String,
     #[prost(uint32, tag = "6")]
     pub host_state_tx_output_index: u32,
     #[prost(message, repeated, tag = "10")]
-    pub bridge_blocks: ::prost::alloc::vec::Vec<StabilityBlock>,
+    pub bridge_blocks: ::prost::alloc::vec::Vec<ProbabilisticBlock>,
     #[prost(message, optional, tag = "11")]
     pub new_epoch_context: ::core::option::Option<EpochContext>,
 }

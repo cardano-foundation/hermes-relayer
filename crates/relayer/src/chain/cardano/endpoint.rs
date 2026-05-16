@@ -8,8 +8,8 @@ use super::signing_key_pair::CardanoSigningKeyPair;
 
 use ibc_relayer_types::clients::ics08_cardano::consensus_state::ConsensusState as MithrilConsensusState;
 use ibc_relayer_types::clients::ics08_cardano::misbehaviour::Misbehaviour as MithrilMisbehaviour;
-use ibc_relayer_types::clients::ics08_cardano_stability::consensus_state::ConsensusState as StabilityConsensusState;
-use ibc_relayer_types::clients::ics08_cardano_stability::misbehaviour::Misbehaviour as StabilityMisbehaviour;
+use ibc_relayer_types::clients::ics08_cardano_probabilistic::consensus_state::ConsensusState as ProbabilisticConsensusState;
+use ibc_relayer_types::clients::ics08_cardano_probabilistic::misbehaviour::Misbehaviour as ProbabilisticMisbehaviour;
 
 use crate::account::Balance;
 use crate::chain::client::ClientSettings;
@@ -296,7 +296,7 @@ impl CardanoChainEndpoint {
     ///   `block_no` for the block that included the transaction.
     /// - Separately, for Cardano↔Cosmos IBC, the Cosmos-side light client only accepts heights
     ///   that satisfy the active Gateway light-client mode. In Mithril mode this is a certified
-    ///   transaction snapshot block number; in stability mode it is a heuristically accepted
+    ///   transaction snapshot block number; in probabilistic mode it is a heuristically accepted
     ///   Cardano block number.
     ///
     /// If Hermes proceeds immediately after inclusion, it may query proofs at a height that the
@@ -365,7 +365,7 @@ impl CardanoChainEndpoint {
             if elapsed >= timeout {
                 return Err(Error::send_tx(format!(
                     "timed out waiting for Gateway-accepted height >= {} (latest={}). \
-                     Note: for Cardano, Height.revision_height is a block-number based height in both Mithril and stability modes.",
+                     Note: for Cardano, Height.revision_height is a block-number based height in both Mithril and probabilistic modes.",
                     included_height, latest,
                 )));
             }
@@ -870,7 +870,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     state.host_state_nft_policy_id.clone(),
                     state.host_state_nft_token_name.clone(),
                 ),
-                AnyClientState::Stability(state) => (
+                AnyClientState::Probabilistic(state) => (
                     state.host_state_nft_policy_id.clone(),
                     state.host_state_nft_token_name.clone(),
                 ),
@@ -908,7 +908,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 state.host_state_nft_policy_id.clone(),
                 state.host_state_nft_token_name.clone(),
             ),
-            AnyClientState::Stability(state) => (
+            AnyClientState::Probabilistic(state) => (
                 state.host_state_nft_policy_id.clone(),
                 state.host_state_nft_token_name.clone(),
             ),
@@ -1001,8 +1001,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     header2,
                 })
             }
-            (AnyHeader::Stability(header1), AnyHeader::Stability(header2)) => {
-                AnyMisbehaviour::Stability(StabilityMisbehaviour {
+            (AnyHeader::Probabilistic(header1), AnyHeader::Probabilistic(header2)) => {
+                AnyMisbehaviour::Probabilistic(ProbabilisticMisbehaviour {
                     client_id: update.client_id().clone(),
                     header1,
                     header2,
@@ -1059,7 +1059,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
         tracing::debug!("Querying Cardano application status via Gateway");
 
-        // Query the latest proof/accepted height from Gateway. In stability mode this is the
+        // Query the latest proof/accepted height from Gateway. In probabilistic mode this is the
         // latest accepted HostState anchor height.
         let height = self
             .rt
@@ -2611,15 +2611,17 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 header.mithril_stake_distribution_certificate,
                 header.transaction_snapshot_certificate.hash,
             ))),
-            AnyHeader::Stability(header) => Ok(AnyConsensusState::from(StabilityConsensusState {
-                root: CommitmentRoot::from_bytes(&ibc_state_root),
-                timestamp: header.timestamp.nanoseconds(),
-                accepted_block_hash: header.anchor_block.hash,
-                accepted_epoch: header.anchor_block.epoch,
-                unique_pools_count: 0,
-                unique_stake_bps: 0,
-                security_score_bps: 0,
-            })),
+            AnyHeader::Probabilistic(header) => {
+                Ok(AnyConsensusState::from(ProbabilisticConsensusState {
+                    root: CommitmentRoot::from_bytes(&ibc_state_root),
+                    timestamp: header.timestamp.nanoseconds(),
+                    accepted_block_hash: header.anchor_block.hash,
+                    accepted_epoch: header.anchor_block.epoch,
+                    unique_pools_count: 0,
+                    unique_stake_bps: 0,
+                    security_score_bps: 0,
+                }))
+            }
             AnyHeader::Tendermint(_) => Err(Error::query(
                 "Cardano build_consensus_state received a Tendermint header".to_string(),
             )),
@@ -2904,7 +2906,7 @@ fn independent_header_trusted_height(header: &AnyHeader) -> Result<ICSHeight, Er
                 header.height
             ))
         }),
-        AnyHeader::Stability(header) => Ok(header.trusted_height),
+        AnyHeader::Probabilistic(header) => Ok(header.trusted_height),
         AnyHeader::Tendermint(_) => Err(Error::query(
             "Cardano misbehaviour check received a Tendermint header".to_string(),
         )),
@@ -2972,21 +2974,21 @@ fn cardano_headers_conflict(
 
             Ok(conflicts)
         }
-        (AnyHeader::Stability(submitted), AnyHeader::Stability(witness)) => {
+        (AnyHeader::Probabilistic(submitted), AnyHeader::Probabilistic(witness)) => {
             if submitted.height != witness.height {
                 return Err(Error::query(format!(
-                    "cannot compare stability headers at different heights: {} and {}",
+                    "cannot compare probabilistic headers at different heights: {} and {}",
                     submitted.height, witness.height
                 )));
             }
 
             let submitted_root = extract_ibc_state_root_from_host_state_tx(
-                &AnyHeader::Stability(submitted.clone()),
+                &AnyHeader::Probabilistic(submitted.clone()),
                 host_state_nft_policy_id,
                 host_state_nft_token_name,
             )?;
             let witness_root = extract_ibc_state_root_from_host_state_tx(
-                &AnyHeader::Stability(witness.clone()),
+                &AnyHeader::Probabilistic(witness.clone()),
                 host_state_nft_policy_id,
                 host_state_nft_token_name,
             )?;
@@ -3001,11 +3003,11 @@ fn cardano_headers_conflict(
                     .hash
                     .trim()
                     .eq_ignore_ascii_case(witness.anchor_block.hash.trim())
-                || stability_windows_conflict_by_block_height(submitted, witness);
+                || probabilistic_windows_conflict_by_block_height(submitted, witness);
 
             if conflicts {
                 tracing::warn!(
-                    "Stability header conflict detected at {}: submitted_root={}, witness_root={}, submitted_host_tx={}, witness_host_tx={}, submitted_anchor={}, witness_anchor={}",
+                    "Probabilistic header conflict detected at {}: submitted_root={}, witness_root={}, submitted_host_tx={}, witness_host_tx={}, submitted_anchor={}, witness_anchor={}",
                     submitted.height,
                     hex::encode(&submitted_root),
                     hex::encode(&witness_root),
@@ -3032,9 +3034,9 @@ fn cardano_headers_conflict(
     }
 }
 
-fn stability_windows_conflict_by_block_height(
-    submitted: &ibc_relayer_types::clients::ics08_cardano_stability::header::Header,
-    witness: &ibc_relayer_types::clients::ics08_cardano_stability::header::Header,
+fn probabilistic_windows_conflict_by_block_height(
+    submitted: &ibc_relayer_types::clients::ics08_cardano_probabilistic::header::Header,
+    witness: &ibc_relayer_types::clients::ics08_cardano_probabilistic::header::Header,
 ) -> bool {
     let submitted_blocks = std::iter::once(&submitted.anchor_block)
         .chain(submitted.bridge_blocks.iter())
@@ -3043,14 +3045,14 @@ fn stability_windows_conflict_by_block_height(
         .chain(witness.bridge_blocks.iter())
         .chain(witness.descendant_blocks.iter());
 
-    // A shared block height with different hashes proves incompatible stability windows.
+    // A shared block height with different hashes proves incompatible probabilistic windows.
     for submitted_block in submitted_blocks {
-        let Some(submitted_height) = stability_block_revision_height(submitted_block) else {
+        let Some(submitted_height) = probabilistic_block_revision_height(submitted_block) else {
             continue;
         };
 
         for witness_block in witness_blocks.clone() {
-            if stability_block_revision_height(witness_block) == Some(submitted_height)
+            if probabilistic_block_revision_height(witness_block) == Some(submitted_height)
                 && !submitted_block
                     .hash
                     .trim()
@@ -3064,8 +3066,8 @@ fn stability_windows_conflict_by_block_height(
     false
 }
 
-fn stability_block_revision_height(
-    block: &ibc_relayer_types::clients::ics08_cardano_stability::raw::StabilityBlock,
+fn probabilistic_block_revision_height(
+    block: &ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::ProbabilisticBlock,
 ) -> Option<u64> {
     block.height.as_ref().map(|height| height.revision_height)
 }
@@ -3076,7 +3078,7 @@ fn cardano_host_state_nft(client_state: &AnyClientState) -> Result<(&[u8], &[u8]
             state.host_state_nft_policy_id.as_slice(),
             state.host_state_nft_token_name.as_slice(),
         )),
-        AnyClientState::Stability(state) => Ok((
+        AnyClientState::Probabilistic(state) => Ok((
             state.host_state_nft_policy_id.as_slice(),
             state.host_state_nft_token_name.as_slice(),
         )),
@@ -3100,7 +3102,7 @@ fn extract_ibc_state_root_from_host_state_tx(
             host_state_nft_policy_id,
             host_state_nft_token_name,
         ),
-        AnyHeader::Stability(header) => extract_ibc_state_root_from_stability_anchor_block(
+        AnyHeader::Probabilistic(header) => extract_ibc_state_root_from_probabilistic_anchor_block(
             header.host_state_tx_hash.trim(),
             header.anchor_block.block_cbor.as_slice(),
             header.host_state_tx_output_index,
@@ -3179,7 +3181,7 @@ fn extract_ibc_state_root_from_host_state_tx_body(
     ))
 }
 
-fn extract_ibc_state_root_from_stability_anchor_block(
+fn extract_ibc_state_root_from_probabilistic_anchor_block(
     tx_hash: &str,
     anchor_block_cbor: &[u8],
     output_index: u32,
@@ -3192,7 +3194,7 @@ fn extract_ibc_state_root_from_stability_anchor_block(
 
     if tx_hash.is_empty() {
         return Err(Error::query(
-            "missing host_state_tx_hash in stability header".to_string(),
+            "missing host_state_tx_hash in probabilistic header".to_string(),
         ));
     }
 
@@ -3205,7 +3207,7 @@ fn extract_ibc_state_root_from_stability_anchor_block(
 
     if anchor_block_cbor.is_empty() {
         return Err(Error::query(
-            "missing anchor block_cbor in stability header".to_string(),
+            "missing anchor block_cbor in probabilistic header".to_string(),
         ));
     }
 
@@ -3234,7 +3236,7 @@ fn extract_ibc_state_root_from_stability_anchor_block(
     }
 
     Err(Error::query(
-        "unsupported stability anchor block CBOR".to_string(),
+        "unsupported probabilistic anchor block CBOR".to_string(),
     ))
 }
 
@@ -3271,7 +3273,7 @@ fn extract_root_from_conway_block<'a>(
     }
 
     Err(Error::query(format!(
-        "HostState tx {tx_hash} not found in stability anchor block"
+        "HostState tx {tx_hash} not found in probabilistic anchor block"
     )))
 }
 
@@ -3295,7 +3297,7 @@ fn extract_root_from_babbage_block<'a>(
     }
 
     Err(Error::query(format!(
-        "HostState tx {tx_hash} not found in stability anchor block"
+        "HostState tx {tx_hash} not found in probabilistic anchor block"
     )))
 }
 

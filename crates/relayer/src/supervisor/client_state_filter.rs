@@ -207,7 +207,7 @@ impl FilterPolicy {
             // security parameters are validated by the client implementation itself.
             None if matches!(
                 state.client_type(),
-                ClientType::Cardano | ClientType::CardanoStability
+                ClientType::CardanoMithril | ClientType::CardanoProbabilistic
             ) =>
             {
                 Permission::Allow

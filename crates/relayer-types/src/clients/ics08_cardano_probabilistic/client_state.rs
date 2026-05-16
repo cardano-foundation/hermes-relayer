@@ -6,15 +6,16 @@ use serde_derive::{Deserialize, Serialize};
 use ibc_proto::google::protobuf::Any;
 use ibc_proto::Protobuf;
 
-use crate::clients::ics08_cardano_stability::error::Error;
-use crate::clients::ics08_cardano_stability::raw;
+use crate::clients::ics08_cardano_probabilistic::error::Error;
+use crate::clients::ics08_cardano_probabilistic::raw;
 use crate::core::ics02_client::client_state::ClientState as Ics2ClientState;
 use crate::core::ics02_client::client_type::ClientType;
 use crate::core::ics02_client::error::Error as Ics02Error;
 use crate::core::ics24_host::identifier::ChainId;
 use crate::Height;
 
-pub const STABILITY_CLIENT_STATE_TYPE_URL: &str = "/ibc.lightclients.stability.v1.ClientState";
+pub const PROBABILISTIC_CLIENT_STATE_TYPE_URL: &str =
+    "/ibc.lightclients.probabilistic.v1.ClientState";
 
 type RawClientState = raw::ClientState;
 type RawHeight = raw::Height;
@@ -46,7 +47,7 @@ impl Ics2ClientState for ClientState {
     }
 
     fn client_type(&self) -> ClientType {
-        ClientType::CardanoStability
+        ClientType::CardanoProbabilistic
     }
 
     fn latest_height(&self) -> Height {
@@ -244,7 +245,7 @@ impl TryFrom<Any> for ClientState {
         }
 
         match raw_any.type_url.as_str() {
-            STABILITY_CLIENT_STATE_TYPE_URL => {
+            PROBABILISTIC_CLIENT_STATE_TYPE_URL => {
                 decode_state(raw_any.value.deref()).map_err(Into::into)
             }
             _ => Err(Ics02Error::unknown_client_state_type(raw_any.type_url)),
@@ -255,7 +256,7 @@ impl TryFrom<Any> for ClientState {
 impl From<ClientState> for Any {
     fn from(value: ClientState) -> Self {
         Any {
-            type_url: STABILITY_CLIENT_STATE_TYPE_URL.to_string(),
+            type_url: PROBABILISTIC_CLIENT_STATE_TYPE_URL.to_string(),
             value: Protobuf::<RawClientState>::encode_vec(value),
         }
     }

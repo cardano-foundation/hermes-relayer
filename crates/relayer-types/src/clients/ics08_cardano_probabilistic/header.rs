@@ -4,25 +4,26 @@ use ibc_proto::Protobuf;
 use prost::Message;
 use serde_derive::{Deserialize, Serialize};
 
-use crate::clients::ics08_cardano_stability::error::Error;
-use crate::clients::ics08_cardano_stability::raw;
+use crate::clients::ics08_cardano_probabilistic::error::Error;
+use crate::clients::ics08_cardano_probabilistic::raw;
 use crate::core::ics02_client::client_type::ClientType;
 use crate::core::ics02_client::error::Error as Ics02Error;
 use crate::timestamp::Timestamp;
 use crate::Height;
 
-pub const STABILITY_HEADER_TYPE_URL: &str = "/ibc.lightclients.stability.v1.StabilityHeader";
+pub const PROBABILISTIC_HEADER_TYPE_URL: &str =
+    "/ibc.lightclients.probabilistic.v1.ProbabilisticHeader";
 
-type RawHeader = raw::StabilityHeader;
+type RawHeader = raw::ProbabilisticHeader;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Header {
     pub trusted_height: Height,
     pub height: Height,
     pub timestamp: Timestamp,
-    pub anchor_block: raw::StabilityBlock,
-    pub bridge_blocks: Vec<raw::StabilityBlock>,
-    pub descendant_blocks: Vec<raw::StabilityBlock>,
+    pub anchor_block: raw::ProbabilisticBlock,
+    pub bridge_blocks: Vec<raw::ProbabilisticBlock>,
+    pub descendant_blocks: Vec<raw::ProbabilisticBlock>,
     pub host_state_tx_hash: String,
     pub host_state_tx_output_index: u32,
     pub new_epoch_context: Option<raw::EpochContext>,
@@ -30,7 +31,7 @@ pub struct Header {
 
 impl crate::core::ics02_client::header::Header for Header {
     fn client_type(&self) -> ClientType {
-        ClientType::CardanoStability
+        ClientType::CardanoProbabilistic
     }
 
     fn height(&self) -> Height {
@@ -107,7 +108,9 @@ impl TryFrom<Any> for Header {
         }
 
         match raw_any.type_url.as_str() {
-            STABILITY_HEADER_TYPE_URL => decode_header(raw_any.value.deref()).map_err(Into::into),
+            PROBABILISTIC_HEADER_TYPE_URL => {
+                decode_header(raw_any.value.deref()).map_err(Into::into)
+            }
             _ => Err(Ics02Error::unknown_header_type(raw_any.type_url)),
         }
     }
@@ -116,7 +119,7 @@ impl TryFrom<Any> for Header {
 impl From<Header> for Any {
     fn from(header: Header) -> Self {
         Any {
-            type_url: STABILITY_HEADER_TYPE_URL.to_string(),
+            type_url: PROBABILISTIC_HEADER_TYPE_URL.to_string(),
             value: Protobuf::<RawHeader>::encode_vec(header),
         }
     }

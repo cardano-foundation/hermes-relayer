@@ -1,7 +1,7 @@
 //! Event parsing for Cardano Gateway events -> Hermes `IbcEvent` conversion.
 //!
 //! The Gateway returns events in the format:
-//! `Event { type: "create_client", attributes: [{ key: "client_id", value: "08-cardano-0" }, ...] }`
+//! `Event { type: "create_client", attributes: [{ key: "client_id", value: "08-cardano-mithril-0" }, ...] }`
 //!
 //! This module converts them into Hermes' `IbcEvent` enum variants.
 
@@ -14,8 +14,9 @@ use ibc_relayer_types::{
         ics08_cardano::{
             header::MITHRIL_HEADER_TYPE_URL, misbehaviour::MITHRIL_MISBEHAVIOUR_TYPE_URL,
         },
-        ics08_cardano_stability::{
-            header::STABILITY_HEADER_TYPE_URL, misbehaviour::STABILITY_MISBEHAVIOUR_TYPE_URL,
+        ics08_cardano_probabilistic::{
+            header::PROBABILISTIC_HEADER_TYPE_URL,
+            misbehaviour::PROBABILISTIC_MISBEHAVIOUR_TYPE_URL,
         },
     },
     core::{
@@ -340,14 +341,14 @@ fn parse_optional_client_message_header(
     })?;
 
     match client_message.type_url.as_str() {
-        TENDERMINT_HEADER_TYPE_URL | MITHRIL_HEADER_TYPE_URL | STABILITY_HEADER_TYPE_URL => {
+        TENDERMINT_HEADER_TYPE_URL | MITHRIL_HEADER_TYPE_URL | PROBABILISTIC_HEADER_TYPE_URL => {
             AnyHeader::try_from(client_message)
                 .map(Some)
                 .map_err(|e| Error::EventAttribute(format!("Invalid update-client header: {e}")))
         }
         TENDERMINT_MISBEHAVIOR_TYPE_URL
         | MITHRIL_MISBEHAVIOUR_TYPE_URL
-        | STABILITY_MISBEHAVIOUR_TYPE_URL => Ok(None),
+        | PROBABILISTIC_MISBEHAVIOUR_TYPE_URL => Ok(None),
         other => Err(Error::EventAttribute(format!(
             "Unknown update-client client message type_url: {other}"
         ))),
@@ -633,12 +634,12 @@ fn parse_client_type(
         .ok_or_else(|| Error::EventAttribute(format!("Missing attribute: {}", key)))?;
 
     match value.as_str() {
-        "cardano" | "08-cardano" => {
-            Ok(ibc_relayer_types::core::ics02_client::client_type::ClientType::Cardano)
+        "cardano-mithril" | "08-cardano-mithril" => {
+            Ok(ibc_relayer_types::core::ics02_client::client_type::ClientType::CardanoMithril)
         }
-        "cardano-stability" | "08-cardano-stability" => {
-            Ok(ibc_relayer_types::core::ics02_client::client_type::ClientType::CardanoStability)
-        }
+        "cardano-probabilistic" | "08-cardano-probabilistic" => Ok(
+            ibc_relayer_types::core::ics02_client::client_type::ClientType::CardanoProbabilistic,
+        ),
         "tendermint" | "07-tendermint" => {
             Ok(ibc_relayer_types::core::ics02_client::client_type::ClientType::Tendermint)
         }
@@ -799,7 +800,7 @@ fn parse_packet(attrs: &HashMap<String, String>) -> Result<Packet, Error> {
 mod tests {
     use super::*;
     use ibc_relayer_types::clients::{
-        ics08_cardano::raw as mithril_raw, ics08_cardano_stability::raw as stability_raw,
+        ics08_cardano::raw as mithril_raw, ics08_cardano_probabilistic::raw as probabilistic_raw,
     };
     use ibc_relayer_types::core::ics02_client::client_type::ClientType;
     use ibc_relayer_types::core::ics02_client::height::Height;
@@ -885,9 +886,12 @@ mod tests {
         }
     }
 
-    fn raw_stability_block(revision_height: u64, hash: &str) -> stability_raw::StabilityBlock {
-        stability_raw::StabilityBlock {
-            height: Some(stability_raw::Height {
+    fn raw_probabilistic_block(
+        revision_height: u64,
+        hash: &str,
+    ) -> probabilistic_raw::ProbabilisticBlock {
+        probabilistic_raw::ProbabilisticBlock {
+            height: Some(probabilistic_raw::Height {
                 revision_number: 0,
                 revision_height,
             }),
@@ -899,13 +903,13 @@ mod tests {
         }
     }
 
-    fn raw_stability_header(revision_height: u64) -> stability_raw::StabilityHeader {
-        stability_raw::StabilityHeader {
-            trusted_height: Some(stability_raw::Height {
+    fn raw_probabilistic_header(revision_height: u64) -> probabilistic_raw::ProbabilisticHeader {
+        probabilistic_raw::ProbabilisticHeader {
+            trusted_height: Some(probabilistic_raw::Height {
                 revision_number: 0,
                 revision_height: revision_height.saturating_sub(1),
             }),
-            anchor_block: Some(raw_stability_block(revision_height, "anchor_hash")),
+            anchor_block: Some(raw_probabilistic_block(revision_height, "anchor_hash")),
             descendant_blocks: vec![],
             host_state_tx_hash: "host_state_tx_hash".to_string(),
             host_state_tx_output_index: 0,
@@ -915,15 +919,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_cardano_stability_client_type_ok() {
+    fn parse_cardano_probabilistic_client_type_ok() {
         let attrs = HashMap::from([(
             "client_type".to_string(),
-            "08-cardano-stability".to_string(),
+            "08-cardano-probabilistic".to_string(),
         )]);
 
         assert_eq!(
             parse_client_type(&attrs, "client_type").unwrap(),
-            ClientType::CardanoStability
+            ClientType::CardanoProbabilistic
         );
     }
 
@@ -936,8 +940,8 @@ mod tests {
         let gateway_event = Event {
             r#type: "update_client".to_string(),
             attributes: attrs(&[
-                ("client_id", "08-cardano-0"),
-                ("client_type", "08-cardano"),
+                ("client_id", "08-cardano-mithril-0"),
+                ("client_type", "08-cardano-mithril"),
                 ("consensus_height", "0-10"),
                 (ATTR_CLIENT_MESSAGE_ANY_HEX, &header_hex),
             ]),
@@ -954,16 +958,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_update_client_event_with_stability_header_any() {
+    fn parse_update_client_event_with_probabilistic_header_any() {
         let header_hex = any_hex(
-            STABILITY_HEADER_TYPE_URL,
-            raw_stability_header(12).encode_to_vec(),
+            PROBABILISTIC_HEADER_TYPE_URL,
+            raw_probabilistic_header(12).encode_to_vec(),
         );
         let gateway_event = Event {
             r#type: "update_client".to_string(),
             attributes: attrs(&[
-                ("client_id", "08-cardano-stability-0"),
-                ("client_type", "08-cardano-stability"),
+                ("client_id", "08-cardano-probabilistic-0"),
+                ("client_type", "08-cardano-probabilistic"),
                 ("consensus_height", "0-12"),
                 (ATTR_CLIENT_MESSAGE_ANY_HEX, &header_hex),
             ]),
@@ -973,7 +977,7 @@ mod tests {
 
         match &events[0] {
             RelayerIbcEvent::UpdateClient(ev) => {
-                assert!(matches!(ev.header, Some(AnyHeader::Stability(_))));
+                assert!(matches!(ev.header, Some(AnyHeader::Probabilistic(_))));
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -1004,8 +1008,8 @@ mod tests {
         let gateway_event = Event {
             r#type: "update_client".to_string(),
             attributes: attrs(&[
-                ("client_id", "08-cardano-0"),
-                ("client_type", "08-cardano"),
+                ("client_id", "08-cardano-mithril-0"),
+                ("client_type", "08-cardano-mithril"),
                 ("consensus_height", "0-10"),
                 (ATTR_CLIENT_MESSAGE_ANY_HEX, &misbehaviour_hex),
             ]),
@@ -1024,8 +1028,8 @@ mod tests {
         let gateway_event = Event {
             r#type: "update_client".to_string(),
             attributes: attrs(&[
-                ("client_id", "08-cardano-0"),
-                ("client_type", "08-cardano"),
+                ("client_id", "08-cardano-mithril-0"),
+                ("client_type", "08-cardano-mithril"),
                 ("consensus_height", "0-10"),
                 (ATTR_CLIENT_MESSAGE_ANY_HEX, "not-hex"),
             ]),

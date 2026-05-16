@@ -16,11 +16,11 @@ define_error! {
 
         InvalidHeight
             { height: u64 }
-            |e| { format_args!("invalid stability header height: {}", e.height) },
+            |e| { format_args!("invalid probabilistic header height: {}", e.height) },
 
         InvalidTimestamp
             { value: u64 }
-            |e| { format_args!("invalid stability header timestamp: {}", e.value) },
+            |e| { format_args!("invalid probabilistic header timestamp: {}", e.value) },
 
         Decode
             [ TraceError<prost::DecodeError> ]

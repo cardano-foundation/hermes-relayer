@@ -2,4 +2,4 @@
 
 pub mod ics07_tendermint;
 pub mod ics08_cardano;
-pub mod ics08_cardano_stability;
+pub mod ics08_cardano_probabilistic;

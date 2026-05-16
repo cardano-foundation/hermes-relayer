@@ -7,23 +7,23 @@ use super::error::Error;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ClientType {
     Tendermint = 1,
-    Cardano = 2,
-    CardanoStability = 3,
+    CardanoMithril = 2,
+    CardanoProbabilistic = 3,
 }
 
 impl ClientType {
     const TENDERMINT_STR: &'static str = "07-tendermint";
-    // Cardano tracking client type. The corresponding protobuf messages are currently under
-    // `ibc.lightclients.mithril.v1.*` (Mithril).
-    const CARDANO_STR: &'static str = "08-cardano";
-    const CARDANO_STABILITY_STR: &'static str = "08-cardano-stability";
+    // Deprecated Mithril-backed Cardano client type. The corresponding protobuf
+    // messages are under `ibc.lightclients.mithril.v1.*`.
+    const CARDANO_MITHRIL_STR: &'static str = "08-cardano-mithril";
+    const CARDANO_PROBABILISTIC_STR: &'static str = "08-cardano-probabilistic";
 
     /// Yields the identifier of this client type as a string
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Tendermint => Self::TENDERMINT_STR,
-            Self::Cardano => Self::CARDANO_STR,
-            Self::CardanoStability => Self::CARDANO_STABILITY_STR,
+            Self::CardanoMithril => Self::CARDANO_MITHRIL_STR,
+            Self::CardanoProbabilistic => Self::CARDANO_PROBABILISTIC_STR,
         }
     }
 }
@@ -40,8 +40,8 @@ impl core::str::FromStr for ClientType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             Self::TENDERMINT_STR => Ok(Self::Tendermint),
-            Self::CARDANO_STR => Ok(Self::Cardano),
-            Self::CARDANO_STABILITY_STR => Ok(Self::CardanoStability),
+            Self::CARDANO_MITHRIL_STR => Ok(Self::CardanoMithril),
+            Self::CARDANO_PROBABILISTIC_STR => Ok(Self::CardanoProbabilistic),
 
             _ => Err(Error::unknown_client_type(s.to_string())),
         }

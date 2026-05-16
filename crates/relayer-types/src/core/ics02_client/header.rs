@@ -10,8 +10,8 @@ use crate::clients::ics07_tendermint::header::{
     decode_header as tm_decode_header, Header as TendermintHeader, TENDERMINT_HEADER_TYPE_URL,
 };
 use crate::clients::ics08_cardano::header::{Header as MithrilHeader, MITHRIL_HEADER_TYPE_URL};
-use crate::clients::ics08_cardano_stability::header::{
-    Header as StabilityHeader, STABILITY_HEADER_TYPE_URL,
+use crate::clients::ics08_cardano_probabilistic::header::{
+    Header as ProbabilisticHeader, PROBABILISTIC_HEADER_TYPE_URL,
 };
 use crate::core::ics02_client::client_type::ClientType;
 use crate::core::ics02_client::error::Error;
@@ -42,7 +42,7 @@ pub fn decode_header(header_bytes: &[u8]) -> Result<AnyHeader, Error> {
 pub enum AnyHeader {
     Tendermint(TendermintHeader),
     Mithril(MithrilHeader),
-    Stability(StabilityHeader),
+    Probabilistic(ProbabilisticHeader),
 }
 
 impl Header for AnyHeader {
@@ -50,7 +50,7 @@ impl Header for AnyHeader {
         match self {
             Self::Tendermint(header) => header.client_type(),
             Self::Mithril(header) => header.client_type(),
-            Self::Stability(header) => header.client_type(),
+            Self::Probabilistic(header) => header.client_type(),
         }
     }
 
@@ -58,7 +58,7 @@ impl Header for AnyHeader {
         match self {
             Self::Tendermint(header) => header.height(),
             Self::Mithril(header) => header.height(),
-            Self::Stability(header) => header.height(),
+            Self::Probabilistic(header) => header.height(),
         }
     }
 
@@ -66,7 +66,7 @@ impl Header for AnyHeader {
         match self {
             Self::Tendermint(header) => header.timestamp(),
             Self::Mithril(header) => header.timestamp(),
-            Self::Stability(header) => header.timestamp(),
+            Self::Probabilistic(header) => header.timestamp(),
         }
     }
 }
@@ -86,9 +86,9 @@ impl TryFrom<Any> for AnyHeader {
                 let val: MithrilHeader = raw.try_into()?;
                 Ok(AnyHeader::Mithril(val))
             }
-            STABILITY_HEADER_TYPE_URL => {
-                let val: StabilityHeader = raw.try_into()?;
-                Ok(AnyHeader::Stability(val))
+            PROBABILISTIC_HEADER_TYPE_URL => {
+                let val: ProbabilisticHeader = raw.try_into()?;
+                Ok(AnyHeader::Probabilistic(val))
             }
 
             _ => Err(Error::unknown_header_type(raw.type_url)),
@@ -106,7 +106,7 @@ impl From<AnyHeader> for Any {
                 value: Protobuf::<RawHeader>::encode_vec(header),
             },
             AnyHeader::Mithril(header) => header.into(),
-            AnyHeader::Stability(header) => header.into(),
+            AnyHeader::Probabilistic(header) => header.into(),
         }
     }
 }
@@ -123,8 +123,8 @@ impl From<MithrilHeader> for AnyHeader {
     }
 }
 
-impl From<StabilityHeader> for AnyHeader {
-    fn from(header: StabilityHeader) -> Self {
-        Self::Stability(header)
+impl From<ProbabilisticHeader> for AnyHeader {
+    fn from(header: ProbabilisticHeader) -> Self {
+        Self::Probabilistic(header)
     }
 }

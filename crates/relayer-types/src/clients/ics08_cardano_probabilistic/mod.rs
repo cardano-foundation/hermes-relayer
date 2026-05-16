@@ -1,7 +1,7 @@
-//! Cardano stability-scored light client types (`08-cardano-stability`)
+//! Cardano probabilistic light client types (`08-cardano-probabilistic`)
 //!
-//! Domain types for the Cosmos-side `08-cardano-stability` light client.
-//! Protobuf messages live under `ibc.lightclients.stability.v1.*`.
+//! Domain types for the Cosmos-side `08-cardano-probabilistic` light client.
+//! Protobuf messages live under `ibc.lightclients.probabilistic.v1.*`.
 
 pub mod client_state;
 pub mod consensus_state;

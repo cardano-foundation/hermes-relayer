@@ -8,10 +8,10 @@ use ibc_relayer_types::clients::ics08_cardano::misbehaviour::{
     Misbehaviour as MithrilMisbehaviour, MITHRIL_MISBEHAVIOUR_TYPE_URL,
 };
 use ibc_relayer_types::clients::ics08_cardano::raw as mithril_raw;
-use ibc_relayer_types::clients::ics08_cardano_stability::misbehaviour::{
-    Misbehaviour as StabilityMisbehaviour, STABILITY_MISBEHAVIOUR_TYPE_URL,
+use ibc_relayer_types::clients::ics08_cardano_probabilistic::misbehaviour::{
+    Misbehaviour as ProbabilisticMisbehaviour, PROBABILISTIC_MISBEHAVIOUR_TYPE_URL,
 };
-use ibc_relayer_types::clients::ics08_cardano_stability::raw as stability_raw;
+use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw as probabilistic_raw;
 use ibc_relayer_types::core::ics02_client::error::Error;
 use ibc_relayer_types::core::ics02_client::header::AnyHeader;
 use ibc_relayer_types::core::ics02_client::misbehaviour::Misbehaviour;
@@ -31,7 +31,7 @@ pub struct MisbehaviourEvidence {
 pub enum AnyMisbehaviour {
     Tendermint(TmMisbehaviour),
     Mithril(MithrilMisbehaviour),
-    Stability(StabilityMisbehaviour),
+    Probabilistic(ProbabilisticMisbehaviour),
 }
 
 impl Misbehaviour for AnyMisbehaviour {
@@ -39,7 +39,7 @@ impl Misbehaviour for AnyMisbehaviour {
         match self {
             Self::Tendermint(misbehaviour) => misbehaviour.client_id(),
             Self::Mithril(misbehaviour) => misbehaviour.client_id(),
-            Self::Stability(misbehaviour) => misbehaviour.client_id(),
+            Self::Probabilistic(misbehaviour) => misbehaviour.client_id(),
         }
     }
 
@@ -47,7 +47,7 @@ impl Misbehaviour for AnyMisbehaviour {
         match self {
             Self::Tendermint(misbehaviour) => misbehaviour.height(),
             Self::Mithril(misbehaviour) => misbehaviour.height(),
-            Self::Stability(misbehaviour) => misbehaviour.height(),
+            Self::Probabilistic(misbehaviour) => misbehaviour.height(),
         }
     }
 }
@@ -67,10 +67,10 @@ impl TryFrom<Any> for AnyMisbehaviour {
                     .map_err(Error::decode)?;
                 Ok(AnyMisbehaviour::Mithril(value.try_into()?))
             }
-            STABILITY_MISBEHAVIOUR_TYPE_URL => {
-                let value = stability_raw::Misbehaviour::decode(raw.value.as_slice())
+            PROBABILISTIC_MISBEHAVIOUR_TYPE_URL => {
+                let value = probabilistic_raw::Misbehaviour::decode(raw.value.as_slice())
                     .map_err(Error::decode)?;
-                Ok(AnyMisbehaviour::Stability(value.try_into()?))
+                Ok(AnyMisbehaviour::Probabilistic(value.try_into()?))
             }
 
             _ => Err(Error::unknown_misbehaviour_type(raw.type_url)),
@@ -92,10 +92,10 @@ impl From<AnyMisbehaviour> for Any {
                     value: raw.encode_to_vec(),
                 }
             }
-            AnyMisbehaviour::Stability(misbehaviour) => {
-                let raw: stability_raw::Misbehaviour = misbehaviour.into();
+            AnyMisbehaviour::Probabilistic(misbehaviour) => {
+                let raw: probabilistic_raw::Misbehaviour = misbehaviour.into();
                 Any {
-                    type_url: STABILITY_MISBEHAVIOUR_TYPE_URL.to_string(),
+                    type_url: PROBABILISTIC_MISBEHAVIOUR_TYPE_URL.to_string(),
                     value: raw.encode_to_vec(),
                 }
             }
@@ -108,7 +108,7 @@ impl core::fmt::Display for AnyMisbehaviour {
         match self {
             AnyMisbehaviour::Tendermint(tm) => write!(f, "{tm}"),
             AnyMisbehaviour::Mithril(mithril) => write!(f, "{mithril}"),
-            AnyMisbehaviour::Stability(stability) => write!(f, "{stability}"),
+            AnyMisbehaviour::Probabilistic(probabilistic) => write!(f, "{probabilistic}"),
         }
     }
 }
@@ -125,8 +125,8 @@ impl From<MithrilMisbehaviour> for AnyMisbehaviour {
     }
 }
 
-impl From<StabilityMisbehaviour> for AnyMisbehaviour {
-    fn from(misbehaviour: StabilityMisbehaviour) -> Self {
-        Self::Stability(misbehaviour)
+impl From<ProbabilisticMisbehaviour> for AnyMisbehaviour {
+    fn from(misbehaviour: ProbabilisticMisbehaviour) -> Self {
+        Self::Probabilistic(misbehaviour)
     }
 }
