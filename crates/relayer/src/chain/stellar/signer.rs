@@ -34,7 +34,7 @@ pub fn sign_tx(
 mod tests {
     use super::*;
 
-    const SECRET: &str = "SBGWSG6BTNCKCOB3DIFPQJAIYMIQF7DMHP7N46WQZR5UHKJCXIPRLHFG";
+    const SECRET: &str = "SBGWSG6BTNCKCOB3DIFBGCVMUPQFYPA2G4O34RMTB343OYPXU5DJDVMN";
     const PASSPHRASE: &str = "Test SDF Network ; September 2015";
 
     #[test]
