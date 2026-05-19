@@ -18,7 +18,7 @@ pub enum StellarError {
     #[error("Signer error: {0}")]
     Signer(String),
 
-    #[error("CBOR decode error: {0}")]
+    #[error("XDR decode error: {0}")]
     Decoding(String),
 
     #[error("Transaction error: {0}")]
@@ -36,33 +36,36 @@ pub enum StellarError {
     #[error("Generic error: {0}")]
     Transaction(String),
 
+    #[error("StrKey error: {0}")]
+    InvalidStrKey(String),
+
     #[error("Generic error: {0}")]
     Generic(String),
 }
 
-impl From<tonic::Status> for Error {
+impl From<tonic::Status> for StellarError {
     fn from(err: tonic::Status) -> Self {
-        Error::GatewayStatus {
+        StellarError::GatewayStatus {
             code: err.code(),
             message: err.message().to_string(),
         }
     }
 }
 
-impl From<tonic::transport::Error> for Error {
+impl From<tonic::transport::Error> for StellarError {
     fn from(err: tonic::transport::Error) -> Self {
-        Error::GatewayClient(err.to_string())
+        StellarError::GatewayClient(err.to_string())
     }
 }
 
-impl From<std::io::Error> for Error {
+impl From<std::io::Error> for StellarError {
     fn from(err: std::io::Error) -> Self {
-        Error::Generic(err.to_string())
+        StellarError::Generic(err.to_string())
     }
 }
 
-impl From<serde_json::Error> for Error {
+impl From<serde_json::Error> for StellarError {
     fn from(err: serde_json::Error) -> Self {
-        Error::Generic(err.to_string())
+        StellarError::Generic(err.to_string())
     }
 }
