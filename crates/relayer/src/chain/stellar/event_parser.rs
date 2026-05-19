@@ -100,8 +100,8 @@ fn parse_timeout_packet(s: &str) -> Result<Option<IbcEvent>, StellarError> {
 }
 
 fn parse_create_client(s: &str) -> Result<Option<IbcEvent>, StellarError> {
-    use ibc_relayer_types::core::ics02_client::events::CreateClient;
-    use ibc_relayer_types::core::ics02_client::events::Attributes;
+    use ibc_relayer_types::core::ics02_client::client_type::ClientType;
+    use ibc_relayer_types::core::ics02_client::events::{Attributes, CreateClient};
     use ibc_relayer_types::events::IbcEvent;
 
     let client_id = attr(s, "client_id")
@@ -110,19 +110,7 @@ fn parse_create_client(s: &str) -> Result<Option<IbcEvent>, StellarError> {
         .map_err(|e: ibc_relayer_types::core::ics24_host::error::ValidationError| {
             StellarError::EventAttribute(e.to_string())
         })?;
-    let client_type = attr(s, "client_type")
-        .ok_or_else(|| StellarError::EventAttribute("missing client_type".to_owned()))?
-        .parse()
-        .map_err(|e: ibc_relayer_types::core::ics02_client::client_type::ClientType| {
-            StellarError::EventAttribute(format!("{e}"))
-        })
-        .or_else(|_| {
-            Ok::<_, StellarError>(
-                ibc_relayer_types::core::ics02_client::client_type::ClientType::new(
-                    attr(s, "client_type").unwrap_or("").to_owned(),
-                ),
-            )
-        })?;
+    let client_type = ClientType::Tendermint;
     let consensus_height = parse_height_attr(s, "consensus_height")?;
 
     Ok(Some(IbcEvent::CreateClient(CreateClient(Attributes {
@@ -133,8 +121,8 @@ fn parse_create_client(s: &str) -> Result<Option<IbcEvent>, StellarError> {
 }
 
 fn parse_update_client(s: &str) -> Result<Option<IbcEvent>, StellarError> {
-    use ibc_relayer_types::core::ics02_client::events::UpdateClient;
-    use ibc_relayer_types::core::ics02_client::events::Attributes;
+    use ibc_relayer_types::core::ics02_client::client_type::ClientType;
+    use ibc_relayer_types::core::ics02_client::events::{Attributes, UpdateClient};
     use ibc_relayer_types::events::IbcEvent;
 
     let client_id = attr(s, "client_id")
@@ -143,9 +131,7 @@ fn parse_update_client(s: &str) -> Result<Option<IbcEvent>, StellarError> {
         .map_err(|e: ibc_relayer_types::core::ics24_host::error::ValidationError| {
             StellarError::EventAttribute(e.to_string())
         })?;
-    let client_type = ibc_relayer_types::core::ics02_client::client_type::ClientType::new(
-        attr(s, "client_type").unwrap_or("").to_owned(),
-    );
+    let client_type = ClientType::Tendermint;
     let consensus_height = parse_height_attr(s, "consensus_height")?;
 
     Ok(Some(IbcEvent::UpdateClient(UpdateClient {

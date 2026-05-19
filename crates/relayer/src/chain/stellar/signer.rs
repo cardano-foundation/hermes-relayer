@@ -2,6 +2,7 @@ use sha2::{Digest, Sha256};
 
 use super::error::StellarError;
 use super::signing_key_pair::StellarSigningKeyPair;
+use crate::keyring::SigningKeyPair;
 
 const ENVELOPE_TYPE_TX: [u8; 4] = [0, 0, 0, 2];
 

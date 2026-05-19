@@ -39,7 +39,7 @@ impl StellarKeyRing {
     }
 
     pub fn remove_key(&mut self, key_name: &str) -> Result<(), Error> {
-        self.inner.remove_key(key_name)
+        <Test as KeyStore<StellarSigningKeyPair>>::remove_key(&mut self.inner, key_name)
     }
 
     pub fn keys(&self) -> Result<Vec<(String, StellarSigningKeyPair)>, Error> {
