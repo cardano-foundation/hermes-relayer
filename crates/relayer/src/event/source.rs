@@ -82,6 +82,10 @@ pub type EventReceiver = channel::Receiver<Result<EventBatch>>;
 pub struct TxEventSourceCmd(channel::Sender<EventSourceCmd>);
 
 impl TxEventSourceCmd {
+    pub(crate) fn from_sender(tx: channel::Sender<EventSourceCmd>) -> Self {
+        Self(tx)
+    }
+
     pub fn shutdown(&self) -> Result<()> {
         self.0
             .send(EventSourceCmd::Shutdown)
