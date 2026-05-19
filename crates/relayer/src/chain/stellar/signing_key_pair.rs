@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use signature::Signer;
 use stellar_strkey::ed25519::{PrivateKey as StrKeySecret, PublicKey as StrKeyPublic};
 
+use super::error::StellarError;
 use crate::config::AddressType;
-use crate::keyring::{errors::Error, KeyType, SigningKeyPair};
+use crate::keyring::{errors::Error as KeyringError, KeyType, SigningKeyPair};
 
 #[derive(Deserialize)]
 pub struct StellarKeyFile {
@@ -25,21 +26,28 @@ fn sep0005_path(account: u32) -> DerivationPath {
     ])
 }
 
-fn key_from_mnemonic(words: &str, account: u32) -> Result<SigningKey, Error> {
+fn key_from_mnemonic(words: &str, account: u32) -> Result<SigningKey, KeyringError> {
     let mnemonic =
-        Mnemonic::from_phrase(words, Language::English).map_err(Error::invalid_mnemonic)?;
+        Mnemonic::from_phrase(words, Language::English).map_err(KeyringError::invalid_mnemonic)?;
 
     let seed = Seed::new(&mnemonic, "");
 
     let master = ExtendedSigningKey::from_seed(seed.as_bytes()).map_err(|e| {
-        Error::bip32_key_generation_failed(StellarSigningKeyPair::KEY_TYPE, e.into())
+        KeyringError::bip32_key_generation_failed(StellarSigningKeyPair::KEY_TYPE, e.into())
     })?;
 
     let child = master.derive(&sep0005_path(account)).map_err(|e| {
-        Error::bip32_key_generation_failed(StellarSigningKeyPair::KEY_TYPE, e.into())
+        KeyringError::bip32_key_generation_failed(StellarSigningKeyPair::KEY_TYPE, e.into())
     })?;
 
     Ok(child.signing_key)
+}
+
+fn stellar_to_keyring(e: StellarError) -> KeyringError {
+    KeyringError::bip32_key_generation_failed(
+        StellarSigningKeyPair::KEY_TYPE,
+        anyhow::anyhow!("{}", e),
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -56,10 +64,15 @@ impl StellarSigningKeyPair {
         StrKeySecret(self.signing_key.to_bytes()).to_string()
     }
 
-    pub fn from_strkey(strkey: &str) -> Result<Self, Error> {
+    pub fn key_hint(&self) -> [u8; 4] {
+        let bytes = self.signing_key.verifying_key().to_bytes();
+        bytes[28..].try_into().expect("slice is 4 bytes")
+    }
+
+    pub fn from_strkey(strkey: &str) -> Result<Self, StellarError> {
         let StrKeySecret(raw) = strkey
             .parse::<StrKeySecret>()
-            .map_err(|_| Error::invalid_strkey(strkey.to_owned()))?;
+            .map_err(|_| StellarError::InvalidStrKey(strkey.to_owned()))?;
         Ok(Self {
             signing_key: SigningKey::from_bytes(&raw),
         })
@@ -70,17 +83,17 @@ impl SigningKeyPair for StellarSigningKeyPair {
     const KEY_TYPE: KeyType = KeyType::Ed25519;
     type KeyFile = StellarKeyFile;
 
-    fn from_key_file(key_file: StellarKeyFile, hd_path: &StandardHDPath) -> Result<Self, Error> {
+    fn from_key_file(key_file: StellarKeyFile, hd_path: &StandardHDPath) -> Result<Self, KeyringError> {
         if let Some(strkey) = key_file.secret_key {
-            return Self::from_strkey(&strkey);
+            return Self::from_strkey(&strkey).map_err(stellar_to_keyring);
         }
         if let Some(mnemonic) = key_file.mnemonic {
             let signing_key = key_from_mnemonic(&mnemonic, hd_path.account())?;
             return Ok(Self { signing_key });
         }
-        Err(Error::invalid_strkey(
+        Err(stellar_to_keyring(StellarError::InvalidStrKey(
             "key file must contain 'secret_key' or 'mnemonic'".to_owned(),
-        ))
+        )))
     }
 
     fn from_mnemonic(
@@ -88,7 +101,7 @@ impl SigningKeyPair for StellarSigningKeyPair {
         hd_path: &StandardHDPath,
         _address_type: &AddressType,
         _account_prefix: &str,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, KeyringError> {
         let signing_key = key_from_mnemonic(mnemonic, hd_path.account())?;
         Ok(Self { signing_key })
     }
@@ -97,7 +110,7 @@ impl SigningKeyPair for StellarSigningKeyPair {
         self.account_id()
     }
 
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, KeyringError> {
         Ok(self.signing_key.sign(message).to_bytes().to_vec())
     }
 
@@ -141,5 +154,12 @@ mod tests {
         let kp = StellarSigningKeyPair::from_strkey(EXPECTED_SECRET).unwrap();
         let sig = kp.sign(b"hello stellar").unwrap();
         assert_eq!(sig.len(), 64);
+    }
+
+    #[test]
+    fn key_hint_is_last_4_bytes_of_pubkey() {
+        let kp = StellarSigningKeyPair::from_strkey(EXPECTED_SECRET).unwrap();
+        let pubkey_bytes = kp.signing_key.verifying_key().to_bytes();
+        assert_eq!(kp.key_hint(), pubkey_bytes[28..]);
     }
 }
