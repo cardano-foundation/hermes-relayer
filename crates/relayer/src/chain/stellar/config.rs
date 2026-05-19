@@ -5,7 +5,7 @@ use ibc_relayer_types::core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::config::PacketFilter;
+use crate::config::{PacketFilter, RefreshRate};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StellarConfig {
@@ -23,4 +23,5 @@ pub struct StellarConfig {
     pub clear_interval: Option<u64>,
     pub query_packets_chunk_size: usize,
     pub clock_drift: Duration,
+    pub client_refresh_rate: RefreshRate,
 }
