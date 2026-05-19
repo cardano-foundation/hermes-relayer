@@ -57,11 +57,11 @@ pub struct StellarSigningKeyPair {
 
 impl StellarSigningKeyPair {
     pub fn account_id(&self) -> String {
-        StrKeyPublic(*self.signing_key.verifying_key().as_bytes()).to_string()
+        format!("{}", StrKeyPublic(*self.signing_key.verifying_key().as_bytes()))
     }
 
     pub fn secret_key_strkey(&self) -> String {
-        StrKeySecret(self.signing_key.to_bytes()).to_string()
+        format!("{}", StrKeySecret(self.signing_key.to_bytes()))
     }
 
     pub fn key_hint(&self) -> [u8; 4] {
@@ -160,6 +160,7 @@ mod tests {
     fn key_hint_is_last_4_bytes_of_pubkey() {
         let kp = StellarSigningKeyPair::from_strkey(EXPECTED_SECRET).unwrap();
         let pubkey_bytes = kp.signing_key.verifying_key().to_bytes();
-        assert_eq!(kp.key_hint(), pubkey_bytes[28..]);
+        let expected: [u8; 4] = pubkey_bytes[28..].try_into().unwrap();
+        assert_eq!(kp.key_hint(), expected);
     }
 }
