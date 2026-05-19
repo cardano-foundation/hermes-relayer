@@ -11,7 +11,8 @@ use eyre::eyre;
 use hdpath::StandardHDPath;
 use ibc_relayer::{
     chain::namada::wallet::CliWalletUtils,
-    config::{ChainConfig, Config},
+    chain::stellar::signing_key_pair::StellarSigningKeyPair,
+    config::{AddressType, ChainConfig, Config},
     keyring::{
         AnySigningKeyPair, KeyRing, NamadaKeyPair, Secp256k1KeyPair, SigningKeyPair,
         SigningKeyPairSized, Store,
@@ -253,6 +254,19 @@ pub fn add_key(
             namada_key.into()
         }
         ChainConfig::Penumbra(_) => unimplemented!("no key storage support for penumbra"),
+        ChainConfig::Stellar(config) => {
+            let mut keyring: KeyRing<StellarSigningKeyPair> =
+                KeyRing::new(Store::Test, "stellar", &config.id, &None)?;
+
+            check_key_exists(&keyring, key_name, overwrite);
+
+            let key_contents =
+                fs::read_to_string(file).map_err(|_| eyre!("error reading the key file"))?;
+            let key_pair = StellarSigningKeyPair::from_seed_file(&key_contents, hd_path)?;
+
+            keyring.add_key(key_name, key_pair.clone())?;
+            key_pair.into()
+        }
     };
 
     Ok(key_pair)
@@ -295,6 +309,22 @@ pub fn restore_key(
             ));
         }
         ChainConfig::Penumbra(_) => return Err(eyre!("no key storage support for penumbra")),
+        ChainConfig::Stellar(config) => {
+            let mut keyring: KeyRing<StellarSigningKeyPair> =
+                KeyRing::new(Store::Test, "stellar", &config.id, &None)?;
+
+            check_key_exists(&keyring, key_name, overwrite);
+
+            let key_pair = StellarSigningKeyPair::from_mnemonic(
+                &mnemonic_content,
+                hdpath,
+                &AddressType::Cosmos,
+                "",
+            )?;
+
+            keyring.add_key(key_name, key_pair.clone())?;
+            key_pair.into()
+        }
     };
 
     Ok(key_pair)

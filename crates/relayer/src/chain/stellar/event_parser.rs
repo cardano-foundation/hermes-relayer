@@ -208,3 +208,115 @@ fn parse_height_attr(s: &str, key: &str) -> Result<Height, StellarError> {
     Height::new(revision_number, revision_height)
         .map_err(|e| StellarError::EventAttribute(e.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ibc_relayer_types::events::IbcEvent;
+
+    fn height(h: u64) -> Height {
+        Height::new(0, h).unwrap()
+    }
+
+    fn packet_attrs(seq: u64) -> String {
+        format!(
+            "type=send_packet\npacket_sequence={seq}\npacket_src_port=transfer\npacket_src_channel=channel-0\npacket_dst_port=transfer\npacket_dst_channel=channel-1\npacket_data=hello\n"
+        )
+    }
+
+    #[test]
+    fn unknown_event_type_returns_none() {
+        let raw = b"type=unknown_event\nfoo=bar\n";
+        let result = parse_event_bytes(raw, height(1)).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn invalid_utf8_returns_error() {
+        let raw: &[u8] = &[0xFF, 0xFE];
+        assert!(parse_event_bytes(raw, height(1)).is_err());
+    }
+
+    #[test]
+    fn send_packet_parsed_correctly() {
+        let raw = packet_attrs(42);
+        let ev = parse_event_bytes(raw.as_bytes(), height(10)).unwrap().unwrap();
+        assert_eq!(ev.height, height(10));
+        assert!(matches!(ev.event, IbcEvent::SendPacket(_)));
+        if let IbcEvent::SendPacket(e) = ev.event {
+            assert_eq!(u64::from(e.packet.sequence), 42);
+            assert_eq!(e.packet.source_port.as_str(), "transfer");
+            assert_eq!(e.packet.destination_channel.as_str(), "channel-1");
+        }
+    }
+
+    #[test]
+    fn recv_packet_parsed_correctly() {
+        let raw = "type=recv_packet\npacket_sequence=7\npacket_src_port=transfer\npacket_src_channel=channel-0\npacket_dst_port=transfer\npacket_dst_channel=channel-2\n";
+        let ev = parse_event_bytes(raw.as_bytes(), height(5)).unwrap().unwrap();
+        assert!(matches!(ev.event, IbcEvent::ReceivePacket(_)));
+        if let IbcEvent::ReceivePacket(e) = ev.event {
+            assert_eq!(u64::from(e.packet.sequence), 7);
+        }
+    }
+
+    #[test]
+    fn write_ack_includes_acknowledgement() {
+        let raw = "type=write_acknowledgement\npacket_sequence=3\npacket_src_port=transfer\npacket_src_channel=channel-0\npacket_dst_port=transfer\npacket_dst_channel=channel-0\nacknowledgement=ack_data\n";
+        let ev = parse_event_bytes(raw.as_bytes(), height(1)).unwrap().unwrap();
+        assert!(matches!(ev.event, IbcEvent::WriteAcknowledgement(_)));
+        if let IbcEvent::WriteAcknowledgement(e) = ev.event {
+            assert_eq!(e.ack, b"ack_data");
+        }
+    }
+
+    #[test]
+    fn create_client_parsed_correctly() {
+        let raw = "type=create_client\nclient_id=07-tendermint-0\nconsensus_height=1-100\n";
+        let ev = parse_event_bytes(raw.as_bytes(), height(1)).unwrap().unwrap();
+        assert!(matches!(ev.event, IbcEvent::CreateClient(_)));
+        if let IbcEvent::CreateClient(e) = ev.event {
+            assert_eq!(e.0.client_id.as_str(), "07-tendermint-0");
+            assert_eq!(e.0.consensus_height, Height::new(1, 100).unwrap());
+        }
+    }
+
+    #[test]
+    fn update_client_parsed_correctly() {
+        let raw = "type=update_client\nclient_id=07-tendermint-1\nconsensus_height=0-200\n";
+        let ev = parse_event_bytes(raw.as_bytes(), height(2)).unwrap().unwrap();
+        assert!(matches!(ev.event, IbcEvent::UpdateClient(_)));
+        if let IbcEvent::UpdateClient(e) = ev.event {
+            assert_eq!(e.common.client_id.as_str(), "07-tendermint-1");
+            assert_eq!(e.common.consensus_height, Height::new(0, 200).unwrap());
+        }
+    }
+
+    #[test]
+    fn parse_events_from_tx_filters_unknown() {
+        let chain_id = ChainId::from_string("stellar-testnet");
+        let events: Vec<Vec<u8>> = vec![
+            packet_attrs(1).into_bytes(),
+            b"type=garbage\n".to_vec(),
+            "type=recv_packet\npacket_sequence=2\npacket_src_port=transfer\npacket_src_channel=channel-0\npacket_dst_port=transfer\npacket_dst_channel=channel-0\n".as_bytes().to_vec(),
+        ];
+        let results = parse_events_from_tx(&events, height(50), &chain_id);
+        assert_eq!(results.len(), 2);
+        assert!(matches!(results[0].event, IbcEvent::SendPacket(_)));
+        assert!(matches!(results[1].event, IbcEvent::ReceivePacket(_)));
+    }
+
+    #[test]
+    fn ack_packet_parsed_correctly() {
+        let raw = "type=acknowledge_packet\npacket_sequence=5\npacket_src_port=transfer\npacket_src_channel=channel-0\npacket_dst_port=transfer\npacket_dst_channel=channel-0\n";
+        let ev = parse_event_bytes(raw.as_bytes(), height(1)).unwrap().unwrap();
+        assert!(matches!(ev.event, IbcEvent::AcknowledgePacket(_)));
+    }
+
+    #[test]
+    fn timeout_packet_parsed_correctly() {
+        let raw = "type=timeout_packet\npacket_sequence=9\npacket_src_port=transfer\npacket_src_channel=channel-0\npacket_dst_port=transfer\npacket_dst_channel=channel-0\n";
+        let ev = parse_event_bytes(raw.as_bytes(), height(1)).unwrap().unwrap();
+        assert!(matches!(ev.event, IbcEvent::TimeoutPacket(_)));
+    }
+}
