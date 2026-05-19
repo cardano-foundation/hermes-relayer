@@ -3,15 +3,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use hdpath::StandardHDPath;
 use ibc_relayer::chain::stellar::{
     keyring::StellarKeyRing,
-    signing_key_pair::StellarSigningKeyPair,
     signer::{sign_tx, stellar_tx_hash},
+    signing_key_pair::StellarSigningKeyPair,
 };
 use ibc_relayer::keyring::SigningKeyPair;
 
 const SECRET: &str = "SBGWSG6BTNCKCOB3DIFBGCVMUPQFYPA2G4O34RMTB343OYPXU5DJDVMN";
 const ACCOUNT: &str = "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6";
-const MNEMONIC: &str =
-    "illness spike retreat truth genius clock brain pass fit cave bargain toe";
+const MNEMONIC: &str = "illness spike retreat truth genius clock brain pass fit cave bargain toe";
 const PASSPHRASE: &str = "Test SDF Network ; September 2015";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -168,8 +167,8 @@ fn tx_hash_differs_for_different_payloads() {
 fn key_from_mnemonic_account0_matches_known_vector() {
     use ibc_relayer::config::AddressType;
     let hd_path: StandardHDPath = "m/44'/148'/0'/0/0".parse().unwrap();
-    let kp = StellarSigningKeyPair::from_mnemonic(MNEMONIC, &hd_path, &AddressType::Cosmos, "")
-        .unwrap();
+    let kp =
+        StellarSigningKeyPair::from_mnemonic(MNEMONIC, &hd_path, &AddressType::Cosmos, "").unwrap();
     assert_eq!(kp.account(), ACCOUNT);
 }
 
