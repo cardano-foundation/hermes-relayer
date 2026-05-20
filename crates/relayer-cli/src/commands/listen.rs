@@ -211,6 +211,9 @@ fn subscribe(
         ChainConfig::Cardano(_) => Err(eyre!(
             "event subscription is not implemented for Cardano; requires Gateway-backed event source support in `hermes listen`"
         )),
+        ChainConfig::Stellar(_) => {
+            Err(eyre!("listen is not yet supported for Stellar chains"))
+        }
     }
 }
 
@@ -225,6 +228,9 @@ fn detect_compatibility_mode(
             return Err(eyre!(
                 "compatibility mode detection is not applicable for Cardano (no Tendermint RPC)"
             ));
+        }
+        ChainConfig::Stellar(_) => {
+            return Err(eyre!("listen is not yet supported for Stellar chains"))
         }
     };
 
@@ -245,6 +251,7 @@ fn detect_compatibility_mode(
                 "compatibility mode detection is not applicable for Cardano (no Tendermint RPC)"
             ));
         }
+        ChainConfig::Stellar(_) => unreachable!(),
     };
 
     Ok(compat_mode)

@@ -4,6 +4,7 @@ use abscissa_core::{Command, Runnable};
 use eyre::eyre;
 use ibc_relayer::{
     chain::cardano::signing_key_pair::CardanoSigningKeyPair,
+    chain::stellar::signing_key_pair::StellarSigningKeyPair,
     config::{ChainConfig, Config},
     keyring::{KeyRing, Store},
 };
@@ -139,6 +140,11 @@ pub fn delete_key(config: &ChainConfig, key_name: &str) -> eyre::Result<()> {
             )?;
             keyring.remove_key(key_name)?;
         }
+        ChainConfig::Stellar(config) => {
+            let mut keyring: KeyRing<StellarSigningKeyPair> =
+                KeyRing::new(Store::Test, "stellar", &config.id, &None)?;
+            keyring.remove_key(key_name)?;
+        }
     }
     Ok(())
 }
@@ -173,6 +179,14 @@ pub fn delete_all_keys(config: &ChainConfig) -> eyre::Result<()> {
                 &config.id,
                 &config.key_store_folder,
             )?;
+            let keys = keyring.keys()?;
+            for (key_name, _) in keys {
+                keyring.remove_key(&key_name)?;
+            }
+        }
+        ChainConfig::Stellar(config) => {
+            let mut keyring: KeyRing<StellarSigningKeyPair> =
+                KeyRing::new(Store::Test, "stellar", &config.id, &None)?;
             let keys = keyring.keys()?;
             for (key_name, _) in keys {
                 keyring.remove_key(&key_name)?;

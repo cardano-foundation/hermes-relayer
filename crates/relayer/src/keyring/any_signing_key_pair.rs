@@ -2,6 +2,7 @@ use serde::Serialize;
 
 use super::{Ed25519KeyPair, KeyType, NamadaKeyPair, Secp256k1KeyPair, SigningKeyPair};
 use crate::chain::cardano::CardanoSigningKeyPair;
+use crate::chain::stellar::signing_key_pair::StellarSigningKeyPair;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
@@ -11,6 +12,7 @@ pub enum AnySigningKeyPair {
     Ed25519(Ed25519KeyPair),
     Namada(NamadaKeyPair),
     Cardano(CardanoSigningKeyPair),
+    Stellar(StellarSigningKeyPair),
 }
 
 impl AnySigningKeyPair {
@@ -20,6 +22,7 @@ impl AnySigningKeyPair {
             Self::Ed25519(key_pair) => key_pair.account(),
             Self::Namada(key_pair) => key_pair.account(),
             Self::Cardano(key_pair) => key_pair.account(),
+            Self::Stellar(key_pair) => key_pair.account(),
         }
     }
 
@@ -29,6 +32,7 @@ impl AnySigningKeyPair {
             Self::Ed25519(_) => Ed25519KeyPair::KEY_TYPE,
             Self::Namada(_) => NamadaKeyPair::KEY_TYPE,
             Self::Cardano(_) => CardanoSigningKeyPair::KEY_TYPE,
+            Self::Stellar(_) => StellarSigningKeyPair::KEY_TYPE,
         }
     }
 
@@ -38,6 +42,7 @@ impl AnySigningKeyPair {
             Self::Ed25519(key_pair) => key_pair.as_any(),
             Self::Namada(key_pair) => key_pair.as_any(),
             Self::Cardano(key_pair) => key_pair.as_any(),
+            Self::Stellar(key_pair) => key_pair.as_any(),
         }
         .downcast_ref::<T>()
         .cloned()
@@ -65,5 +70,11 @@ impl From<NamadaKeyPair> for AnySigningKeyPair {
 impl From<CardanoSigningKeyPair> for AnySigningKeyPair {
     fn from(key_pair: CardanoSigningKeyPair) -> Self {
         Self::Cardano(key_pair)
+    }
+}
+
+impl From<StellarSigningKeyPair> for AnySigningKeyPair {
+    fn from(key_pair: StellarSigningKeyPair) -> Self {
+        Self::Stellar(key_pair)
     }
 }

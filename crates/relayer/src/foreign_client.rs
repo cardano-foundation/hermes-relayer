@@ -1037,6 +1037,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             }
             ChainConfig::Penumbra(config) => config.client_refresh_rate,
             ChainConfig::Cardano(config) => config.client_refresh_rate,
+            ChainConfig::Stellar(config) => config.client_refresh_rate,
         };
 
         let refresh_period = client_state
@@ -1935,6 +1936,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             }
             ChainConfig::Penumbra(_) => false,
             ChainConfig::Cardano(_) => false,
+            ChainConfig::Stellar(_) => false,
         };
 
         let mut msgs = vec![];

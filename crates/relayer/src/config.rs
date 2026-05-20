@@ -30,6 +30,7 @@ use ibc_relayer_types::timestamp::ZERO_DURATION;
 
 use crate::chain::cosmos::config::CosmosSdkConfig;
 use crate::chain::penumbra::config::PenumbraConfig;
+use crate::chain::stellar::config::StellarConfig;
 use crate::config::types::ics20_field_size_limit::Ics20FieldSizeLimit;
 use crate::config::types::TrustThreshold;
 use crate::error::Error as RelayerError;
@@ -330,6 +331,7 @@ impl Config {
                 }
                 ChainConfig::Penumbra { .. } => { /* no-op for now (erwan) */ }
                 ChainConfig::Cardano { .. } => { /* no-op for Cardano */ }
+                ChainConfig::Stellar { .. } => { /* no-op for now */ }
             }
         }
 
@@ -666,6 +668,7 @@ pub enum ChainConfig {
     Namada(CosmosSdkConfig),
     Penumbra(PenumbraConfig),
     Cardano(crate::chain::cardano::CardanoConfig),
+    Stellar(StellarConfig),
 }
 
 impl ChainConfig {
@@ -675,6 +678,7 @@ impl ChainConfig {
             Self::Namada(config) => &config.id,
             Self::Penumbra(config) => &config.id,
             Self::Cardano(config) => &config.id,
+            Self::Stellar(config) => &config.id,
         }
     }
 
@@ -684,6 +688,7 @@ impl ChainConfig {
             Self::Namada(config) => &config.packet_filter,
             Self::Penumbra(config) => &config.packet_filter,
             Self::Cardano(config) => &config.packet_filter,
+            Self::Stellar(config) => &config.packet_filter,
         }
     }
 
@@ -693,6 +698,7 @@ impl ChainConfig {
             Self::Namada(config) => config.max_block_time,
             Self::Penumbra(config) => config.max_block_time,
             Self::Cardano(config) => config.max_block_time,
+            Self::Stellar(config) => config.max_block_time,
         }
     }
 
@@ -702,6 +708,7 @@ impl ChainConfig {
             Self::Namada(config) => &config.key_name,
             Self::Penumbra(config) => &config.stub_key_name,
             Self::Cardano(config) => &config.key_name,
+            Self::Stellar(config) => &config.stub_key_name,
         }
     }
 
@@ -711,6 +718,7 @@ impl ChainConfig {
             Self::Namada(config) => config.key_name = key_name,
             Self::Penumbra(_) => { /* no-op */ }
             Self::Cardano(config) => config.key_name = key_name,
+            Self::Stellar(config) => config.key_name = key_name,
         }
     }
 
@@ -753,6 +761,7 @@ impl ChainConfig {
                     .map(|(key_name, keys)| (key_name, keys.into()))
                     .collect()
             }
+            ChainConfig::Stellar(_) => vec![],
         };
 
         Ok(keys)
@@ -764,6 +773,7 @@ impl ChainConfig {
             Self::Namada(config) => config.trust_threshold,
             Self::Penumbra(config) => config.trust_threshold,
             Self::Cardano(config) => config.trust_threshold.unwrap_or_default(),
+            Self::Stellar(config) => config.trust_threshold,
         }
     }
 
@@ -772,6 +782,7 @@ impl ChainConfig {
             Self::CosmosSdk(config) | Self::Namada(config) => config.clear_interval,
             Self::Penumbra(config) => config.clear_interval,
             Self::Cardano(config) => config.clear_interval,
+            Self::Stellar(config) => config.clear_interval,
         }
     }
 
@@ -780,6 +791,7 @@ impl ChainConfig {
             Self::CosmosSdk(config) | Self::Namada(config) => config.query_packets_chunk_size,
             Self::Penumbra(config) => config.query_packets_chunk_size,
             Self::Cardano(config) => config.query_packets_chunk_size,
+            Self::Stellar(config) => config.query_packets_chunk_size,
         }
     }
 
@@ -790,6 +802,7 @@ impl ChainConfig {
             }
             Self::Penumbra(config) => config.query_packets_chunk_size = query_packets_chunk_size,
             Self::Cardano(config) => config.query_packets_chunk_size = query_packets_chunk_size,
+            Self::Stellar(config) => config.query_packets_chunk_size = query_packets_chunk_size,
         }
     }
 
@@ -803,6 +816,7 @@ impl ChainConfig {
                 .unwrap_or_else(|| Cow::Owned(Vec::new())),
             Self::Penumbra(_config) => Cow::Owned(Vec::new()),
             Self::Cardano(_config) => Cow::Owned(Vec::new()),
+            Self::Stellar(_config) => Cow::Owned(Vec::new()),
         }
     }
 
@@ -811,6 +825,7 @@ impl ChainConfig {
             Self::CosmosSdk(config) | Self::Namada(config) => config.allow_ccq,
             Self::Penumbra(_config) => false,
             Self::Cardano(_config) => false,
+            Self::Stellar(_config) => false,
         }
     }
 
@@ -819,6 +834,7 @@ impl ChainConfig {
             Self::CosmosSdk(config) | Self::Namada(config) => config.clock_drift,
             Self::Penumbra(config) => config.clock_drift,
             Self::Cardano(config) => config.clock_drift,
+            Self::Stellar(config) => config.clock_drift,
         }
     }
 
@@ -827,6 +843,7 @@ impl ChainConfig {
             Self::Namada(_) | Self::CosmosSdk(_) => true,
             Self::Penumbra(_) => false,
             Self::Cardano(_) => true,
+            Self::Stellar(_) => true,
         }
     }
 }
@@ -866,6 +883,10 @@ impl<'de> Deserialize<'de> for ChainConfig {
             "Cardano" => crate::chain::cardano::CardanoConfig::deserialize(value)
                 .map(Self::Cardano)
                 .map_err(|e| serde::de::Error::custom(format!("invalid Cardano config: {e}"))),
+            //
+            "Stellar" => StellarConfig::deserialize(value)
+                .map(Self::Stellar)
+                .map_err(|e| serde::de::Error::custom(format!("invalid Stellar config: {e}"))),
             //
             chain_type => Err(serde::de::Error::custom(format!(
                 "unknown chain type: {chain_type}",
@@ -1064,6 +1085,7 @@ mod tests {
             }
             ChainConfig::Penumbra(_) => panic!("expected cosmos chain config"),
             ChainConfig::Cardano(_) => panic!("expected cosmos chain config"),
+            ChainConfig::Stellar(_) => panic!("expected cosmos chain config"),
         };
 
         assert_eq!(excluded_sequences1, excluded_sequences2);
