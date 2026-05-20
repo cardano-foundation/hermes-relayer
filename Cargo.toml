@@ -113,7 +113,6 @@ test-log                 = "0.2.18"
 thiserror                = "1.0.69"
 time                     = "0.3"
 tiny-bip39               = "1.0.0"
-stellar-strkey           = "0.0.16"
 tiny-keccak              = { version = "2.0.2", default-features = false }
 tokio                    = "1.39.2"
 tokio-stream             = "0.1.16"
@@ -123,6 +122,7 @@ tracing                  = { version = "0.1.36", default-features = false }
 tracing-subscriber       = "0.3.14"
 uint                     = "0.9"
 uuid                     = "1.10.5"
+stellar-strkey                     = "0.0.16"
 
 [profile.release]
 overflow-checks = true
