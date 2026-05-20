@@ -72,6 +72,8 @@ pub struct ClientState {
     pub slot_length_ns: u64,
     #[prost(message, repeated, tag = "17")]
     pub epoch_contexts: ::prost::alloc::vec::Vec<EpochContext>,
+    #[prost(uint64, tag = "18")]
+    pub pool_registration_cutoff_slot_exclusive: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
