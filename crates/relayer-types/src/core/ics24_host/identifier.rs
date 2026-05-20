@@ -190,6 +190,8 @@ impl ClientId {
     pub fn prefix(client_type: ClientType) -> &'static str {
         match client_type {
             ClientType::Tendermint => ClientType::Tendermint.as_str(),
+            ClientType::CardanoMithril => ClientType::CardanoMithril.as_str(),
+            ClientType::CardanoProbabilistic => ClientType::CardanoProbabilistic.as_str(),
         }
     }
 

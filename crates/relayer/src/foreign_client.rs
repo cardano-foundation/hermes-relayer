@@ -16,11 +16,11 @@ use tracing::{debug, error, info, instrument, trace, warn};
 use flex_error::define_error;
 use ibc_relayer_types::applications::ics28_ccv::msgs::ccv_misbehaviour::MsgSubmitIcsConsumerMisbehaviour;
 use ibc_relayer_types::core::ics02_client::client_state::ClientState;
+use ibc_relayer_types::core::ics02_client::client_type::ClientType;
 use ibc_relayer_types::core::ics02_client::error::Error as ClientError;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
 use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header};
 use ibc_relayer_types::core::ics02_client::msgs::create_client::MsgCreateClient;
-use ibc_relayer_types::core::ics02_client::msgs::misbehaviour::MsgSubmitMisbehaviour;
 use ibc_relayer_types::core::ics02_client::msgs::update_client::MsgUpdateClient;
 use ibc_relayer_types::core::ics02_client::msgs::upgrade_client::MsgUpgradeClient;
 use ibc_relayer_types::core::ics02_client::trust_threshold::TrustThreshold;
@@ -48,6 +48,8 @@ use crate::util::pretty::{PrettyDuration, PrettySlice};
 const MAX_MISBEHAVIOUR_CHECK_DURATION: Duration = Duration::from_secs(120);
 
 const MAX_RETRIES: usize = 5;
+const CREATE_CLIENT_DISCOVERY_MAX_RETRIES: usize = 30;
+const CREATE_CLIENT_DISCOVERY_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExpiredOrFrozen {
@@ -699,7 +701,13 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 )
             })?;
 
-        assert!(!res.is_empty());
+        if res.is_empty() {
+            return Err(ForeignClientError::client_create(
+                self.dst_chain.id(),
+                "create client transaction committed but returned no IBC events".to_string(),
+                RelayerError::event(),
+            ));
+        }
         Ok(res[0].clone())
     }
 
@@ -711,19 +719,137 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         fields(client = %self)
     )]
     fn create(&mut self) -> Result<(), ForeignClientError> {
-        let event_with_height = self
-            .build_create_client_and_send(CreateOptions::default())
+        let existing_client_ids = match self.query_destination_clients_for_source_chain() {
+            Ok(client_ids) => Some(client_ids),
+            Err(error) => {
+                debug!(
+                    "destination client pre-scan unavailable, falling back to event-only client creation path: {}",
+                    error
+                );
+                None
+            }
+        };
+        let new_msg = self.build_create_client(CreateOptions::default())?;
+
+        let res = self
+            .dst_chain
+            .send_messages_and_wait_commit(TrackedMsgs::new_single(
+                new_msg.to_any(),
+                "create client",
+            ))
+            .map_err(|e| {
+                ForeignClientError::client_create(
+                    self.dst_chain.id(),
+                    "failed sending message to dst chain ".to_string(),
+                    e,
+                )
+            })
             .map_err(|e| {
                 error!("failed to create client: {}", e);
                 e
             })?;
 
-        self.id = extract_client_id(&event_with_height.event)?.clone();
+        if let Some(event_with_height) = res.first() {
+            self.id = extract_client_id(&event_with_height.event)?.clone();
+            info!(id = %self.id, "client was created successfully");
+            debug!(id = %self.id, ?event_with_height.event, "event emitted after creation");
+            return Ok(());
+        }
 
-        info!(id = %self.id, "🍭 client was created successfully");
-        debug!(id = %self.id, ?event_with_height.event, "event emitted after creation");
+        let Some(existing_client_ids) = existing_client_ids.as_deref() else {
+            return Err(ForeignClientError::client_create(
+                self.dst_chain.id(),
+                "create client transaction committed but returned no IBC events, and destination chain does not support client discovery fallback".to_string(),
+                RelayerError::event(),
+            ));
+        };
+
+        self.id = self.infer_latest_created_client_id(existing_client_ids)?;
+        warn!(
+            id = %self.id,
+            "create client emitted no parsable IBC event, inferred client id from destination chain state"
+        );
+        info!(id = %self.id, "client was created successfully");
 
         Ok(())
+    }
+
+    fn query_destination_clients_for_source_chain(
+        &self,
+    ) -> Result<Vec<ClientId>, ForeignClientError> {
+        let src_chain_id = self.src_chain.id();
+        self.dst_chain
+            .query_clients(QueryClientStatesRequest { pagination: None })
+            .map_err(|e| {
+                ForeignClientError::client_create(
+                    self.dst_chain.id(),
+                    "failed to query destination clients after create client".to_string(),
+                    e,
+                )
+            })
+            .map(|clients| {
+                clients
+                    .into_iter()
+                    .filter(|client| client.client_state.chain_id() == src_chain_id)
+                    .map(|client| client.client_id)
+                    .collect()
+            })
+    }
+
+    fn infer_latest_created_client_id(
+        &self,
+        previous_client_ids: &[ClientId],
+    ) -> Result<ClientId, ForeignClientError> {
+        let previous_client_ids: Vec<String> = previous_client_ids
+            .iter()
+            .map(|client_id| client_id.to_string())
+            .collect();
+
+        for attempt in 0..CREATE_CLIENT_DISCOVERY_MAX_RETRIES {
+            let newest_observed = self
+                .query_destination_clients_for_source_chain()?
+                .into_iter()
+                .filter(|client_id| {
+                    !previous_client_ids
+                        .iter()
+                        .any(|previous_id| previous_id == client_id.as_str())
+                })
+                .max_by_key(|client_id| parse_client_counter(client_id.as_str()));
+
+            if let Some(client_id) = newest_observed {
+                return Ok(client_id);
+            }
+
+            if attempt + 1 < CREATE_CLIENT_DISCOVERY_MAX_RETRIES {
+                debug!(
+                    retries_remaining = CREATE_CLIENT_DISCOVERY_MAX_RETRIES - attempt - 1,
+                    "create client emitted no parsable event, waiting for destination chain indexers"
+                );
+                thread::sleep(CREATE_CLIENT_DISCOVERY_RETRY_DELAY);
+            }
+        }
+
+        let latest_known_client = self
+            .query_destination_clients_for_source_chain()?
+            .into_iter()
+            .max_by_key(|client_id| parse_client_counter(client_id.as_str()));
+
+        if let Some(client_id) = latest_known_client {
+            return Err(ForeignClientError::client_create(
+                self.dst_chain.id(),
+                format!(
+                    "create client returned no events and no new matching client id appeared on destination chain (latest observed: {})",
+                    client_id
+                ),
+                RelayerError::event(),
+            ));
+        }
+
+        Err(ForeignClientError::client_create(
+            self.dst_chain.id(),
+            "create client returned no events and no matching client id was found on destination chain".to_string(),
+            RelayerError::event(),
+        ))
     }
 
     #[instrument(
@@ -910,6 +1036,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 config.client_refresh_rate
             }
             ChainConfig::Penumbra(config) => config.client_refresh_rate,
+            ChainConfig::Cardano(config) => config.client_refresh_rate,
         };
 
         let refresh_period = client_state
@@ -1069,12 +1196,25 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             )
         })?;
 
+        let local_ts_adjusted = || {
+            (Timestamp::now() + client_state.max_clock_drift()).map_err(|e| {
+                ForeignClientError::client_update_timing(
+                    self.dst_chain.id(),
+                    client_state.max_clock_drift(),
+                    "failed to adjust local clock with clock drift".to_string(),
+                    e,
+                )
+            })
+        };
+
         if header.timestamp().after(&ts_adjusted) {
             // Header would be considered in the future, wait for destination chain to
-            // advance to the next height.
+            // advance to the next height. For Cardano/probabilistic mode, the accepted proof height
+            // can legitimately stay flat while wall-clock time keeps advancing, so also allow
+            // the local clock to satisfy the delay bound.
             warn!(
                 "src header {} is after dst latest header {} + client state drift {},\
-                 wait for next height on {}",
+                 wait for next height on {} or for local time to catch up",
                 header.timestamp(),
                 status.timestamp,
                 PrettyDuration(&client_state.max_clock_drift()),
@@ -1083,6 +1223,10 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
 
             let target_dst_height = status.height.increment();
             loop {
+                if !header.timestamp().after(&local_ts_adjusted()?) {
+                    break;
+                }
+
                 thread::sleep(Duration::from_millis(300));
                 status = self.dst_chain().query_application_status().map_err(|e| {
                     ForeignClientError::client_update(
@@ -1108,7 +1252,11 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 )
             })?;
 
-        if header.timestamp().after(&next_ts_adjusted) {
+        let next_local_ts_adjusted = local_ts_adjusted()?;
+
+        if header.timestamp().after(&next_ts_adjusted)
+            && header.timestamp().after(&next_local_ts_adjusted)
+        {
             // The header is still in the future
             Err(ForeignClientError::header_in_the_future(
                 self.src_chain.id(),
@@ -1226,6 +1374,24 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         );
         // Get the latest client state on destination.
         let (client_state, _) = self.validated_client_state()?;
+
+        if client_state.latest_height() >= target_height {
+            debug!(
+                latest_height = %client_state.latest_height(),
+                %target_height,
+                "client already at or above target height, skipping update"
+            );
+
+            telemetry!(
+                client_updates_skipped,
+                &self.src_chain.id(),
+                &self.dst_chain.id(),
+                &self.id,
+                1,
+            );
+
+            return Ok(vec![]);
+        }
 
         let trusted_height = match maybe_trusted_height {
             Some(trusted_height) => {
@@ -1657,9 +1823,12 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 break;
             }
 
-            // No header in events, cannot run misbehavior.
-            // May happen on chains running older SDKs (e.g., Akash)
-            if update_event.header.is_none() {
+            // No header in events, cannot run misbehavior. Cardano update-client
+            // events do not currently carry the submitted client message, so the
+            // Cardano chain-specific checker is allowed to skip cleanly.
+            if update_event.header.is_none()
+                && !client_type_allows_missing_update_header(update_event.client_type())
+            {
                 return Err(ForeignClientError::misbehaviour_exit(format!(
                     "could not extract header from update client event {:?} emitted by chain {}",
                     update_event,
@@ -1765,6 +1934,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 config.ccv_consumer_chain
             }
             ChainConfig::Penumbra(_) => false,
+            ChainConfig::Cardano(_) => false,
         };
 
         let mut msgs = vec![];
@@ -1780,42 +1950,39 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             );
         }
 
-        let tm_misbehaviour = match &evidence.misbehaviour {
-            AnyMisbehaviour::Tendermint(tm_misbehaviour) => Some(tm_misbehaviour.clone()),
-        }
-        .ok_or_else(|| {
-            ForeignClientError::misbehaviour_desc(format!(
-                "underlying evidence is not a Tendermint misbehaviour: {:?}",
-                evidence.misbehaviour
-            ))
-        })?;
-
         // If the misbehaving chain is a CCV consumer chain, we need to add
         // the corresponding CCV message for the provider.
         if is_ccv_consumer_chain {
-            match fetch_ccv_consumer_id(&self.dst_chain(), &self.id) {
-                Ok(consumer_id) => {
-                    msgs.push(
-                        MsgSubmitIcsConsumerMisbehaviour {
-                            submitter: signer.clone(),
-                            misbehaviour: tm_misbehaviour,
-                            consumer_id,
-                        }
-                        .to_any(),
-                    );
+            if let AnyMisbehaviour::Tendermint(tm_misbehaviour) = &evidence.misbehaviour {
+                match fetch_ccv_consumer_id(&self.dst_chain(), &self.id) {
+                    Ok(consumer_id) => {
+                        msgs.push(
+                            MsgSubmitIcsConsumerMisbehaviour {
+                                submitter: signer.clone(),
+                                misbehaviour: tm_misbehaviour.clone(),
+                                consumer_id,
+                            }
+                            .to_any(),
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "cannot build CCV misbehaviour evidence: failed to fetch CCV consumer id for client {}: {}",
+                            self.id, e
+                        );
+                    }
                 }
-                Err(e) => {
-                    error!(
-                        "cannot build CCV misbehaviour evidence: failed to fetch CCV consumer id for client {}: {}",
-                        self.id, e
-                    );
-                }
+            } else {
+                warn!(
+                    "skipping CCV misbehaviour evidence for non-Tendermint client message {}",
+                    evidence.misbehaviour
+                );
             }
         }
 
         msgs.push(
-            MsgSubmitMisbehaviour {
-                misbehaviour: evidence.misbehaviour.into(),
+            MsgUpdateClient {
+                header: evidence.misbehaviour.into(),
                 client_id: self.id.clone(),
                 signer,
             }
@@ -1947,6 +2114,39 @@ pub fn extract_client_id(event: &IbcEvent) -> Result<&ClientId, ForeignClientErr
         _ => Err(ForeignClientError::missing_client_id_from_event(
             event.clone(),
         )),
+    }
+}
+
+fn parse_client_counter(client_id: &str) -> u64 {
+    client_id
+        .rsplit('-')
+        .next()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or_default()
+}
+
+fn client_type_allows_missing_update_header(client_type: ClientType) -> bool {
+    matches!(
+        client_type,
+        ClientType::CardanoMithril | ClientType::CardanoProbabilistic
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{client_type_allows_missing_update_header, ClientType};
+
+    #[test]
+    fn cardano_clients_may_skip_misbehaviour_without_update_header() {
+        assert!(client_type_allows_missing_update_header(
+            ClientType::CardanoMithril
+        ));
+        assert!(client_type_allows_missing_update_header(
+            ClientType::CardanoProbabilistic
+        ));
+        assert!(!client_type_allows_missing_update_header(
+            ClientType::Tendermint
+        ));
     }
 }
 

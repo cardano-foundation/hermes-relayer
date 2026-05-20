@@ -479,6 +479,27 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
             .map(|h| h.decrement().map_err(|e| LinkError::decrement_height(h, e)))
             .transpose()?;
 
+        let clear_height = if let Some(clear_height) = clear_height {
+            let latest_src_height = self.src_latest_height()?;
+            let capped_clear_height =
+                cap_packet_clearing_height_to_latest(clear_height, latest_src_height);
+
+            if capped_clear_height != clear_height {
+                warn!(
+                    %clear_height,
+                    %latest_src_height,
+                    %capped_clear_height,
+                    src_chain = %self.src_chain().id(),
+                    src_channel = %self.src_channel_id(),
+                    "packet clearing query height is ahead of source latest height; capping to avoid waiting for an unavailable proof height",
+                );
+            }
+
+            Some(capped_clear_height)
+        } else {
+            None
+        };
+
         self.relay_pending_packets(clear_height, clear_limit)?;
 
         debug!(height = ?clear_height, "done relaying pending packets at clear height");
@@ -1180,10 +1201,28 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
         }
 
         // Retain only sequences which should not be filtered out
-        let raw_sequences: Vec<Sequence> = sequences
+        let mut raw_sequences: Vec<Sequence> = sequences
             .into_iter()
             .filter(|sequence| !self.exclude_src_sequences.contains(sequence))
             .collect();
+        raw_sequences.sort();
+
+        let raw_sequences = if self.ordered_channel() && raw_sequences.len() > 1 {
+            let earliest = raw_sequences[0];
+            let blocked = &raw_sequences[1..];
+            warn!(
+                src_chain = %self.src_chain().id(),
+                dst_chain = %self.dst_chain().id(),
+                src_channel = %self.src_channel_id(),
+                dst_channel = %self.dst_channel_id(),
+                earliest_sequence = %earliest,
+                blocked_sequences = %blocked.iter().copied().collated().format(", "),
+                "ordered channel has later unreceived packets blocked behind an earlier packet; attempting to clear the earliest sequence first",
+            );
+            vec![earliest]
+        } else {
+            raw_sequences
+        };
 
         let sequences = &raw_sequences[..raw_sequences.len().min(clear_limit)];
 
@@ -1363,6 +1402,14 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
         } else {
             (PacketMsgType::TimeoutUnordered, packet.sequence)
         };
+        info!(
+            src_chain = %self.src_chain().id(),
+            dst_chain = %self.dst_chain().id(),
+            packet_sequence = %packet.sequence,
+            next_sequence_received = %next_sequence_received,
+            packet_type = ?packet_type,
+            "building packet timeout for pending packet",
+        );
 
         let proofs = self
             .dst_chain()
@@ -1975,6 +2022,15 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
     }
 }
 
+fn cap_packet_clearing_height_to_latest(clear_height: Height, latest_src_height: Height) -> Height {
+    // Packet clearing cannot build proofs beyond the source chain's latest queryable height.
+    if clear_height > latest_src_height {
+        latest_src_height
+    } else {
+        clear_height
+    }
+}
+
 #[tracing::instrument(skip_all)]
 fn check_ics20_fields_size(
     data: &[u8],
@@ -2003,5 +2059,34 @@ fn check_ics20_fields_size(
 
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn height(revision_height: u64) -> Height {
+        Height::new(0, revision_height).expect("valid test height")
+    }
+
+    #[test]
+    fn packet_clearing_height_is_capped_when_ahead_of_latest_source_height() {
+        assert_eq!(
+            cap_packet_clearing_height_to_latest(height(20), height(10)),
+            height(10)
+        );
+    }
+
+    #[test]
+    fn packet_clearing_height_is_unchanged_when_not_ahead_of_latest_source_height() {
+        assert_eq!(
+            cap_packet_clearing_height_to_latest(height(10), height(10)),
+            height(10)
+        );
+        assert_eq!(
+            cap_packet_clearing_height_to_latest(height(5), height(10)),
+            height(5)
+        );
     }
 }
