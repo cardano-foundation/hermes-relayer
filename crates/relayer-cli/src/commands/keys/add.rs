@@ -11,10 +11,10 @@ use eyre::eyre;
 use hdpath::StandardHDPath;
 use ibc_relayer::{
     chain::{
-        cardano::signing_key_pair::CardanoSigningKeyPair,
-        chain::stellar::signing_key_pair::StellarSigningKeyPair, namada::wallet::CliWalletUtils,
+        cardano::signing_key_pair::CardanoSigningKeyPair, namada::wallet::CliWalletUtils,
+        stellar::signing_key_pair::StellarSigningKeyPair,
     },
-    config::{ChainConfig, Config},
+    config::{AddressType, ChainConfig, Config},
     keyring::{
         AnySigningKeyPair, KeyRing, NamadaKeyPair, Secp256k1KeyPair, SigningKeyPair,
         SigningKeyPairSized, Store,
@@ -281,6 +281,10 @@ pub fn add_key(
             let mut keyring: KeyRing<StellarSigningKeyPair> =
                 KeyRing::new(Store::Test, "stellar", &config.id, &None)?;
 
+            check_key_exists(&keyring, key_name, overwrite);
+
+            let key_contents =
+                fs::read_to_string(file).map_err(|_| eyre!("error reading the key file"))?;
             let key_pair = StellarSigningKeyPair::from_seed_file(&key_contents, hd_path)?;
 
             keyring.add_key(key_name, key_pair.clone())?;
@@ -358,7 +362,7 @@ pub fn restore_key(
                 hdpath,
                 &AddressType::Cosmos,
                 "",
-            );
+            )?;
 
             keyring.add_key(key_name, key_pair.clone())?;
             key_pair.into()

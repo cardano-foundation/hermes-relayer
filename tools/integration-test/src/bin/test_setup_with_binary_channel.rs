@@ -54,6 +54,7 @@ impl TestOverrides for Test {
                 }
                 ChainConfig::Cardano(_) => { /* no-op */ }
                 ChainConfig::Penumbra(_) => { /* no-op */ }
+                ChainConfig::Stellar(_) => { /* no-op */ }
             }
         }
     }

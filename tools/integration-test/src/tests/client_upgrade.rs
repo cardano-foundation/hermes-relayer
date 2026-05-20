@@ -174,6 +174,7 @@ impl BinaryChainTest for ClientUpgradeTest {
                 Ok(())
             }
             AnyClientState::Mithril(_) => unreachable!("unexpected client state type"),
+            AnyClientState::Probabilistic(_) => unreachable!("unexpected client state type"),
         }
     }
 }
@@ -228,6 +229,7 @@ impl BinaryChainTest for InvalidClientUpgradeTest {
                 Ok(())
             }
             AnyClientState::Mithril(_) => unreachable!("unexpected client state type"),
+            AnyClientState::Probabilistic(_) => unreachable!("unexpected client state type"),
         }
     }
 }
@@ -329,6 +331,7 @@ impl BinaryChainTest for HeightTooHighClientUpgradeTest {
                 Ok(())
             }
             AnyClientState::Mithril(_) => unreachable!("unexpected client state type"),
+            AnyClientState::Probabilistic(_) => unreachable!("unexpected client state type"),
         }
     }
 }
@@ -433,6 +436,7 @@ impl BinaryChainTest for HeightTooLowClientUpgradeTest {
                 Ok(())
             }
             AnyClientState::Mithril(_) => unreachable!("unexpected client state type"),
+            AnyClientState::Probabilistic(_) => unreachable!("unexpected client state type"),
         }
     }
 }

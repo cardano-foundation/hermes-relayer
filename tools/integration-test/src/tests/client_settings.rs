@@ -34,6 +34,7 @@ impl TestOverrides for ClientDefaultsTest {
             }
             ChainConfig::Penumbra(_) => { /* no-op */ }
             ChainConfig::Cardano(_) => { /* no-op */ }
+            ChainConfig::Stellar(_) => { /* no-op */ }
         }
 
         match &mut config.chains[1] {
@@ -45,6 +46,7 @@ impl TestOverrides for ClientDefaultsTest {
             }
             ChainConfig::Penumbra(_) => { /* no-op */ }
             ChainConfig::Cardano(_) => { /* no-op */ }
+            ChainConfig::Stellar(_) => { /* no-op */ }
         }
     }
 }

@@ -38,6 +38,7 @@ pub fn update_relayer_config_for_consumer_chain(config: &mut Config) {
             ChainConfig::CosmosSdk(_) | ChainConfig::Namada(_) => {}
             ChainConfig::Penumbra(_) => { /* no-op Penumbra does not support CCV */ }
             ChainConfig::Cardano(_) => { /* no-op Cardano does not support CCV */ }
+            ChainConfig::Stellar(_) => { /* no-op Stellar does not support CCV */ }
         }
     }
 }

@@ -50,7 +50,7 @@ impl StellarEventSource {
             last_height: 0,
         };
 
-        (source, TxEventSourceCmd::from_sender(tx_cmd))
+        (source, TxEventSourceCmd::new(tx_cmd))
     }
 
     pub fn run(mut self) {

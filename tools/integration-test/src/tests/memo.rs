@@ -41,6 +41,7 @@ impl TestOverrides for MemoTest {
                 }
                 ChainConfig::Penumbra(_) => { /* no-op */ }
                 ChainConfig::Cardano(_) => { /* no-op */ }
+                ChainConfig::Stellar(_) => { /* no-op */ }
             }
         }
     }
@@ -103,6 +104,7 @@ impl TestOverrides for MemoOverwriteTest {
                 }
                 ChainConfig::Penumbra(_) => { /* no-op */ }
                 ChainConfig::Cardano(_) => { /* no-op */ }
+                ChainConfig::Stellar(_) => { /* no-op */ }
             }
         }
     }

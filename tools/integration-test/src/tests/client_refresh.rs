@@ -136,6 +136,7 @@ impl BinaryChainTest for ClientFailsTest {
                         }
                         ChainConfig::Penumbra(_) => { /* no-op */ }
                         ChainConfig::Cardano(_) => { /* no-op */ }
+                        ChainConfig::Stellar(_) => { /* no-op */ }
                     }
                 }
 
@@ -148,6 +149,7 @@ impl BinaryChainTest for ClientFailsTest {
                     }
                     ChainConfig::Penumbra(_) => { /* no-op */ }
                     ChainConfig::Cardano(_) => { /* no-op */ }
+                    ChainConfig::Stellar(_) => { /* no-op */ }
                 }
             },
             config,
