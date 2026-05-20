@@ -2132,24 +2132,6 @@ fn client_type_allows_missing_update_header(client_type: ClientType) -> bool {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{client_type_allows_missing_update_header, ClientType};
-
-    #[test]
-    fn cardano_clients_may_skip_misbehaviour_without_update_header() {
-        assert!(client_type_allows_missing_update_header(
-            ClientType::CardanoMithril
-        ));
-        assert!(client_type_allows_missing_update_header(
-            ClientType::CardanoProbabilistic
-        ));
-        assert!(!client_type_allows_missing_update_header(
-            ClientType::Tendermint
-        ));
-    }
-}
-
 pub fn fetch_ccv_consumer_id(
     provider: &impl ChainHandle,
     client_id: &ClientId,
@@ -2166,4 +2148,22 @@ pub fn fetch_ccv_consumer_id(
     })?;
 
     Ok(consumer_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{client_type_allows_missing_update_header, ClientType};
+
+    #[test]
+    fn cardano_clients_may_skip_misbehaviour_without_update_header() {
+        assert!(client_type_allows_missing_update_header(
+            ClientType::CardanoMithril
+        ));
+        assert!(client_type_allows_missing_update_header(
+            ClientType::CardanoProbabilistic
+        ));
+        assert!(!client_type_allows_missing_update_header(
+            ClientType::Tendermint
+        ));
+    }
 }
