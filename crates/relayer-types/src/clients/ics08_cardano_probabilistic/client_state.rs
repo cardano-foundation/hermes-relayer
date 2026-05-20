@@ -27,7 +27,6 @@ pub struct ClientState {
     pub frozen_height: Option<Height>,
     pub current_epoch: u64,
     pub trusting_period: Duration,
-    pub heuristic_params: raw::HeuristicParams,
     pub upgrade_path: Vec<String>,
     pub host_state_nft_policy_id: Vec<u8>,
     pub host_state_nft_token_name: Vec<u8>,
@@ -75,7 +74,6 @@ impl TryFrom<RawClientState> for ClientState {
             frozen_height,
             current_epoch,
             trusting_period,
-            heuristic_params,
             upgrade_path,
             host_state_nft_policy_id,
             host_state_nft_token_name,
@@ -100,9 +98,6 @@ impl TryFrom<RawClientState> for ClientState {
         let trusting_period = trusting_period
             .and_then(|d| duration_from_proto(d).ok())
             .ok_or_else(|| Error::missing_field("trusting_period"))?;
-
-        let heuristic_params =
-            heuristic_params.ok_or_else(|| Error::missing_field("heuristic_params"))?;
 
         if host_state_nft_policy_id.is_empty() {
             return Err(Error::missing_field("host_state_nft_policy_id"));
@@ -151,7 +146,6 @@ impl TryFrom<RawClientState> for ClientState {
             frozen_height,
             current_epoch,
             trusting_period,
-            heuristic_params,
             upgrade_path,
             host_state_nft_policy_id,
             host_state_nft_token_name,
@@ -175,7 +169,6 @@ impl From<ClientState> for RawClientState {
             frozen_height: value.frozen_height.map(Into::into),
             current_epoch: value.current_epoch,
             trusting_period: Some(duration_to_proto(value.trusting_period)),
-            heuristic_params: Some(value.heuristic_params),
             upgrade_path: value.upgrade_path,
             host_state_nft_policy_id: value.host_state_nft_policy_id,
             host_state_nft_token_name: value.host_state_nft_token_name,

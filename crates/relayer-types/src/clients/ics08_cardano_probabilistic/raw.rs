@@ -11,22 +11,6 @@ pub struct Height {
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
-pub struct HeuristicParams {
-    #[prost(uint64, tag = "4")]
-    pub threshold_depth: u64,
-    #[prost(uint64, tag = "5")]
-    pub threshold_unique_pools: u64,
-    #[prost(uint64, tag = "6")]
-    pub threshold_unique_stake_bps: u64,
-    #[prost(uint64, tag = "7")]
-    pub depth_weight_bps: u64,
-    #[prost(uint64, tag = "8")]
-    pub pools_weight_bps: u64,
-    #[prost(uint64, tag = "9")]
-    pub stake_weight_bps: u64,
-}
-
-#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 pub struct StakeDistributionEntry {
     #[prost(string, tag = "1")]
     pub pool_id: ::prost::alloc::string::String,
@@ -66,8 +50,6 @@ pub struct ClientState {
     pub current_epoch: u64,
     #[prost(message, optional, tag = "5")]
     pub trusting_period: ::core::option::Option<ibc_proto::google::protobuf::Duration>,
-    #[prost(message, optional, tag = "6")]
-    pub heuristic_params: ::core::option::Option<HeuristicParams>,
     #[prost(string, repeated, tag = "7")]
     pub upgrade_path: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(bytes = "vec", tag = "8")]
