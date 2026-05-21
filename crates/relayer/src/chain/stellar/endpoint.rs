@@ -602,3 +602,76 @@ fn ledger_close_time_secs(ledger_header_xdr: &[u8]) -> Result<u64, Error> {
         .map_err(|e| Error::query(format!("LedgerHeader XDR decode failed: {e}")))?;
     Ok(header.scp_value.close_time.0)
 }
+
+async fn dispatch_msg(
+    msg_client: &StdMutex<GatewayMsgClient>,
+    type_url: &str,
+    value: Vec<u8>,
+    signer: &str,
+) -> Result<(), Error> {
+    use ibc_proto::ibc::core::client::v1 as cosmos_client;
+
+    match type_url {
+        "/ibc.core.client.v1.MsgCreateClient" => {
+            let m = cosmos_client::MsgCreateClient::decode(value.as_slice())
+                .map_err(|e| Error::send_tx(format!("MsgCreateClient decode: {e}")))?;
+            let cs_bytes = m.client_state.map(|a| a.value).unwrap_or_default();
+            let cons_bytes = m.consensus_state.map(|a| a.value).unwrap_or_default();
+            let mut guard = msg_client.lock().unwrap();
+            guard
+                .create_client(super::gateway_client::MsgCreateClientRequest {
+                    client_state: cs_bytes,
+                    consensus_state: cons_bytes,
+                    signer: if m.signer.is_empty() {
+                        signer.to_string()
+                    } else {
+                        m.signer
+                    },
+                })
+                .await
+                .map_err(|e| Error::send_tx(format!("gateway create_client failed: {e}")))?;
+        }
+        "/ibc.core.client.v1.MsgUpdateClient" => {
+            let m = cosmos_client::MsgUpdateClient::decode(value.as_slice())
+                .map_err(|e| Error::send_tx(format!("MsgUpdateClient decode: {e}")))?;
+            let header_bytes = m.client_message.map(|a| a.value).unwrap_or_default();
+            let mut guard = msg_client.lock().unwrap();
+            guard
+                .update_client(super::gateway_client::MsgUpdateClientRequest {
+                    client_id: m.client_id,
+                    header: header_bytes,
+                    signer: if m.signer.is_empty() {
+                        signer.to_string()
+                    } else {
+                        m.signer
+                    },
+                })
+                .await
+                .map_err(|e| Error::send_tx(format!("gateway update_client failed: {e}")))?;
+        }
+        other => {
+            return Err(Error::send_tx(format!(
+                "Stellar endpoint does not yet encode message type {other}",
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn decode_merkle_proof(bytes: &[u8]) -> Result<Option<MerkleProof>, Error> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let raw = ibc_proto::ibc::core::commitment::v1::MerkleProof::decode(bytes)
+        .map_err(|e| Error::query(format!("MerkleProof decode failed: {e}")))?;
+    Ok(Some(MerkleProof::from(raw)))
+}
+
+fn ledger_previous_hash(ledger_header_xdr: &[u8]) -> Result<Vec<u8>, Error> {
+    use stellar_xdr::curr::{LedgerHeader, Limits, ReadXdr};
+
+    let header = LedgerHeader::from_xdr(ledger_header_xdr, Limits::none())
+        .map_err(|e| Error::query(format!("LedgerHeader XDR decode failed: {e}")))?;
+    Ok(header.previous_ledger_hash.0.to_vec())
+}
