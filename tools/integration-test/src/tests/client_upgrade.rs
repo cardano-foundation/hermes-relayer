@@ -173,8 +173,11 @@ impl BinaryChainTest for ClientUpgradeTest {
                 assert_eq!(client_state.chain_id, upgraded_chain_id);
                 Ok(())
             }
-            AnyClientState::Mithril(_) => unreachable!("unexpected client state type"),
-            AnyClientState::Probabilistic(_) => unreachable!("unexpected client state type"),
+            AnyClientState::Mithril(_)
+            | AnyClientState::Probabilistic(_)
+            | AnyClientState::Stellar(_) => {
+                unreachable!("unexpected client state type")
+            }
         }
     }
 }
@@ -228,8 +231,11 @@ impl BinaryChainTest for InvalidClientUpgradeTest {
                 assert_eq!(client_state.chain_id, chains.handle_a().id());
                 Ok(())
             }
-            AnyClientState::Mithril(_) => unreachable!("unexpected client state type"),
-            AnyClientState::Probabilistic(_) => unreachable!("unexpected client state type"),
+            AnyClientState::Mithril(_)
+            | AnyClientState::Probabilistic(_)
+            | AnyClientState::Stellar(_) => {
+                unreachable!("unexpected client state type")
+            }
         }
     }
 }
@@ -330,8 +336,11 @@ impl BinaryChainTest for HeightTooHighClientUpgradeTest {
                 assert_eq!(client_state.chain_id, chains.handle_a().id());
                 Ok(())
             }
-            AnyClientState::Mithril(_) => unreachable!("unexpected client state type"),
-            AnyClientState::Probabilistic(_) => unreachable!("unexpected client state type"),
+            AnyClientState::Mithril(_)
+            | AnyClientState::Probabilistic(_)
+            | AnyClientState::Stellar(_) => {
+                unreachable!("unexpected client state type")
+            }
         }
     }
 }
@@ -435,8 +444,11 @@ impl BinaryChainTest for HeightTooLowClientUpgradeTest {
                 assert_eq!(client_state.chain_id, chains.handle_a().id());
                 Ok(())
             }
-            AnyClientState::Mithril(_) => unreachable!("unexpected client state type"),
-            AnyClientState::Probabilistic(_) => unreachable!("unexpected client state type"),
+            AnyClientState::Mithril(_)
+            | AnyClientState::Probabilistic(_)
+            | AnyClientState::Stellar(_) => {
+                unreachable!("unexpected client state type")
+            }
         }
     }
 }

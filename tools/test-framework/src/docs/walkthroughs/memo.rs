@@ -34,6 +34,7 @@
 //!                 ChainConfig::CosmosSdk(chain_config) | ChainConfig::Namada(chain_config) => {
 //!                     chain_config.memo_prefix = self.memo.clone();
 //!                 }
+//!                 _ => {}
 //!             }
 //!         }
 //!     }
