@@ -502,10 +502,33 @@ impl ChainEndpoint for StellarChainEndpoint {
 
     fn query_packet_receipt(
         &self,
-        _request: QueryPacketReceiptRequest,
+        request: QueryPacketReceiptRequest,
         _include_proof: IncludeProof,
     ) -> Result<(Vec<u8>, Option<MerkleProof>), Error> {
-        unimplemented!()
+        let height = match request.height {
+            QueryHeight::Latest => self.query_application_status()?.height.revision_height(),
+            QueryHeight::Specific(h) => h.revision_height(),
+        };
+        let resp = self
+            .rt
+            .block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                guard
+                    .query_packet_receipt(super::gateway_client::QueryPacketReceiptRequest {
+                        client_id: request.channel_id.to_string(),
+                        sequence: request.sequence.into(),
+                        height,
+                    })
+                    .await
+            })
+            .map_err(|e| {
+                Error::query(format!(
+                    "Stellar gateway query_packet_receipt failed: {e}"
+                ))
+            })?;
+        let proof = decode_merkle_proof(&resp.proof)?;
+        let value = if resp.received { vec![0x01] } else { Vec::new() };
+        Ok((value, proof))
     }
 
     fn query_unreceived_packets(
@@ -517,10 +540,32 @@ impl ChainEndpoint for StellarChainEndpoint {
 
     fn query_packet_acknowledgement(
         &self,
-        _request: QueryPacketAcknowledgementRequest,
+        request: QueryPacketAcknowledgementRequest,
         _include_proof: IncludeProof,
     ) -> Result<(Vec<u8>, Option<MerkleProof>), Error> {
-        unimplemented!()
+        let height = match request.height {
+            QueryHeight::Latest => self.query_application_status()?.height.revision_height(),
+            QueryHeight::Specific(h) => h.revision_height(),
+        };
+        let resp = self
+            .rt
+            .block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                guard
+                    .query_acknowledgement(super::gateway_client::QueryAcknowledgementRequest {
+                        client_id: request.channel_id.to_string(),
+                        sequence: request.sequence.into(),
+                        height,
+                    })
+                    .await
+            })
+            .map_err(|e| {
+                Error::query(format!(
+                    "Stellar gateway query_acknowledgement failed: {e}"
+                ))
+            })?;
+        let proof = decode_merkle_proof(&resp.proof)?;
+        Ok((resp.acknowledgement, proof))
     }
 
     fn query_packet_acknowledgements(
