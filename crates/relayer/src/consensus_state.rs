@@ -13,6 +13,9 @@ use ibc_relayer_types::clients::ics08_cardano::consensus_state::{
 use ibc_relayer_types::clients::ics08_cardano_probabilistic::consensus_state::{
     ConsensusState as ProbabilisticConsensusState, PROBABILISTIC_CONSENSUS_STATE_TYPE_URL,
 };
+use ibc_relayer_types::clients::ics10_stellar::consensus_state::{
+    ConsensusState as StellarConsensusState, STELLAR_CONSENSUS_STATE_TYPE_URL,
+};
 
 use ibc_relayer_types::core::ics02_client::client_type::ClientType;
 use ibc_relayer_types::core::ics02_client::consensus_state::ConsensusState;
@@ -30,6 +33,8 @@ pub enum AnyConsensusState {
     Mithril(MithrilConsensusState),
     /// Probabilistic Cardano consensus state (`08-cardano-probabilistic`), encoded as `ibc.lightclients.probabilistic.v1.ConsensusState`.
     Probabilistic(ProbabilisticConsensusState),
+    /// Stellar consensus state (`10-stellar`), encoded as `ibc.lightclients.stellar.v1.ConsensusState`.
+    Stellar(StellarConsensusState),
 }
 
 impl AnyConsensusState {
@@ -38,6 +43,7 @@ impl AnyConsensusState {
             Self::Tendermint(cs_state) => cs_state.timestamp.into(),
             Self::Mithril(cs_state) => ConsensusState::timestamp(cs_state),
             Self::Probabilistic(cs_state) => ConsensusState::timestamp(cs_state),
+            Self::Stellar(cs_state) => ConsensusState::timestamp(cs_state),
         }
     }
 
@@ -46,6 +52,7 @@ impl AnyConsensusState {
             AnyConsensusState::Tendermint(_cs) => ClientType::Tendermint,
             AnyConsensusState::Mithril(_cs) => ClientType::CardanoMithril,
             AnyConsensusState::Probabilistic(_cs) => ClientType::CardanoProbabilistic,
+            AnyConsensusState::Stellar(_cs) => ClientType::Stellar,
         }
     }
 }
@@ -68,6 +75,9 @@ impl TryFrom<Any> for AnyConsensusState {
             PROBABILISTIC_CONSENSUS_STATE_TYPE_URL => {
                 Ok(AnyConsensusState::Probabilistic(value.try_into()?))
             }
+            STELLAR_CONSENSUS_STATE_TYPE_URL => {
+                Ok(AnyConsensusState::Stellar(value.try_into()?))
+            }
 
             _ => Err(Error::unknown_consensus_state_type(value.type_url)),
         }
@@ -83,6 +93,7 @@ impl From<AnyConsensusState> for Any {
             },
             AnyConsensusState::Mithril(value) => value.into(),
             AnyConsensusState::Probabilistic(value) => value.into(),
+            AnyConsensusState::Stellar(value) => value.into(),
         }
     }
 }
@@ -102,6 +113,12 @@ impl From<MithrilConsensusState> for AnyConsensusState {
 impl From<ProbabilisticConsensusState> for AnyConsensusState {
     fn from(cs: ProbabilisticConsensusState) -> Self {
         Self::Probabilistic(cs)
+    }
+}
+
+impl From<StellarConsensusState> for AnyConsensusState {
+    fn from(cs: StellarConsensusState) -> Self {
+        Self::Stellar(cs)
     }
 }
 
@@ -152,6 +169,7 @@ impl ConsensusState for AnyConsensusState {
             Self::Tendermint(cs_state) => cs_state.root(),
             Self::Mithril(cs_state) => ConsensusState::root(cs_state),
             Self::Probabilistic(cs_state) => ConsensusState::root(cs_state),
+            Self::Stellar(cs_state) => ConsensusState::root(cs_state),
         }
     }
 
