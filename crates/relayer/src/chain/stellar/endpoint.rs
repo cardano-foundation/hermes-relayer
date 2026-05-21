@@ -468,7 +468,29 @@ impl ChainEndpoint for StellarChainEndpoint {
         &self,
         _request: QueryHostConsensusStateRequest,
     ) -> Result<Self::ConsensusState, Error> {
-        unimplemented!()
+        let status = self.query_application_status()?;
+        let target = ICSHeight::new(0, status.height.revision_height())
+            .map_err(|e| Error::query(format!("invalid Stellar height: {e}")))?;
+        let lb = self
+            .rt
+            .block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                guard
+                    .query_ibc_header(QueryIbcHeaderRequest {
+                        height: target.revision_height(),
+                    })
+                    .await
+            })
+            .map_err(|e| Error::query(format!("query_ibc_header failed: {e}")))?;
+        let wire = gateway_client::StellarHeader::decode(lb.header.as_slice())
+            .map_err(|e| Error::query(format!("StellarHeader decode failed: {e}")))?;
+        let close_time = ledger_close_time_secs(&wire.ledger_header_xdr)?;
+        let ledger_hash = ledger_previous_hash(&wire.ledger_header_xdr)?;
+        Ok(AnyConsensusState::Stellar(StellarConsensusState {
+            root: CommitmentRoot::from_bytes(&wire.ibc_state_root),
+            timestamp: close_time,
+            ledger_hash,
+        }))
     }
 
     fn build_client_state(
