@@ -1,4 +1,6 @@
 use alloc::sync::Arc;
+use core::str::FromStr;
+use std::sync::Mutex as StdMutex;
 
 use ibc_proto::ibc::apps::fee::v1::{
     QueryIncentivizedPacketRequest, QueryIncentivizedPacketResponse,
@@ -6,6 +8,8 @@ use ibc_proto::ibc::apps::fee::v1::{
 use ibc_proto::ibc::core::channel::v1::{QueryUpgradeErrorRequest, QueryUpgradeRequest};
 use ibc_relayer_types::applications::ics28_ccv::msgs::{ConsumerChain, ConsumerId};
 use ibc_relayer_types::applications::ics31_icq::response::CrossChainQueryResponse;
+use ibc_relayer_types::clients::ics10_stellar::header::Header as StellarHeader;
+use ibc_relayer_types::clients::ics10_stellar::raw as stellar_raw;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
 use ibc_relayer_types::core::ics02_client::header::AnyHeader;
 use ibc_relayer_types::core::ics02_client::height::Height;
@@ -21,33 +25,45 @@ use ibc_relayer_types::core::ics24_host::identifier::{
 use ibc_relayer_types::signer::Signer;
 use ibc_relayer_types::timestamp::Timestamp;
 use ibc_relayer_types::Height as ICSHeight;
+use prost::Message as _;
 use tendermint_rpc::endpoint::broadcast::tx_sync::Response as TxResponse;
 use tokio::runtime::Runtime as TokioRuntime;
 
 use crate::account::Balance;
 use crate::chain::client::ClientSettings;
+use crate::chain::cosmos::version::Specs as CosmosSpecs;
 use crate::chain::endpoint::{ChainEndpoint, ChainStatus, HealthCheck};
 use crate::chain::handle::Subscription;
 use crate::chain::requests::*;
 use crate::chain::tracking::TrackedMsgs;
 use crate::chain::version::Specs;
 use crate::client_state::{AnyClientState, IdentifiedAnyClientState};
-use crate::config::ChainConfig;
+use crate::config::{ChainConfig, Error as ConfigError};
 use crate::consensus_state::AnyConsensusState;
 use crate::denom::DenomTrace;
 use crate::error::Error;
 use crate::event::IbcEventWithHeight;
-use crate::keyring::KeyRing;
+use crate::keyring::{KeyRing, Store};
 use crate::misbehaviour::MisbehaviourEvidence;
 
 use super::config::StellarConfig;
+use super::gateway_client::{
+    self, GatewayMsgClient, GatewayQueryClient, QueryIbcHeaderRequest,
+};
 use super::signing_key_pair::StellarSigningKeyPair;
 
-pub struct StellarLightBlock;
+pub struct StellarLightBlock {
+    pub ledger_seq: u64,
+    pub ledger_hash: Vec<u8>,
+    pub ibc_state_root: Vec<u8>,
+    pub timestamp: Timestamp,
+}
 
 pub struct StellarChainEndpoint {
     pub config: StellarConfig,
     pub keyring: KeyRing<StellarSigningKeyPair>,
+    pub gateway_query: StdMutex<GatewayQueryClient>,
+    pub gateway_msg: StdMutex<GatewayMsgClient>,
     pub rt: Arc<TokioRuntime>,
 }
 
@@ -60,23 +76,70 @@ impl ChainEndpoint for StellarChainEndpoint {
     type SigningKeyPair = StellarSigningKeyPair;
 
     fn id(&self) -> &ChainId {
-        unimplemented!()
+        &self.config.id
     }
 
     fn config(&self) -> ChainConfig {
-        unimplemented!()
+        ChainConfig::Stellar(self.config.clone())
     }
 
-    fn bootstrap(_config: ChainConfig, _rt: Arc<TokioRuntime>) -> Result<Self, Error> {
-        unimplemented!()
+    fn bootstrap(config: ChainConfig, rt: Arc<TokioRuntime>) -> Result<Self, Error> {
+        let stellar_config = match config {
+            ChainConfig::Stellar(c) => c,
+            _ => return Err(Error::config(ConfigError::wrong_type())),
+        };
+
+        tracing::info!(
+            "Bootstrapping Stellar chain endpoint id={} gateway={}",
+            stellar_config.id,
+            stellar_config.gateway_url,
+        );
+
+        let gateway_query = rt
+            .block_on(GatewayQueryClient::connect(
+                stellar_config.gateway_url.clone(),
+            ))
+            .map_err(|e| {
+                tracing::error!("Stellar gateway query connect failed: {e}");
+                Error::config(ConfigError::wrong_type())
+            })?;
+        let gateway_msg = rt
+            .block_on(GatewayMsgClient::connect(stellar_config.gateway_url.clone()))
+            .map_err(|e| {
+                tracing::error!("Stellar gateway msg connect failed: {e}");
+                Error::config(ConfigError::wrong_type())
+            })?;
+
+        let keyring =
+            KeyRing::new(Store::Test, "stellar", &stellar_config.id, &None).map_err(Error::key_base)?;
+
+        Ok(Self {
+            config: stellar_config,
+            keyring,
+            gateway_query: StdMutex::new(gateway_query),
+            gateway_msg: StdMutex::new(gateway_msg),
+            rt,
+        })
     }
 
     fn shutdown(self) -> Result<(), Error> {
-        unimplemented!()
+        Ok(())
     }
 
     fn health_check(&mut self) -> Result<HealthCheck, Error> {
-        unimplemented!()
+        let resp = self
+            .rt
+            .block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                guard.latest_height().await
+            })
+            .map_err(|e| Error::query(format!("Stellar gateway latest_height failed: {e}")))?;
+        if resp.revision_height == 0 {
+            return Err(Error::query(
+                "Stellar gateway reported revision_height=0".to_string(),
+            ));
+        }
+        Ok(HealthCheck::Healthy)
     }
 
     fn subscribe(&mut self) -> Result<Subscription, Error> {
@@ -84,23 +147,37 @@ impl ChainEndpoint for StellarChainEndpoint {
     }
 
     fn keybase(&self) -> &KeyRing<Self::SigningKeyPair> {
-        unimplemented!()
+        &self.keyring
     }
 
     fn keybase_mut(&mut self) -> &mut KeyRing<Self::SigningKeyPair> {
-        unimplemented!()
+        &mut self.keyring
     }
 
     fn get_signer(&self) -> Result<Signer, Error> {
-        unimplemented!()
+        let key = self
+            .keyring
+            .get_key(&self.config.key_name)
+            .map_err(Error::key_base)?;
+        Signer::from_str(&key.account_id()).map_err(|e| {
+            Error::key_base(crate::keyring::errors::Error::invalid_mnemonic(
+                anyhow::anyhow!("Invalid Stellar signer address: {e}"),
+            ))
+        })
     }
 
     fn get_key(&self) -> Result<Self::SigningKeyPair, Error> {
-        unimplemented!()
+        self.keyring
+            .get_key(&self.config.key_name)
+            .map_err(Error::key_base)
     }
 
     fn version_specs(&self) -> Result<Specs, Error> {
-        unimplemented!()
+        Ok(Specs::Cosmos(CosmosSpecs {
+            cosmos_sdk: None,
+            ibc_go: None,
+            consensus: None,
+        }))
     }
 
     fn send_messages_and_wait_commit(
@@ -156,7 +233,42 @@ impl ChainEndpoint for StellarChainEndpoint {
     }
 
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
-        unimplemented!()
+        let latest = self
+            .rt
+            .block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                guard.latest_height().await
+            })
+            .map_err(|e| Error::query(format!("Stellar gateway latest_height failed: {e}")))?;
+
+        let height = ICSHeight::new(latest.revision_number, latest.revision_height)
+            .map_err(|e| Error::query(format!("invalid Stellar height from gateway: {e}")))?;
+
+        let header_resp = self
+            .rt
+            .block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                guard
+                    .query_ibc_header(super::gateway_client::QueryIbcHeaderRequest {
+                        height: height.revision_height(),
+                    })
+                    .await
+            })
+            .map_err(|e| {
+                Error::query(format!(
+                    "Stellar gateway query_ibc_header failed at {height}: {e}"
+                ))
+            })?;
+
+        let wire_header = gateway_client::StellarHeader::decode(header_resp.header.as_slice())
+            .map_err(|e| Error::query(format!("StellarHeader decode failed: {e}")))?;
+
+        let close_time_secs = ledger_close_time_secs(&wire_header.ledger_header_xdr)?;
+        let timestamp =
+            Timestamp::from_nanoseconds(close_time_secs.saturating_mul(1_000_000_000))
+                .map_err(|e| Error::query(format!("invalid Stellar close_time: {e}")))?;
+
+        Ok(ChainStatus { height, timestamp })
     }
 
     fn query_clients(
@@ -349,11 +461,51 @@ impl ChainEndpoint for StellarChainEndpoint {
 
     fn build_header(
         &mut self,
-        _trusted_height: ICSHeight,
-        _target_height: ICSHeight,
+        trusted_height: ICSHeight,
+        target_height: ICSHeight,
         _client_state: &AnyClientState,
     ) -> Result<(Self::Header, Vec<Self::Header>), Error> {
-        unimplemented!()
+        let resp = self
+            .rt
+            .block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                guard
+                    .query_ibc_header(QueryIbcHeaderRequest {
+                        height: target_height.revision_height(),
+                    })
+                    .await
+            })
+            .map_err(|e| {
+                Error::query(format!(
+                    "Stellar gateway query_ibc_header failed at {target_height}: {e}"
+                ))
+            })?;
+
+        let wire = gateway_client::StellarHeader::decode(resp.header.as_slice())
+            .map_err(|e| Error::query(format!("StellarHeader decode failed: {e}")))?;
+
+        let envelope = stellar_raw::ScpEnvelope {
+            node_id: wire.scp_node_id,
+            statement_xdr: Vec::new(),
+            signature: wire.scp_signature,
+        };
+
+        let raw = stellar_raw::StellarHeader {
+            ledger_seq: wire.ledger_seq as u64,
+            ledger_header_xdr: wire.ledger_header_xdr,
+            ibc_state_root: wire.ibc_state_root,
+            scp_envelopes: vec![envelope],
+            trusted_height: Some(stellar_raw::Height {
+                revision_number: trusted_height.revision_number(),
+                revision_height: trusted_height.revision_height(),
+            }),
+        };
+
+        let header: StellarHeader = raw
+            .try_into()
+            .map_err(|e| Error::query(format!("StellarHeader try_into failed: {e}")))?;
+
+        Ok((AnyHeader::Stellar(header), vec![]))
     }
 
     fn maybe_register_counterparty_payee(
@@ -404,4 +556,12 @@ impl ChainEndpoint for StellarChainEndpoint {
     fn query_ccv_consumer_id(&self, _client_id: ClientId) -> Result<ConsumerId, Error> {
         unimplemented!()
     }
+}
+
+fn ledger_close_time_secs(ledger_header_xdr: &[u8]) -> Result<u64, Error> {
+    use stellar_xdr::curr::{LedgerHeader, Limits, ReadXdr};
+
+    let header = LedgerHeader::from_xdr(ledger_header_xdr, Limits::none())
+        .map_err(|e| Error::query(format!("LedgerHeader XDR decode failed: {e}")))?;
+    Ok(header.scp_value.close_time.0)
 }
