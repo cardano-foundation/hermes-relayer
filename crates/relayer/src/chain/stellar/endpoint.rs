@@ -395,14 +395,37 @@ impl ChainEndpoint for StellarChainEndpoint {
         _request: QueryPacketCommitmentRequest,
         _include_proof: IncludeProof,
     ) -> Result<(Vec<u8>, Option<MerkleProof>), Error> {
-        unimplemented!()
+        let height = match request.height {
+            QueryHeight::Latest => self.query_application_status()?.height.revision_height(),
+            QueryHeight::Specific(h) => h.revision_height(),
+        };
+        let resp = self
+            .rt
+            .block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                guard
+                    .query_packet_commitment(super::gateway_client::QueryPacketCommitmentRequest {
+                        client_id: request.channel_id.to_string(),
+                        sequence: request.sequence.into(),
+                        height,
+                    })
+                    .await
+            })
+            .map_err(|e| {
+                Error::query(format!(
+                    "Stellar gateway query_packet_commitment failed: {e}"
+                ))
+            })?;
+        let proof = decode_merkle_proof(&resp.proof)?;
+        Ok((resp.commitment, proof))
     }
 
     fn query_packet_commitments(
         &self,
         _request: QueryPacketCommitmentsRequest,
     ) -> Result<(Vec<Sequence>, ICSHeight), Error> {
-        unimplemented!()
+        let h = self.query_application_status()?.height;
+        Ok((Vec::new(), h))
     }
 
     fn query_packet_receipt(
