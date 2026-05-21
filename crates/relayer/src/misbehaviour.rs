@@ -12,6 +12,10 @@ use ibc_relayer_types::clients::ics08_cardano_probabilistic::misbehaviour::{
     Misbehaviour as ProbabilisticMisbehaviour, PROBABILISTIC_MISBEHAVIOUR_TYPE_URL,
 };
 use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw as probabilistic_raw;
+use ibc_relayer_types::clients::ics10_stellar::misbehaviour::{
+    Misbehaviour as StellarMisbehaviour, STELLAR_MISBEHAVIOUR_TYPE_URL,
+};
+use ibc_relayer_types::clients::ics10_stellar::raw as stellar_raw;
 use ibc_relayer_types::core::ics02_client::error::Error;
 use ibc_relayer_types::core::ics02_client::header::AnyHeader;
 use ibc_relayer_types::core::ics02_client::misbehaviour::Misbehaviour;
@@ -32,6 +36,7 @@ pub enum AnyMisbehaviour {
     Tendermint(TmMisbehaviour),
     Mithril(MithrilMisbehaviour),
     Probabilistic(ProbabilisticMisbehaviour),
+    Stellar(StellarMisbehaviour),
 }
 
 impl Misbehaviour for AnyMisbehaviour {
@@ -40,6 +45,7 @@ impl Misbehaviour for AnyMisbehaviour {
             Self::Tendermint(misbehaviour) => misbehaviour.client_id(),
             Self::Mithril(misbehaviour) => misbehaviour.client_id(),
             Self::Probabilistic(misbehaviour) => misbehaviour.client_id(),
+            Self::Stellar(misbehaviour) => misbehaviour.client_id(),
         }
     }
 
@@ -48,6 +54,7 @@ impl Misbehaviour for AnyMisbehaviour {
             Self::Tendermint(misbehaviour) => misbehaviour.height(),
             Self::Mithril(misbehaviour) => misbehaviour.height(),
             Self::Probabilistic(misbehaviour) => misbehaviour.height(),
+            Self::Stellar(misbehaviour) => misbehaviour.height(),
         }
     }
 }
@@ -71,6 +78,11 @@ impl TryFrom<Any> for AnyMisbehaviour {
                 let value = probabilistic_raw::Misbehaviour::decode(raw.value.as_slice())
                     .map_err(Error::decode)?;
                 Ok(AnyMisbehaviour::Probabilistic(value.try_into()?))
+            }
+            STELLAR_MISBEHAVIOUR_TYPE_URL => {
+                let value = stellar_raw::Misbehaviour::decode(raw.value.as_slice())
+                    .map_err(Error::decode)?;
+                Ok(AnyMisbehaviour::Stellar(value.try_into()?))
             }
 
             _ => Err(Error::unknown_misbehaviour_type(raw.type_url)),
@@ -99,6 +111,13 @@ impl From<AnyMisbehaviour> for Any {
                     value: raw.encode_to_vec(),
                 }
             }
+            AnyMisbehaviour::Stellar(misbehaviour) => {
+                let raw: stellar_raw::Misbehaviour = misbehaviour.into();
+                Any {
+                    type_url: STELLAR_MISBEHAVIOUR_TYPE_URL.to_string(),
+                    value: raw.encode_to_vec(),
+                }
+            }
         }
     }
 }
@@ -109,6 +128,7 @@ impl core::fmt::Display for AnyMisbehaviour {
             AnyMisbehaviour::Tendermint(tm) => write!(f, "{tm}"),
             AnyMisbehaviour::Mithril(mithril) => write!(f, "{mithril}"),
             AnyMisbehaviour::Probabilistic(probabilistic) => write!(f, "{probabilistic}"),
+            AnyMisbehaviour::Stellar(stellar) => write!(f, "{stellar}"),
         }
     }
 }
@@ -128,5 +148,11 @@ impl From<MithrilMisbehaviour> for AnyMisbehaviour {
 impl From<ProbabilisticMisbehaviour> for AnyMisbehaviour {
     fn from(misbehaviour: ProbabilisticMisbehaviour) -> Self {
         Self::Probabilistic(misbehaviour)
+    }
+}
+
+impl From<StellarMisbehaviour> for AnyMisbehaviour {
+    fn from(misbehaviour: StellarMisbehaviour) -> Self {
+        Self::Stellar(misbehaviour)
     }
 }
