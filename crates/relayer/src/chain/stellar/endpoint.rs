@@ -151,7 +151,8 @@ impl ChainEndpoint for StellarChainEndpoint {
     }
 
     fn query_commitment_prefix(&self) -> Result<CommitmentPrefix, Error> {
-        unimplemented!()
+        CommitmentPrefix::try_from(b"ibc".to_vec())
+            .map_err(|e| Error::query(format!("invalid commitment prefix for Stellar: {e}")))
     }
 
     fn query_application_status(&self) -> Result<ChainStatus, Error> {

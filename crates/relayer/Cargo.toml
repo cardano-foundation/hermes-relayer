@@ -85,6 +85,7 @@ tendermint-rpc                   = { workspace = true, features = ["http-client"
 thiserror                        = { workspace = true }
 tiny-bip39                       = { workspace = true }
 stellar-strkey                   = { workspace = true }
+stellar-xdr                      = { version = "26.0", default-features = false, features = ["curr", "std"] }
 tiny-keccak                      = { workspace = true, features = ["keccak"] }
 tokio                            = { workspace = true, features = ["rt-multi-thread", "time", "sync"] }
 tokio-stream                     = { workspace = true }

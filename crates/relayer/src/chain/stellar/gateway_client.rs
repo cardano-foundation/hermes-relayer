@@ -93,6 +93,26 @@ pub struct QueryPacketReceiptResponse {
 }
 
 #[derive(Clone, Message)]
+pub struct QueryAcknowledgementRequest {
+    #[prost(string, tag = "1")]
+    pub client_id: String,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(uint64, tag = "3")]
+    pub height: u64,
+}
+
+#[derive(Clone, Message)]
+pub struct QueryAcknowledgementResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub acknowledgement: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub proof: Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub proof_height: u64,
+}
+
+#[derive(Clone, Message)]
 pub struct QueryNextSeqRecvRequest {
     #[prost(string, tag = "1")]
     pub client_id: String,
@@ -329,6 +349,21 @@ impl GatewayQueryClient {
         self.ready().await?;
         let path = http::uri::PathAndQuery::from_static(
             "/stellar.gateway.v1.StellarGatewayQuery/QueryPacketReceipt",
+        );
+        self.inner
+            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .await
+            .map(|r| r.into_inner())
+            .map_err(StellarError::from)
+    }
+
+    pub async fn query_acknowledgement(
+        &mut self,
+        request: QueryAcknowledgementRequest,
+    ) -> Result<QueryAcknowledgementResponse, StellarError> {
+        self.ready().await?;
+        let path = http::uri::PathAndQuery::from_static(
+            "/stellar.gateway.v1.StellarGatewayQuery/QueryAcknowledgement",
         );
         self.inner
             .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
