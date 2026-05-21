@@ -192,6 +192,7 @@ impl ClientId {
             ClientType::Tendermint => ClientType::Tendermint.as_str(),
             ClientType::CardanoMithril => ClientType::CardanoMithril.as_str(),
             ClientType::CardanoProbabilistic => ClientType::CardanoProbabilistic.as_str(),
+            ClientType::Stellar => ClientType::Stellar.as_str(),
         }
     }
 
