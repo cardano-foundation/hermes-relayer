@@ -932,33 +932,15 @@ impl ChainEndpoint for CardanoChainEndpoint {
         update: &UpdateClient,
         client_state: &AnyClientState,
     ) -> Result<Option<MisbehaviourEvidence>, Error> {
-        let Some(submitted_header) = update.header.as_ref() else {
-            if self.config.require_update_event_headers_for_misbehaviour {
-                return Err(Error::query(format!(
-                    "cannot check Cardano misbehaviour for client {} at consensus height {}: update-client event does not include the submitted header",
-                    update.client_id(),
-                    update.consensus_height(),
-                )));
-            }
-
-            tracing::warn!(
-                "skipping Cardano misbehaviour check for client {} at consensus height {}: update-client event does not include the submitted header",
-                update.client_id(),
-                update.consensus_height(),
-            );
+        let Some(submitted_header) = submitted_cardano_update_header(
+            update,
+            self.config.require_update_event_headers_for_misbehaviour,
+        )?
+        else {
             return Ok(None);
         };
 
         let target_height = submitted_header.height();
-        if target_height != update.consensus_height() {
-            return Err(Error::query(format!(
-                "update event consensus height {} does not match submitted Cardano header height {} for client {}",
-                update.consensus_height(),
-                target_height,
-                update.client_id()
-            )));
-        }
-
         let trusted_height = independent_header_trusted_height(submitted_header)?;
         let witness_gateway_client = self
             .witness_gateway_client
@@ -982,50 +964,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 ))
             })?;
 
-        if witness_header.height() != target_height {
-            return Err(Error::query(format!(
-                "independent Cardano header height mismatch: expected {target_height}, got {}",
-                witness_header.height()
-            )));
-        }
-
-        if !cardano_headers_conflict(submitted_header, &witness_header, client_state)? {
-            return Ok(None);
-        }
-
-        let misbehaviour = match (submitted_header.clone(), witness_header) {
-            (AnyHeader::Mithril(header1), AnyHeader::Mithril(header2)) => {
-                AnyMisbehaviour::Mithril(MithrilMisbehaviour {
-                    client_id: update.client_id().clone(),
-                    header1,
-                    header2,
-                })
-            }
-            (AnyHeader::Probabilistic(header1), AnyHeader::Probabilistic(header2)) => {
-                AnyMisbehaviour::Probabilistic(ProbabilisticMisbehaviour {
-                    client_id: update.client_id().clone(),
-                    header1,
-                    header2,
-                })
-            }
-            (AnyHeader::Tendermint(_), _) => {
-                return Err(Error::query(
-                    "Cardano misbehaviour check received a Tendermint update header".to_string(),
-                ))
-            }
-            (left, right) => {
-                return Err(Error::query(format!(
-                    "Cardano misbehaviour check cannot compare different header types: submitted={:?}, witness={:?}",
-                    left.client_type(),
-                    right.client_type()
-                )))
-            }
-        };
-
-        Ok(Some(MisbehaviourEvidence {
-            misbehaviour,
-            supporting_headers: vec![],
-        }))
+        cardano_misbehaviour_evidence(update, submitted_header, witness_header, client_state)
     }
 
     fn query_balance(&self, key_name: Option<&str>, denom: Option<&str>) -> Result<Balance, Error> {
@@ -2901,6 +2840,93 @@ fn independent_header_trusted_height(header: &AnyHeader) -> Result<ICSHeight, Er
     }
 }
 
+fn submitted_cardano_update_header(
+    update: &UpdateClient,
+    require_update_event_header: bool,
+) -> Result<Option<&AnyHeader>, Error> {
+    let Some(submitted_header) = update.header.as_ref() else {
+        if require_update_event_header {
+            return Err(Error::query(format!(
+                "cannot check Cardano misbehaviour for client {} at consensus height {}: update-client event does not include the submitted header",
+                update.client_id(),
+                update.consensus_height(),
+            )));
+        }
+
+        tracing::warn!(
+            "skipping Cardano misbehaviour check for client {} at consensus height {}: update-client event does not include the submitted header",
+            update.client_id(),
+            update.consensus_height(),
+        );
+        return Ok(None);
+    };
+
+    let target_height = submitted_header.height();
+    if target_height != update.consensus_height() {
+        return Err(Error::query(format!(
+            "update event consensus height {} does not match submitted Cardano header height {} for client {}",
+            update.consensus_height(),
+            target_height,
+            update.client_id()
+        )));
+    }
+
+    Ok(Some(submitted_header))
+}
+
+fn cardano_misbehaviour_evidence(
+    update: &UpdateClient,
+    submitted_header: &AnyHeader,
+    witness_header: AnyHeader,
+    client_state: &AnyClientState,
+) -> Result<Option<MisbehaviourEvidence>, Error> {
+    let target_height = submitted_header.height();
+    if witness_header.height() != target_height {
+        return Err(Error::query(format!(
+            "independent Cardano header height mismatch: expected {target_height}, got {}",
+            witness_header.height()
+        )));
+    }
+
+    if !cardano_headers_conflict(submitted_header, &witness_header, client_state)? {
+        return Ok(None);
+    }
+
+    let misbehaviour = match (submitted_header.clone(), witness_header) {
+        (AnyHeader::Mithril(header1), AnyHeader::Mithril(header2)) => {
+            AnyMisbehaviour::Mithril(MithrilMisbehaviour {
+                client_id: update.client_id().clone(),
+                header1,
+                header2,
+            })
+        }
+        (AnyHeader::Probabilistic(header1), AnyHeader::Probabilistic(header2)) => {
+            AnyMisbehaviour::Probabilistic(ProbabilisticMisbehaviour {
+                client_id: update.client_id().clone(),
+                header1,
+                header2,
+            })
+        }
+        (AnyHeader::Tendermint(_), _) => {
+            return Err(Error::query(
+                "Cardano misbehaviour check received a Tendermint update header".to_string(),
+            ))
+        }
+        (left, right) => {
+            return Err(Error::query(format!(
+                "Cardano misbehaviour check cannot compare different header types: submitted={:?}, witness={:?}",
+                left.client_type(),
+                right.client_type()
+            )))
+        }
+    };
+
+    Ok(Some(MisbehaviourEvidence {
+        misbehaviour,
+        supporting_headers: vec![],
+    }))
+}
+
 fn cardano_headers_conflict(
     submitted: &AnyHeader,
     witness: &AnyHeader,
@@ -2970,6 +2996,28 @@ fn cardano_headers_conflict(
                 )));
             }
 
+            let cheap_conflict = !submitted
+                .host_state_tx_hash
+                .trim()
+                .eq_ignore_ascii_case(witness.host_state_tx_hash.trim())
+                || !submitted
+                    .anchor_block
+                    .hash
+                    .trim()
+                    .eq_ignore_ascii_case(witness.anchor_block.hash.trim())
+                || probabilistic_windows_conflict_by_block_height(submitted, witness);
+            if cheap_conflict {
+                tracing::warn!(
+                    "Probabilistic header conflict detected at {}: submitted_host_tx={}, witness_host_tx={}, submitted_anchor={}, witness_anchor={}",
+                    submitted.height,
+                    submitted.host_state_tx_hash,
+                    witness.host_state_tx_hash,
+                    submitted.anchor_block.hash,
+                    witness.anchor_block.hash,
+                );
+                return Ok(true);
+            }
+
             let submitted_root = extract_ibc_state_root_from_host_state_tx(
                 &AnyHeader::Probabilistic(submitted.clone()),
                 host_state_nft_policy_id,
@@ -2981,17 +3029,7 @@ fn cardano_headers_conflict(
                 host_state_nft_token_name,
             )?;
 
-            let conflicts = submitted_root != witness_root
-                || !submitted
-                    .host_state_tx_hash
-                    .trim()
-                    .eq_ignore_ascii_case(witness.host_state_tx_hash.trim())
-                || !submitted
-                    .anchor_block
-                    .hash
-                    .trim()
-                    .eq_ignore_ascii_case(witness.anchor_block.hash.trim())
-                || probabilistic_windows_conflict_by_block_height(submitted, witness);
+            let conflicts = submitted_root != witness_root;
 
             if conflicts {
                 tracing::warn!(
@@ -3576,21 +3614,29 @@ fn decode_optional_merkle_proof(proof: &[u8], context: &str) -> Result<Option<Me
 
 fn proof_height_from_response(
     proof_height: Option<ibc_proto::ibc::core::client::v1::Height>,
-    fallback: ICSHeight,
+    requested_height: ICSHeight,
     context: &str,
 ) -> Result<ICSHeight, Error> {
-    let Some(proof_height) = proof_height else {
-        tracing::warn!(
-            "Cardano Gateway response for {context} omitted proof_height; falling back to query height {fallback}"
-        );
-        return Ok(fallback);
-    };
+    let proof_height = proof_height.ok_or_else(|| {
+        Error::query(format!(
+            "Cardano Gateway response for {context} omitted proof_height for requested height {requested_height}"
+        ))
+    })?;
 
-    ICSHeight::new(proof_height.revision_number, proof_height.revision_height).map_err(|e| {
+    let proof_height = ICSHeight::new(proof_height.revision_number, proof_height.revision_height)
+        .map_err(|e| {
         Error::query(format!(
             "Invalid {context} proof_height from Cardano Gateway: {e}"
         ))
-    })
+    })?;
+
+    if proof_height != requested_height {
+        return Err(Error::query(format!(
+            "Cardano Gateway {context} proof height mismatch: requested {requested_height}, got {proof_height}"
+        )));
+    }
+
+    Ok(proof_height)
 }
 
 fn plutus_constructor_index(
@@ -3622,7 +3668,235 @@ fn cardano_latest_height_unhealthy_error(
 mod tests {
     use super::*;
     use crate::chain::cardano::error::Error as CardanoError;
+    use crate::client_state::AnyClientState;
     use ibc_proto::ibc::core::client::v1::Height as RawHeight;
+    use ibc_proto::Protobuf;
+    use ibc_relayer_types::clients::ics08_cardano::{
+        client_state::ClientState as MithrilClientState, header::Header as MithrilHeader,
+        raw as mithril_raw,
+    };
+    use ibc_relayer_types::clients::ics08_cardano_probabilistic::{
+        client_state::ClientState as ProbabilisticClientState,
+        header::Header as ProbabilisticHeader, raw as probabilistic_raw,
+    };
+    use ibc_relayer_types::core::ics02_client::client_type::ClientType;
+    use ibc_relayer_types::core::ics02_client::events::Attributes;
+    use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ClientId};
+    use ibc_relayer_types::timestamp::Timestamp;
+    use std::time::Duration;
+
+    const HOST_STATE_NFT_POLICY_ID: [u8; 28] = [7; 28];
+    const HOST_STATE_NFT_TOKEN_NAME: &[u8] = b"host_state_nft";
+
+    fn height(revision_height: u64) -> ICSHeight {
+        ICSHeight::new(0, revision_height).expect("valid height")
+    }
+
+    fn client_id() -> ClientId {
+        "08-cardano-mithril-0".parse().expect("valid client id")
+    }
+
+    fn host_state_tx_body_cbor(root: [u8; 32]) -> Vec<u8> {
+        fn encode_host_state_output(
+            e: &mut pallas_codec::minicbor::Encoder<&mut Vec<u8>>,
+            root: [u8; 32],
+        ) {
+            use pallas_codec::minicbor::data::Tag;
+
+            // Minimal post-Alonzo output map containing only the fields the
+            // HostState root extractor reads: address, multiasset value, datum.
+            e.map(3).unwrap();
+            e.u8(0).unwrap();
+            e.bytes(&[0]).unwrap();
+
+            // Value with exactly one HostState NFT under the configured policy.
+            // The extractor rejects outputs that do not carry this NFT.
+            e.u8(1).unwrap();
+            e.array(2).unwrap();
+            e.u8(0).unwrap();
+            e.map(1).unwrap();
+            e.bytes(&HOST_STATE_NFT_POLICY_ID).unwrap();
+            e.map(1).unwrap();
+            e.bytes(HOST_STATE_NFT_TOKEN_NAME).unwrap();
+            e.u8(1).unwrap();
+
+            e.u8(2).unwrap();
+            e.array(2).unwrap();
+            e.u8(1).unwrap();
+
+            // Inline datum shape expected by `extract_ibc_state_root_from_host_state_datum`:
+            // HostState(state, nft_policy), where state contains the 32-byte IBC root.
+            let mut datum = Vec::new();
+            let mut datum_encoder = pallas_codec::minicbor::Encoder::new(&mut datum);
+            datum_encoder.tag(Tag::Unassigned(121)).unwrap();
+            datum_encoder.array(2).unwrap();
+            datum_encoder.tag(Tag::Unassigned(121)).unwrap();
+            datum_encoder.array(2).unwrap();
+            datum_encoder.bytes(&[]).unwrap();
+            datum_encoder.bytes(&root).unwrap();
+            datum_encoder.bytes(&HOST_STATE_NFT_POLICY_ID).unwrap();
+
+            e.tag(Tag::Cbor).unwrap();
+            e.bytes(&datum).unwrap();
+        }
+
+        let mut tx_body = Vec::new();
+        let mut encoder = pallas_codec::minicbor::Encoder::new(&mut tx_body);
+        // Minimal transaction body: no inputs, one HostState output, zero fee.
+        // This keeps the fixture small while still exercising real CBOR decoding.
+        encoder.map(3).unwrap();
+        encoder.u8(0).unwrap();
+        encoder.array(0).unwrap();
+        encoder.u8(1).unwrap();
+        encoder.array(1).unwrap();
+        encode_host_state_output(&mut encoder, root);
+        encoder.u8(2).unwrap();
+        encoder.u8(0).unwrap();
+        tx_body
+    }
+
+    fn raw_protocol_parameters() -> mithril_raw::MithrilProtocolParameters {
+        mithril_raw::MithrilProtocolParameters {
+            k: 1,
+            m: 2,
+            phi_f: None,
+        }
+    }
+
+    fn raw_certificate(hash: &str) -> mithril_raw::MithrilCertificate {
+        mithril_raw::MithrilCertificate {
+            hash: hash.to_string(),
+            previous_hash: String::new(),
+            epoch: 0,
+            signed_entity_type: None,
+            metadata: Some(mithril_raw::CertificateMetadata {
+                network: "testnet".to_string(),
+                protocol_version: "v1".to_string(),
+                protocol_parameters: Some(raw_protocol_parameters()),
+                initiated_at: "2024-01-01T00:00:00Z".to_string(),
+                sealed_at: "2024-01-01T00:00:01Z".to_string(),
+                signers: vec![],
+            }),
+            protocol_message: None,
+            signed_message: String::new(),
+            aggregate_verification_key: String::new(),
+            multi_signature: String::new(),
+            genesis_signature: String::new(),
+        }
+    }
+
+    fn mithril_header(revision_height: u64, root: [u8; 32]) -> MithrilHeader {
+        let tx_body = host_state_tx_body_cbor(root);
+
+        MithrilHeader {
+            height: height(revision_height),
+            timestamp: Timestamp::from_nanoseconds(1).expect("valid timestamp"),
+            mithril_stake_distribution: mithril_raw::MithrilStakeDistribution {
+                epoch: 0,
+                signers_with_stake: vec![],
+                hash: "stake_distribution".to_string(),
+                certificate_hash: "stake_distribution_cert".to_string(),
+                created_at: 1,
+                protocol_parameter: Some(raw_protocol_parameters()),
+            },
+            mithril_stake_distribution_certificate: raw_certificate("stake_distribution_cert"),
+            transaction_snapshot: mithril_raw::CardanoTransactionSnapshot {
+                merkle_root: "snapshot_root".to_string(),
+                epoch: 0,
+                block_number: revision_height,
+                hash: "snapshot".to_string(),
+                certificate_hash: "tx_snapshot_cert".to_string(),
+                created_at: "2024-01-01T00:00:01Z".to_string(),
+            },
+            transaction_snapshot_certificate: raw_certificate("tx_snapshot_cert"),
+            previous_mithril_stake_distribution_certificates: vec![],
+            // Match the fixture body hash so conflicts come from the requested
+            // root/certificate fields, not from malformed fixture data.
+            host_state_tx_hash: hex::encode(blake2b_256(&tx_body)),
+            host_state_tx_body_cbor: tx_body,
+            host_state_tx_output_index: 0,
+            host_state_tx_proof: vec![1],
+        }
+    }
+
+    fn mithril_client_state() -> AnyClientState {
+        AnyClientState::Mithril(MithrilClientState {
+            chain_id: ChainId::from_string("cardano-1"),
+            latest_height: height(10),
+            frozen_height: None,
+            current_epoch: 0,
+            trusting_period: Duration::from_secs(60),
+            protocol_parameters: raw_protocol_parameters(),
+            upgrade_path: vec![],
+            host_state_nft_policy_id: HOST_STATE_NFT_POLICY_ID.to_vec(),
+            host_state_nft_token_name: HOST_STATE_NFT_TOKEN_NAME.to_vec(),
+        })
+    }
+
+    fn probabilistic_client_state() -> AnyClientState {
+        AnyClientState::Probabilistic(ProbabilisticClientState {
+            chain_id: ChainId::from_string("cardano-1"),
+            latest_height: height(10),
+            frozen_height: None,
+            current_epoch: 0,
+            trusting_period: Duration::from_secs(60),
+            upgrade_path: vec![],
+            host_state_nft_policy_id: HOST_STATE_NFT_POLICY_ID.to_vec(),
+            host_state_nft_token_name: HOST_STATE_NFT_TOKEN_NAME.to_vec(),
+            epoch_stake_distribution: vec![],
+            epoch_nonce: vec![0; 32],
+            slots_per_kes_period: 1,
+            current_epoch_start_slot: 1,
+            current_epoch_end_slot_exclusive: 2,
+            system_start_unix_ns: 1,
+            slot_length_ns: 1,
+            epoch_contexts: vec![],
+            pool_registration_cutoff_slot_exclusive: 0,
+        })
+    }
+
+    fn probabilistic_block(
+        revision_height: u64,
+        hash: &str,
+    ) -> probabilistic_raw::ProbabilisticBlock {
+        probabilistic_raw::ProbabilisticBlock {
+            height: Some(probabilistic_raw::Height {
+                revision_number: 0,
+                revision_height,
+            }),
+            slot: revision_height,
+            hash: hash.to_string(),
+            epoch: 0,
+            timestamp: 1,
+            block_cbor: vec![],
+        }
+    }
+
+    fn probabilistic_header(revision_height: u64, anchor_hash: &str) -> ProbabilisticHeader {
+        ProbabilisticHeader {
+            trusted_height: height(revision_height - 1),
+            height: height(revision_height),
+            timestamp: Timestamp::from_nanoseconds(1).expect("valid timestamp"),
+            anchor_block: probabilistic_block(revision_height, anchor_hash),
+            bridge_blocks: vec![],
+            descendant_blocks: vec![],
+            // Anchor/hash conflicts short-circuit before block CBOR root extraction.
+            host_state_tx_hash: "host_tx".to_string(),
+            host_state_tx_output_index: 0,
+            new_epoch_context: None,
+        }
+    }
+
+    fn update_client(header: Option<AnyHeader>, consensus_height: ICSHeight) -> UpdateClient {
+        UpdateClient {
+            common: Attributes {
+                client_id: client_id(),
+                client_type: ClientType::CardanoMithril,
+                consensus_height,
+            },
+            header,
+        }
+    }
 
     #[test]
     fn latest_height_failure_is_unhealthy_even_when_client_states_probe_succeeds() {
@@ -3692,32 +3966,185 @@ mod tests {
     }
 
     #[test]
-    fn proof_height_from_gateway_response_overrides_query_height() {
-        let fallback = ICSHeight::new(0, 10).expect("valid fallback height");
+    fn proof_height_accepts_exact_requested_height() {
+        let requested = ICSHeight::new(0, 42).expect("valid requested height");
+
+        // Packet proofs must be tied to the exact query height Hermes requested.
+        // Returning any other height would let Gateway silently prove another state.
         let proof_height = proof_height_from_response(
             Some(RawHeight {
                 revision_number: 0,
                 revision_height: 42,
             }),
-            fallback,
+            requested,
             "packet commitment",
         )
         .expect("valid proof height");
 
-        assert_eq!(
-            proof_height,
-            ICSHeight::new(0, 42).expect("valid proof height")
-        );
+        assert_eq!(proof_height, requested);
     }
 
     #[test]
-    fn proof_height_falls_back_when_gateway_omits_height() {
-        let fallback = ICSHeight::new(0, 10).expect("valid fallback height");
+    fn proof_height_errors_when_gateway_omits_height() {
+        let requested = ICSHeight::new(0, 10).expect("valid requested height");
+
+        // Missing proof height used to fall back to the query height. Keep this
+        // strict so Gateway omissions cannot hide proof serving bugs.
+        let error = proof_height_from_response(None, requested, "packet commitment")
+            .expect_err("missing proof height must fail");
+
+        assert!(error.to_string().contains("omitted proof_height"));
+        assert!(error.to_string().contains("0-10"));
+    }
+
+    #[test]
+    fn proof_height_errors_when_gateway_returns_wrong_height() {
+        let requested = ICSHeight::new(0, 10).expect("valid requested height");
+
+        // A proof for an adjacent height is not equivalent: packet state may have
+        // changed between accepted HostState anchors.
+        let error = proof_height_from_response(
+            Some(RawHeight {
+                revision_number: 0,
+                revision_height: 11,
+            }),
+            requested,
+            "packet commitment",
+        )
+        .expect_err("mismatched proof height must fail");
+
+        assert!(error.to_string().contains("proof height mismatch"));
+        assert!(error.to_string().contains("requested 0-10"));
+        assert!(error.to_string().contains("got 0-11"));
+    }
+
+    #[test]
+    fn missing_update_header_is_skipped_when_not_strict() {
+        let update = update_client(None, height(10));
+
+        // Non-strict mode preserves the existing operational behavior for old
+        // Gateway events that do not embed the submitted client message.
+        assert!(submitted_cardano_update_header(&update, false)
+            .expect("non-strict missing header")
+            .is_none());
+    }
+
+    #[test]
+    fn missing_update_header_errors_when_strict() {
+        let update = update_client(None, height(10));
+
+        // Strict mode is the production-safe path: without the submitted header,
+        // Hermes cannot compare the event payload against an independent witness.
+        let error = submitted_cardano_update_header(&update, true)
+            .expect_err("strict missing header must fail");
+
+        assert!(error
+            .to_string()
+            .contains("does not include the submitted header"));
+    }
+
+    #[test]
+    fn misbehaviour_no_conflict_returns_no_evidence() {
+        let submitted = AnyHeader::Mithril(mithril_header(10, [1; 32]));
+        let witness = submitted.clone();
+        let update = update_client(Some(submitted.clone()), height(10));
+
+        // Identical submitted and witness headers should be treated as a valid
+        // client update, not as misbehaviour evidence.
+        let evidence =
+            cardano_misbehaviour_evidence(&update, &submitted, witness, &mithril_client_state())
+                .expect("misbehaviour check succeeds");
+
+        assert!(evidence.is_none());
+    }
+
+    #[test]
+    fn misbehaviour_root_conflict_returns_evidence() {
+        let submitted = AnyHeader::Mithril(mithril_header(10, [1; 32]));
+        let witness = AnyHeader::Mithril(mithril_header(10, [2; 32]));
+        let update = update_client(Some(submitted.clone()), height(10));
+
+        // Same height plus different extracted HostState root is the core
+        // fork/conflict signal for Mithril-backed Cardano headers.
+        let evidence =
+            cardano_misbehaviour_evidence(&update, &submitted, witness, &mithril_client_state())
+                .expect("misbehaviour check succeeds")
+                .expect("conflicting roots produce evidence");
+
+        assert!(matches!(evidence.misbehaviour, AnyMisbehaviour::Mithril(_)));
+    }
+
+    #[test]
+    fn misbehaviour_anchor_hash_conflict_returns_evidence() {
+        let submitted = AnyHeader::Probabilistic(probabilistic_header(10, "anchor_a"));
+        let witness = AnyHeader::Probabilistic(probabilistic_header(10, "anchor_b"));
+        let update = UpdateClient {
+            common: Attributes {
+                client_id: client_id(),
+                client_type: ClientType::CardanoProbabilistic,
+                consensus_height: height(10),
+            },
+            header: Some(submitted.clone()),
+        };
+
+        // Probabilistic headers can prove conflict before root extraction when
+        // the accepted anchor at the same height has a different block hash.
+        let evidence = cardano_misbehaviour_evidence(
+            &update,
+            &submitted,
+            witness,
+            &probabilistic_client_state(),
+        )
+        .expect("misbehaviour check succeeds")
+        .expect("conflicting anchors produce evidence");
+
+        assert!(matches!(
+            evidence.misbehaviour,
+            AnyMisbehaviour::Probabilistic(_)
+        ));
+    }
+
+    #[test]
+    fn misbehaviour_witness_wrong_height_errors() {
+        let submitted = AnyHeader::Mithril(mithril_header(10, [1; 32]));
+        let witness = AnyHeader::Mithril(mithril_header(11, [1; 32]));
+        let update = update_client(Some(submitted.clone()), height(10));
+
+        // Evidence requires two headers at the same client height. A mismatched
+        // witness height means the independent query is unusable, not conflicting.
+        let error =
+            cardano_misbehaviour_evidence(&update, &submitted, witness, &mithril_client_state())
+                .expect_err("wrong witness height must fail");
+
+        assert!(error
+            .to_string()
+            .contains("independent Cardano header height mismatch"));
+    }
+
+    #[test]
+    fn mithril_evidence_is_encoded_as_msg_update_client_misbehaviour() {
+        let submitted = mithril_header(10, [1; 32]);
+        let witness = mithril_header(10, [2; 32]);
+        let misbehaviour = AnyMisbehaviour::Mithril(MithrilMisbehaviour {
+            client_id: client_id(),
+            header1: submitted,
+            header2: witness,
+        });
+
+        // Hermes submits Cardano evidence through MsgUpdateClient with the
+        // misbehaviour Any in `client_message`, matching the Gateway contract.
+        let msg = ibc_relayer_types::core::ics02_client::msgs::update_client::MsgUpdateClient {
+            client_id: client_id(),
+            header: misbehaviour.into(),
+            signer: "cardano-signer".parse().expect("valid signer"),
+        };
+        let raw: ibc_proto::ibc::core::client::v1::MsgUpdateClient = msg.into();
+        let header = raw.client_message.expect("client message");
 
         assert_eq!(
-            proof_height_from_response(None, fallback, "packet commitment")
-                .expect("fallback proof height"),
-            fallback
+            header.type_url,
+            ibc_relayer_types::clients::ics08_cardano::misbehaviour::MITHRIL_MISBEHAVIOUR_TYPE_URL
         );
+        assert!(MithrilMisbehaviour::decode_vec(&header.value).is_ok());
     }
 }
