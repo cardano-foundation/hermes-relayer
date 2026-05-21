@@ -304,17 +304,36 @@ impl ChainEndpoint for StellarChainEndpoint {
 
     fn query_consensus_state(
         &self,
-        _request: QueryConsensusStateRequest,
+        request: QueryConsensusStateRequest,
         _include_proof: IncludeProof,
     ) -> Result<(AnyConsensusState, Option<MerkleProof>), Error> {
-        unimplemented!()
+        let resp = self
+            .rt
+            .block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                guard
+                    .query_consensus_state(super::gateway_client::QueryConsensusStateRequest {
+                        client_id: request.client_id.to_string(),
+                        revision_number: request.consensus_height.revision_number(),
+                        revision_height: request.consensus_height.revision_height(),
+                    })
+                    .await
+            })
+            .map_err(|e| {
+                Error::query(format!("Stellar gateway query_consensus_state failed: {e}"))
+            })?;
+        let any = ibc_proto::google::protobuf::Any::decode(resp.consensus_state.as_slice())
+            .map_err(|e| Error::query(format!("consensus_state Any decode failed: {e}")))?;
+        let cs = AnyConsensusState::try_from(any)
+            .map_err(|e| Error::query(format!("AnyConsensusState decode failed: {e}")))?;
+        Ok((cs, None))
     }
 
     fn query_consensus_state_heights(
         &self,
         _request: QueryConsensusStateHeightsRequest,
     ) -> Result<Vec<ICSHeight>, Error> {
-        unimplemented!()
+        Ok(Vec::new())
     }
 
     fn query_upgraded_client_state(
@@ -392,7 +411,7 @@ impl ChainEndpoint for StellarChainEndpoint {
 
     fn query_packet_commitment(
         &self,
-        _request: QueryPacketCommitmentRequest,
+        request: QueryPacketCommitmentRequest,
         _include_proof: IncludeProof,
     ) -> Result<(Vec<u8>, Option<MerkleProof>), Error> {
         let height = match request.height {
