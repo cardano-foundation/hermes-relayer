@@ -1163,11 +1163,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 Error::query(format!("Gateway query_client_state failed: {}", e))
             })?;
 
-        assert_gateway_proof_height(
-            "query_client_state",
-            response.proof_height.clone(),
-            gateway_height,
-        )?;
+        assert_gateway_proof_height("query_client_state", response.proof_height, gateway_height)?;
 
         let client_state_any = response
             .client_state
@@ -1221,7 +1217,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
         assert_gateway_proof_height(
             "query_consensus_state",
-            response.proof_height.clone(),
+            response.proof_height,
             gateway_height,
         )?;
 
@@ -1461,11 +1457,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             let response = QueryConnectionResponse::decode(&response_bytes[..]).map_err(|e| {
                 Error::query(format!("Failed to decode connection response: {}", e))
             })?;
-            assert_gateway_proof_height(
-                "query_connection",
-                response.proof_height.clone(),
-                gateway_height,
-            )?;
+            assert_gateway_proof_height("query_connection", response.proof_height, gateway_height)?;
 
             let connection_end = response
                 .connection
@@ -1620,11 +1612,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
             let response = QueryChannelResponse::decode(&response_bytes[..])
                 .map_err(|e| Error::query(format!("Failed to decode channel response: {}", e)))?;
-            assert_gateway_proof_height(
-                "query_channel",
-                response.proof_height.clone(),
-                gateway_height,
-            )?;
+            assert_gateway_proof_height("query_channel", response.proof_height, gateway_height)?;
 
             let channel_proto = response
                 .channel
@@ -1727,7 +1715,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 })?;
             assert_gateway_proof_height(
                 "query_packet_commitment",
-                response.proof_height.clone(),
+                response.proof_height,
                 gateway_height,
             )?;
 
@@ -1836,7 +1824,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 })?;
             assert_gateway_proof_height(
                 "query_packet_receipt",
-                response.proof_height.clone(),
+                response.proof_height,
                 gateway_height,
             )?;
 
@@ -1957,7 +1945,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 })?;
             assert_gateway_proof_height(
                 "query_packet_acknowledgement",
-                response.proof_height.clone(),
+                response.proof_height,
                 gateway_height,
             )?;
 
@@ -2126,7 +2114,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 })?;
             assert_gateway_proof_height(
                 "query_next_sequence_receive",
-                response.proof_height.clone(),
+                response.proof_height,
                 gateway_height,
             )?;
 
