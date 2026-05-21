@@ -213,10 +213,41 @@ impl ChainEndpoint for StellarChainEndpoint {
     fn verify_header(
         &mut self,
         _trusted: ICSHeight,
-        _target: ICSHeight,
+        target: ICSHeight,
         _client_state: &AnyClientState,
     ) -> Result<Self::LightBlock, Error> {
-        unimplemented!()
+        let resp = self
+            .rt
+            .block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                guard
+                    .query_ibc_header(QueryIbcHeaderRequest {
+                        height: target.revision_height(),
+                    })
+                    .await
+            })
+            .map_err(|e| {
+                Error::query(format!(
+                    "Stellar gateway query_ibc_header failed at {target}: {e}"
+                ))
+            })?;
+
+        let wire = gateway_client::StellarHeader::decode(resp.header.as_slice())
+            .map_err(|e| Error::query(format!("StellarHeader decode failed: {e}")))?;
+
+        let close_time = ledger_close_time_secs(&wire.ledger_header_xdr)?;
+        let timestamp = Timestamp::from_nanoseconds(close_time.saturating_mul(1_000_000_000))
+            .map_err(|e| Error::query(format!("invalid Stellar close_time: {e}")))?;
+        let ledger_hash = ledger_previous_hash(&wire.ledger_header_xdr)?;
+
+        Ok(StellarLightBlock {
+            ledger_seq: wire.ledger_seq as u64,
+            ledger_hash,
+            ibc_state_root: wire.ibc_state_root,
+            timestamp,
+            close_time_secs: close_time,
+            scp_node_id: wire.scp_node_id,
+        })
     }
 
     fn check_misbehaviour(
