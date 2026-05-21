@@ -9,6 +9,7 @@ pub enum ClientType {
     Tendermint = 1,
     CardanoMithril = 2,
     CardanoProbabilistic = 3,
+    Stellar = 4,
 }
 
 impl ClientType {
@@ -17,6 +18,9 @@ impl ClientType {
     // messages are under `ibc.lightclients.mithril.v1.*`.
     const CARDANO_MITHRIL_STR: &'static str = "08-cardano-mithril";
     const CARDANO_PROBABILISTIC_STR: &'static str = "08-cardano-probabilistic";
+    // Stellar light client (loaded into Cosmos via `08-wasm`). Protobuf messages live
+    // under `ibc.lightclients.stellar.v1.*`.
+    const STELLAR_STR: &'static str = "10-stellar";
 
     /// Yields the identifier of this client type as a string
     pub fn as_str(&self) -> &'static str {
@@ -24,6 +28,7 @@ impl ClientType {
             Self::Tendermint => Self::TENDERMINT_STR,
             Self::CardanoMithril => Self::CARDANO_MITHRIL_STR,
             Self::CardanoProbabilistic => Self::CARDANO_PROBABILISTIC_STR,
+            Self::Stellar => Self::STELLAR_STR,
         }
     }
 }
@@ -42,6 +47,7 @@ impl core::str::FromStr for ClientType {
             Self::TENDERMINT_STR => Ok(Self::Tendermint),
             Self::CARDANO_MITHRIL_STR => Ok(Self::CardanoMithril),
             Self::CARDANO_PROBABILISTIC_STR => Ok(Self::CardanoProbabilistic),
+            Self::STELLAR_STR => Ok(Self::Stellar),
 
             _ => Err(Error::unknown_client_type(s.to_string())),
         }
