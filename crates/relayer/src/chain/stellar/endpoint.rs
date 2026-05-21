@@ -8,8 +8,11 @@ use ibc_proto::ibc::apps::fee::v1::{
 use ibc_proto::ibc::core::channel::v1::{QueryUpgradeErrorRequest, QueryUpgradeRequest};
 use ibc_relayer_types::applications::ics28_ccv::msgs::{ConsumerChain, ConsumerId};
 use ibc_relayer_types::applications::ics31_icq::response::CrossChainQueryResponse;
+use ibc_relayer_types::clients::ics10_stellar::client_state::ClientState as StellarClientState;
+use ibc_relayer_types::clients::ics10_stellar::consensus_state::ConsensusState as StellarConsensusState;
 use ibc_relayer_types::clients::ics10_stellar::header::Header as StellarHeader;
 use ibc_relayer_types::clients::ics10_stellar::raw as stellar_raw;
+use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentRoot;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
 use ibc_relayer_types::core::ics02_client::header::AnyHeader;
 use ibc_relayer_types::core::ics02_client::height::Height;
@@ -57,6 +60,8 @@ pub struct StellarLightBlock {
     pub ledger_hash: Vec<u8>,
     pub ibc_state_root: Vec<u8>,
     pub timestamp: Timestamp,
+    pub close_time_secs: u64,
+    pub scp_node_id: Vec<u8>,
 }
 
 pub struct StellarChainEndpoint {
@@ -182,16 +187,27 @@ impl ChainEndpoint for StellarChainEndpoint {
 
     fn send_messages_and_wait_commit(
         &mut self,
-        _tracked_msgs: TrackedMsgs,
+        tracked_msgs: TrackedMsgs,
     ) -> Result<Vec<IbcEventWithHeight>, Error> {
-        unimplemented!()
+        let signer = self.get_signer()?.to_string();
+
+        self.rt.block_on(async {
+            for msg in tracked_msgs.msgs.iter() {
+                dispatch_msg(&self.gateway_msg, &msg.type_url, msg.value.clone(), &signer)
+                    .await?;
+            }
+            Ok::<(), Error>(())
+        })?;
+
+        Ok(Vec::new())
     }
 
     fn send_messages_and_wait_check_tx(
         &mut self,
-        _tracked_msgs: TrackedMsgs,
+        tracked_msgs: TrackedMsgs,
     ) -> Result<Vec<TxResponse>, Error> {
-        unimplemented!()
+        self.send_messages_and_wait_commit(tracked_msgs)?;
+        Ok(Vec::new())
     }
 
     fn verify_header(
@@ -305,28 +321,32 @@ impl ChainEndpoint for StellarChainEndpoint {
         &self,
         _request: QueryUpgradedClientStateRequest,
     ) -> Result<(AnyClientState, MerkleProof), Error> {
-        unimplemented!()
+        Err(Error::query(
+            "Stellar does not support client upgrades via IBC".to_string(),
+        ))
     }
 
     fn query_upgraded_consensus_state(
         &self,
         _request: QueryUpgradedConsensusStateRequest,
     ) -> Result<(AnyConsensusState, MerkleProof), Error> {
-        unimplemented!()
+        Err(Error::query(
+            "Stellar does not support client upgrades via IBC".to_string(),
+        ))
     }
 
     fn query_connections(
         &self,
         _request: QueryConnectionsRequest,
     ) -> Result<Vec<IdentifiedConnectionEnd>, Error> {
-        unimplemented!()
+        Ok(Vec::new())
     }
 
     fn query_client_connections(
         &self,
         _request: QueryClientConnectionsRequest,
     ) -> Result<Vec<ConnectionId>, Error> {
-        unimplemented!()
+        Ok(Vec::new())
     }
 
     fn query_connection(
@@ -334,21 +354,23 @@ impl ChainEndpoint for StellarChainEndpoint {
         _request: QueryConnectionRequest,
         _include_proof: IncludeProof,
     ) -> Result<(ConnectionEnd, Option<MerkleProof>), Error> {
-        unimplemented!()
+        Err(Error::query(
+            "Connection queries are not part of IBC v2".to_string(),
+        ))
     }
 
     fn query_connection_channels(
         &self,
         _request: QueryConnectionChannelsRequest,
     ) -> Result<Vec<IdentifiedChannelEnd>, Error> {
-        unimplemented!()
+        Ok(Vec::new())
     }
 
     fn query_channels(
         &self,
         _request: QueryChannelsRequest,
     ) -> Result<Vec<IdentifiedChannelEnd>, Error> {
-        unimplemented!()
+        Ok(Vec::new())
     }
 
     fn query_channel(
@@ -356,14 +378,16 @@ impl ChainEndpoint for StellarChainEndpoint {
         _request: QueryChannelRequest,
         _include_proof: IncludeProof,
     ) -> Result<(ChannelEnd, Option<MerkleProof>), Error> {
-        unimplemented!()
+        Err(Error::query(
+            "Channel queries are not part of IBC v2".to_string(),
+        ))
     }
 
     fn query_channel_client_state(
         &self,
         _request: QueryChannelClientStateRequest,
     ) -> Result<Option<IdentifiedAnyClientState>, Error> {
-        unimplemented!()
+        Ok(None)
     }
 
     fn query_packet_commitment(
