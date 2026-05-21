@@ -291,15 +291,37 @@ impl ChainEndpoint for StellarChainEndpoint {
         &self,
         _request: QueryClientStatesRequest,
     ) -> Result<Vec<IdentifiedAnyClientState>, Error> {
-        unimplemented!()
+        Ok(Vec::new())
     }
 
     fn query_client_state(
         &self,
-        _request: QueryClientStateRequest,
+        request: QueryClientStateRequest,
         _include_proof: IncludeProof,
     ) -> Result<(AnyClientState, Option<MerkleProof>), Error> {
-        unimplemented!()
+        let height = match request.height {
+            QueryHeight::Latest => self.query_application_status()?.height.revision_height(),
+            QueryHeight::Specific(h) => h.revision_height(),
+        };
+        let resp = self
+            .rt
+            .block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                guard
+                    .query_client_state(super::gateway_client::QueryClientStateRequest {
+                        client_id: request.client_id.to_string(),
+                        height,
+                    })
+                    .await
+            })
+            .map_err(|e| {
+                Error::query(format!("Stellar gateway query_client_state failed: {e}"))
+            })?;
+        let any = ibc_proto::google::protobuf::Any::decode(resp.client_state.as_slice())
+            .map_err(|e| Error::query(format!("client_state Any decode failed: {e}")))?;
+        let cs = AnyClientState::try_from(any)
+            .map_err(|e| Error::query(format!("AnyClientState decode failed: {e}")))?;
+        Ok((cs, None))
     }
 
     fn query_consensus_state(
