@@ -13,6 +13,9 @@ use crate::clients::ics08_cardano::header::{Header as MithrilHeader, MITHRIL_HEA
 use crate::clients::ics08_cardano_probabilistic::header::{
     Header as ProbabilisticHeader, PROBABILISTIC_HEADER_TYPE_URL,
 };
+use crate::clients::ics10_stellar::header::{
+    Header as StellarHeader, STELLAR_HEADER_TYPE_URL,
+};
 use crate::core::ics02_client::client_type::ClientType;
 use crate::core::ics02_client::error::Error;
 use crate::timestamp::Timestamp;
@@ -43,6 +46,7 @@ pub enum AnyHeader {
     Tendermint(TendermintHeader),
     Mithril(MithrilHeader),
     Probabilistic(ProbabilisticHeader),
+    Stellar(StellarHeader),
 }
 
 impl Header for AnyHeader {
@@ -51,6 +55,7 @@ impl Header for AnyHeader {
             Self::Tendermint(header) => header.client_type(),
             Self::Mithril(header) => header.client_type(),
             Self::Probabilistic(header) => header.client_type(),
+            Self::Stellar(header) => header.client_type(),
         }
     }
 
@@ -59,6 +64,7 @@ impl Header for AnyHeader {
             Self::Tendermint(header) => header.height(),
             Self::Mithril(header) => header.height(),
             Self::Probabilistic(header) => header.height(),
+            Self::Stellar(header) => header.height(),
         }
     }
 
@@ -67,6 +73,7 @@ impl Header for AnyHeader {
             Self::Tendermint(header) => header.timestamp(),
             Self::Mithril(header) => header.timestamp(),
             Self::Probabilistic(header) => header.timestamp(),
+            Self::Stellar(header) => header.timestamp(),
         }
     }
 }
@@ -90,6 +97,10 @@ impl TryFrom<Any> for AnyHeader {
                 let val: ProbabilisticHeader = raw.try_into()?;
                 Ok(AnyHeader::Probabilistic(val))
             }
+            STELLAR_HEADER_TYPE_URL => {
+                let val: StellarHeader = raw.try_into()?;
+                Ok(AnyHeader::Stellar(val))
+            }
 
             _ => Err(Error::unknown_header_type(raw.type_url)),
         }
@@ -107,6 +118,7 @@ impl From<AnyHeader> for Any {
             },
             AnyHeader::Mithril(header) => header.into(),
             AnyHeader::Probabilistic(header) => header.into(),
+            AnyHeader::Stellar(header) => header.into(),
         }
     }
 }
@@ -126,5 +138,11 @@ impl From<MithrilHeader> for AnyHeader {
 impl From<ProbabilisticHeader> for AnyHeader {
     fn from(header: ProbabilisticHeader) -> Self {
         Self::Probabilistic(header)
+    }
+}
+
+impl From<StellarHeader> for AnyHeader {
+    fn from(header: StellarHeader) -> Self {
+        Self::Stellar(header)
     }
 }
