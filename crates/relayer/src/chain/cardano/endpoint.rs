@@ -2625,6 +2625,9 @@ impl ChainEndpoint for CardanoChainEndpoint {
             AnyHeader::Tendermint(_) => Err(Error::query(
                 "Cardano build_consensus_state received a Tendermint header".to_string(),
             )),
+            AnyHeader::Stellar(_) => Err(Error::query(
+                "Cardano build_consensus_state received a Stellar header".to_string(),
+            )),
         }
     }
 
@@ -2910,6 +2913,9 @@ fn independent_header_trusted_height(header: &AnyHeader) -> Result<ICSHeight, Er
         AnyHeader::Tendermint(_) => Err(Error::query(
             "Cardano misbehaviour check received a Tendermint header".to_string(),
         )),
+        AnyHeader::Stellar(_) => Err(Error::query(
+            "Cardano misbehaviour check received a Stellar header".to_string(),
+        )),
     }
 }
 
@@ -3111,6 +3117,9 @@ fn extract_ibc_state_root_from_host_state_tx(
         ),
         AnyHeader::Tendermint(_) => Err(Error::query(
             "unexpected Tendermint header in Cardano host state extraction".to_string(),
+        )),
+        AnyHeader::Stellar(_) => Err(Error::query(
+            "unexpected Stellar header in Cardano host state extraction".to_string(),
         )),
     }
 }

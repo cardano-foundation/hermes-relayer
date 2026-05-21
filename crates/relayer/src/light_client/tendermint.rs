@@ -164,6 +164,10 @@ impl super::LightClient<CosmosSdkChain> for LightClient {
                 "received probabilistic header in Tendermint light client for chain {}",
                 self.chain_id
             ))),
+            AnyHeader::Stellar(_) => Err(Error::misbehaviour(format!(
+                "received Stellar header in Tendermint light client for chain {}",
+                self.chain_id
+            ))),
         }?;
 
         let client_state = match client_state {
@@ -173,6 +177,9 @@ impl super::LightClient<CosmosSdkChain> for LightClient {
             )),
             AnyClientState::Probabilistic(_) => Err(Error::client_state_type(
                 "received probabilistic client state in Tendermint light client".to_string(),
+            )),
+            AnyClientState::Stellar(_) => Err(Error::client_state_type(
+                "received Stellar client state in Tendermint light client".to_string(),
             )),
         }?;
 
@@ -377,6 +384,9 @@ impl LightClient {
             )),
             AnyClientState::Probabilistic(_) => Err(Error::client_state_type(
                 "received probabilistic client state in Tendermint light client".to_string(),
+            )),
+            AnyClientState::Stellar(_) => Err(Error::client_state_type(
+                "received Stellar client state in Tendermint light client".to_string(),
             )),
         }?;
 
