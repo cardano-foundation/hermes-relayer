@@ -15,6 +15,9 @@ use ibc_relayer_types::clients::ics08_cardano::client_state::{
 use ibc_relayer_types::clients::ics08_cardano_probabilistic::client_state::{
     ClientState as ProbabilisticClientState, PROBABILISTIC_CLIENT_STATE_TYPE_URL,
 };
+use ibc_relayer_types::clients::ics10_stellar::client_state::{
+    ClientState as StellarClientState, STELLAR_CLIENT_STATE_TYPE_URL,
+};
 
 use ibc_relayer_types::core::ics02_client::client_state::ClientState;
 use ibc_relayer_types::core::ics02_client::client_type::ClientType;
@@ -32,6 +35,8 @@ pub enum AnyClientState {
     Mithril(MithrilClientState),
     /// Probabilistic Cardano client state (`08-cardano-probabilistic`), encoded as `ibc.lightclients.probabilistic.v1.ClientState`.
     Probabilistic(ProbabilisticClientState),
+    /// Stellar client state (`10-stellar`), encoded as `ibc.lightclients.stellar.v1.ClientState`.
+    Stellar(StellarClientState),
 }
 
 impl AnyClientState {
@@ -40,6 +45,7 @@ impl AnyClientState {
             AnyClientState::Tendermint(tm_state) => tm_state.chain_id(),
             AnyClientState::Mithril(mithril_state) => mithril_state.chain_id(),
             AnyClientState::Probabilistic(probabilistic_state) => probabilistic_state.chain_id(),
+            AnyClientState::Stellar(stellar_state) => stellar_state.chain_id(),
         }
     }
 
@@ -48,6 +54,7 @@ impl AnyClientState {
             Self::Tendermint(tm_state) => tm_state.latest_height(),
             Self::Mithril(mithril_state) => mithril_state.latest_height(),
             Self::Probabilistic(probabilistic_state) => probabilistic_state.latest_height(),
+            Self::Stellar(stellar_state) => stellar_state.latest_height(),
         }
     }
 
@@ -56,6 +63,7 @@ impl AnyClientState {
             Self::Tendermint(tm_state) => tm_state.frozen_height(),
             Self::Mithril(mithril_state) => mithril_state.frozen_height(),
             Self::Probabilistic(probabilistic_state) => probabilistic_state.frozen_height(),
+            Self::Stellar(stellar_state) => stellar_state.frozen_height(),
         }
     }
 
@@ -64,6 +72,8 @@ impl AnyClientState {
             AnyClientState::Tendermint(state) => Some(state.trust_threshold),
             AnyClientState::Mithril(_) => None, // Mithril client doesn't use trust threshold
             AnyClientState::Probabilistic(_) => None,
+            // Stellar uses FBA quorum signatures, not Tendermint-style trust thresholds.
+            AnyClientState::Stellar(_) => None,
         }
     }
 
@@ -72,6 +82,10 @@ impl AnyClientState {
             AnyClientState::Tendermint(state) => state.trusting_period,
             AnyClientState::Mithril(state) => state.trusting_period,
             AnyClientState::Probabilistic(state) => state.trusting_period,
+            // Stellar `ClientState` has no trusting period concept (validators rotate via
+            // SCP quorum config, not a time-based trust window). Surface a permissive
+            // default; the verifier doesn't gate updates on this value.
+            AnyClientState::Stellar(_) => Duration::from_secs(60 * 60 * 24 * 14),
         }
     }
 
@@ -80,6 +94,7 @@ impl AnyClientState {
             AnyClientState::Tendermint(state) => state.max_clock_drift,
             AnyClientState::Mithril(_) => Duration::from_secs(300), // 5 minutes default
             AnyClientState::Probabilistic(_) => Duration::from_secs(300),
+            AnyClientState::Stellar(_) => Duration::from_secs(300),
         }
     }
 
@@ -88,6 +103,7 @@ impl AnyClientState {
             Self::Tendermint(state) => state.client_type(),
             Self::Mithril(state) => state.client_type(),
             Self::Probabilistic(state) => state.client_type(),
+            Self::Stellar(state) => state.client_type(),
         }
     }
 
@@ -96,6 +112,7 @@ impl AnyClientState {
             Self::Tendermint(state) => state.expired(elapsed),
             Self::Mithril(state) => state.expired(elapsed),
             Self::Probabilistic(state) => state.expired(elapsed),
+            Self::Stellar(state) => state.expired(elapsed),
         }
     }
 }
@@ -118,6 +135,7 @@ impl TryFrom<Any> for AnyClientState {
             PROBABILISTIC_CLIENT_STATE_TYPE_URL => {
                 Ok(AnyClientState::Probabilistic(raw.try_into()?))
             }
+            STELLAR_CLIENT_STATE_TYPE_URL => Ok(AnyClientState::Stellar(raw.try_into()?)),
 
             _ => Err(Error::unknown_client_state_type(raw.type_url)),
         }
@@ -133,6 +151,7 @@ impl From<AnyClientState> for Any {
             },
             AnyClientState::Mithril(value) => value.into(),
             AnyClientState::Probabilistic(value) => value.into(),
+            AnyClientState::Stellar(value) => value.into(),
         }
     }
 }
@@ -174,6 +193,12 @@ impl From<MithrilClientState> for AnyClientState {
 impl From<ProbabilisticClientState> for AnyClientState {
     fn from(cs: ProbabilisticClientState) -> Self {
         Self::Probabilistic(cs)
+    }
+}
+
+impl From<StellarClientState> for AnyClientState {
+    fn from(cs: StellarClientState) -> Self {
+        Self::Stellar(cs)
     }
 }
 
