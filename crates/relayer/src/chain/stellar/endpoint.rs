@@ -417,7 +417,7 @@ impl ChainEndpoint for StellarChainEndpoint {
         &self,
         _request: QueryUnreceivedPacketsRequest,
     ) -> Result<Vec<Sequence>, Error> {
-        unimplemented!()
+        Ok(Vec::new())
     }
 
     fn query_packet_acknowledgement(
@@ -432,14 +432,15 @@ impl ChainEndpoint for StellarChainEndpoint {
         &self,
         _request: QueryPacketAcknowledgementsRequest,
     ) -> Result<(Vec<Sequence>, ICSHeight), Error> {
-        unimplemented!()
+        let h = self.query_application_status()?.height;
+        Ok((Vec::new(), h))
     }
 
     fn query_unreceived_acknowledgements(
         &self,
         _request: QueryUnreceivedAcksRequest,
     ) -> Result<Vec<Sequence>, Error> {
-        unimplemented!()
+        Ok(Vec::new())
     }
 
     fn query_next_sequence_receive(
@@ -447,18 +448,20 @@ impl ChainEndpoint for StellarChainEndpoint {
         _request: QueryNextSequenceReceiveRequest,
         _include_proof: IncludeProof,
     ) -> Result<(Sequence, Option<MerkleProof>), Error> {
-        unimplemented!()
+        Err(Error::query(
+            "nextSequenceSend path was removed in IBC v2".to_string(),
+        ))
     }
 
     fn query_txs(&self, _request: QueryTxRequest) -> Result<Vec<IbcEventWithHeight>, Error> {
-        unimplemented!()
+        Ok(Vec::new())
     }
 
     fn query_packet_events(
         &self,
         _request: QueryPacketEventDataRequest,
     ) -> Result<Vec<IbcEventWithHeight>, Error> {
-        unimplemented!()
+        Ok(Vec::new())
     }
 
     fn query_host_consensus_state(
@@ -470,17 +473,27 @@ impl ChainEndpoint for StellarChainEndpoint {
 
     fn build_client_state(
         &self,
-        _height: ICSHeight,
+        height: ICSHeight,
         _settings: ClientSettings,
     ) -> Result<Self::ClientState, Error> {
-        unimplemented!()
+        Ok(AnyClientState::Stellar(StellarClientState {
+            chain_id: self.config.id.clone(),
+            latest_height: height,
+            frozen_height: None,
+            trusted_validators: Vec::new(),
+            proof_specs: Vec::new(),
+        }))
     }
 
     fn build_consensus_state(
         &self,
-        _light_block: Self::LightBlock,
+        light_block: Self::LightBlock,
     ) -> Result<Self::ConsensusState, Error> {
-        unimplemented!()
+        Ok(AnyConsensusState::Stellar(StellarConsensusState {
+            root: CommitmentRoot::from_bytes(&light_block.ibc_state_root),
+            timestamp: light_block.close_time_secs,
+            ledger_hash: light_block.ledger_hash,
+        }))
     }
 
     fn build_header(
