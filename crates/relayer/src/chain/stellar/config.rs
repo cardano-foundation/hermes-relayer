@@ -17,11 +17,13 @@ pub struct StellarConfig {
     pub ibc_contract_id: String,
     pub key_name: String,
     pub stub_key_name: String,
+    #[serde(with = "humantime_serde")]
     pub max_block_time: Duration,
     pub packet_filter: PacketFilter,
     pub trust_threshold: TrustThreshold,
     pub clear_interval: Option<u64>,
     pub query_packets_chunk_size: usize,
+    #[serde(with = "humantime_serde")]
     pub clock_drift: Duration,
     pub client_refresh_rate: RefreshRate,
 }
