@@ -189,8 +189,8 @@ pub struct MsgRegisterCounterpartyRequest {
     pub client_id: String,
     #[prost(string, tag = "2")]
     pub counterparty_client_id: String,
-    #[prost(bytes = "vec", tag = "3")]
-    pub merkle_prefix: Vec<u8>,
+    #[prost(bytes = "vec", repeated, tag = "3")]
+    pub counterparty_commitment_prefix: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Message)]
@@ -306,7 +306,11 @@ impl GatewayQueryClient {
             "/stellar.gateway.v1.StellarGatewayQuery/QueryClientState",
         );
         self.inner
-            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
             .await
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
@@ -321,7 +325,11 @@ impl GatewayQueryClient {
             "/stellar.gateway.v1.StellarGatewayQuery/QueryConsensusState",
         );
         self.inner
-            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
             .await
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
@@ -336,7 +344,11 @@ impl GatewayQueryClient {
             "/stellar.gateway.v1.StellarGatewayQuery/QueryPacketCommitment",
         );
         self.inner
-            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
             .await
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
@@ -351,7 +363,11 @@ impl GatewayQueryClient {
             "/stellar.gateway.v1.StellarGatewayQuery/QueryPacketReceipt",
         );
         self.inner
-            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
             .await
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
@@ -366,7 +382,11 @@ impl GatewayQueryClient {
             "/stellar.gateway.v1.StellarGatewayQuery/QueryAcknowledgement",
         );
         self.inner
-            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
             .await
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
@@ -381,7 +401,11 @@ impl GatewayQueryClient {
             "/stellar.gateway.v1.StellarGatewayQuery/QueryNextSeqRecv",
         );
         self.inner
-            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
             .await
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
@@ -396,7 +420,11 @@ impl GatewayQueryClient {
             "/stellar.gateway.v1.StellarGatewayQuery/QueryIbcHeader",
         );
         self.inner
-            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
             .await
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
@@ -436,7 +464,11 @@ impl GatewayMsgClient {
             "/stellar.gateway.v1.StellarGatewayMsg/SubmitSignedTx",
         );
         self.inner
-            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
             .await
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
@@ -451,7 +483,11 @@ impl GatewayMsgClient {
             "/stellar.gateway.v1.StellarGatewayMsg/CreateClient",
         );
         self.inner
-            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
             .await
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
@@ -466,7 +502,11 @@ impl GatewayMsgClient {
             "/stellar.gateway.v1.StellarGatewayMsg/UpdateClient",
         );
         self.inner
-            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
             .await
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
@@ -481,7 +521,11 @@ impl GatewayMsgClient {
             "/stellar.gateway.v1.StellarGatewayMsg/RegisterCounterparty",
         );
         self.inner
-            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
             .await
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
@@ -496,7 +540,11 @@ impl GatewayMsgClient {
             "/stellar.gateway.v1.StellarGatewayMsg/RecvPacket",
         );
         self.inner
-            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
             .await
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
@@ -507,11 +555,14 @@ impl GatewayMsgClient {
         request: MsgAckPacketRequest,
     ) -> Result<MsgAckPacketResponse, StellarError> {
         self.ready().await?;
-        let path = http::uri::PathAndQuery::from_static(
-            "/stellar.gateway.v1.StellarGatewayMsg/AckPacket",
-        );
+        let path =
+            http::uri::PathAndQuery::from_static("/stellar.gateway.v1.StellarGatewayMsg/AckPacket");
         self.inner
-            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
             .await
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
@@ -526,7 +577,11 @@ impl GatewayMsgClient {
             "/stellar.gateway.v1.StellarGatewayMsg/TimeoutPacket",
         );
         self.inner
-            .unary(tonic::Request::new(request), path, tonic::codec::ProstCodec::default())
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
             .await
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
