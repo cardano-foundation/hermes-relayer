@@ -32,6 +32,7 @@ pub mod client;
 pub mod connection;
 pub mod cross_chain_query;
 pub mod packet;
+pub mod stellar_packet;
 pub mod wallet;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
