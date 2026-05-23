@@ -162,6 +162,10 @@ pub struct MsgCreateClientRequest {
     pub consensus_state: Vec<u8>,
     #[prost(string, tag = "3")]
     pub signer: String,
+    #[prost(string, tag = "4")]
+    pub client_type: String,
+    #[prost(uint64, tag = "5")]
+    pub height: u64,
 }
 
 #[derive(Clone, Message)]
