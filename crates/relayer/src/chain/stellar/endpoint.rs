@@ -910,12 +910,12 @@ async fn dispatch_msg(
         url if url == v2_msgs::TYPE_URL_SUBMIT_MISBEHAVIOUR => {
             let m = v2_msgs::MsgSubmitMisbehaviour::decode(value.as_slice())
                 .map_err(|e| Error::send_tx(format!("MsgSubmitMisbehaviour decode: {e}")))?;
-            let header_bytes = m.misbehaviour.map(|a| a.value).unwrap_or_default();
+            let client_message = m.misbehaviour.map(|a| a.value).unwrap_or_default();
             let mut guard = msg_client.lock().unwrap();
             guard
-                .update_client(super::gateway_client::MsgUpdateClientRequest {
+                .submit_misbehaviour(super::gateway_client::MsgSubmitMisbehaviourRequest {
                     client_id: m.client_id,
-                    header: header_bytes,
+                    client_message,
                     signer: if m.signer.is_empty() {
                         signer.to_string()
                     } else {

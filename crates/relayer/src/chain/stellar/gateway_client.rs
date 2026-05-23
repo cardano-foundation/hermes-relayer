@@ -590,4 +590,36 @@ impl GatewayMsgClient {
             .map(|r| r.into_inner())
             .map_err(StellarError::from)
     }
+
+    pub async fn submit_misbehaviour(
+        &mut self,
+        request: MsgSubmitMisbehaviourRequest,
+    ) -> Result<MsgSubmitMisbehaviourResponse, StellarError> {
+        self.ready().await?;
+        let path = http::uri::PathAndQuery::from_static(
+            "/stellar.gateway.v1.StellarGatewayMsg/SubmitMisbehaviour",
+        );
+        self.inner
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
+            .await
+            .map(|r| r.into_inner())
+            .map_err(StellarError::from)
+    }
 }
+
+#[derive(Clone, Message)]
+pub struct MsgSubmitMisbehaviourRequest {
+    #[prost(string, tag = "1")]
+    pub client_id: String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub client_message: Vec<u8>,
+    #[prost(string, tag = "3")]
+    pub signer: String,
+}
+
+#[derive(Clone, Message)]
+pub struct MsgSubmitMisbehaviourResponse {}
