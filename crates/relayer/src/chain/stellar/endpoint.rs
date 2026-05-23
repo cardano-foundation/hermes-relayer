@@ -1,6 +1,9 @@
 use alloc::sync::Arc;
 use core::str::FromStr;
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Mutex as StdMutex;
+use std::time::Duration;
 
 use ibc_proto::ibc::apps::fee::v1::{
     QueryIncentivizedPacketRequest, QueryIncentivizedPacketResponse,
@@ -25,6 +28,7 @@ use ibc_relayer_types::core::ics23_commitment::merkle::MerkleProof;
 use ibc_relayer_types::core::ics24_host::identifier::{
     ChainId, ChannelId, ClientId, ConnectionId, PortId,
 };
+use ibc_relayer_types::events::{IbcEvent, ModuleEvent, ModuleEventAttribute, ModuleId};
 use ibc_relayer_types::signer::Signer;
 use ibc_relayer_types::timestamp::Timestamp;
 use ibc_relayer_types::Height as ICSHeight;
@@ -39,19 +43,22 @@ use crate::chain::endpoint::{ChainEndpoint, ChainStatus, HealthCheck};
 use crate::chain::handle::Subscription;
 use crate::chain::requests::*;
 use crate::chain::tracking::TrackedMsgs;
+use crate::chain::tracking::TrackingId;
 use crate::chain::version::Specs;
 use crate::client_state::{AnyClientState, IdentifiedAnyClientState};
 use crate::config::{ChainConfig, Error as ConfigError};
 use crate::consensus_state::AnyConsensusState;
 use crate::denom::DenomTrace;
 use crate::error::Error;
+use crate::event::source::{Error as SourceError, EventBatch};
 use crate::event::IbcEventWithHeight;
 use crate::keyring::{KeyRing, Store};
 use crate::misbehaviour::MisbehaviourEvidence;
 
 use super::config::StellarConfig;
 use super::gateway_client::{
-    self, GatewayMsgClient, GatewayQueryClient, QueryIbcHeaderRequest,
+    self, EventsRequest, GatewayContractEvent, GatewayMsgClient, GatewayQueryClient,
+    QueryIbcHeaderRequest,
 };
 use super::signing_key_pair::StellarSigningKeyPair;
 
@@ -152,8 +159,19 @@ impl ChainEndpoint for StellarChainEndpoint {
 
     fn subscribe(&mut self) -> Result<Subscription, Error> {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut guard = self.event_sender.lock().unwrap();
-        *guard = Some(tx);
+        {
+            let mut guard = self.event_sender.lock().unwrap();
+            *guard = Some(tx.clone());
+        }
+
+        let chain_id = self.config.id.clone();
+        let gateway_url = self.config.gateway_url.clone();
+        let poll_interval = Duration::from_secs(2);
+
+        self.rt.spawn(async move {
+            run_event_polling(chain_id, gateway_url, tx, poll_interval).await;
+        });
+
         Ok(rx)
     }
 
@@ -956,4 +974,147 @@ fn ledger_previous_hash(ledger_header_xdr: &[u8]) -> Result<Vec<u8>, Error> {
     let header = LedgerHeader::from_xdr(ledger_header_xdr, Limits::none())
         .map_err(|e| Error::query(format!("LedgerHeader XDR decode failed: {e}")))?;
     Ok(header.previous_ledger_hash.0.to_vec())
+}
+
+const STELLAR_ROUTER_MODULE: &str = "stellaribcrouter";
+
+async fn run_event_polling(
+    chain_id: ChainId,
+    gateway_url: String,
+    sender: crossbeam_channel::Sender<Arc<crate::event::source::Result<EventBatch>>>,
+    poll_interval: Duration,
+) {
+    let mut client = match GatewayQueryClient::connect(gateway_url.clone()).await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = sender.send(Arc::new(Err(SourceError::collect_events_failed(format!(
+                "Stellar event polling: gateway connect failed: {e}"
+            )))));
+            return;
+        }
+    };
+
+    let mut start_ledger: u32 = match client.latest_height().await {
+        Ok(h) => h.revision_height as u32,
+        Err(e) => {
+            tracing::warn!(
+                target: "stellar_events",
+                "latest_height failed at startup: {e}; defaulting start_ledger to 1"
+            );
+            1
+        }
+    };
+    let mut cursor = String::new();
+
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        let req = EventsRequest {
+            start_ledger: if cursor.is_empty() { start_ledger } else { 0 },
+            cursor: cursor.clone(),
+            limit: 200,
+        };
+
+        let resp = match client.events(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    target: "stellar_events",
+                    "gateway events poll failed (start_ledger={start_ledger}, cursor='{cursor}'): {e}"
+                );
+                continue;
+            }
+        };
+
+        if !resp.cursor.is_empty() {
+            cursor = resp.cursor;
+        }
+        if resp.latest_ledger as u32 > start_ledger {
+            start_ledger = resp.latest_ledger as u32;
+        }
+
+        let mut by_ledger: BTreeMap<u64, Vec<IbcEventWithHeight>> = BTreeMap::new();
+        for ev in resp.events {
+            let height = match ICSHeight::new(0, ev.ledger) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            if let Some(ibc_ev) = translate_router_event(&ev) {
+                by_ledger
+                    .entry(ev.ledger)
+                    .or_default()
+                    .push(IbcEventWithHeight::new(ibc_ev, height));
+            }
+        }
+
+        for (ledger_seq, events) in by_ledger {
+            let height = match ICSHeight::new(0, ledger_seq) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            let batch = EventBatch {
+                chain_id: chain_id.clone(),
+                tracking_id: TrackingId::new_uuid(),
+                height,
+                events,
+            };
+            if sender.send(Arc::new(Ok(batch))).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn translate_router_event(ev: &GatewayContractEvent) -> Option<IbcEvent> {
+    use stellar_xdr::curr::{Limits, ReadXdr, ScVal};
+
+    let topics: Vec<ScVal> = ev
+        .topics_xdr
+        .iter()
+        .filter_map(|t| ScVal::from_xdr(t, Limits::none()).ok())
+        .collect();
+
+    let kind = match topics.first() {
+        Some(ScVal::Symbol(sym)) => core::str::from_utf8(sym.0.as_slice()).ok()?.to_owned(),
+        _ => return None,
+    };
+
+    if !matches!(
+        kind.as_str(),
+        "send_packet" | "recv_packet" | "write_ack" | "ack_packet" | "timeout_packet"
+    ) {
+        return None;
+    }
+
+    let module_name = ModuleId::new(Cow::Borrowed(STELLAR_ROUTER_MODULE)).ok()?;
+
+    let mut attributes = Vec::with_capacity(4);
+    attributes.push(ModuleEventAttribute {
+        key: "tx_hash".to_string(),
+        value: ev.tx_hash.clone(),
+    });
+    attributes.push(ModuleEventAttribute {
+        key: "event_id".to_string(),
+        value: ev.id.clone(),
+    });
+    if let Some(ScVal::String(s)) = topics.get(1) {
+        if let Ok(client_id) = core::str::from_utf8(s.0.as_slice()) {
+            attributes.push(ModuleEventAttribute {
+                key: "client_id".to_string(),
+                value: client_id.to_string(),
+            });
+        }
+    }
+    if let Some(ScVal::U64(seq)) = topics.get(2) {
+        attributes.push(ModuleEventAttribute {
+            key: "sequence".to_string(),
+            value: seq.to_string(),
+        });
+    }
+
+    Some(IbcEvent::AppModule(ModuleEvent {
+        kind,
+        module_name,
+        attributes,
+    }))
 }

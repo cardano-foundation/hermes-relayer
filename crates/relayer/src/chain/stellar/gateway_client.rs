@@ -141,6 +141,44 @@ pub struct QueryIbcHeaderResponse {
 }
 
 #[derive(Clone, Message)]
+pub struct EventsRequest {
+    #[prost(uint32, tag = "1")]
+    pub start_ledger: u32,
+    #[prost(string, tag = "2")]
+    pub cursor: String,
+    #[prost(uint32, tag = "3")]
+    pub limit: u32,
+}
+
+#[derive(Clone, Message)]
+pub struct EventsResponse {
+    #[prost(uint64, tag = "1")]
+    pub latest_ledger: u64,
+    #[prost(string, tag = "2")]
+    pub cursor: String,
+    #[prost(message, repeated, tag = "3")]
+    pub events: Vec<GatewayContractEvent>,
+}
+
+#[derive(Clone, Message)]
+pub struct GatewayContractEvent {
+    #[prost(string, tag = "1")]
+    pub id: String,
+    #[prost(uint64, tag = "2")]
+    pub ledger: u64,
+    #[prost(string, tag = "3")]
+    pub ledger_closed_at: String,
+    #[prost(string, tag = "4")]
+    pub contract_id: String,
+    #[prost(string, tag = "5")]
+    pub tx_hash: String,
+    #[prost(bytes = "vec", repeated, tag = "6")]
+    pub topics_xdr: Vec<Vec<u8>>,
+    #[prost(bytes = "vec", tag = "7")]
+    pub value_xdr: Vec<u8>,
+}
+
+#[derive(Clone, Message)]
 pub struct SubmitSignedTxRequest {
     #[prost(bytes = "vec", tag = "1")]
     pub tx_xdr: Vec<u8>,
@@ -423,6 +461,24 @@ impl GatewayQueryClient {
         let path = http::uri::PathAndQuery::from_static(
             "/stellar.gateway.v1.StellarGatewayQuery/QueryIbcHeader",
         );
+        self.inner
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
+            .await
+            .map(|r| r.into_inner())
+            .map_err(StellarError::from)
+    }
+
+    pub async fn events(
+        &mut self,
+        request: EventsRequest,
+    ) -> Result<EventsResponse, StellarError> {
+        self.ready().await?;
+        let path =
+            http::uri::PathAndQuery::from_static("/stellar.gateway.v1.StellarGatewayQuery/Events");
         self.inner
             .unary(
                 tonic::Request::new(request),
