@@ -70,6 +70,8 @@ pub struct StellarChainEndpoint {
     pub gateway_query: StdMutex<GatewayQueryClient>,
     pub gateway_msg: StdMutex<GatewayMsgClient>,
     pub rt: Arc<TokioRuntime>,
+    pub event_sender:
+        StdMutex<Option<crossbeam_channel::Sender<Arc<crate::event::source::Result<crate::event::source::EventBatch>>>>>,
 }
 
 impl ChainEndpoint for StellarChainEndpoint {
@@ -124,6 +126,7 @@ impl ChainEndpoint for StellarChainEndpoint {
             gateway_query: StdMutex::new(gateway_query),
             gateway_msg: StdMutex::new(gateway_msg),
             rt,
+            event_sender: StdMutex::new(None),
         })
     }
 
@@ -148,7 +151,10 @@ impl ChainEndpoint for StellarChainEndpoint {
     }
 
     fn subscribe(&mut self) -> Result<Subscription, Error> {
-        unimplemented!()
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut guard = self.event_sender.lock().unwrap();
+        *guard = Some(tx);
+        Ok(rx)
     }
 
     fn keybase(&self) -> &KeyRing<Self::SigningKeyPair> {
