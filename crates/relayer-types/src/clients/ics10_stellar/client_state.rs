@@ -198,3 +198,52 @@ impl From<ClientState> for Any {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_state(wasm_checksum: Option<Vec<u8>>) -> ClientState {
+        ClientState {
+            chain_id: ChainId::from_string("stellar-testnet"),
+            latest_height: Height::new(0, 100).unwrap(),
+            frozen_height: None,
+            trusted_validators: vec![vec![0x42; 32]],
+            proof_specs: vec![],
+            network_id: vec![0x33; 32],
+            wasm_checksum,
+        }
+    }
+
+    #[test]
+    fn native_any_uses_stellar_type_url_and_round_trips() {
+        let original = sample_state(None);
+        let any: Any = original.clone().into();
+        assert_eq!(any.type_url, STELLAR_CLIENT_STATE_TYPE_URL);
+        let decoded: ClientState = any.try_into().unwrap();
+        assert_eq!(decoded, original);
+        assert!(decoded.wasm_checksum.is_none());
+    }
+
+    #[test]
+    fn wasm_any_uses_wasm_type_url_and_round_trips_with_checksum() {
+        let checksum = vec![0xAB; 32];
+        let original = sample_state(Some(checksum.clone()));
+        let any: Any = original.clone().into();
+        assert_eq!(any.type_url, WASM_CLIENT_STATE_TYPE_URL);
+        let decoded: ClientState = any.try_into().unwrap();
+        assert_eq!(decoded.chain_id, original.chain_id);
+        assert_eq!(decoded.latest_height, original.latest_height);
+        assert_eq!(decoded.network_id, original.network_id);
+        assert_eq!(decoded.wasm_checksum, Some(checksum));
+    }
+
+    #[test]
+    fn network_id_is_carried_through_native_round_trip() {
+        let original = sample_state(None);
+        let raw: RawClientState = original.clone().into();
+        assert_eq!(raw.network_id, original.network_id);
+        let decoded: ClientState = raw.try_into().unwrap();
+        assert_eq!(decoded.network_id, original.network_id);
+    }
+}

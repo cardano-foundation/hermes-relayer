@@ -138,3 +138,39 @@ impl From<ConsensusState> for Any {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(wrap_as_wasm: bool) -> ConsensusState {
+        ConsensusState {
+            root: CommitmentRoot::from_bytes(&[0x11; 32]),
+            timestamp: 1_700_000_000,
+            ledger_hash: vec![0xaa; 32],
+            wrap_as_wasm,
+        }
+    }
+
+    #[test]
+    fn native_any_uses_stellar_type_url_and_round_trips() {
+        let original = sample(false);
+        let any: Any = original.clone().into();
+        assert_eq!(any.type_url, STELLAR_CONSENSUS_STATE_TYPE_URL);
+        let decoded: ConsensusState = any.try_into().unwrap();
+        assert_eq!(decoded.timestamp, original.timestamp);
+        assert_eq!(decoded.ledger_hash, original.ledger_hash);
+        assert!(!decoded.wrap_as_wasm);
+    }
+
+    #[test]
+    fn wasm_any_wraps_and_round_trips_marking_wasm() {
+        let original = sample(true);
+        let any: Any = original.clone().into();
+        assert_eq!(any.type_url, WASM_CONSENSUS_STATE_TYPE_URL);
+        let decoded: ConsensusState = any.try_into().unwrap();
+        assert_eq!(decoded.timestamp, original.timestamp);
+        assert_eq!(decoded.ledger_hash, original.ledger_hash);
+        assert!(decoded.wrap_as_wasm);
+    }
+}

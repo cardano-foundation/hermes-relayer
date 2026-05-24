@@ -178,3 +178,60 @@ impl From<Header> for Any {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_header(ts_secs: u64) -> Header {
+        Header {
+            trusted_height: Height::new(0, 100).unwrap(),
+            height: Height::new(0, 105).unwrap(),
+            timestamp: Timestamp::from_nanoseconds(ts_secs.saturating_mul(1_000_000_000))
+                .unwrap_or_else(|_| Timestamp::none()),
+            ledger_header_xdr: vec![0xCC; 16],
+            ibc_state_root: vec![0x11; 32],
+            scp_envelopes: vec![ScpEnvelope {
+                node_id: vec![0x42; 32],
+                statement_xdr: vec![1, 2, 3],
+                signature: vec![0u8; 64],
+            }],
+            ledger_hash: vec![0xaa; 32],
+            previous_ledger_hash: vec![0xbb; 32],
+        }
+    }
+
+    #[test]
+    fn raw_round_trip_carries_new_fields() {
+        let original = sample_header(1_700_000_500);
+        let raw: RawHeader = original.clone().into();
+        assert_eq!(raw.timestamp, 1_700_000_500);
+        assert_eq!(raw.ledger_hash, original.ledger_hash);
+        assert_eq!(raw.previous_ledger_hash, original.previous_ledger_hash);
+
+        let decoded: Header = raw.try_into().unwrap();
+        assert_eq!(decoded.height, original.height);
+        assert_eq!(decoded.ledger_hash, original.ledger_hash);
+        assert_eq!(decoded.previous_ledger_hash, original.previous_ledger_hash);
+    }
+
+    #[test]
+    fn timestamp_zero_decodes_as_none() {
+        let mut original = sample_header(0);
+        original.timestamp = Timestamp::none();
+        let raw: RawHeader = original.clone().into();
+        assert_eq!(raw.timestamp, 0);
+        let decoded: Header = raw.try_into().unwrap();
+        assert_eq!(decoded.timestamp, Timestamp::none());
+    }
+
+    #[test]
+    fn any_round_trip_through_stellar_type_url() {
+        let original = sample_header(1_700_000_500);
+        let any: Any = original.clone().into();
+        assert_eq!(any.type_url, STELLAR_HEADER_TYPE_URL);
+        let decoded: Header = any.try_into().unwrap();
+        assert_eq!(decoded.ledger_hash, original.ledger_hash);
+        assert_eq!(decoded.previous_ledger_hash, original.previous_ledger_hash);
+    }
+}
