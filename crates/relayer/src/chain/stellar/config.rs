@@ -26,4 +26,6 @@ pub struct StellarConfig {
     #[serde(with = "humantime_serde")]
     pub clock_drift: Duration,
     pub client_refresh_rate: RefreshRate,
+    #[serde(default)]
+    pub wasm_checksum_hex: Option<String>,
 }
