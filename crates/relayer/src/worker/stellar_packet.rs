@@ -1,7 +1,9 @@
 use core::time::Duration;
 
+use stellar_xdr::curr::{Limits, ReadXdr, ScVal};
 use tracing::{debug, error_span, info, warn};
 
+use ibc_relayer_types::clients::ics10_stellar::v2_msgs::{Packet, Payload};
 use ibc_relayer_types::core::ics24_host::identifier::ChainId;
 use ibc_relayer_types::events::{IbcEvent, ModuleEvent};
 
@@ -20,6 +22,8 @@ pub struct StellarPacketEvent {
     pub sequence: u64,
     pub tx_hash: String,
     pub event_id: String,
+    pub value_xdr: Vec<u8>,
+    pub contract_id: String,
 }
 
 pub fn extract_router_event(ev: &ModuleEvent) -> Option<StellarPacketEvent> {
@@ -38,6 +42,8 @@ pub fn extract_router_event(ev: &ModuleEvent) -> Option<StellarPacketEvent> {
         sequence: 0,
         tx_hash: String::new(),
         event_id: String::new(),
+        value_xdr: Vec::new(),
+        contract_id: String::new(),
     };
     for attr in &ev.attributes {
         match attr.key.as_str() {
@@ -49,10 +55,200 @@ pub fn extract_router_event(ev: &ModuleEvent) -> Option<StellarPacketEvent> {
             }
             "tx_hash" => out.tx_hash = attr.value.clone(),
             "event_id" => out.event_id = attr.value.clone(),
+            "value_xdr_hex" => {
+                if let Some(bytes) = decode_hex(&attr.value) {
+                    out.value_xdr = bytes;
+                }
+            }
+            "contract_id" => out.contract_id = attr.value.clone(),
             _ => {}
         }
     }
     Some(out)
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PacketDecodeError {
+    #[error("event body XDR decode failed: {0}")]
+    Xdr(String),
+    #[error("event body is not a struct map (got ScVal variant: {0})")]
+    NotAStruct(&'static str),
+    #[error("missing field {0} in event body")]
+    MissingField(&'static str),
+    #[error("field {field} has unexpected type ({reason})")]
+    WrongFieldType { field: &'static str, reason: String },
+}
+
+/// Decode the body of a router `send_packet` / `recv_packet` event into a
+/// `v2_msgs::Packet`. The router emits the packet as a `#[contracttype]`
+/// struct, which Soroban encodes as an `ScVal::Map` of `(Symbol(field_name),
+/// field_value)` entries.
+pub fn decode_packet_from_event_body(value_xdr: &[u8]) -> Result<Packet, PacketDecodeError> {
+    let body = ScVal::from_xdr(value_xdr, Limits::none())
+        .map_err(|e| PacketDecodeError::Xdr(e.to_string()))?;
+    decode_packet_scval(&body)
+}
+
+fn decode_packet_scval(value: &ScVal) -> Result<Packet, PacketDecodeError> {
+    let entries = struct_entries(value)?;
+
+    let sequence = u64_field(entries, "sequence")?;
+    let source_client = string_field(entries, "source_client")?;
+    let dest_client = string_field(entries, "dest_client")?;
+    let timeout_timestamp = u64_field(entries, "timeout_timestamp")?;
+    let payloads_scval = lookup(entries, "payloads")?;
+    let payloads = decode_payloads(payloads_scval)?;
+
+    Ok(Packet {
+        sequence,
+        source_client,
+        dest_client,
+        timeout_timestamp,
+        payloads,
+    })
+}
+
+fn decode_payloads(value: &ScVal) -> Result<Vec<Payload>, PacketDecodeError> {
+    let vec = match value {
+        ScVal::Vec(Some(v)) => v,
+        ScVal::Vec(None) => {
+            return Ok(Vec::new());
+        }
+        other => {
+            return Err(PacketDecodeError::WrongFieldType {
+                field: "payloads",
+                reason: format!("expected Vec, got {}", scval_variant_name(other)),
+            });
+        }
+    };
+    vec.0.iter().map(decode_payload).collect()
+}
+
+fn decode_payload(value: &ScVal) -> Result<Payload, PacketDecodeError> {
+    let entries = struct_entries(value)?;
+    let source_port = string_field(entries, "source_port")?;
+    let dest_port = string_field(entries, "dest_port")?;
+    let version = string_field(entries, "version")?;
+    let encoding = string_field(entries, "encoding")?;
+    let value_bytes = match lookup(entries, "value")? {
+        ScVal::Bytes(b) => b.0.to_vec(),
+        other => {
+            return Err(PacketDecodeError::WrongFieldType {
+                field: "value",
+                reason: format!("expected Bytes, got {}", scval_variant_name(other)),
+            });
+        }
+    };
+    Ok(Payload {
+        source_port,
+        dest_port,
+        version,
+        encoding,
+        value: value_bytes,
+    })
+}
+
+fn struct_entries(value: &ScVal) -> Result<&[stellar_xdr::curr::ScMapEntry], PacketDecodeError> {
+    match value {
+        ScVal::Map(Some(m)) => Ok(m.0.as_slice()),
+        other => Err(PacketDecodeError::NotAStruct(scval_variant_name(other))),
+    }
+}
+
+fn lookup<'a>(
+    entries: &'a [stellar_xdr::curr::ScMapEntry],
+    name: &'static str,
+) -> Result<&'a ScVal, PacketDecodeError> {
+    for entry in entries {
+        if let ScVal::Symbol(sym) = &entry.key {
+            if sym.0.as_slice() == name.as_bytes() {
+                return Ok(&entry.val);
+            }
+        }
+    }
+    Err(PacketDecodeError::MissingField(name))
+}
+
+fn u64_field(
+    entries: &[stellar_xdr::curr::ScMapEntry],
+    name: &'static str,
+) -> Result<u64, PacketDecodeError> {
+    match lookup(entries, name)? {
+        ScVal::U64(n) => Ok(*n),
+        other => Err(PacketDecodeError::WrongFieldType {
+            field: name,
+            reason: format!("expected U64, got {}", scval_variant_name(other)),
+        }),
+    }
+}
+
+fn string_field(
+    entries: &[stellar_xdr::curr::ScMapEntry],
+    name: &'static str,
+) -> Result<String, PacketDecodeError> {
+    match lookup(entries, name)? {
+        ScVal::String(s) => core::str::from_utf8(s.0.as_slice())
+            .map(|s| s.to_owned())
+            .map_err(|e| PacketDecodeError::WrongFieldType {
+                field: name,
+                reason: format!("String not UTF-8: {e}"),
+            }),
+        other => Err(PacketDecodeError::WrongFieldType {
+            field: name,
+            reason: format!("expected String, got {}", scval_variant_name(other)),
+        }),
+    }
+}
+
+fn scval_variant_name(value: &ScVal) -> &'static str {
+    match value {
+        ScVal::Bool(_) => "Bool",
+        ScVal::Void => "Void",
+        ScVal::Error(_) => "Error",
+        ScVal::U32(_) => "U32",
+        ScVal::I32(_) => "I32",
+        ScVal::U64(_) => "U64",
+        ScVal::I64(_) => "I64",
+        ScVal::Timepoint(_) => "Timepoint",
+        ScVal::Duration(_) => "Duration",
+        ScVal::U128(_) => "U128",
+        ScVal::I128(_) => "I128",
+        ScVal::U256(_) => "U256",
+        ScVal::I256(_) => "I256",
+        ScVal::Bytes(_) => "Bytes",
+        ScVal::String(_) => "String",
+        ScVal::Symbol(_) => "Symbol",
+        ScVal::Vec(_) => "Vec",
+        ScVal::Map(_) => "Map",
+        ScVal::Address(_) => "Address",
+        ScVal::ContractInstance(_) => "ContractInstance",
+        ScVal::LedgerKeyContractInstance => "LedgerKeyContractInstance",
+        ScVal::LedgerKeyNonce(_) => "LedgerKeyNonce",
+    }
+}
+
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim().trim_start_matches("0x");
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for i in (0..bytes.len()).step_by(2) {
+        let hi = char_to_nibble(bytes[i])?;
+        let lo = char_to_nibble(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+fn char_to_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 pub fn spawn_stellar_packet_worker(chain_id: ChainId, subscription: Subscription) -> TaskHandle {
@@ -85,6 +281,19 @@ fn process_batch(chain_id: &ChainId, batch: &EventBatch) {
     for ev in &batch.events {
         if let IbcEvent::AppModule(m) = &ev.event {
             if let Some(packet_ev) = extract_router_event(m) {
+                let payload_summary = if packet_ev.value_xdr.is_empty() {
+                    "none".to_string()
+                } else {
+                    match decode_packet_from_event_body(&packet_ev.value_xdr) {
+                        Ok(packet) => format!(
+                            "src={} dst={} payloads={}",
+                            packet.source_client,
+                            packet.dest_client,
+                            packet.payloads.len()
+                        ),
+                        Err(e) => format!("decode_failed: {e}"),
+                    }
+                };
                 info!(
                     target: "stellar_packet",
                     chain = %chain_id,
@@ -94,6 +303,7 @@ fn process_batch(chain_id: &ChainId, batch: &EventBatch) {
                     tx_hash = %packet_ev.tx_hash,
                     event_id = %packet_ev.event_id,
                     ledger = height.revision_height(),
+                    payload = %payload_summary,
                     "observed stellar router event"
                 );
             }
@@ -211,5 +421,198 @@ mod tests {
                 "kind {kind} should be accepted"
             );
         }
+    }
+
+    #[test]
+    fn value_xdr_hex_attribute_round_trips() {
+        let raw_bytes = vec![0x00, 0xAB, 0xCD, 0xFF];
+        let hex = "00abcdff";
+        let ev = build_event(
+            "send_packet",
+            "stellaribcrouter",
+            &[
+                ("client_id", "10-stellar-0"),
+                ("sequence", "1"),
+                ("value_xdr_hex", hex),
+                ("contract_id", "CABC"),
+            ],
+        );
+        let out = extract_router_event(&ev).unwrap();
+        assert_eq!(out.value_xdr, raw_bytes);
+        assert_eq!(out.contract_id, "CABC");
+    }
+
+    #[test]
+    fn malformed_value_xdr_hex_falls_back_to_empty() {
+        let ev = build_event(
+            "send_packet",
+            "stellaribcrouter",
+            &[
+                ("client_id", "c"),
+                ("sequence", "1"),
+                ("value_xdr_hex", "zz"),
+            ],
+        );
+        let out = extract_router_event(&ev).unwrap();
+        assert!(out.value_xdr.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod decoder_tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        BytesM, Limits, ScBytes, ScMap, ScMapEntry, ScString, ScSymbol, ScVec, StringM, VecM,
+        WriteXdr,
+    };
+
+    fn sym(s: &str) -> ScVal {
+        ScVal::Symbol(ScSymbol(StringM::<32>::try_from(s.as_bytes().to_vec()).unwrap()))
+    }
+
+    fn string_val(s: &str) -> ScVal {
+        ScVal::String(ScString(StringM::try_from(s.as_bytes().to_vec()).unwrap()))
+    }
+
+    fn bytes_val(b: &[u8]) -> ScVal {
+        ScVal::Bytes(ScBytes(BytesM::try_from(b.to_vec()).unwrap()))
+    }
+
+    fn struct_val(entries: Vec<(&str, ScVal)>) -> ScVal {
+        let mapped: Vec<ScMapEntry> = entries
+            .into_iter()
+            .map(|(k, v)| ScMapEntry { key: sym(k), val: v })
+            .collect();
+        ScVal::Map(Some(ScMap(VecM::try_from(mapped).unwrap())))
+    }
+
+    fn vec_val(items: Vec<ScVal>) -> ScVal {
+        ScVal::Vec(Some(ScVec(VecM::try_from(items).unwrap())))
+    }
+
+    fn sample_payload() -> ScVal {
+        struct_val(vec![
+            ("source_port", string_val("transfer")),
+            ("dest_port", string_val("transfer")),
+            ("version", string_val("ics20-2")),
+            ("encoding", string_val("json")),
+            ("value", bytes_val(b"app-data")),
+        ])
+    }
+
+    fn sample_packet_scval() -> ScVal {
+        struct_val(vec![
+            ("sequence", ScVal::U64(42)),
+            ("source_client", string_val("10-stellar-0")),
+            ("dest_client", string_val("07-tendermint-0")),
+            ("timeout_timestamp", ScVal::U64(1_700_000_500)),
+            ("payloads", vec_val(vec![sample_payload()])),
+        ])
+    }
+
+    #[test]
+    fn decode_single_payload_packet() {
+        let xdr = sample_packet_scval().to_xdr(Limits::none()).unwrap();
+        let packet = decode_packet_from_event_body(&xdr).unwrap();
+        assert_eq!(packet.sequence, 42);
+        assert_eq!(packet.source_client, "10-stellar-0");
+        assert_eq!(packet.dest_client, "07-tendermint-0");
+        assert_eq!(packet.timeout_timestamp, 1_700_000_500);
+        assert_eq!(packet.payloads.len(), 1);
+        let p = &packet.payloads[0];
+        assert_eq!(p.source_port, "transfer");
+        assert_eq!(p.dest_port, "transfer");
+        assert_eq!(p.version, "ics20-2");
+        assert_eq!(p.encoding, "json");
+        assert_eq!(p.value, b"app-data");
+    }
+
+    #[test]
+    fn decode_empty_payloads_vec_is_ok() {
+        let body = struct_val(vec![
+            ("sequence", ScVal::U64(1)),
+            ("source_client", string_val("a")),
+            ("dest_client", string_val("b")),
+            ("timeout_timestamp", ScVal::U64(0)),
+            ("payloads", vec_val(vec![])),
+        ]);
+        let xdr = body.to_xdr(Limits::none()).unwrap();
+        let packet = decode_packet_from_event_body(&xdr).unwrap();
+        assert!(packet.payloads.is_empty());
+    }
+
+    #[test]
+    fn decode_rejects_non_struct_body() {
+        let xdr = ScVal::U64(99).to_xdr(Limits::none()).unwrap();
+        let err = decode_packet_from_event_body(&xdr).unwrap_err();
+        assert!(matches!(err, PacketDecodeError::NotAStruct(_)));
+    }
+
+    #[test]
+    fn decode_rejects_missing_required_field() {
+        let body = struct_val(vec![
+            ("sequence", ScVal::U64(1)),
+            ("source_client", string_val("a")),
+            ("dest_client", string_val("b")),
+            // timeout_timestamp missing
+            ("payloads", vec_val(vec![])),
+        ]);
+        let xdr = body.to_xdr(Limits::none()).unwrap();
+        let err = decode_packet_from_event_body(&xdr).unwrap_err();
+        assert_eq!(err, PacketDecodeError::MissingField("timeout_timestamp"));
+    }
+
+    #[test]
+    fn decode_rejects_wrong_field_type() {
+        let body = struct_val(vec![
+            ("sequence", string_val("not-a-u64")),
+            ("source_client", string_val("a")),
+            ("dest_client", string_val("b")),
+            ("timeout_timestamp", ScVal::U64(0)),
+            ("payloads", vec_val(vec![])),
+        ]);
+        let xdr = body.to_xdr(Limits::none()).unwrap();
+        let err = decode_packet_from_event_body(&xdr).unwrap_err();
+        assert!(matches!(
+            err,
+            PacketDecodeError::WrongFieldType { field: "sequence", .. }
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_garbage_xdr() {
+        let err = decode_packet_from_event_body(b"not xdr").unwrap_err();
+        assert!(matches!(err, PacketDecodeError::Xdr(_)));
+    }
+
+    #[test]
+    fn decode_multi_payload_packet_preserves_order() {
+        let p1 = struct_val(vec![
+            ("source_port", string_val("transfer")),
+            ("dest_port", string_val("transfer")),
+            ("version", string_val("v1")),
+            ("encoding", string_val("json")),
+            ("value", bytes_val(b"first")),
+        ]);
+        let p2 = struct_val(vec![
+            ("source_port", string_val("erroring")),
+            ("dest_port", string_val("erroring")),
+            ("version", string_val("v1")),
+            ("encoding", string_val("cbor")),
+            ("value", bytes_val(b"second")),
+        ]);
+        let body = struct_val(vec![
+            ("sequence", ScVal::U64(2)),
+            ("source_client", string_val("src")),
+            ("dest_client", string_val("dst")),
+            ("timeout_timestamp", ScVal::U64(999)),
+            ("payloads", vec_val(vec![p1, p2])),
+        ]);
+        let xdr = body.to_xdr(Limits::none()).unwrap();
+        let packet = decode_packet_from_event_body(&xdr).unwrap();
+        assert_eq!(packet.payloads.len(), 2);
+        assert_eq!(packet.payloads[0].value, b"first");
+        assert_eq!(packet.payloads[1].value, b"second");
+        assert_eq!(packet.payloads[1].encoding, "cbor");
     }
 }

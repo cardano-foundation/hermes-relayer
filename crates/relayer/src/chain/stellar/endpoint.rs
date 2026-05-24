@@ -714,7 +714,7 @@ impl ChainEndpoint for StellarChainEndpoint {
 
         let envelope = stellar_raw::ScpEnvelope {
             node_id: wire.scp_node_id,
-            statement_xdr: Vec::new(),
+            statement_xdr: wire.signed_value_xdr,
             signature: wire.scp_signature,
         };
 
@@ -1176,10 +1176,32 @@ fn translate_router_event(ev: &GatewayContractEvent) -> Option<IbcEvent> {
             value: seq.to_string(),
         });
     }
+    if !ev.value_xdr.is_empty() {
+        attributes.push(ModuleEventAttribute {
+            key: "value_xdr_hex".to_string(),
+            value: hex_encode_bytes(&ev.value_xdr),
+        });
+    }
+    if !ev.contract_id.is_empty() {
+        attributes.push(ModuleEventAttribute {
+            key: "contract_id".to_string(),
+            value: ev.contract_id.clone(),
+        });
+    }
 
     Some(IbcEvent::AppModule(ModuleEvent {
         kind,
         module_name,
         attributes,
     }))
+}
+
+fn hex_encode_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }

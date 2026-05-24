@@ -297,6 +297,8 @@ pub struct StellarHeader {
     pub scp_node_id: Vec<u8>,
     #[prost(bytes = "vec", tag = "5")]
     pub scp_signature: Vec<u8>,
+    #[prost(bytes = "vec", tag = "6")]
+    pub signed_value_xdr: Vec<u8>,
 }
 
 pub struct GatewayQueryClient {
