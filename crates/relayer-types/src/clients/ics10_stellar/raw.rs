@@ -30,6 +30,8 @@ pub struct ClientState {
     pub trusted_validators: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
     #[prost(bytes = "vec", repeated, tag = "5")]
     pub proof_specs: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    #[prost(bytes = "vec", tag = "6")]
+    pub network_id: ::prost::alloc::vec::Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
@@ -54,6 +56,12 @@ pub struct StellarHeader {
     pub scp_envelopes: ::prost::alloc::vec::Vec<ScpEnvelope>,
     #[prost(message, optional, tag = "5")]
     pub trusted_height: ::core::option::Option<Height>,
+    #[prost(uint64, tag = "6")]
+    pub timestamp: u64,
+    #[prost(bytes = "vec", tag = "7")]
+    pub ledger_hash: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "8")]
+    pub previous_ledger_hash: ::prost::alloc::vec::Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
