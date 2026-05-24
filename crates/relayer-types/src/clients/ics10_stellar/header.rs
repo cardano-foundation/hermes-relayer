@@ -25,6 +25,8 @@ pub struct Header {
     pub ledger_header_xdr: Vec<u8>,
     pub ibc_state_root: Vec<u8>,
     pub scp_envelopes: Vec<ScpEnvelope>,
+    pub ledger_hash: Vec<u8>,
+    pub previous_ledger_hash: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,7 +111,12 @@ impl TryFrom<RawHeader> for Header {
             return Err(Error::missing_field("scp_envelopes"));
         }
 
-        let timestamp = Timestamp::none();
+        let timestamp = if raw.timestamp == 0 {
+            Timestamp::none()
+        } else {
+            Timestamp::from_nanoseconds(raw.timestamp.saturating_mul(1_000_000_000))
+                .unwrap_or_else(|_| Timestamp::none())
+        };
 
         Ok(Self {
             trusted_height,
@@ -118,18 +125,28 @@ impl TryFrom<RawHeader> for Header {
             ledger_header_xdr: raw.ledger_header_xdr,
             ibc_state_root: raw.ibc_state_root,
             scp_envelopes: raw.scp_envelopes.into_iter().map(Into::into).collect(),
+            ledger_hash: raw.ledger_hash,
+            previous_ledger_hash: raw.previous_ledger_hash,
         })
     }
 }
 
 impl From<Header> for RawHeader {
     fn from(value: Header) -> Self {
+        let timestamp_secs = value
+            .timestamp
+            .nanoseconds()
+            .checked_div(1_000_000_000)
+            .unwrap_or(0);
         RawHeader {
             ledger_seq: value.height.revision_height(),
             ledger_header_xdr: value.ledger_header_xdr,
             ibc_state_root: value.ibc_state_root,
             scp_envelopes: value.scp_envelopes.into_iter().map(Into::into).collect(),
             trusted_height: Some(value.trusted_height.into()),
+            timestamp: timestamp_secs,
+            ledger_hash: value.ledger_hash,
+            previous_ledger_hash: value.previous_ledger_hash,
         }
     }
 }
