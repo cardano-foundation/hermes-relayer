@@ -4,6 +4,7 @@ use prost::Message;
 use serde_derive::{Deserialize, Serialize};
 
 use ibc_proto::google::protobuf::Any;
+use ibc_proto::ibc::lightclients::wasm::v1::ClientState as RawWasmClientState;
 use ibc_proto::Protobuf;
 
 use crate::clients::ics10_stellar::error::Error;
@@ -15,6 +16,7 @@ use crate::core::ics24_host::identifier::ChainId;
 use crate::Height;
 
 pub const STELLAR_CLIENT_STATE_TYPE_URL: &str = "/ibc.lightclients.stellar.v1.ClientState";
+pub const WASM_CLIENT_STATE_TYPE_URL: &str = "/ibc.lightclients.wasm.v1.ClientState";
 
 const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 
@@ -28,6 +30,9 @@ pub struct ClientState {
     pub frozen_height: Option<Height>,
     pub trusted_validators: Vec<Vec<u8>>,
     pub proof_specs: Vec<Vec<u8>>,
+    pub network_id: Vec<u8>,
+    #[serde(skip)]
+    pub wasm_checksum: Option<Vec<u8>>,
 }
 
 impl Ics2ClientState for ClientState {
@@ -64,6 +69,7 @@ impl TryFrom<RawClientState> for ClientState {
             frozen_height,
             trusted_validators,
             proof_specs,
+            network_id,
         } = raw;
 
         let chain_id = ChainId::from_string(&raw_chain_id);
@@ -95,6 +101,8 @@ impl TryFrom<RawClientState> for ClientState {
             frozen_height,
             trusted_validators,
             proof_specs,
+            network_id,
+            wasm_checksum: None,
         })
     }
 }
@@ -107,6 +115,7 @@ impl From<ClientState> for RawClientState {
             frozen_height: value.frozen_height.map(Into::into),
             trusted_validators: value.trusted_validators,
             proof_specs: value.proof_specs,
+            network_id: value.network_id,
         }
     }
 }
@@ -151,6 +160,15 @@ impl TryFrom<Any> for ClientState {
             STELLAR_CLIENT_STATE_TYPE_URL => {
                 decode_state(raw_any.value.deref()).map_err(Into::into)
             }
+            WASM_CLIENT_STATE_TYPE_URL => {
+                let wasm = RawWasmClientState::decode(raw_any.value.deref())
+                    .map_err(|e| Error::decode(e))?;
+                let mut inner = decode_state(&wasm.data).map_err(Into::<Ics02Error>::into)?;
+                if !wasm.checksum.is_empty() {
+                    inner.wasm_checksum = Some(wasm.checksum);
+                }
+                Ok(inner)
+            }
             _ => Err(Ics02Error::unknown_client_state_type(raw_any.type_url)),
         }
     }
@@ -158,6 +176,22 @@ impl TryFrom<Any> for ClientState {
 
 impl From<ClientState> for Any {
     fn from(value: ClientState) -> Self {
+        if let Some(checksum) = value.wasm_checksum.clone() {
+            let latest_height = value.latest_height;
+            let inner_bytes = Protobuf::<RawClientState>::encode_vec(value);
+            let wasm = RawWasmClientState {
+                data: inner_bytes,
+                checksum,
+                latest_height: Some(ibc_proto::ibc::core::client::v1::Height {
+                    revision_number: latest_height.revision_number(),
+                    revision_height: latest_height.revision_height(),
+                }),
+            };
+            return Any {
+                type_url: WASM_CLIENT_STATE_TYPE_URL.to_string(),
+                value: wasm.encode_to_vec(),
+            };
+        }
         Any {
             type_url: STELLAR_CLIENT_STATE_TYPE_URL.to_string(),
             value: Protobuf::<RawClientState>::encode_vec(value),

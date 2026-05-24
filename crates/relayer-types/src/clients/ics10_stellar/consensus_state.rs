@@ -2,6 +2,7 @@ use prost::Message;
 use serde_derive::{Deserialize, Serialize};
 
 use ibc_proto::google::protobuf::Any;
+use ibc_proto::ibc::lightclients::wasm::v1::ConsensusState as RawWasmConsensusState;
 use ibc_proto::Protobuf;
 
 use crate::clients::ics10_stellar::error::Error;
@@ -13,6 +14,7 @@ use crate::core::ics23_commitment::commitment::CommitmentRoot;
 use crate::timestamp::Timestamp;
 
 pub const STELLAR_CONSENSUS_STATE_TYPE_URL: &str = "/ibc.lightclients.stellar.v1.ConsensusState";
+pub const WASM_CONSENSUS_STATE_TYPE_URL: &str = "/ibc.lightclients.wasm.v1.ConsensusState";
 
 const HASH_BYTES: usize = 32;
 
@@ -23,6 +25,8 @@ pub struct ConsensusState {
     pub root: CommitmentRoot,
     pub timestamp: u64,
     pub ledger_hash: Vec<u8>,
+    #[serde(skip)]
+    pub wrap_as_wasm: bool,
 }
 
 impl Ics2ConsensusState for ConsensusState {
@@ -69,6 +73,7 @@ impl TryFrom<RawConsensusState> for ConsensusState {
             root: CommitmentRoot::from_bytes(&raw.root),
             timestamp: raw.timestamp,
             ledger_hash: raw.ledger_hash,
+            wrap_as_wasm: false,
         })
     }
 }
@@ -101,6 +106,13 @@ impl TryFrom<Any> for ConsensusState {
             STELLAR_CONSENSUS_STATE_TYPE_URL => {
                 decode_state(raw_any.value.deref()).map_err(Into::into)
             }
+            WASM_CONSENSUS_STATE_TYPE_URL => {
+                let wasm = RawWasmConsensusState::decode(raw_any.value.deref())
+                    .map_err(|e| Error::decode(e))?;
+                let mut inner = decode_state(&wasm.data).map_err(Into::<Ics02Error>::into)?;
+                inner.wrap_as_wasm = true;
+                Ok(inner)
+            }
             _ => Err(Ics02Error::unknown_consensus_state_type(raw_any.type_url)),
         }
     }
@@ -108,6 +120,18 @@ impl TryFrom<Any> for ConsensusState {
 
 impl From<ConsensusState> for Any {
     fn from(value: ConsensusState) -> Self {
+        if value.wrap_as_wasm {
+            let inner_bytes = {
+                let mut without = value.clone();
+                without.wrap_as_wasm = false;
+                Protobuf::<RawConsensusState>::encode_vec(without)
+            };
+            let wasm = RawWasmConsensusState { data: inner_bytes };
+            return Any {
+                type_url: WASM_CONSENSUS_STATE_TYPE_URL.to_string(),
+                value: wasm.encode_to_vec(),
+            };
+        }
         Any {
             type_url: STELLAR_CONSENSUS_STATE_TYPE_URL.to_string(),
             value: Protobuf::<RawConsensusState>::encode_vec(value),
