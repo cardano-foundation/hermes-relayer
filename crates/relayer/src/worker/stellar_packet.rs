@@ -1,11 +1,17 @@
 use core::time::Duration;
+use std::sync::Arc;
 
+use prost::Message;
 use stellar_xdr::curr::{Limits, ReadXdr, ScVal};
 use tracing::{debug, error_span, info, warn};
 
-use ibc_relayer_types::clients::ics10_stellar::v2_msgs::{Packet, Payload};
+use ibc_proto::google::protobuf::Any;
+use ibc_relayer_types::clients::ics10_stellar::v2_msgs::{
+    Height as V2Height, MsgRecvPacket, Packet, Payload, TYPE_URL_RECV_PACKET,
+};
 use ibc_relayer_types::core::ics24_host::identifier::ChainId;
 use ibc_relayer_types::events::{IbcEvent, ModuleEvent};
+use ibc_relayer_types::Height as ICSHeight;
 
 use crate::chain::handle::Subscription;
 use crate::event::source::EventBatch;
@@ -251,7 +257,90 @@ fn char_to_nibble(b: u8) -> Option<u8> {
     }
 }
 
-pub fn spawn_stellar_packet_worker(chain_id: ChainId, subscription: Subscription) -> TaskHandle {
+#[derive(Debug, thiserror::Error)]
+pub enum PacketProofError {
+    #[error("proof source failed: {0}")]
+    QueryFailed(String),
+    #[error("no commitment for client_id={client_id} sequence={sequence} at height={height}")]
+    CommitmentAbsent {
+        client_id: String,
+        sequence: u64,
+        height: u64,
+    },
+}
+
+pub trait PacketProofSource: Send + Sync {
+    fn packet_commitment_proof(
+        &self,
+        client_id: &str,
+        sequence: u64,
+    ) -> Result<(Vec<u8>, ICSHeight), PacketProofError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BuildMsgError {
+    #[error(transparent)]
+    Decode(#[from] PacketDecodeError),
+    #[error("source chain has no body bytes for this send_packet event")]
+    MissingValueXdr,
+    #[error(transparent)]
+    Proof(#[from] PacketProofError),
+    #[error("packet sequence in event ({event}) disagrees with decoded packet ({decoded})")]
+    SequenceMismatch { event: u64, decoded: u64 },
+}
+
+pub fn build_msg_recv_packet(
+    packet: Packet,
+    proof_commitment: Vec<u8>,
+    proof_height: ICSHeight,
+    signer: String,
+) -> Any {
+    let msg = MsgRecvPacket {
+        packet: Some(packet),
+        proof_commitment,
+        proof_height: Some(V2Height {
+            revision_number: proof_height.revision_number(),
+            revision_height: proof_height.revision_height(),
+        }),
+        signer,
+    };
+    Any {
+        type_url: TYPE_URL_RECV_PACKET.to_string(),
+        value: msg.encode_to_vec(),
+    }
+}
+
+pub fn build_msg_recv_packet_from_event<S: PacketProofSource + ?Sized>(
+    event: &StellarPacketEvent,
+    source: &S,
+    signer: String,
+) -> Result<Any, BuildMsgError> {
+    if event.value_xdr.is_empty() {
+        return Err(BuildMsgError::MissingValueXdr);
+    }
+    let packet = decode_packet_from_event_body(&event.value_xdr)?;
+    if packet.sequence != event.sequence {
+        return Err(BuildMsgError::SequenceMismatch {
+            event: event.sequence,
+            decoded: packet.sequence,
+        });
+    }
+    let (proof_commitment, proof_height) =
+        source.packet_commitment_proof(&event.client_id, event.sequence)?;
+    Ok(build_msg_recv_packet(
+        packet,
+        proof_commitment,
+        proof_height,
+        signer,
+    ))
+}
+
+pub fn spawn_stellar_packet_worker(
+    chain_id: ChainId,
+    subscription: Subscription,
+    proof_source: Option<Arc<dyn PacketProofSource>>,
+    signer: String,
+) -> TaskHandle {
     let span = error_span!("worker.stellar_packet", chain.id = %chain_id);
 
     spawn_background_task(
@@ -260,7 +349,7 @@ pub fn spawn_stellar_packet_worker(chain_id: ChainId, subscription: Subscription
         move || match subscription.recv() {
             Ok(arc_batch) => match arc_batch.as_ref() {
                 Ok(batch) => {
-                    process_batch(&chain_id, batch);
+                    process_batch(&chain_id, batch, proof_source.as_deref(), signer.as_str());
                     Ok(Next::Continue)
                 }
                 Err(err) => {
@@ -276,7 +365,12 @@ pub fn spawn_stellar_packet_worker(chain_id: ChainId, subscription: Subscription
     )
 }
 
-fn process_batch(chain_id: &ChainId, batch: &EventBatch) {
+fn process_batch(
+    chain_id: &ChainId,
+    batch: &EventBatch,
+    proof_source: Option<&dyn PacketProofSource>,
+    signer: &str,
+) {
     let height = batch.height;
     for ev in &batch.events {
         if let IbcEvent::AppModule(m) = &ev.event {
@@ -294,6 +388,25 @@ fn process_batch(chain_id: &ChainId, batch: &EventBatch) {
                         Err(e) => format!("decode_failed: {e}"),
                     }
                 };
+                let recv_any_status = if packet_ev.kind == "send_packet" {
+                    match proof_source {
+                        Some(src) => match build_msg_recv_packet_from_event(
+                            &packet_ev,
+                            src,
+                            signer.to_string(),
+                        ) {
+                            Ok(any) => format!(
+                                "built_msg_recv_packet bytes={} type_url={}",
+                                any.value.len(),
+                                any.type_url
+                            ),
+                            Err(e) => format!("build_failed: {e}"),
+                        },
+                        None => "no_proof_source".to_string(),
+                    }
+                } else {
+                    "n/a".to_string()
+                };
                 info!(
                     target: "stellar_packet",
                     chain = %chain_id,
@@ -304,6 +417,7 @@ fn process_batch(chain_id: &ChainId, batch: &EventBatch) {
                     event_id = %packet_ev.event_id,
                     ledger = height.revision_height(),
                     payload = %payload_summary,
+                    recv_any = %recv_any_status,
                     "observed stellar router event"
                 );
             }
@@ -467,7 +581,9 @@ mod decoder_tests {
     };
 
     fn sym(s: &str) -> ScVal {
-        ScVal::Symbol(ScSymbol(StringM::<32>::try_from(s.as_bytes().to_vec()).unwrap()))
+        ScVal::Symbol(ScSymbol(
+            StringM::<32>::try_from(s.as_bytes().to_vec()).unwrap(),
+        ))
     }
 
     fn string_val(s: &str) -> ScVal {
@@ -481,7 +597,10 @@ mod decoder_tests {
     fn struct_val(entries: Vec<(&str, ScVal)>) -> ScVal {
         let mapped: Vec<ScMapEntry> = entries
             .into_iter()
-            .map(|(k, v)| ScMapEntry { key: sym(k), val: v })
+            .map(|(k, v)| ScMapEntry {
+                key: sym(k),
+                val: v,
+            })
             .collect();
         ScVal::Map(Some(ScMap(VecM::try_from(mapped).unwrap())))
     }
@@ -575,7 +694,10 @@ mod decoder_tests {
         let err = decode_packet_from_event_body(&xdr).unwrap_err();
         assert!(matches!(
             err,
-            PacketDecodeError::WrongFieldType { field: "sequence", .. }
+            PacketDecodeError::WrongFieldType {
+                field: "sequence",
+                ..
+            }
         ));
     }
 
@@ -583,6 +705,145 @@ mod decoder_tests {
     fn decode_rejects_garbage_xdr() {
         let err = decode_packet_from_event_body(b"not xdr").unwrap_err();
         assert!(matches!(err, PacketDecodeError::Xdr(_)));
+    }
+
+    struct FakeProofSource {
+        proof: Vec<u8>,
+        height: ICSHeight,
+    }
+    impl PacketProofSource for FakeProofSource {
+        fn packet_commitment_proof(
+            &self,
+            _client_id: &str,
+            _sequence: u64,
+        ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
+            Ok((self.proof.clone(), self.height))
+        }
+    }
+    struct FailingProofSource;
+    impl PacketProofSource for FailingProofSource {
+        fn packet_commitment_proof(
+            &self,
+            client_id: &str,
+            sequence: u64,
+        ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
+            Err(PacketProofError::CommitmentAbsent {
+                client_id: client_id.to_string(),
+                sequence,
+                height: 0,
+            })
+        }
+    }
+
+    fn packet_body_with_sequence(sequence: u64) -> Vec<u8> {
+        struct_val(vec![
+            ("sequence", ScVal::U64(sequence)),
+            ("source_client", string_val("10-stellar-0")),
+            ("dest_client", string_val("07-tendermint-0")),
+            ("timeout_timestamp", ScVal::U64(1_700_000_500)),
+            ("payloads", vec_val(vec![sample_payload()])),
+        ])
+        .to_xdr(Limits::none())
+        .unwrap()
+    }
+
+    fn synthetic_event(sequence: u64) -> StellarPacketEvent {
+        StellarPacketEvent {
+            kind: "send_packet".to_string(),
+            client_id: "10-stellar-0".to_string(),
+            sequence,
+            tx_hash: "tx-hash".to_string(),
+            event_id: "ev-1".to_string(),
+            value_xdr: packet_body_with_sequence(sequence),
+            contract_id: "CABC".to_string(),
+        }
+    }
+
+    #[test]
+    fn build_msg_recv_packet_produces_well_formed_any() {
+        let decoded = decode_packet_scval(&sample_packet_scval()).unwrap();
+        let proof_height = ICSHeight::new(0, 105).unwrap();
+        let any = build_msg_recv_packet(
+            decoded.clone(),
+            vec![0xAB, 0xCD],
+            proof_height,
+            "stellar1signer".to_string(),
+        );
+        assert_eq!(any.type_url, TYPE_URL_RECV_PACKET);
+
+        let parsed = MsgRecvPacket::decode(any.value.as_slice()).unwrap();
+        assert_eq!(parsed.signer, "stellar1signer");
+        assert_eq!(parsed.proof_commitment, vec![0xAB, 0xCD]);
+        let h = parsed.proof_height.unwrap();
+        assert_eq!(h.revision_number, 0);
+        assert_eq!(h.revision_height, 105);
+        let p = parsed.packet.unwrap();
+        assert_eq!(p.sequence, decoded.sequence);
+        assert_eq!(p.source_client, decoded.source_client);
+        assert_eq!(p.payloads.len(), decoded.payloads.len());
+    }
+
+    #[test]
+    fn build_from_event_happy_path() {
+        let event = synthetic_event(42);
+        let src = FakeProofSource {
+            proof: vec![0x11, 0x22, 0x33],
+            height: ICSHeight::new(0, 200).unwrap(),
+        };
+        let any =
+            build_msg_recv_packet_from_event(&event, &src, "signer".to_string()).unwrap();
+        let parsed = MsgRecvPacket::decode(any.value.as_slice()).unwrap();
+        assert_eq!(parsed.signer, "signer");
+        assert_eq!(parsed.proof_commitment, vec![0x11, 0x22, 0x33]);
+        assert_eq!(parsed.proof_height.unwrap().revision_height, 200);
+        assert_eq!(parsed.packet.unwrap().sequence, 42);
+    }
+
+    #[test]
+    fn build_from_event_missing_value_xdr_errors() {
+        let mut event = synthetic_event(1);
+        event.value_xdr.clear();
+        let src = FakeProofSource {
+            proof: vec![],
+            height: ICSHeight::new(0, 1).unwrap(),
+        };
+        let err = build_msg_recv_packet_from_event(&event, &src, "s".into()).unwrap_err();
+        assert!(matches!(err, BuildMsgError::MissingValueXdr));
+    }
+
+    #[test]
+    fn build_from_event_sequence_mismatch_errors() {
+        let mut event = synthetic_event(42);
+        event.sequence = 999;
+        let src = FakeProofSource {
+            proof: vec![],
+            height: ICSHeight::new(0, 1).unwrap(),
+        };
+        let err = build_msg_recv_packet_from_event(&event, &src, "s".into()).unwrap_err();
+        assert!(matches!(
+            err,
+            BuildMsgError::SequenceMismatch { event: 999, decoded: 42 }
+        ));
+    }
+
+    #[test]
+    fn build_from_event_propagates_proof_query_failure() {
+        let event = synthetic_event(7);
+        let err = build_msg_recv_packet_from_event(&event, &FailingProofSource, "s".into())
+            .unwrap_err();
+        assert!(matches!(err, BuildMsgError::Proof(_)));
+    }
+
+    #[test]
+    fn build_from_event_propagates_decode_failure() {
+        let mut event = synthetic_event(1);
+        event.value_xdr = b"not xdr".to_vec();
+        let src = FakeProofSource {
+            proof: vec![],
+            height: ICSHeight::new(0, 1).unwrap(),
+        };
+        let err = build_msg_recv_packet_from_event(&event, &src, "s".into()).unwrap_err();
+        assert!(matches!(err, BuildMsgError::Decode(_)));
     }
 
     #[test]
