@@ -5,7 +5,7 @@ use abscissa_core::{Command, Runnable};
 
 use ibc_relayer::chain::handle::{BaseChainHandle, ChainHandle};
 use ibc_relayer::worker::stellar_packet::{
-    spawn_stellar_packet_worker, PacketProofSource, PacketRelayDestination,
+    spawn_stellar_packet_worker, PacketProofSource, PacketRelayDestination, StellarPacketDeps,
 };
 use ibc_relayer::worker::stellar_packet_adapters::{
     ChainHandleDestination, ChainHandleProofSource,
@@ -83,22 +83,40 @@ impl Runnable for StartStellarPacketRelayCmd {
             },
         };
 
+        let src_arc = Arc::new(src.clone());
+        let dst_arc = Arc::new(dst.clone());
+
         let proof_source: Arc<dyn PacketProofSource> =
-            Arc::new(ChainHandleProofSource::new(Arc::new(src.clone())));
+            Arc::new(ChainHandleProofSource::new(src_arc.clone()));
         let destination: Arc<dyn PacketRelayDestination> =
-            Arc::new(ChainHandleDestination::new(Arc::new(dst.clone())));
+            Arc::new(ChainHandleDestination::new(dst_arc));
+
+        let absence_source: Option<
+            Arc<dyn ibc_relayer::worker::stellar_packet::PacketAbsenceProofSource>,
+        > = Some(Arc::new(ChainHandleProofSource::new(Arc::new(dst.clone()))));
+        let source_submitter: Option<Arc<dyn PacketRelayDestination>> =
+            Some(Arc::new(ChainHandleDestination::new(src_arc)));
+        let source_signer = match src.get_signer() {
+            Ok(s) => s.to_string(),
+            Err(_) => signer.clone(),
+        };
 
         info!(
-            "stellar packet relay starting: src={} dst={} signer={}",
-            self.src_chain_id, self.dst_chain_id, signer
+            "stellar packet relay starting: src={} dst={} signer={} source_signer={}",
+            self.src_chain_id, self.dst_chain_id, signer, source_signer
         );
 
         let handle = spawn_stellar_packet_worker(
             self.src_chain_id.clone(),
             subscription,
-            Some(proof_source),
-            Some(destination),
-            signer,
+            StellarPacketDeps {
+                proof_source: Some(proof_source),
+                destination: Some(destination),
+                absence_source,
+                source_submitter,
+                signer,
+                source_signer,
+            },
         );
 
         info!("worker spawned; blocking until interrupted (Ctrl-C)");

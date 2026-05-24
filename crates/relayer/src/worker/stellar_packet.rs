@@ -414,12 +414,32 @@ pub fn build_msg_recv_packet_from_event<S: PacketProofSource + ?Sized>(
     ))
 }
 
+pub struct StellarPacketDeps {
+    pub proof_source: Option<Arc<dyn PacketProofSource>>,
+    pub destination: Option<Arc<dyn PacketRelayDestination>>,
+    pub absence_source: Option<Arc<dyn PacketAbsenceProofSource>>,
+    pub source_submitter: Option<Arc<dyn PacketRelayDestination>>,
+    pub signer: String,
+    pub source_signer: String,
+}
+
+impl StellarPacketDeps {
+    pub fn observer_only() -> Self {
+        Self {
+            proof_source: None,
+            destination: None,
+            absence_source: None,
+            source_submitter: None,
+            signer: String::new(),
+            source_signer: String::new(),
+        }
+    }
+}
+
 pub fn spawn_stellar_packet_worker(
     chain_id: ChainId,
     subscription: Subscription,
-    proof_source: Option<Arc<dyn PacketProofSource>>,
-    destination: Option<Arc<dyn PacketRelayDestination>>,
-    signer: String,
+    deps: StellarPacketDeps,
 ) -> TaskHandle {
     let span = error_span!("worker.stellar_packet", chain.id = %chain_id);
 
@@ -429,13 +449,7 @@ pub fn spawn_stellar_packet_worker(
         move || match subscription.recv() {
             Ok(arc_batch) => match arc_batch.as_ref() {
                 Ok(batch) => {
-                    process_batch(
-                        &chain_id,
-                        batch,
-                        proof_source.as_deref(),
-                        destination.as_deref(),
-                        signer.as_str(),
-                    );
+                    process_batch(&chain_id, batch, &deps);
                     Ok(Next::Continue)
                 }
                 Err(err) => {
@@ -451,32 +465,28 @@ pub fn spawn_stellar_packet_worker(
     )
 }
 
-fn process_batch(
-    chain_id: &ChainId,
-    batch: &EventBatch,
-    proof_source: Option<&dyn PacketProofSource>,
-    destination: Option<&dyn PacketRelayDestination>,
-    signer: &str,
-) {
+fn process_batch(chain_id: &ChainId, batch: &EventBatch, deps: &StellarPacketDeps) {
     let height = batch.height;
     for ev in &batch.events {
         if let IbcEvent::AppModule(m) = &ev.event {
             if let Some(packet_ev) = extract_router_event(m) {
-                let payload_summary = if packet_ev.value_xdr.is_empty() {
-                    "none".to_string()
+                let decoded = if packet_ev.value_xdr.is_empty() {
+                    None
                 } else {
-                    match decode_packet_from_event_body(&packet_ev.value_xdr) {
-                        Ok(packet) => format!(
-                            "src={} dst={} payloads={}",
-                            packet.source_client,
-                            packet.dest_client,
-                            packet.payloads.len()
-                        ),
-                        Err(e) => format!("decode_failed: {e}"),
-                    }
+                    decode_packet_from_event_body(&packet_ev.value_xdr).ok()
+                };
+                let payload_summary = match (&packet_ev.value_xdr.is_empty(), &decoded) {
+                    (true, _) => "none".to_string(),
+                    (false, Some(p)) => format!(
+                        "src={} dst={} payloads={}",
+                        p.source_client,
+                        p.dest_client,
+                        p.payloads.len()
+                    ),
+                    (false, None) => "decode_failed".to_string(),
                 };
                 let relay_status = if packet_ev.kind == "send_packet" {
-                    relay_send_packet(&packet_ev, proof_source, destination, signer)
+                    dispatch_send_packet(&packet_ev, decoded.as_ref(), deps)
                 } else {
                     "n/a".to_string()
                 };
@@ -496,6 +506,32 @@ fn process_batch(
             }
         }
     }
+}
+
+fn dispatch_send_packet(
+    packet_ev: &StellarPacketEvent,
+    decoded: Option<&Packet>,
+    deps: &StellarPacketDeps,
+) -> String {
+    let now = now_unix_secs();
+    if let Some(packet) = decoded {
+        if packet.timeout_timestamp > 0 && now > packet.timeout_timestamp {
+            return relay_timeout(
+                packet_ev,
+                deps.absence_source.as_deref(),
+                deps.source_submitter.as_deref(),
+                &deps.source_signer,
+                packet.timeout_timestamp,
+                now,
+            );
+        }
+    }
+    relay_send_packet(
+        packet_ev,
+        deps.proof_source.as_deref(),
+        deps.destination.as_deref(),
+        &deps.signer,
+    )
 }
 
 fn relay_send_packet(
@@ -523,6 +559,43 @@ fn relay_send_packet(
         Ok(tx_hash) => format!("{any_summary} submit=ok tx={tx_hash}"),
         Err(e) => format!("{any_summary} submit=failed: {e}"),
     }
+}
+
+fn relay_timeout(
+    packet_ev: &StellarPacketEvent,
+    absence_source: Option<&dyn PacketAbsenceProofSource>,
+    source_submitter: Option<&dyn PacketRelayDestination>,
+    source_signer: &str,
+    timeout_ts: u64,
+    now: u64,
+) -> String {
+    let prefix = format!("timeout(timeout_ts={timeout_ts} now={now})");
+    let Some(absence) = absence_source else {
+        return format!("{prefix} skip=no_absence_source");
+    };
+    let any = match build_msg_timeout_from_event(packet_ev, absence, source_signer.to_string()) {
+        Ok(a) => a,
+        Err(e) => return format!("{prefix} build_failed: {e}"),
+    };
+    let any_summary = format!(
+        "built_msg_timeout bytes={} type_url={}",
+        any.value.len(),
+        any.type_url
+    );
+    let Some(submitter) = source_submitter else {
+        return format!("{prefix} {any_summary} submit=no_source_submitter");
+    };
+    match submitter.submit(vec![any]) {
+        Ok(tx_hash) => format!("{prefix} {any_summary} submit=ok tx={tx_hash}"),
+        Err(e) => format!("{prefix} {any_summary} submit=failed: {e}"),
+    }
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1165,6 +1238,208 @@ mod decoder_tests {
         let event = synthetic_event(1);
         assert_ne!(event.client_id, "07-tendermint-0");
         build_msg_timeout_from_event(&event, &AssertingSource, "s".into()).unwrap();
+    }
+
+    #[test]
+    fn relay_timeout_happy_path_submits_msg_timeout_to_source() {
+        let event = synthetic_event(5);
+        let absence = FakeAbsenceSource {
+            proof: vec![0x77, 0x88],
+            height: ICSHeight::new(0, 300).unwrap(),
+        };
+        let src_submitter = RecordingDestination {
+            submitted: std::sync::Mutex::new(Vec::new()),
+            tx_hash: "TX-TIMEOUT".to_string(),
+        };
+        let status = relay_timeout(
+            &event,
+            Some(&absence),
+            Some(&src_submitter),
+            "source-signer",
+            1_700_000_000,
+            1_700_000_500,
+        );
+        assert!(
+            status.contains("submit=ok") && status.contains("tx=TX-TIMEOUT"),
+            "unexpected status: {status}"
+        );
+        let recorded = src_submitter.submitted.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0][0].type_url, TYPE_URL_TIMEOUT);
+        let parsed = MsgTimeout::decode(recorded[0][0].value.as_slice()).unwrap();
+        assert_eq!(parsed.signer, "source-signer");
+        assert_eq!(parsed.proof_unreceived, vec![0x77, 0x88]);
+    }
+
+    #[test]
+    fn relay_timeout_no_absence_source_skips() {
+        let event = synthetic_event(1);
+        let status = relay_timeout(&event, None, None, "s", 100, 200);
+        assert!(status.contains("skip=no_absence_source"), "got: {status}");
+    }
+
+    #[test]
+    fn relay_timeout_no_source_submitter_skips_after_build() {
+        let event = synthetic_event(1);
+        let absence = FakeAbsenceSource {
+            proof: vec![],
+            height: ICSHeight::new(0, 1).unwrap(),
+        };
+        let status = relay_timeout(&event, Some(&absence), None, "s", 100, 200);
+        assert!(
+            status.contains("submit=no_source_submitter"),
+            "got: {status}"
+        );
+    }
+
+    #[test]
+    fn relay_timeout_propagates_build_failure() {
+        let mut event = synthetic_event(1);
+        event.value_xdr = b"junk".to_vec();
+        let absence = FakeAbsenceSource {
+            proof: vec![],
+            height: ICSHeight::new(0, 1).unwrap(),
+        };
+        let dst = RecordingDestination {
+            submitted: std::sync::Mutex::new(Vec::new()),
+            tx_hash: "tx".to_string(),
+        };
+        let status = relay_timeout(&event, Some(&absence), Some(&dst), "s", 100, 200);
+        assert!(status.contains("build_failed:"), "got: {status}");
+        assert!(dst.submitted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dispatch_routes_unexpired_packet_to_send_path() {
+        let event = synthetic_event(1);
+        let happy_dst = RecordingDestination {
+            submitted: std::sync::Mutex::new(Vec::new()),
+            tx_hash: "TX-RECV".to_string(),
+        };
+        let timeout_dst = RecordingDestination {
+            submitted: std::sync::Mutex::new(Vec::new()),
+            tx_hash: "TX-TIMEOUT".to_string(),
+        };
+        let deps = StellarPacketDeps {
+            proof_source: Some(Arc::new(FakeProofSource {
+                proof: vec![0xAB],
+                height: ICSHeight::new(0, 50).unwrap(),
+            })),
+            destination: Some(Arc::new(RecordingDestination {
+                submitted: std::sync::Mutex::new(Vec::new()),
+                tx_hash: "TX-RECV".to_string(),
+            })),
+            absence_source: Some(Arc::new(FakeAbsenceSource {
+                proof: vec![0xCD],
+                height: ICSHeight::new(0, 60).unwrap(),
+            })),
+            source_submitter: Some(Arc::new(RecordingDestination {
+                submitted: std::sync::Mutex::new(Vec::new()),
+                tx_hash: "TX-TIMEOUT".to_string(),
+            })),
+            signer: "dst-signer".to_string(),
+            source_signer: "src-signer".to_string(),
+        };
+
+        let body_xdr = struct_val(vec![
+            ("sequence", ScVal::U64(1)),
+            ("source_client", string_val("10-stellar-0")),
+            ("dest_client", string_val("07-tendermint-0")),
+            ("timeout_timestamp", ScVal::U64(u64::MAX / 2)),
+            ("payloads", vec_val(vec![sample_payload()])),
+        ])
+        .to_xdr(Limits::none())
+        .unwrap();
+        let mut event = event;
+        event.value_xdr = body_xdr;
+        let decoded = decode_packet_from_event_body(&event.value_xdr).unwrap();
+        let status = dispatch_send_packet(&event, Some(&decoded), &deps);
+        assert!(
+            status.contains("built_msg_recv_packet"),
+            "expected send-path status, got: {status}"
+        );
+        assert!(!status.contains("built_msg_timeout"), "got: {status}");
+        let _ = (happy_dst, timeout_dst); // silence dead_code: kept inline above
+    }
+
+    #[test]
+    fn dispatch_routes_expired_packet_to_timeout_path() {
+        let event = synthetic_event(2);
+        let body_xdr = struct_val(vec![
+            ("sequence", ScVal::U64(2)),
+            ("source_client", string_val("10-stellar-0")),
+            ("dest_client", string_val("07-tendermint-0")),
+            ("timeout_timestamp", ScVal::U64(1)), // far past
+            ("payloads", vec_val(vec![sample_payload()])),
+        ])
+        .to_xdr(Limits::none())
+        .unwrap();
+        let mut event = event;
+        event.value_xdr = body_xdr;
+        let decoded = decode_packet_from_event_body(&event.value_xdr).unwrap();
+
+        let recv_dst = RecordingDestination {
+            submitted: std::sync::Mutex::new(Vec::new()),
+            tx_hash: "TX-RECV".to_string(),
+        };
+        let timeout_dst = RecordingDestination {
+            submitted: std::sync::Mutex::new(Vec::new()),
+            tx_hash: "TX-TIMEOUT".to_string(),
+        };
+        let deps = StellarPacketDeps {
+            proof_source: Some(Arc::new(FakeProofSource {
+                proof: vec![0xAB],
+                height: ICSHeight::new(0, 50).unwrap(),
+            })),
+            destination: Some(Arc::new(recv_dst)),
+            absence_source: Some(Arc::new(FakeAbsenceSource {
+                proof: vec![0xCD, 0xEF],
+                height: ICSHeight::new(0, 75).unwrap(),
+            })),
+            source_submitter: Some(Arc::new(timeout_dst)),
+            signer: "dst-signer".to_string(),
+            source_signer: "src-signer".to_string(),
+        };
+        let status = dispatch_send_packet(&event, Some(&decoded), &deps);
+        assert!(
+            status.contains("built_msg_timeout"),
+            "expected timeout-path status, got: {status}"
+        );
+        assert!(!status.contains("built_msg_recv_packet"), "got: {status}");
+    }
+
+    #[test]
+    fn dispatch_routes_to_send_path_when_packet_timeout_is_zero() {
+        let event = synthetic_event(3);
+        let body_xdr = struct_val(vec![
+            ("sequence", ScVal::U64(3)),
+            ("source_client", string_val("10-stellar-0")),
+            ("dest_client", string_val("07-tendermint-0")),
+            ("timeout_timestamp", ScVal::U64(0)),
+            ("payloads", vec_val(vec![sample_payload()])),
+        ])
+        .to_xdr(Limits::none())
+        .unwrap();
+        let mut event = event;
+        event.value_xdr = body_xdr;
+        let decoded = decode_packet_from_event_body(&event.value_xdr).unwrap();
+
+        let deps = StellarPacketDeps {
+            proof_source: Some(Arc::new(FakeProofSource {
+                proof: vec![],
+                height: ICSHeight::new(0, 1).unwrap(),
+            })),
+            destination: None,
+            absence_source: Some(Arc::new(FakeAbsenceSource {
+                proof: vec![],
+                height: ICSHeight::new(0, 1).unwrap(),
+            })),
+            source_submitter: None,
+            signer: "s".to_string(),
+            source_signer: "s".to_string(),
+        };
+        let status = dispatch_send_packet(&event, Some(&decoded), &deps);
+        assert!(status.contains("built_msg_recv_packet"), "got: {status}");
     }
 
     #[test]
