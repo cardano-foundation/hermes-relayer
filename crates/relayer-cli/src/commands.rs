@@ -13,6 +13,7 @@ mod logs;
 mod misbehaviour;
 mod query;
 mod start;
+mod start_stellar_packet_relay;
 mod tx;
 mod update;
 mod upgrade;
@@ -21,8 +22,9 @@ mod version;
 use self::{
     clear::ClearCmds, completions::CompletionsCmd, config::ConfigCmd, create::CreateCmds,
     evidence::EvidenceCmd, fee::FeeCmd, health::HealthCheckCmd, keys::KeysCmd, listen::ListenCmd,
-    logs::LogsCmd, misbehaviour::MisbehaviourCmd, query::QueryCmd, start::StartCmd, tx::TxCmd,
-    update::UpdateCmds, upgrade::UpgradeCmds, version::VersionCmd,
+    logs::LogsCmd, misbehaviour::MisbehaviourCmd, query::QueryCmd, start::StartCmd,
+    start_stellar_packet_relay::StartStellarPacketRelayCmd, tx::TxCmd, update::UpdateCmds,
+    upgrade::UpgradeCmds, version::VersionCmd,
 };
 
 use core::time::Duration;
@@ -71,6 +73,12 @@ pub enum CliCmd {
     ///
     /// Relays packets and open handshake messages between all chains in the config.
     Start(StartCmd),
+
+    /// Run the Stellar→Cosmos packet relay worker for a single chain pair.
+    ///
+    /// Subscribes to the Stellar source chain, observes router send_packet
+    /// events, and submits v2 MsgRecvPacket to the destination Cosmos chain.
+    StartStellarPacketRelay(StartStellarPacketRelayCmd),
 
     /// Query objects from the chain
     #[clap(subcommand)]

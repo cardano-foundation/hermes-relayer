@@ -1,0 +1,209 @@
+use std::sync::Arc;
+
+use ibc_proto::google::protobuf::Any;
+use ibc_proto::ibc::core::commitment::v1::MerkleProof as RawMerkleProof;
+use ibc_relayer_types::core::ics04_channel::packet::Sequence;
+use ibc_relayer_types::core::ics23_commitment::merkle::MerkleProof;
+use ibc_relayer_types::core::ics24_host::identifier::{ChannelId, PortId};
+use ibc_relayer_types::Height as ICSHeight;
+use prost::Message;
+
+use crate::chain::handle::ChainHandle;
+use crate::chain::requests::{
+    IncludeProof, QueryHeight, QueryPacketCommitmentRequest, QueryPacketReceiptRequest,
+};
+use crate::chain::tracking::{TrackedMsgs, TrackingId};
+
+use super::stellar_packet::{
+    PacketAbsenceProofSource, PacketProofError, PacketProofSource, PacketRelayDestination,
+    SubmitError,
+};
+
+pub struct ChainHandleProofSource<H: ChainHandle> {
+    handle: Arc<H>,
+    port_id: PortId,
+}
+
+impl<H: ChainHandle> ChainHandleProofSource<H> {
+    pub fn new(handle: Arc<H>) -> Self {
+        Self {
+            handle,
+            port_id: PortId::transfer(),
+        }
+    }
+
+    pub fn with_port_id(handle: Arc<H>, port_id: PortId) -> Self {
+        Self { handle, port_id }
+    }
+}
+
+impl<H: ChainHandle> PacketAbsenceProofSource for ChainHandleProofSource<H> {
+    fn packet_receipt_absence_proof(
+        &self,
+        dest_client_id: &str,
+        sequence: u64,
+    ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
+        let status = self
+            .handle
+            .query_application_status()
+            .map_err(|e| PacketProofError::QueryFailed(format!("query_application_status: {e}")))?;
+        let channel_id: ChannelId = dest_client_id
+            .parse()
+            .map_err(|e| PacketProofError::QueryFailed(format!("dest_client_id parse: {e}")))?;
+        let req = QueryPacketReceiptRequest {
+            port_id: self.port_id.clone(),
+            channel_id,
+            sequence: Sequence::from(sequence),
+            height: QueryHeight::Specific(status.height),
+        };
+        let (receipt, proof) = self
+            .handle
+            .query_packet_receipt(req, IncludeProof::Yes)
+            .map_err(|e| PacketProofError::QueryFailed(format!("query_packet_receipt: {e}")))?;
+        if !receipt.is_empty() {
+            return Err(PacketProofError::QueryFailed(format!(
+                "receipt present at {dest_client_id}/{sequence}: cannot prove absence"
+            )));
+        }
+        let proof = proof.ok_or_else(|| {
+            PacketProofError::QueryFailed(
+                "chain did not return a non-membership MerkleProof".to_string(),
+            )
+        })?;
+        Ok((encode_merkle_proof(&proof), status.height))
+    }
+}
+
+impl<H: ChainHandle> PacketProofSource for ChainHandleProofSource<H> {
+    fn packet_commitment_proof(
+        &self,
+        client_id: &str,
+        sequence: u64,
+    ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
+        let status = self
+            .handle
+            .query_application_status()
+            .map_err(|e| PacketProofError::QueryFailed(format!("query_application_status: {e}")))?;
+
+        let channel_id: ChannelId = client_id
+            .parse()
+            .map_err(|e| PacketProofError::QueryFailed(format!("client_id parse: {e}")))?;
+        let req = QueryPacketCommitmentRequest {
+            port_id: self.port_id.clone(),
+            channel_id,
+            sequence: Sequence::from(sequence),
+            height: QueryHeight::Specific(status.height),
+        };
+        let (commitment, proof) = self
+            .handle
+            .query_packet_commitment(req, IncludeProof::Yes)
+            .map_err(|e| PacketProofError::QueryFailed(format!("query_packet_commitment: {e}")))?;
+
+        if commitment.is_empty() {
+            return Err(PacketProofError::CommitmentAbsent {
+                client_id: client_id.to_string(),
+                sequence,
+                height: status.height.revision_height(),
+            });
+        }
+        let proof = proof.ok_or_else(|| {
+            PacketProofError::QueryFailed("chain did not return a MerkleProof".to_string())
+        })?;
+        let proof_bytes = encode_merkle_proof(&proof);
+        Ok((proof_bytes, status.height))
+    }
+}
+
+/// Wraps a hermes `ChainHandle` (destination chain) and adapts it to the
+/// worker's `PacketRelayDestination` trait. Submits the pre-encoded `Any`
+/// messages via `send_messages_and_wait_commit`. Returns a short summary as
+/// the "tx hash" — hermes' commit path returns the resulting IBC events,
+/// not the tx hash directly, so we synthesize a stable, observable summary.
+pub struct ChainHandleDestination<H: ChainHandle> {
+    handle: Arc<H>,
+}
+
+impl<H: ChainHandle> ChainHandleDestination<H> {
+    pub fn new(handle: Arc<H>) -> Self {
+        Self { handle }
+    }
+}
+
+impl<H: ChainHandle> PacketRelayDestination for ChainHandleDestination<H> {
+    fn submit(&self, msgs: Vec<Any>) -> Result<String, SubmitError> {
+        let tracked = TrackedMsgs {
+            msgs,
+            tracking_id: TrackingId::new_static("stellar-packet-relay"),
+        };
+        let events = self
+            .handle
+            .send_messages_and_wait_commit(tracked)
+            .map_err(|e| {
+                SubmitError::SubmitFailed(format!("send_messages_and_wait_commit: {e}"))
+            })?;
+        Ok(format!(
+            "committed_with_{}_events_at_h{}",
+            events.len(),
+            events
+                .first()
+                .map(|e| e.height.revision_height())
+                .unwrap_or(0)
+        ))
+    }
+}
+
+fn encode_merkle_proof(proof: &MerkleProof) -> Vec<u8> {
+    let raw: RawMerkleProof = proof.clone().into();
+    raw.encode_to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ibc_proto::ics23::{
+        commitment_proof::Proof, CommitmentProof, ExistenceProof, HashOp, LeafOp,
+    };
+
+    fn sample_proof() -> MerkleProof {
+        let cp = CommitmentProof {
+            proof: Some(Proof::Exist(ExistenceProof {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                leaf: Some(LeafOp {
+                    hash: HashOp::Sha256 as i32,
+                    prehash_key: HashOp::NoHash as i32,
+                    prehash_value: HashOp::NoHash as i32,
+                    length: 0,
+                    prefix: Vec::new(),
+                }),
+                path: vec![],
+            })),
+        };
+        MerkleProof { proofs: vec![cp] }
+    }
+
+    #[test]
+    fn encode_merkle_proof_round_trips() {
+        let proof = sample_proof();
+        let bytes = encode_merkle_proof(&proof);
+        assert!(!bytes.is_empty());
+
+        let decoded = RawMerkleProof::decode(bytes.as_slice()).unwrap();
+        let back: MerkleProof = decoded.into();
+        assert_eq!(back.proofs.len(), 1);
+        match back.proofs[0].proof.as_ref().unwrap() {
+            Proof::Exist(e) => {
+                assert_eq!(e.key, b"k");
+                assert_eq!(e.value, b"v");
+            }
+            other => panic!("expected ExistenceProof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_merkle_proof_empty_proofs_encodes_to_empty_bytes() {
+        let empty = MerkleProof { proofs: vec![] };
+        let bytes = encode_merkle_proof(&empty);
+        assert!(bytes.is_empty(), "empty proofs prost-encodes to zero bytes");
+    }
+}

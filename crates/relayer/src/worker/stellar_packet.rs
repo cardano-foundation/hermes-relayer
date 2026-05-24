@@ -7,7 +7,8 @@ use tracing::{debug, error_span, info, warn};
 
 use ibc_proto::google::protobuf::Any;
 use ibc_relayer_types::clients::ics10_stellar::v2_msgs::{
-    Height as V2Height, MsgRecvPacket, Packet, Payload, TYPE_URL_RECV_PACKET,
+    Height as V2Height, MsgRecvPacket, MsgTimeout, Packet, Payload, TYPE_URL_RECV_PACKET,
+    TYPE_URL_TIMEOUT,
 };
 use ibc_relayer_types::core::ics24_host::identifier::ChainId;
 use ibc_relayer_types::events::{IbcEvent, ModuleEvent};
@@ -278,6 +279,84 @@ pub trait PacketProofSource: Send + Sync {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub enum SubmitError {
+    #[error("destination submit failed: {0}")]
+    SubmitFailed(String),
+}
+
+pub trait PacketRelayDestination: Send + Sync {
+    /// Submit a batch of pre-encoded `Any` messages to the destination chain
+    /// and wait for inclusion. Returns the tx hash on success.
+    fn submit(&self, msgs: Vec<Any>) -> Result<String, SubmitError>;
+}
+
+pub trait PacketAbsenceProofSource: Send + Sync {
+    fn packet_receipt_absence_proof(
+        &self,
+        dest_client_id: &str,
+        sequence: u64,
+    ) -> Result<(Vec<u8>, ICSHeight), PacketProofError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BuildTimeoutError {
+    #[error(transparent)]
+    Decode(#[from] PacketDecodeError),
+    #[error("source chain has no body bytes for this send_packet event")]
+    MissingValueXdr,
+    #[error(transparent)]
+    Proof(#[from] PacketProofError),
+    #[error("packet sequence in event ({event}) disagrees with decoded packet ({decoded})")]
+    SequenceMismatch { event: u64, decoded: u64 },
+}
+
+pub fn build_msg_timeout(
+    packet: Packet,
+    proof_unreceived: Vec<u8>,
+    proof_height: ICSHeight,
+    signer: String,
+) -> Any {
+    let msg = MsgTimeout {
+        packet: Some(packet),
+        proof_unreceived,
+        proof_height: Some(V2Height {
+            revision_number: proof_height.revision_number(),
+            revision_height: proof_height.revision_height(),
+        }),
+        signer,
+    };
+    Any {
+        type_url: TYPE_URL_TIMEOUT.to_string(),
+        value: msg.encode_to_vec(),
+    }
+}
+
+pub fn build_msg_timeout_from_event<S: PacketAbsenceProofSource + ?Sized>(
+    event: &StellarPacketEvent,
+    absence: &S,
+    signer: String,
+) -> Result<Any, BuildTimeoutError> {
+    if event.value_xdr.is_empty() {
+        return Err(BuildTimeoutError::MissingValueXdr);
+    }
+    let packet = decode_packet_from_event_body(&event.value_xdr)?;
+    if packet.sequence != event.sequence {
+        return Err(BuildTimeoutError::SequenceMismatch {
+            event: event.sequence,
+            decoded: packet.sequence,
+        });
+    }
+    let (proof_unreceived, proof_height) =
+        absence.packet_receipt_absence_proof(&packet.dest_client, packet.sequence)?;
+    Ok(build_msg_timeout(
+        packet,
+        proof_unreceived,
+        proof_height,
+        signer,
+    ))
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum BuildMsgError {
     #[error(transparent)]
     Decode(#[from] PacketDecodeError),
@@ -339,6 +418,7 @@ pub fn spawn_stellar_packet_worker(
     chain_id: ChainId,
     subscription: Subscription,
     proof_source: Option<Arc<dyn PacketProofSource>>,
+    destination: Option<Arc<dyn PacketRelayDestination>>,
     signer: String,
 ) -> TaskHandle {
     let span = error_span!("worker.stellar_packet", chain.id = %chain_id);
@@ -349,7 +429,13 @@ pub fn spawn_stellar_packet_worker(
         move || match subscription.recv() {
             Ok(arc_batch) => match arc_batch.as_ref() {
                 Ok(batch) => {
-                    process_batch(&chain_id, batch, proof_source.as_deref(), signer.as_str());
+                    process_batch(
+                        &chain_id,
+                        batch,
+                        proof_source.as_deref(),
+                        destination.as_deref(),
+                        signer.as_str(),
+                    );
                     Ok(Next::Continue)
                 }
                 Err(err) => {
@@ -369,6 +455,7 @@ fn process_batch(
     chain_id: &ChainId,
     batch: &EventBatch,
     proof_source: Option<&dyn PacketProofSource>,
+    destination: Option<&dyn PacketRelayDestination>,
     signer: &str,
 ) {
     let height = batch.height;
@@ -388,22 +475,8 @@ fn process_batch(
                         Err(e) => format!("decode_failed: {e}"),
                     }
                 };
-                let recv_any_status = if packet_ev.kind == "send_packet" {
-                    match proof_source {
-                        Some(src) => match build_msg_recv_packet_from_event(
-                            &packet_ev,
-                            src,
-                            signer.to_string(),
-                        ) {
-                            Ok(any) => format!(
-                                "built_msg_recv_packet bytes={} type_url={}",
-                                any.value.len(),
-                                any.type_url
-                            ),
-                            Err(e) => format!("build_failed: {e}"),
-                        },
-                        None => "no_proof_source".to_string(),
-                    }
+                let relay_status = if packet_ev.kind == "send_packet" {
+                    relay_send_packet(&packet_ev, proof_source, destination, signer)
                 } else {
                     "n/a".to_string()
                 };
@@ -417,11 +490,38 @@ fn process_batch(
                     event_id = %packet_ev.event_id,
                     ledger = height.revision_height(),
                     payload = %payload_summary,
-                    recv_any = %recv_any_status,
+                    relay = %relay_status,
                     "observed stellar router event"
                 );
             }
         }
+    }
+}
+
+fn relay_send_packet(
+    packet_ev: &StellarPacketEvent,
+    proof_source: Option<&dyn PacketProofSource>,
+    destination: Option<&dyn PacketRelayDestination>,
+    signer: &str,
+) -> String {
+    let Some(src) = proof_source else {
+        return "no_proof_source".to_string();
+    };
+    let any = match build_msg_recv_packet_from_event(packet_ev, src, signer.to_string()) {
+        Ok(a) => a,
+        Err(e) => return format!("build_failed: {e}"),
+    };
+    let any_summary = format!(
+        "built_msg_recv_packet bytes={} type_url={}",
+        any.value.len(),
+        any.type_url
+    );
+    let Some(dst) = destination else {
+        return format!("{any_summary} submit=no_destination");
+    };
+    match dst.submit(vec![any]) {
+        Ok(tx_hash) => format!("{any_summary} submit=ok tx={tx_hash}"),
+        Err(e) => format!("{any_summary} submit=failed: {e}"),
     }
 }
 
@@ -790,8 +890,7 @@ mod decoder_tests {
             proof: vec![0x11, 0x22, 0x33],
             height: ICSHeight::new(0, 200).unwrap(),
         };
-        let any =
-            build_msg_recv_packet_from_event(&event, &src, "signer".to_string()).unwrap();
+        let any = build_msg_recv_packet_from_event(&event, &src, "signer".to_string()).unwrap();
         let parsed = MsgRecvPacket::decode(any.value.as_slice()).unwrap();
         assert_eq!(parsed.signer, "signer");
         assert_eq!(parsed.proof_commitment, vec![0x11, 0x22, 0x33]);
@@ -822,15 +921,18 @@ mod decoder_tests {
         let err = build_msg_recv_packet_from_event(&event, &src, "s".into()).unwrap_err();
         assert!(matches!(
             err,
-            BuildMsgError::SequenceMismatch { event: 999, decoded: 42 }
+            BuildMsgError::SequenceMismatch {
+                event: 999,
+                decoded: 42
+            }
         ));
     }
 
     #[test]
     fn build_from_event_propagates_proof_query_failure() {
         let event = synthetic_event(7);
-        let err = build_msg_recv_packet_from_event(&event, &FailingProofSource, "s".into())
-            .unwrap_err();
+        let err =
+            build_msg_recv_packet_from_event(&event, &FailingProofSource, "s".into()).unwrap_err();
         assert!(matches!(err, BuildMsgError::Proof(_)));
     }
 
@@ -844,6 +946,242 @@ mod decoder_tests {
         };
         let err = build_msg_recv_packet_from_event(&event, &src, "s".into()).unwrap_err();
         assert!(matches!(err, BuildMsgError::Decode(_)));
+    }
+
+    struct RecordingDestination {
+        submitted: std::sync::Mutex<Vec<Vec<Any>>>,
+        tx_hash: String,
+    }
+    impl PacketRelayDestination for RecordingDestination {
+        fn submit(&self, msgs: Vec<Any>) -> Result<String, SubmitError> {
+            self.submitted.lock().unwrap().push(msgs);
+            Ok(self.tx_hash.clone())
+        }
+    }
+
+    struct FailingDestination;
+    impl PacketRelayDestination for FailingDestination {
+        fn submit(&self, _msgs: Vec<Any>) -> Result<String, SubmitError> {
+            Err(SubmitError::SubmitFailed("nack from chain".to_string()))
+        }
+    }
+
+    #[test]
+    fn relay_send_packet_submits_built_any_to_destination() {
+        let event = synthetic_event(11);
+        let src = FakeProofSource {
+            proof: vec![0xAA],
+            height: ICSHeight::new(0, 50).unwrap(),
+        };
+        let dst = RecordingDestination {
+            submitted: std::sync::Mutex::new(Vec::new()),
+            tx_hash: "ABC123".to_string(),
+        };
+
+        let status = relay_send_packet(&event, Some(&src), Some(&dst), "signer");
+        assert!(
+            status.contains("submit=ok") && status.contains("tx=ABC123"),
+            "unexpected status: {status}"
+        );
+
+        let recorded = dst.submitted.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let msgs = &recorded[0];
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].type_url, TYPE_URL_RECV_PACKET);
+        let parsed = MsgRecvPacket::decode(msgs[0].value.as_slice()).unwrap();
+        assert_eq!(parsed.packet.unwrap().sequence, 11);
+        assert_eq!(parsed.signer, "signer");
+    }
+
+    #[test]
+    fn relay_send_packet_reports_no_destination_when_unset() {
+        let event = synthetic_event(1);
+        let src = FakeProofSource {
+            proof: vec![],
+            height: ICSHeight::new(0, 1).unwrap(),
+        };
+        let status = relay_send_packet(&event, Some(&src), None, "s");
+        assert!(
+            status.contains("submit=no_destination"),
+            "unexpected status: {status}"
+        );
+    }
+
+    #[test]
+    fn relay_send_packet_reports_submit_failure() {
+        let event = synthetic_event(1);
+        let src = FakeProofSource {
+            proof: vec![],
+            height: ICSHeight::new(0, 1).unwrap(),
+        };
+        let status = relay_send_packet(&event, Some(&src), Some(&FailingDestination), "s");
+        assert!(
+            status.contains("submit=failed: destination submit failed: nack from chain"),
+            "unexpected status: {status}"
+        );
+    }
+
+    #[test]
+    fn relay_send_packet_skips_when_no_proof_source() {
+        let event = synthetic_event(1);
+        let dst = RecordingDestination {
+            submitted: std::sync::Mutex::new(Vec::new()),
+            tx_hash: "tx".to_string(),
+        };
+        let status = relay_send_packet(&event, None, Some(&dst), "s");
+        assert_eq!(status, "no_proof_source");
+        assert!(dst.submitted.lock().unwrap().is_empty());
+    }
+
+    struct FakeAbsenceSource {
+        proof: Vec<u8>,
+        height: ICSHeight,
+    }
+    impl PacketAbsenceProofSource for FakeAbsenceSource {
+        fn packet_receipt_absence_proof(
+            &self,
+            _dest_client_id: &str,
+            _sequence: u64,
+        ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
+            Ok((self.proof.clone(), self.height))
+        }
+    }
+    struct FailingAbsenceSource;
+    impl PacketAbsenceProofSource for FailingAbsenceSource {
+        fn packet_receipt_absence_proof(
+            &self,
+            dest_client_id: &str,
+            sequence: u64,
+        ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
+            // A non-empty receipt means the packet DID land, so timeout is
+            // not authorised. Surface this as a generic query failure.
+            Err(PacketProofError::QueryFailed(format!(
+                "receipt present for {dest_client_id}/{sequence}"
+            )))
+        }
+    }
+
+    #[test]
+    fn build_msg_timeout_produces_well_formed_any() {
+        let packet = decode_packet_scval(&sample_packet_scval()).unwrap();
+        let any = build_msg_timeout(
+            packet.clone(),
+            vec![0xDE, 0xAD],
+            ICSHeight::new(0, 321).unwrap(),
+            "signer".to_string(),
+        );
+        assert_eq!(any.type_url, TYPE_URL_TIMEOUT);
+        let parsed = MsgTimeout::decode(any.value.as_slice()).unwrap();
+        assert_eq!(parsed.signer, "signer");
+        assert_eq!(parsed.proof_unreceived, vec![0xDE, 0xAD]);
+        let h = parsed.proof_height.unwrap();
+        assert_eq!(h.revision_height, 321);
+        let p = parsed.packet.unwrap();
+        assert_eq!(p.sequence, packet.sequence);
+        assert_eq!(p.dest_client, packet.dest_client);
+    }
+
+    #[test]
+    fn build_timeout_from_event_happy_path() {
+        let event = synthetic_event(42);
+        let src = FakeAbsenceSource {
+            proof: vec![0x11, 0x22],
+            height: ICSHeight::new(0, 500).unwrap(),
+        };
+        let any = build_msg_timeout_from_event(&event, &src, "signer".to_string()).unwrap();
+        let parsed = MsgTimeout::decode(any.value.as_slice()).unwrap();
+        assert_eq!(parsed.packet.unwrap().sequence, 42);
+        assert_eq!(parsed.proof_unreceived, vec![0x11, 0x22]);
+        assert_eq!(parsed.proof_height.unwrap().revision_height, 500);
+    }
+
+    #[test]
+    fn build_timeout_from_event_missing_value_xdr_errors() {
+        let mut event = synthetic_event(1);
+        event.value_xdr.clear();
+        let src = FakeAbsenceSource {
+            proof: vec![],
+            height: ICSHeight::new(0, 1).unwrap(),
+        };
+        let err = build_msg_timeout_from_event(&event, &src, "s".into()).unwrap_err();
+        assert!(matches!(err, BuildTimeoutError::MissingValueXdr));
+    }
+
+    #[test]
+    fn build_timeout_from_event_sequence_mismatch_errors() {
+        let mut event = synthetic_event(42);
+        event.sequence = 999;
+        let src = FakeAbsenceSource {
+            proof: vec![],
+            height: ICSHeight::new(0, 1).unwrap(),
+        };
+        let err = build_msg_timeout_from_event(&event, &src, "s".into()).unwrap_err();
+        assert!(matches!(
+            err,
+            BuildTimeoutError::SequenceMismatch {
+                event: 999,
+                decoded: 42
+            }
+        ));
+    }
+
+    #[test]
+    fn build_timeout_from_event_propagates_absence_query_failure() {
+        let event = synthetic_event(7);
+        let err =
+            build_msg_timeout_from_event(&event, &FailingAbsenceSource, "s".into()).unwrap_err();
+        assert!(matches!(err, BuildTimeoutError::Proof(_)));
+    }
+
+    #[test]
+    fn build_timeout_from_event_propagates_decode_failure() {
+        let mut event = synthetic_event(1);
+        event.value_xdr = b"not xdr".to_vec();
+        let src = FakeAbsenceSource {
+            proof: vec![],
+            height: ICSHeight::new(0, 1).unwrap(),
+        };
+        let err = build_msg_timeout_from_event(&event, &src, "s".into()).unwrap_err();
+        assert!(matches!(err, BuildTimeoutError::Decode(_)));
+    }
+
+    #[test]
+    fn build_timeout_uses_dest_client_from_packet_not_event_client_id() {
+        struct AssertingSource;
+        impl PacketAbsenceProofSource for AssertingSource {
+            fn packet_receipt_absence_proof(
+                &self,
+                dest_client_id: &str,
+                _sequence: u64,
+            ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
+                assert_eq!(
+                    dest_client_id, "07-tendermint-0",
+                    "must query against packet.dest_client, not event.client_id"
+                );
+                Ok((vec![], ICSHeight::new(0, 1).unwrap()))
+            }
+        }
+        let event = synthetic_event(1);
+        assert_ne!(event.client_id, "07-tendermint-0");
+        build_msg_timeout_from_event(&event, &AssertingSource, "s".into()).unwrap();
+    }
+
+    #[test]
+    fn relay_send_packet_does_not_submit_when_build_fails() {
+        let mut event = synthetic_event(1);
+        event.value_xdr = b"garbage".to_vec();
+        let src = FakeProofSource {
+            proof: vec![],
+            height: ICSHeight::new(0, 1).unwrap(),
+        };
+        let dst = RecordingDestination {
+            submitted: std::sync::Mutex::new(Vec::new()),
+            tx_hash: "tx".to_string(),
+        };
+        let status = relay_send_packet(&event, Some(&src), Some(&dst), "s");
+        assert!(status.starts_with("build_failed:"), "got: {status}");
+        assert!(dst.submitted.lock().unwrap().is_empty());
     }
 
     #[test]
