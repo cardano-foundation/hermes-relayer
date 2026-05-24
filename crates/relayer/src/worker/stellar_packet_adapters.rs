@@ -114,11 +114,6 @@ impl<H: ChainHandle> PacketProofSource for ChainHandleProofSource<H> {
     }
 }
 
-/// Wraps a hermes `ChainHandle` (destination chain) and adapts it to the
-/// worker's `PacketRelayDestination` trait. Submits the pre-encoded `Any`
-/// messages via `send_messages_and_wait_commit`. Returns a short summary as
-/// the "tx hash" — hermes' commit path returns the resulting IBC events,
-/// not the tx hash directly, so we synthesize a stable, observable summary.
 pub struct ChainHandleDestination<H: ChainHandle> {
     handle: Arc<H>,
 }

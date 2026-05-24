@@ -1043,6 +1043,25 @@ fn ledger_previous_hash(ledger_header_xdr: &[u8]) -> Result<Vec<u8>, Error> {
 
 const STELLAR_ROUTER_MODULE: &str = "stellaribcrouter";
 
+const POLL_RECONNECT_THRESHOLD: u32 = 5;
+const POLL_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+fn poll_backoff(base: Duration, consecutive_errors: u32) -> Duration {
+    if consecutive_errors == 0 {
+        return base;
+    }
+    let factor = 1u64
+        .checked_shl(consecutive_errors)
+        .unwrap_or(u64::MAX / base.as_millis().max(1) as u64);
+    let ms = (base.as_millis() as u64).saturating_mul(factor);
+    let candidate = Duration::from_millis(ms);
+    if candidate > POLL_MAX_BACKOFF {
+        POLL_MAX_BACKOFF
+    } else {
+        candidate
+    }
+}
+
 async fn run_event_polling(
     chain_id: ChainId,
     gateway_url: String,
@@ -1070,9 +1089,10 @@ async fn run_event_polling(
         }
     };
     let mut cursor = String::new();
+    let mut consecutive_errors: u32 = 0;
 
     loop {
-        tokio::time::sleep(poll_interval).await;
+        tokio::time::sleep(poll_backoff(poll_interval, consecutive_errors)).await;
 
         let req = EventsRequest {
             start_ledger: if cursor.is_empty() { start_ledger } else { 0 },
@@ -1081,12 +1101,43 @@ async fn run_event_polling(
         };
 
         let resp = match client.events(req).await {
-            Ok(r) => r,
+            Ok(r) => {
+                if consecutive_errors > 0 {
+                    tracing::info!(
+                        target: "stellar_events",
+                        "{chain_id}: gateway recovered after {consecutive_errors} consecutive errors"
+                    );
+                }
+                consecutive_errors = 0;
+                r
+            }
             Err(e) => {
+                consecutive_errors = consecutive_errors.saturating_add(1);
                 tracing::warn!(
                     target: "stellar_events",
-                    "gateway events poll failed (start_ledger={start_ledger}, cursor='{cursor}'): {e}"
+                    "{chain_id}: gateway events poll failed (start_ledger={start_ledger}, cursor='{cursor}', consecutive={consecutive_errors}): {e}"
                 );
+                if consecutive_errors >= POLL_RECONNECT_THRESHOLD {
+                    tracing::warn!(
+                        target: "stellar_events",
+                        "{chain_id}: dropping gateway client after {consecutive_errors} failures, reconnecting to {gateway_url}"
+                    );
+                    match GatewayQueryClient::connect(gateway_url.clone()).await {
+                        Ok(c) => {
+                            client = c;
+                            tracing::info!(
+                                target: "stellar_events",
+                                "{chain_id}: gateway client reconnected"
+                            );
+                        }
+                        Err(reconnect_err) => {
+                            tracing::warn!(
+                                target: "stellar_events",
+                                "{chain_id}: gateway reconnect failed: {reconnect_err}"
+                            );
+                        }
+                    }
+                }
                 continue;
             }
         };
@@ -1204,4 +1255,46 @@ fn hex_encode_bytes(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_backoff_zero_errors_returns_base() {
+        let base = Duration::from_secs(2);
+        assert_eq!(poll_backoff(base, 0), base);
+    }
+
+    #[test]
+    fn poll_backoff_doubles_per_consecutive_error() {
+        let base = Duration::from_secs(2);
+        assert_eq!(poll_backoff(base, 1), Duration::from_secs(4));
+        assert_eq!(poll_backoff(base, 2), Duration::from_secs(8));
+        assert_eq!(poll_backoff(base, 3), Duration::from_secs(16));
+        assert_eq!(poll_backoff(base, 4), Duration::from_secs(32));
+    }
+
+    #[test]
+    fn poll_backoff_caps_at_60s() {
+        let base = Duration::from_secs(2);
+        assert_eq!(poll_backoff(base, 5), POLL_MAX_BACKOFF);
+        assert_eq!(poll_backoff(base, 20), POLL_MAX_BACKOFF);
+        assert_eq!(poll_backoff(base, u32::MAX), POLL_MAX_BACKOFF);
+    }
+
+    #[test]
+    fn poll_backoff_uses_caller_base() {
+        let base = Duration::from_millis(500);
+        assert_eq!(poll_backoff(base, 3), Duration::from_secs(4));
+        assert_eq!(poll_backoff(base, 7), POLL_MAX_BACKOFF);
+    }
+
+    #[test]
+    fn poll_backoff_does_not_overflow_on_large_consecutive_counts() {
+        let base = Duration::from_secs(2);
+        let d = poll_backoff(base, u32::MAX);
+        assert!(d <= POLL_MAX_BACKOFF);
+    }
 }

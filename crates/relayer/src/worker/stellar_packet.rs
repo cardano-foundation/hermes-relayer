@@ -86,10 +86,6 @@ pub enum PacketDecodeError {
     WrongFieldType { field: &'static str, reason: String },
 }
 
-/// Decode the body of a router `send_packet` / `recv_packet` event into a
-/// `v2_msgs::Packet`. The router emits the packet as a `#[contracttype]`
-/// struct, which Soroban encodes as an `ScVal::Map` of `(Symbol(field_name),
-/// field_value)` entries.
 pub fn decode_packet_from_event_body(value_xdr: &[u8]) -> Result<Packet, PacketDecodeError> {
     let body = ScVal::from_xdr(value_xdr, Limits::none())
         .map_err(|e| PacketDecodeError::Xdr(e.to_string()))?;
@@ -285,8 +281,6 @@ pub enum SubmitError {
 }
 
 pub trait PacketRelayDestination: Send + Sync {
-    /// Submit a batch of pre-encoded `Any` messages to the destination chain
-    /// and wait for inclusion. Returns the tx hash on success.
     fn submit(&self, msgs: Vec<Any>) -> Result<String, SubmitError>;
 }
 
@@ -846,7 +840,6 @@ mod decoder_tests {
             ("sequence", ScVal::U64(1)),
             ("source_client", string_val("a")),
             ("dest_client", string_val("b")),
-            // timeout_timestamp missing
             ("payloads", vec_val(vec![])),
         ]);
         let xdr = body.to_xdr(Limits::none()).unwrap();
@@ -1127,8 +1120,6 @@ mod decoder_tests {
             dest_client_id: &str,
             sequence: u64,
         ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
-            // A non-empty receipt means the packet DID land, so timeout is
-            // not authorised. Surface this as a generic query failure.
             Err(PacketProofError::QueryFailed(format!(
                 "receipt present for {dest_client_id}/{sequence}"
             )))
@@ -1312,14 +1303,6 @@ mod decoder_tests {
     #[test]
     fn dispatch_routes_unexpired_packet_to_send_path() {
         let event = synthetic_event(1);
-        let happy_dst = RecordingDestination {
-            submitted: std::sync::Mutex::new(Vec::new()),
-            tx_hash: "TX-RECV".to_string(),
-        };
-        let timeout_dst = RecordingDestination {
-            submitted: std::sync::Mutex::new(Vec::new()),
-            tx_hash: "TX-TIMEOUT".to_string(),
-        };
         let deps = StellarPacketDeps {
             proof_source: Some(Arc::new(FakeProofSource {
                 proof: vec![0xAB],
@@ -1359,7 +1342,6 @@ mod decoder_tests {
             "expected send-path status, got: {status}"
         );
         assert!(!status.contains("built_msg_timeout"), "got: {status}");
-        let _ = (happy_dst, timeout_dst); // silence dead_code: kept inline above
     }
 
     #[test]
@@ -1369,7 +1351,7 @@ mod decoder_tests {
             ("sequence", ScVal::U64(2)),
             ("source_client", string_val("10-stellar-0")),
             ("dest_client", string_val("07-tendermint-0")),
-            ("timeout_timestamp", ScVal::U64(1)), // far past
+            ("timeout_timestamp", ScVal::U64(1)),
             ("payloads", vec_val(vec![sample_payload()])),
         ])
         .to_xdr(Limits::none())
