@@ -654,6 +654,7 @@ impl ChainEndpoint for StellarChainEndpoint {
             root: CommitmentRoot::from_bytes(&wire.ibc_state_root),
             timestamp: close_time,
             ledger_hash,
+            wrap_as_wasm: self.is_wasm_wrapped(),
         }))
     }
 
@@ -662,12 +663,15 @@ impl ChainEndpoint for StellarChainEndpoint {
         height: ICSHeight,
         _settings: ClientSettings,
     ) -> Result<Self::ClientState, Error> {
+        let network_id = network_id_from_passphrase(&self.config.network_passphrase);
         Ok(AnyClientState::Stellar(StellarClientState {
             chain_id: self.config.id.clone(),
             latest_height: height,
             frozen_height: None,
             trusted_validators: Vec::new(),
             proof_specs: Vec::new(),
+            network_id,
+            wasm_checksum: self.wasm_checksum_bytes()?,
         }))
     }
 
@@ -679,6 +683,7 @@ impl ChainEndpoint for StellarChainEndpoint {
             root: CommitmentRoot::from_bytes(&light_block.ibc_state_root),
             timestamp: light_block.close_time_secs,
             ledger_hash: light_block.ledger_hash,
+            wrap_as_wasm: self.is_wasm_wrapped(),
         }))
     }
 
@@ -713,6 +718,9 @@ impl ChainEndpoint for StellarChainEndpoint {
             signature: wire.scp_signature,
         };
 
+        let timestamp_secs = ledger_close_time_secs(&wire.ledger_header_xdr).unwrap_or(0);
+        let previous_ledger_hash =
+            ledger_previous_hash(&wire.ledger_header_xdr).unwrap_or_default();
         let raw = stellar_raw::StellarHeader {
             ledger_seq: wire.ledger_seq as u64,
             ledger_header_xdr: wire.ledger_header_xdr,
@@ -722,6 +730,9 @@ impl ChainEndpoint for StellarChainEndpoint {
                 revision_number: trusted_height.revision_number(),
                 revision_height: trusted_height.revision_height(),
             }),
+            timestamp: timestamp_secs,
+            ledger_hash: Vec::new(),
+            previous_ledger_hash,
         };
 
         let header: StellarHeader = raw
@@ -779,6 +790,60 @@ impl ChainEndpoint for StellarChainEndpoint {
     fn query_ccv_consumer_id(&self, _client_id: ClientId) -> Result<ConsumerId, Error> {
         unimplemented!()
     }
+}
+
+impl StellarChainEndpoint {
+    fn is_wasm_wrapped(&self) -> bool {
+        self.config
+            .wasm_checksum_hex
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn wasm_checksum_bytes(&self) -> Result<Option<Vec<u8>>, Error> {
+        let Some(hex) = self
+            .config
+            .wasm_checksum_hex
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let bytes = hex_decode(hex)
+            .map_err(|e| Error::query(format!("invalid wasm_checksum_hex on Stellar config: {e}")))?;
+        Ok(Some(bytes))
+    }
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    let s = s.trim().trim_start_matches("0x");
+    if s.len() % 2 != 0 {
+        return Err(format!("hex string has odd length: {}", s.len()));
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for i in (0..bytes.len()).step_by(2) {
+        let hi = char_to_nibble(bytes[i]).ok_or_else(|| format!("invalid hex char at {i}"))?;
+        let lo =
+            char_to_nibble(bytes[i + 1]).ok_or_else(|| format!("invalid hex char at {}", i + 1))?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn char_to_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn network_id_from_passphrase(passphrase: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(passphrase.as_bytes()).to_vec()
 }
 
 fn ledger_close_time_secs(ledger_header_xdr: &[u8]) -> Result<u64, Error> {
