@@ -1672,6 +1672,25 @@ mod tests {
     }
 
     #[test]
+    fn request_with_query_height_sets_cosmos_block_height_metadata() {
+        // Gateway query methods route requested heights through Cosmos-compatible
+        // metadata; packet proof tests rely on this height being sent unchanged.
+        let request = GatewayClient::request_with_query_height(
+            (),
+            Some(Height::new(0, 42).expect("valid height")),
+        )
+        .expect("request with query height");
+
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-cosmos-block-height")
+                .expect("height metadata"),
+            "42"
+        );
+    }
+
+    #[test]
     fn cardano_transfer_amount_rejects_non_integer_string() {
         let coin = transfer_coin("1.5");
 
