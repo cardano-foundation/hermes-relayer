@@ -225,6 +225,14 @@ pub struct TelemetryState {
 
     /// Observed ICS31 CrossChainQuery error Responses
     cross_chain_query_error_responses: Counter<u64>,
+
+    stellar_router_events_observed: Counter<u64>,
+    stellar_relay_succeeded: Counter<u64>,
+    stellar_relay_build_failed: Counter<u64>,
+    stellar_relay_submit_failed: Counter<u64>,
+    stellar_polling_attempts: Counter<u64>,
+    stellar_polling_failures: Counter<u64>,
+    stellar_polling_reconnects: Counter<u64>,
 }
 
 impl TelemetryState {
@@ -498,6 +506,35 @@ impl TelemetryState {
             cross_chain_query_error_responses: meter
                 .u64_counter("cross_chain_query_error_responses")
                 .with_description("Number of ICS-31 error query responses")
+                .init(),
+
+            stellar_router_events_observed: meter
+                .u64_counter("stellar_router_events_observed")
+                .with_description("Stellar router events observed (send_packet/recv_packet/write_ack/ack_packet/timeout_packet)")
+                .init(),
+            stellar_relay_succeeded: meter
+                .u64_counter("stellar_relay_succeeded")
+                .with_description("Stellar packet relays that successfully submitted to the counterparty")
+                .init(),
+            stellar_relay_build_failed: meter
+                .u64_counter("stellar_relay_build_failed")
+                .with_description("Stellar packet relays that failed to build the outgoing Any")
+                .init(),
+            stellar_relay_submit_failed: meter
+                .u64_counter("stellar_relay_submit_failed")
+                .with_description("Stellar packet relays that built an Any but failed to submit")
+                .init(),
+            stellar_polling_attempts: meter
+                .u64_counter("stellar_polling_attempts")
+                .with_description("Stellar gateway event poll attempts")
+                .init(),
+            stellar_polling_failures: meter
+                .u64_counter("stellar_polling_failures")
+                .with_description("Stellar gateway event poll attempts that returned an error")
+                .init(),
+            stellar_polling_reconnects: meter
+                .u64_counter("stellar_polling_reconnects")
+                .with_description("Stellar gateway client reconnect attempts after consecutive poll failures")
                 .init(),
         }
     }
@@ -916,6 +953,53 @@ impl TelemetryState {
         ];
 
         self.timeout_events.add(1, labels);
+    }
+
+    pub fn stellar_router_event_observed(&self, chain_id: &ChainId, kind: &str) {
+        let labels = &[
+            KeyValue::new("chain", chain_id.to_string()),
+            KeyValue::new("kind", kind.to_string()),
+        ];
+        self.stellar_router_events_observed.add(1, labels);
+    }
+
+    pub fn stellar_relay_success(&self, chain_id: &ChainId, path: &str) {
+        let labels = &[
+            KeyValue::new("chain", chain_id.to_string()),
+            KeyValue::new("path", path.to_string()),
+        ];
+        self.stellar_relay_succeeded.add(1, labels);
+    }
+
+    pub fn stellar_relay_build_failure(&self, chain_id: &ChainId, path: &str) {
+        let labels = &[
+            KeyValue::new("chain", chain_id.to_string()),
+            KeyValue::new("path", path.to_string()),
+        ];
+        self.stellar_relay_build_failed.add(1, labels);
+    }
+
+    pub fn stellar_relay_submit_failure(&self, chain_id: &ChainId, path: &str) {
+        let labels = &[
+            KeyValue::new("chain", chain_id.to_string()),
+            KeyValue::new("path", path.to_string()),
+        ];
+        self.stellar_relay_submit_failed.add(1, labels);
+    }
+
+    pub fn stellar_polling_attempt(&self, chain_id: &ChainId) {
+        let labels = &[KeyValue::new("chain", chain_id.to_string())];
+        self.stellar_polling_attempts.add(1, labels);
+    }
+
+    pub fn stellar_polling_failure(&self, chain_id: &ChainId) {
+        let labels = &[KeyValue::new("chain", chain_id.to_string())];
+        self.stellar_polling_failures.add(1, labels);
+    }
+
+    pub fn stellar_polling_reconnect(&self, chain_id: &ChainId) {
+        let labels = &[KeyValue::new("chain", chain_id.to_string())];
+        self.stellar_polling_reconnects.add(1, labels);
     }
 
     pub fn cleared_send_packet_events(

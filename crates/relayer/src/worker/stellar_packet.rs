@@ -464,6 +464,7 @@ fn process_batch(chain_id: &ChainId, batch: &EventBatch, deps: &StellarPacketDep
     for ev in &batch.events {
         if let IbcEvent::AppModule(m) = &ev.event {
             if let Some(packet_ev) = extract_router_event(m) {
+                crate::telemetry!(stellar_router_event_observed, chain_id, &packet_ev.kind);
                 let decoded = if packet_ev.value_xdr.is_empty() {
                     None
                 } else {
@@ -480,7 +481,7 @@ fn process_batch(chain_id: &ChainId, batch: &EventBatch, deps: &StellarPacketDep
                     (false, None) => "decode_failed".to_string(),
                 };
                 let relay_status = if packet_ev.kind == "send_packet" {
-                    dispatch_send_packet(&packet_ev, decoded.as_ref(), deps)
+                    dispatch_send_packet(chain_id, &packet_ev, decoded.as_ref(), deps)
                 } else {
                     "n/a".to_string()
                 };
@@ -503,6 +504,7 @@ fn process_batch(chain_id: &ChainId, batch: &EventBatch, deps: &StellarPacketDep
 }
 
 fn dispatch_send_packet(
+    chain_id: &ChainId,
     packet_ev: &StellarPacketEvent,
     decoded: Option<&Packet>,
     deps: &StellarPacketDeps,
@@ -511,6 +513,7 @@ fn dispatch_send_packet(
     if let Some(packet) = decoded {
         if packet.timeout_timestamp > 0 && now > packet.timeout_timestamp {
             return relay_timeout(
+                chain_id,
                 packet_ev,
                 deps.absence_source.as_deref(),
                 deps.source_submitter.as_deref(),
@@ -521,6 +524,7 @@ fn dispatch_send_packet(
         }
     }
     relay_send_packet(
+        chain_id,
         packet_ev,
         deps.proof_source.as_deref(),
         deps.destination.as_deref(),
@@ -529,6 +533,7 @@ fn dispatch_send_packet(
 }
 
 fn relay_send_packet(
+    chain_id: &ChainId,
     packet_ev: &StellarPacketEvent,
     proof_source: Option<&dyn PacketProofSource>,
     destination: Option<&dyn PacketRelayDestination>,
@@ -539,7 +544,10 @@ fn relay_send_packet(
     };
     let any = match build_msg_recv_packet_from_event(packet_ev, src, signer.to_string()) {
         Ok(a) => a,
-        Err(e) => return format!("build_failed: {e}"),
+        Err(e) => {
+            crate::telemetry!(stellar_relay_build_failure, chain_id, "recv");
+            return format!("build_failed: {e}");
+        }
     };
     let any_summary = format!(
         "built_msg_recv_packet bytes={} type_url={}",
@@ -550,12 +558,19 @@ fn relay_send_packet(
         return format!("{any_summary} submit=no_destination");
     };
     match dst.submit(vec![any]) {
-        Ok(tx_hash) => format!("{any_summary} submit=ok tx={tx_hash}"),
-        Err(e) => format!("{any_summary} submit=failed: {e}"),
+        Ok(tx_hash) => {
+            crate::telemetry!(stellar_relay_success, chain_id, "recv");
+            format!("{any_summary} submit=ok tx={tx_hash}")
+        }
+        Err(e) => {
+            crate::telemetry!(stellar_relay_submit_failure, chain_id, "recv");
+            format!("{any_summary} submit=failed: {e}")
+        }
     }
 }
 
 fn relay_timeout(
+    chain_id: &ChainId,
     packet_ev: &StellarPacketEvent,
     absence_source: Option<&dyn PacketAbsenceProofSource>,
     source_submitter: Option<&dyn PacketRelayDestination>,
@@ -569,7 +584,10 @@ fn relay_timeout(
     };
     let any = match build_msg_timeout_from_event(packet_ev, absence, source_signer.to_string()) {
         Ok(a) => a,
-        Err(e) => return format!("{prefix} build_failed: {e}"),
+        Err(e) => {
+            crate::telemetry!(stellar_relay_build_failure, chain_id, "timeout");
+            return format!("{prefix} build_failed: {e}");
+        }
     };
     let any_summary = format!(
         "built_msg_timeout bytes={} type_url={}",
@@ -580,8 +598,14 @@ fn relay_timeout(
         return format!("{prefix} {any_summary} submit=no_source_submitter");
     };
     match submitter.submit(vec![any]) {
-        Ok(tx_hash) => format!("{prefix} {any_summary} submit=ok tx={tx_hash}"),
-        Err(e) => format!("{prefix} {any_summary} submit=failed: {e}"),
+        Ok(tx_hash) => {
+            crate::telemetry!(stellar_relay_success, chain_id, "timeout");
+            format!("{prefix} {any_summary} submit=ok tx={tx_hash}")
+        }
+        Err(e) => {
+            crate::telemetry!(stellar_relay_submit_failure, chain_id, "timeout");
+            format!("{prefix} {any_summary} submit=failed: {e}")
+        }
     }
 }
 
@@ -873,6 +897,10 @@ mod decoder_tests {
         assert!(matches!(err, PacketDecodeError::Xdr(_)));
     }
 
+    fn test_chain_id() -> ChainId {
+        ChainId::from_string("stellar-testnet")
+    }
+
     struct FakeProofSource {
         proof: Vec<u8>,
         height: ICSHeight,
@@ -1044,7 +1072,7 @@ mod decoder_tests {
             tx_hash: "ABC123".to_string(),
         };
 
-        let status = relay_send_packet(&event, Some(&src), Some(&dst), "signer");
+        let status = relay_send_packet(&test_chain_id(), &event, Some(&src), Some(&dst), "signer");
         assert!(
             status.contains("submit=ok") && status.contains("tx=ABC123"),
             "unexpected status: {status}"
@@ -1067,7 +1095,7 @@ mod decoder_tests {
             proof: vec![],
             height: ICSHeight::new(0, 1).unwrap(),
         };
-        let status = relay_send_packet(&event, Some(&src), None, "s");
+        let status = relay_send_packet(&test_chain_id(), &event, Some(&src), None, "s");
         assert!(
             status.contains("submit=no_destination"),
             "unexpected status: {status}"
@@ -1081,7 +1109,13 @@ mod decoder_tests {
             proof: vec![],
             height: ICSHeight::new(0, 1).unwrap(),
         };
-        let status = relay_send_packet(&event, Some(&src), Some(&FailingDestination), "s");
+        let status = relay_send_packet(
+            &test_chain_id(),
+            &event,
+            Some(&src),
+            Some(&FailingDestination),
+            "s",
+        );
         assert!(
             status.contains("submit=failed: destination submit failed: nack from chain"),
             "unexpected status: {status}"
@@ -1095,7 +1129,7 @@ mod decoder_tests {
             submitted: std::sync::Mutex::new(Vec::new()),
             tx_hash: "tx".to_string(),
         };
-        let status = relay_send_packet(&event, None, Some(&dst), "s");
+        let status = relay_send_packet(&test_chain_id(), &event, None, Some(&dst), "s");
         assert_eq!(status, "no_proof_source");
         assert!(dst.submitted.lock().unwrap().is_empty());
     }
@@ -1243,6 +1277,7 @@ mod decoder_tests {
             tx_hash: "TX-TIMEOUT".to_string(),
         };
         let status = relay_timeout(
+            &test_chain_id(),
             &event,
             Some(&absence),
             Some(&src_submitter),
@@ -1265,7 +1300,7 @@ mod decoder_tests {
     #[test]
     fn relay_timeout_no_absence_source_skips() {
         let event = synthetic_event(1);
-        let status = relay_timeout(&event, None, None, "s", 100, 200);
+        let status = relay_timeout(&test_chain_id(), &event, None, None, "s", 100, 200);
         assert!(status.contains("skip=no_absence_source"), "got: {status}");
     }
 
@@ -1276,7 +1311,7 @@ mod decoder_tests {
             proof: vec![],
             height: ICSHeight::new(0, 1).unwrap(),
         };
-        let status = relay_timeout(&event, Some(&absence), None, "s", 100, 200);
+        let status = relay_timeout(&test_chain_id(), &event, Some(&absence), None, "s", 100, 200);
         assert!(
             status.contains("submit=no_source_submitter"),
             "got: {status}"
@@ -1295,7 +1330,7 @@ mod decoder_tests {
             submitted: std::sync::Mutex::new(Vec::new()),
             tx_hash: "tx".to_string(),
         };
-        let status = relay_timeout(&event, Some(&absence), Some(&dst), "s", 100, 200);
+        let status = relay_timeout(&test_chain_id(), &event, Some(&absence), Some(&dst), "s", 100, 200);
         assert!(status.contains("build_failed:"), "got: {status}");
         assert!(dst.submitted.lock().unwrap().is_empty());
     }
@@ -1336,7 +1371,7 @@ mod decoder_tests {
         let mut event = event;
         event.value_xdr = body_xdr;
         let decoded = decode_packet_from_event_body(&event.value_xdr).unwrap();
-        let status = dispatch_send_packet(&event, Some(&decoded), &deps);
+        let status = dispatch_send_packet(&test_chain_id(), &event, Some(&decoded), &deps);
         assert!(
             status.contains("built_msg_recv_packet"),
             "expected send-path status, got: {status}"
@@ -1382,7 +1417,7 @@ mod decoder_tests {
             signer: "dst-signer".to_string(),
             source_signer: "src-signer".to_string(),
         };
-        let status = dispatch_send_packet(&event, Some(&decoded), &deps);
+        let status = dispatch_send_packet(&test_chain_id(), &event, Some(&decoded), &deps);
         assert!(
             status.contains("built_msg_timeout"),
             "expected timeout-path status, got: {status}"
@@ -1420,7 +1455,7 @@ mod decoder_tests {
             signer: "s".to_string(),
             source_signer: "s".to_string(),
         };
-        let status = dispatch_send_packet(&event, Some(&decoded), &deps);
+        let status = dispatch_send_packet(&test_chain_id(), &event, Some(&decoded), &deps);
         assert!(status.contains("built_msg_recv_packet"), "got: {status}");
     }
 
@@ -1436,7 +1471,7 @@ mod decoder_tests {
             submitted: std::sync::Mutex::new(Vec::new()),
             tx_hash: "tx".to_string(),
         };
-        let status = relay_send_packet(&event, Some(&src), Some(&dst), "s");
+        let status = relay_send_packet(&test_chain_id(), &event, Some(&src), Some(&dst), "s");
         assert!(status.starts_with("build_failed:"), "got: {status}");
         assert!(dst.submitted.lock().unwrap().is_empty());
     }

@@ -1100,6 +1100,8 @@ async fn run_event_polling(
             limit: 200,
         };
 
+        crate::telemetry!(stellar_polling_attempt, &chain_id);
+
         let resp = match client.events(req).await {
             Ok(r) => {
                 if consecutive_errors > 0 {
@@ -1113,11 +1115,13 @@ async fn run_event_polling(
             }
             Err(e) => {
                 consecutive_errors = consecutive_errors.saturating_add(1);
+                crate::telemetry!(stellar_polling_failure, &chain_id);
                 tracing::warn!(
                     target: "stellar_events",
                     "{chain_id}: gateway events poll failed (start_ledger={start_ledger}, cursor='{cursor}', consecutive={consecutive_errors}): {e}"
                 );
                 if consecutive_errors >= POLL_RECONNECT_THRESHOLD {
+                    crate::telemetry!(stellar_polling_reconnect, &chain_id);
                     tracing::warn!(
                         target: "stellar_events",
                         "{chain_id}: dropping gateway client after {consecutive_errors} failures, reconnecting to {gateway_url}"
