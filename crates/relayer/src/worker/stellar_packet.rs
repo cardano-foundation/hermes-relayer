@@ -1507,3 +1507,265 @@ mod decoder_tests {
         assert_eq!(packet.payloads[1].encoding, "cbor");
     }
 }
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use std::borrow::Cow;
+    use std::time::Duration;
+
+    use stellar_xdr::curr::{
+        BytesM, Limits, ScBytes, ScMap, ScMapEntry, ScString, ScSymbol, ScVec, StringM, VecM,
+        WriteXdr,
+    };
+
+    use ibc_relayer_types::events::{ModuleEventAttribute, ModuleId};
+    use crate::chain::tracking::TrackingId;
+
+    fn sym(s: &str) -> ScVal {
+        ScVal::Symbol(ScSymbol(StringM::<32>::try_from(s.as_bytes().to_vec()).unwrap()))
+    }
+    fn string_val(s: &str) -> ScVal {
+        ScVal::String(ScString(StringM::try_from(s.as_bytes().to_vec()).unwrap()))
+    }
+    fn bytes_val(b: &[u8]) -> ScVal {
+        ScVal::Bytes(ScBytes(BytesM::try_from(b.to_vec()).unwrap()))
+    }
+    fn struct_val(entries: Vec<(&str, ScVal)>) -> ScVal {
+        let mapped: Vec<ScMapEntry> = entries
+            .into_iter()
+            .map(|(k, v)| ScMapEntry { key: sym(k), val: v })
+            .collect();
+        ScVal::Map(Some(ScMap(VecM::try_from(mapped).unwrap())))
+    }
+    fn vec_val(items: Vec<ScVal>) -> ScVal {
+        ScVal::Vec(Some(ScVec(VecM::try_from(items).unwrap())))
+    }
+    fn sample_payload() -> ScVal {
+        struct_val(vec![
+            ("source_port", string_val("transfer")),
+            ("dest_port", string_val("transfer")),
+            ("version", string_val("ics20-2")),
+            ("encoding", string_val("json")),
+            ("value", bytes_val(b"app-data")),
+        ])
+    }
+    fn packet_body(sequence: u64, timeout_ts: u64) -> Vec<u8> {
+        struct_val(vec![
+            ("sequence", ScVal::U64(sequence)),
+            ("source_client", string_val("10-stellar-0")),
+            ("dest_client", string_val("07-tendermint-0")),
+            ("timeout_timestamp", ScVal::U64(timeout_ts)),
+            ("payloads", vec_val(vec![sample_payload()])),
+        ])
+        .to_xdr(Limits::none())
+        .unwrap()
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        out
+    }
+
+    fn make_event_batch(chain_id: &ChainId, sequence: u64, timeout_ts: u64) -> EventBatch {
+        let module = ModuleId::new(Cow::Borrowed(ROUTER_MODULE)).unwrap();
+        let value_xdr = packet_body(sequence, timeout_ts);
+        let module_ev = ModuleEvent {
+            kind: "send_packet".to_string(),
+            module_name: module,
+            attributes: vec![
+                ModuleEventAttribute {
+                    key: "client_id".into(),
+                    value: "10-stellar-0".into(),
+                },
+                ModuleEventAttribute {
+                    key: "sequence".into(),
+                    value: sequence.to_string(),
+                },
+                ModuleEventAttribute {
+                    key: "tx_hash".into(),
+                    value: "tx-1".into(),
+                },
+                ModuleEventAttribute {
+                    key: "event_id".into(),
+                    value: "ev-1".into(),
+                },
+                ModuleEventAttribute {
+                    key: "value_xdr_hex".into(),
+                    value: hex_encode(&value_xdr),
+                },
+            ],
+        };
+        let height = ICSHeight::new(0, 100).unwrap();
+        EventBatch {
+            chain_id: chain_id.clone(),
+            tracking_id: TrackingId::new_static("smoke-test"),
+            height,
+            events: vec![crate::event::IbcEventWithHeight::new(
+                IbcEvent::AppModule(module_ev),
+                height,
+            )],
+        }
+    }
+
+    struct RecordingDestination {
+        submitted: std::sync::Mutex<Vec<Vec<Any>>>,
+    }
+    impl PacketRelayDestination for RecordingDestination {
+        fn submit(&self, msgs: Vec<Any>) -> Result<String, SubmitError> {
+            let mut g = self.submitted.lock().unwrap();
+            let i = g.len();
+            g.push(msgs);
+            Ok(format!("smoke-tx-{i}"))
+        }
+    }
+
+    struct CannedProofSource;
+    impl PacketProofSource for CannedProofSource {
+        fn packet_commitment_proof(
+            &self,
+            _client_id: &str,
+            _sequence: u64,
+        ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
+            Ok((vec![0xAB, 0xCD], ICSHeight::new(0, 200).unwrap()))
+        }
+    }
+
+    fn wait_for<F: Fn() -> bool>(check: F, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if check() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        check()
+    }
+
+    #[test]
+    fn worker_consumes_event_and_submits_msg_recv_packet() {
+        let chain_id = ChainId::from_string("stellar-testnet");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let recorder = Arc::new(RecordingDestination {
+            submitted: std::sync::Mutex::new(Vec::new()),
+        });
+        let destination: Arc<dyn PacketRelayDestination> = recorder.clone();
+
+        let deps = StellarPacketDeps {
+            proof_source: Some(Arc::new(CannedProofSource)),
+            destination: Some(destination),
+            absence_source: None,
+            source_submitter: None,
+            signer: "signer".to_string(),
+            source_signer: String::new(),
+        };
+
+        let handle = spawn_stellar_packet_worker(chain_id.clone(), rx, deps);
+
+        let batch = make_event_batch(&chain_id, 42, u64::MAX / 2);
+        tx.send(Arc::new(Ok(batch))).unwrap();
+
+        let arrived = wait_for(
+            || !recorder.submitted.lock().unwrap().is_empty(),
+            Duration::from_secs(3),
+        );
+        assert!(arrived, "worker did not submit anything within 3s");
+
+        let recorded = recorder.submitted.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let msgs = &recorded[0];
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].type_url, TYPE_URL_RECV_PACKET);
+        let parsed = MsgRecvPacket::decode(msgs[0].value.as_slice()).unwrap();
+        let packet = parsed.packet.unwrap();
+        assert_eq!(packet.sequence, 42);
+        assert_eq!(packet.source_client, "10-stellar-0");
+        assert_eq!(packet.dest_client, "07-tendermint-0");
+        assert_eq!(parsed.signer, "signer");
+        assert_eq!(parsed.proof_commitment, vec![0xAB, 0xCD]);
+        assert_eq!(parsed.proof_height.unwrap().revision_height, 200);
+
+        drop(tx);
+        handle.shutdown_and_wait();
+    }
+
+    #[test]
+    fn worker_routes_expired_packet_to_timeout_path() {
+        let chain_id = ChainId::from_string("stellar-testnet");
+        let (tx, rx) = crossbeam_channel::unbounded();
+
+        let recv_recorder = Arc::new(RecordingDestination {
+            submitted: std::sync::Mutex::new(Vec::new()),
+        });
+        let timeout_recorder = Arc::new(RecordingDestination {
+            submitted: std::sync::Mutex::new(Vec::new()),
+        });
+        let destination: Arc<dyn PacketRelayDestination> = recv_recorder.clone();
+        let source_submitter: Arc<dyn PacketRelayDestination> = timeout_recorder.clone();
+
+        struct CannedAbsence;
+        impl PacketAbsenceProofSource for CannedAbsence {
+            fn packet_receipt_absence_proof(
+                &self,
+                _dest: &str,
+                _seq: u64,
+            ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
+                Ok((vec![0xFE, 0xED], ICSHeight::new(0, 250).unwrap()))
+            }
+        }
+
+        let deps = StellarPacketDeps {
+            proof_source: Some(Arc::new(CannedProofSource)),
+            destination: Some(destination),
+            absence_source: Some(Arc::new(CannedAbsence)),
+            source_submitter: Some(source_submitter),
+            signer: "dst-signer".to_string(),
+            source_signer: "src-signer".to_string(),
+        };
+
+        let handle = spawn_stellar_packet_worker(chain_id.clone(), rx, deps);
+
+        let batch = make_event_batch(&chain_id, 7, 1);
+        tx.send(Arc::new(Ok(batch))).unwrap();
+
+        let arrived = wait_for(
+            || !timeout_recorder.submitted.lock().unwrap().is_empty(),
+            Duration::from_secs(3),
+        );
+        assert!(arrived, "worker did not submit timeout within 3s");
+
+        assert!(
+            recv_recorder.submitted.lock().unwrap().is_empty(),
+            "expected NO MsgRecvPacket submission for an expired packet"
+        );
+        let recorded = timeout_recorder.submitted.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0][0].type_url, TYPE_URL_TIMEOUT);
+        let parsed = MsgTimeout::decode(recorded[0][0].value.as_slice()).unwrap();
+        assert_eq!(parsed.packet.unwrap().sequence, 7);
+        assert_eq!(parsed.signer, "src-signer");
+        assert_eq!(parsed.proof_unreceived, vec![0xFE, 0xED]);
+
+        drop(tx);
+        handle.shutdown_and_wait();
+    }
+
+    #[test]
+    fn worker_exits_when_subscription_closes() {
+        let chain_id = ChainId::from_string("stellar-testnet");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let deps = StellarPacketDeps::observer_only();
+        let handle = spawn_stellar_packet_worker(chain_id, rx, deps);
+
+        drop(tx);
+
+        let stopped = wait_for(|| handle.is_stopped(), Duration::from_secs(3));
+        assert!(stopped, "worker did not exit after subscription closed");
+        handle.shutdown_and_wait();
+    }
+}
