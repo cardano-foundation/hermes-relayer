@@ -1141,7 +1141,7 @@ async fn dispatch_msg(
                 let mut guard = msg_client.lock().unwrap();
                 guard
                     .create_client(super::gateway_client::MsgCreateClientRequest {
-                        client_state: client_state_any.encode_to_vec(),
+                        client_state: client_state_any.value,
                         consensus_state,
                         signer: source,
                         client_type,
