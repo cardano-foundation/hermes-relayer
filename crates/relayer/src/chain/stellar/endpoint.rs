@@ -228,8 +228,9 @@ impl ChainEndpoint for StellarChainEndpoint {
         let network_passphrase = self.config.network_passphrase.clone();
 
         self.rt.block_on(async {
+            let mut events = Vec::new();
             for msg in tracked_msgs.msgs.iter() {
-                dispatch_msg(
+                let msg_events = dispatch_msg(
                     &self.gateway_msg,
                     &msg.type_url,
                     msg.value.clone(),
@@ -238,11 +239,10 @@ impl ChainEndpoint for StellarChainEndpoint {
                     &network_passphrase,
                 )
                 .await?;
+                events.extend(msg_events);
             }
-            Ok::<(), Error>(())
-        })?;
-
-        Ok(Vec::new())
+            Ok::<Vec<IbcEventWithHeight>, Error>(events)
+        })
     }
 
     fn send_messages_and_wait_check_tx(
@@ -1070,6 +1070,15 @@ fn sign_stellar_tx(
         .map_err(|e| Error::send_tx(format!("encode signed tx envelope: {e}")))
 }
 
+fn scval_string_from_xdr(bytes: &[u8]) -> Option<String> {
+    use stellar_xdr::curr::{Limits, ReadXdr, ScVal};
+    match ScVal::from_xdr(bytes, Limits::none()).ok()? {
+        ScVal::String(s) => core::str::from_utf8(s.0.as_slice()).ok().map(|s| s.to_string()),
+        ScVal::Symbol(s) => core::str::from_utf8(s.0.as_slice()).ok().map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
 async fn dispatch_msg(
     msg_client: &StdMutex<GatewayMsgClient>,
     type_url: &str,
@@ -1077,9 +1086,11 @@ async fn dispatch_msg(
     signer: &str,
     signing_key: &StellarSigningKeyPair,
     network_passphrase: &str,
-) -> Result<(), Error> {
+) -> Result<Vec<IbcEventWithHeight>, Error> {
     use ibc_proto::ibc::core::client::v1 as cosmos_client;
     use ibc_relayer_types::clients::ics10_stellar::v2_msgs;
+
+    let mut events: Vec<IbcEventWithHeight> = Vec::new();
 
     match type_url {
         "/ibc.core.client.v1.MsgCreateClient" => {
@@ -1166,6 +1177,32 @@ async fn dispatch_msg(
                 tx_hash = %submitted.tx_hash,
                 "stellar create_client submitted (signed by relayer key)"
             );
+
+            use ibc_relayer_types::core::ics02_client::client_type::ClientType;
+            use ibc_relayer_types::core::ics02_client::events::{
+                Attributes as ClientAttributes, CreateClient,
+            };
+
+            let client_id_str = scval_string_from_xdr(&submitted.return_value).ok_or_else(|| {
+                Error::send_tx(
+                    "create_client tx returned no client id in its return value".to_string(),
+                )
+            })?;
+            let client_id = ClientId::from_str(&client_id_str)
+                .map_err(|e| Error::send_tx(format!("invalid client id {client_id_str}: {e}")))?;
+            let consensus_height = ICSHeight::new(0, height)
+                .map_err(|e| Error::send_tx(format!("invalid consensus height {height}: {e}")))?;
+
+            tracing::info!(%client_id, %consensus_height, "stellar create_client minted");
+
+            events.push(IbcEventWithHeight::new(
+                IbcEvent::CreateClient(CreateClient(ClientAttributes {
+                    client_id,
+                    client_type: ClientType::Tendermint,
+                    consensus_height,
+                })),
+                consensus_height,
+            ));
         }
         "/ibc.core.client.v1.MsgUpdateClient" => {
             let m = cosmos_client::MsgUpdateClient::decode(value.as_slice())
@@ -1287,7 +1324,7 @@ async fn dispatch_msg(
         }
     }
 
-    Ok(())
+    Ok(events)
 }
 
 fn decode_merkle_proof(bytes: &[u8]) -> Result<Option<MerkleProof>, Error> {
