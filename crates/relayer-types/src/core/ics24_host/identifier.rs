@@ -193,6 +193,7 @@ impl ClientId {
             ClientType::CardanoMithril => ClientType::CardanoMithril.as_str(),
             ClientType::CardanoProbabilistic => ClientType::CardanoProbabilistic.as_str(),
             ClientType::Stellar => ClientType::Stellar.as_str(),
+            ClientType::Wasm => ClientType::Wasm.as_str(),
         }
     }
 
