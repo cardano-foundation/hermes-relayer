@@ -16,15 +16,17 @@ use ibc_relayer_types::clients::ics10_stellar::consensus_state::ConsensusState a
 use ibc_relayer_types::clients::ics10_stellar::header::Header as StellarHeader;
 use ibc_relayer_types::clients::ics10_stellar::misbehaviour::Misbehaviour as StellarMisbehaviour;
 use ibc_relayer_types::clients::ics10_stellar::raw as stellar_raw;
-use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentRoot;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
 use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header as IbcHeader};
 use ibc_relayer_types::core::ics02_client::height::Height;
-use ibc_relayer_types::core::ics03_connection::connection::{ConnectionEnd, IdentifiedConnectionEnd};
+use ibc_relayer_types::core::ics03_connection::connection::{
+    ConnectionEnd, IdentifiedConnectionEnd,
+};
 use ibc_relayer_types::core::ics04_channel::channel::{ChannelEnd, IdentifiedChannelEnd};
 use ibc_relayer_types::core::ics04_channel::packet::Sequence;
 use ibc_relayer_types::core::ics04_channel::upgrade::{ErrorReceipt, Upgrade};
 use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentPrefix;
+use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentRoot;
 use ibc_relayer_types::core::ics23_commitment::merkle::MerkleProof;
 use ibc_relayer_types::core::ics24_host::identifier::{
     ChainId, ChannelId, ClientId, ConnectionId, PortId,
@@ -78,8 +80,13 @@ pub struct StellarChainEndpoint {
     pub gateway_query: StdMutex<GatewayQueryClient>,
     pub gateway_msg: StdMutex<GatewayMsgClient>,
     pub rt: Arc<TokioRuntime>,
-    pub event_sender:
-        StdMutex<Option<crossbeam_channel::Sender<Arc<crate::event::source::Result<crate::event::source::EventBatch>>>>>,
+    pub event_sender: StdMutex<
+        Option<
+            crossbeam_channel::Sender<
+                Arc<crate::event::source::Result<crate::event::source::EventBatch>>,
+            >,
+        >,
+    >,
 }
 
 impl ChainEndpoint for StellarChainEndpoint {
@@ -119,14 +126,16 @@ impl ChainEndpoint for StellarChainEndpoint {
                 Error::config(ConfigError::wrong_type())
             })?;
         let gateway_msg = rt
-            .block_on(GatewayMsgClient::connect(stellar_config.gateway_url.clone()))
+            .block_on(GatewayMsgClient::connect(
+                stellar_config.gateway_url.clone(),
+            ))
             .map_err(|e| {
                 tracing::error!("Stellar gateway msg connect failed: {e}");
                 Error::config(ConfigError::wrong_type())
             })?;
 
-        let keyring =
-            KeyRing::new(Store::Test, "stellar", &stellar_config.id, &None).map_err(Error::key_base)?;
+        let keyring = KeyRing::new(Store::Test, "stellar", &stellar_config.id, &None)
+            .map_err(Error::key_base)?;
 
         Ok(Self {
             config: stellar_config,
@@ -407,9 +416,8 @@ impl ChainEndpoint for StellarChainEndpoint {
             .map_err(|e| Error::query(format!("StellarHeader decode failed: {e}")))?;
 
         let close_time_secs = ledger_close_time_secs(&wire_header.ledger_header_xdr)?;
-        let timestamp =
-            Timestamp::from_nanoseconds(close_time_secs.saturating_mul(1_000_000_000))
-                .map_err(|e| Error::query(format!("invalid Stellar close_time: {e}")))?;
+        let timestamp = Timestamp::from_nanoseconds(close_time_secs.saturating_mul(1_000_000_000))
+            .map_err(|e| Error::query(format!("invalid Stellar close_time: {e}")))?;
 
         Ok(ChainStatus { height, timestamp })
     }
@@ -441,9 +449,7 @@ impl ChainEndpoint for StellarChainEndpoint {
                     })
                     .await
             })
-            .map_err(|e| {
-                Error::query(format!("Stellar gateway query_client_state failed: {e}"))
-            })?;
+            .map_err(|e| Error::query(format!("Stellar gateway query_client_state failed: {e}")))?;
         let any = ibc_proto::google::protobuf::Any::decode(resp.client_state.as_slice())
             .map_err(|e| Error::query(format!("client_state Any decode failed: {e}")))?;
         let cs = AnyClientState::try_from(any)
@@ -618,12 +624,14 @@ impl ChainEndpoint for StellarChainEndpoint {
                     .await
             })
             .map_err(|e| {
-                Error::query(format!(
-                    "Stellar gateway query_packet_receipt failed: {e}"
-                ))
+                Error::query(format!("Stellar gateway query_packet_receipt failed: {e}"))
             })?;
         let proof = decode_merkle_proof(&resp.proof)?;
-        let value = if resp.received { vec![0x01] } else { Vec::new() };
+        let value = if resp.received {
+            vec![0x01]
+        } else {
+            Vec::new()
+        };
         Ok((value, proof))
     }
 
@@ -656,9 +664,7 @@ impl ChainEndpoint for StellarChainEndpoint {
                     .await
             })
             .map_err(|e| {
-                Error::query(format!(
-                    "Stellar gateway query_acknowledgement failed: {e}"
-                ))
+                Error::query(format!("Stellar gateway query_acknowledgement failed: {e}"))
             })?;
         let proof = decode_merkle_proof(&resp.proof)?;
         Ok((resp.acknowledgement, proof))
@@ -895,8 +901,9 @@ impl StellarChainEndpoint {
         else {
             return Ok(None);
         };
-        let bytes = hex_decode(hex)
-            .map_err(|e| Error::query(format!("invalid wasm_checksum_hex on Stellar config: {e}")))?;
+        let bytes = hex_decode(hex).map_err(|e| {
+            Error::query(format!("invalid wasm_checksum_hex on Stellar config: {e}"))
+        })?;
         Ok(Some(bytes))
     }
 }
@@ -939,9 +946,7 @@ fn ledger_close_time_secs(ledger_header_xdr: &[u8]) -> Result<u64, Error> {
     Ok(header.scp_value.close_time.0)
 }
 
-fn submitted_stellar_update_header(
-    update: &UpdateClient,
-) -> Result<Option<&StellarHeader>, Error> {
+fn submitted_stellar_update_header(update: &UpdateClient) -> Result<Option<&StellarHeader>, Error> {
     let Some(any_header) = update.header.as_ref() else {
         tracing::warn!(
             "skipping Stellar misbehaviour check for client {} at consensus height {}: \
@@ -1084,10 +1089,10 @@ async fn dispatch_msg(
 
             let m = cosmos_client::MsgCreateClient::decode(value.as_slice())
                 .map_err(|e| Error::send_tx(format!("MsgCreateClient decode: {e}")))?;
-            let client_state_any = m
-                .client_state
-                .ok_or_else(|| Error::send_tx("MsgCreateClient missing client_state".to_string()))?;
-            let cons_bytes = m.consensus_state.map(|a| a.value).unwrap_or_default();
+            let client_state_any = m.client_state.ok_or_else(|| {
+                Error::send_tx("MsgCreateClient missing client_state".to_string())
+            })?;
+            let consensus_state = m.consensus_state.map(|a| a.value).unwrap_or_default();
 
             let client_type = match client_state_any.type_url.as_str() {
                 TENDERMINT_CLIENT_STATE_TYPE_URL => "07-tendermint".to_string(),
@@ -1098,6 +1103,12 @@ async fn dispatch_msg(
                     )))
                 }
             };
+
+            tracing::info!(
+                client_type = %client_type,
+                type_url = %client_state_any.type_url.as_str(),
+                "/ibc.core.client.v1.MsgCreateClient"
+            );
 
             let height = match client_state_any.type_url.as_str() {
                 TENDERMINT_CLIENT_STATE_TYPE_URL => {
@@ -1110,29 +1121,44 @@ async fn dispatch_msg(
                 _ => 0,
             };
 
+            tracing::info!(
+                height = %height,
+                "/ibc.core.client.v1.MsgCreateClient"
+            );
+
             let source = if m.signer.is_empty() {
                 signer.to_string()
             } else {
                 m.signer
             };
+
+            tracing::info!(
+                source = %source,
+                "/ibc.core.client.v1.MsgCreateClient"
+            );
+
             let prepared = {
                 let mut guard = msg_client.lock().unwrap();
                 guard
                     .create_client(super::gateway_client::MsgCreateClientRequest {
-                        client_state: client_state_any.value,
-                        consensus_state: cons_bytes,
+                        client_state: client_state_any.encode_to_vec(),
+                        consensus_state,
                         signer: source,
                         client_type,
                         height,
                     })
                     .await
-                    .map_err(|e| Error::send_tx(format!("gateway create_client (prepare) failed: {e}")))?
+                    .map_err(|e| {
+                        Error::send_tx(format!("gateway create_client (prepare) failed: {e}"))
+                    })?
             };
             let signed = sign_stellar_tx(&prepared.tx_xdr, signing_key, network_passphrase)?;
             let submitted = {
                 let mut guard = msg_client.lock().unwrap();
                 guard
-                    .submit_signed_tx(super::gateway_client::SubmitSignedTxRequest { tx_xdr: signed })
+                    .submit_signed_tx(super::gateway_client::SubmitSignedTxRequest {
+                        tx_xdr: signed,
+                    })
                     .await
                     .map_err(|e| Error::send_tx(format!("gateway submit_signed_tx failed: {e}")))?
             };
@@ -1170,19 +1196,15 @@ async fn dispatch_msg(
                     counterparty_commitment_prefix: m.counterparty_commitment_prefix,
                 })
                 .await
-                .map_err(|e| Error::send_tx(format!("gateway register_counterparty failed: {e}")))?;
+                .map_err(|e| {
+                    Error::send_tx(format!("gateway register_counterparty failed: {e}"))
+                })?;
         }
         url if url == v2_msgs::TYPE_URL_RECV_PACKET => {
             let m = v2_msgs::MsgRecvPacket::decode(value.as_slice())
                 .map_err(|e| Error::send_tx(format!("MsgRecvPacket decode: {e}")))?;
-            let packet_bytes = m
-                .packet
-                .map(|p| p.encode_to_vec())
-                .unwrap_or_default();
-            let proof_height = m
-                .proof_height
-                .map(|h| h.revision_height)
-                .unwrap_or(0);
+            let packet_bytes = m.packet.map(|p| p.encode_to_vec()).unwrap_or_default();
+            let proof_height = m.proof_height.map(|h| h.revision_height).unwrap_or(0);
             let mut guard = msg_client.lock().unwrap();
             guard
                 .recv_packet(super::gateway_client::MsgRecvPacketRequest {
@@ -1201,15 +1223,9 @@ async fn dispatch_msg(
         url if url == v2_msgs::TYPE_URL_ACKNOWLEDGEMENT => {
             let m = v2_msgs::MsgAcknowledgement::decode(value.as_slice())
                 .map_err(|e| Error::send_tx(format!("MsgAcknowledgement decode: {e}")))?;
-            let packet_bytes = m
-                .packet
-                .map(|p| p.encode_to_vec())
-                .unwrap_or_default();
+            let packet_bytes = m.packet.map(|p| p.encode_to_vec()).unwrap_or_default();
             let ack_bytes = m.acknowledgements.into_iter().next().unwrap_or_default();
-            let proof_height = m
-                .proof_height
-                .map(|h| h.revision_height)
-                .unwrap_or(0);
+            let proof_height = m.proof_height.map(|h| h.revision_height).unwrap_or(0);
             let mut guard = msg_client.lock().unwrap();
             guard
                 .ack_packet(super::gateway_client::MsgAckPacketRequest {
@@ -1229,14 +1245,8 @@ async fn dispatch_msg(
         url if url == v2_msgs::TYPE_URL_TIMEOUT => {
             let m = v2_msgs::MsgTimeout::decode(value.as_slice())
                 .map_err(|e| Error::send_tx(format!("MsgTimeout decode: {e}")))?;
-            let packet_bytes = m
-                .packet
-                .map(|p| p.encode_to_vec())
-                .unwrap_or_default();
-            let proof_height = m
-                .proof_height
-                .map(|h| h.revision_height)
-                .unwrap_or(0);
+            let packet_bytes = m.packet.map(|p| p.encode_to_vec()).unwrap_or_default();
+            let proof_height = m.proof_height.map(|h| h.revision_height).unwrap_or(0);
             let mut guard = msg_client.lock().unwrap();
             guard
                 .timeout_packet(super::gateway_client::MsgTimeoutPacketRequest {

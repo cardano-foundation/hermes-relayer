@@ -478,10 +478,7 @@ impl GatewayQueryClient {
             .map_err(StellarError::from)
     }
 
-    pub async fn events(
-        &mut self,
-        request: EventsRequest,
-    ) -> Result<EventsResponse, StellarError> {
+    pub async fn events(&mut self, request: EventsRequest) -> Result<EventsResponse, StellarError> {
         self.ready().await?;
         let path =
             http::uri::PathAndQuery::from_static("/stellar.gateway.v1.StellarGatewayQuery/Events");
