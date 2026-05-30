@@ -14,10 +14,11 @@ use ibc_relayer_types::applications::ics31_icq::response::CrossChainQueryRespons
 use ibc_relayer_types::clients::ics10_stellar::client_state::ClientState as StellarClientState;
 use ibc_relayer_types::clients::ics10_stellar::consensus_state::ConsensusState as StellarConsensusState;
 use ibc_relayer_types::clients::ics10_stellar::header::Header as StellarHeader;
+use ibc_relayer_types::clients::ics10_stellar::misbehaviour::Misbehaviour as StellarMisbehaviour;
 use ibc_relayer_types::clients::ics10_stellar::raw as stellar_raw;
 use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentRoot;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
-use ibc_relayer_types::core::ics02_client::header::AnyHeader;
+use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header as IbcHeader};
 use ibc_relayer_types::core::ics02_client::height::Height;
 use ibc_relayer_types::core::ics03_connection::connection::{ConnectionEnd, IdentifiedConnectionEnd};
 use ibc_relayer_types::core::ics04_channel::channel::{ChannelEnd, IdentifiedChannelEnd};
@@ -52,8 +53,8 @@ use crate::denom::DenomTrace;
 use crate::error::Error;
 use crate::event::source::{Error as SourceError, EventBatch};
 use crate::event::IbcEventWithHeight;
-use crate::keyring::{KeyRing, Store};
-use crate::misbehaviour::MisbehaviourEvidence;
+use crate::keyring::{KeyRing, SigningKeyPair, Store};
+use crate::misbehaviour::{AnyMisbehaviour, MisbehaviourEvidence};
 
 use super::config::StellarConfig;
 use super::gateway_client::{
@@ -214,11 +215,20 @@ impl ChainEndpoint for StellarChainEndpoint {
         tracked_msgs: TrackedMsgs,
     ) -> Result<Vec<IbcEventWithHeight>, Error> {
         let signer = self.get_signer()?.to_string();
+        let signing_key = self.get_key()?;
+        let network_passphrase = self.config.network_passphrase.clone();
 
         self.rt.block_on(async {
             for msg in tracked_msgs.msgs.iter() {
-                dispatch_msg(&self.gateway_msg, &msg.type_url, msg.value.clone(), &signer)
-                    .await?;
+                dispatch_msg(
+                    &self.gateway_msg,
+                    &msg.type_url,
+                    msg.value.clone(),
+                    &signer,
+                    &signing_key,
+                    &network_passphrase,
+                )
+                .await?;
             }
             Ok::<(), Error>(())
         })?;
@@ -276,26 +286,88 @@ impl ChainEndpoint for StellarChainEndpoint {
 
     fn check_misbehaviour(
         &mut self,
-        _update: &UpdateClient,
-        _client_state: &AnyClientState,
+        update: &UpdateClient,
+        client_state: &AnyClientState,
     ) -> Result<Option<MisbehaviourEvidence>, Error> {
-        unimplemented!()
+        let Some(submitted_header) = submitted_stellar_update_header(update)? else {
+            return Ok(None);
+        };
+
+        let target_height = submitted_header.height;
+        let trusted_height = submitted_header.trusted_height;
+
+        tracing::warn!(
+            client = %update.client_id(),
+            target_height = %target_height,
+            "Stellar misbehaviour witness Gateway not configured; reusing the primary Gateway. \
+             This only catches local inconsistencies — it is not an independent witness."
+        );
+
+        let witness_resp = self
+            .rt
+            .block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                guard
+                    .query_ibc_header(QueryIbcHeaderRequest {
+                        height: target_height.revision_height(),
+                    })
+                    .await
+            })
+            .map_err(|e| {
+                Error::query(format!(
+                    "failed to independently query Stellar header at {target_height}: {e}"
+                ))
+            })?;
+
+        let wire = gateway_client::StellarHeader::decode(witness_resp.header.as_slice())
+            .map_err(|e| Error::query(format!("witness StellarHeader decode failed: {e}")))?;
+
+        let witness_envelope = stellar_raw::ScpEnvelope {
+            node_id: wire.scp_node_id,
+            statement_xdr: wire.signed_value_xdr,
+            signature: wire.scp_signature,
+        };
+        let timestamp_secs = ledger_close_time_secs(&wire.ledger_header_xdr).unwrap_or(0);
+        let previous_ledger_hash =
+            ledger_previous_hash(&wire.ledger_header_xdr).unwrap_or_default();
+        let witness_raw = stellar_raw::StellarHeader {
+            ledger_seq: wire.ledger_seq as u64,
+            ledger_header_xdr: wire.ledger_header_xdr,
+            ibc_state_root: wire.ibc_state_root,
+            scp_envelopes: vec![witness_envelope],
+            trusted_height: Some(stellar_raw::Height {
+                revision_number: trusted_height.revision_number(),
+                revision_height: trusted_height.revision_height(),
+            }),
+            timestamp: timestamp_secs,
+            ledger_hash: Vec::new(),
+            previous_ledger_hash,
+        };
+        let witness_header: StellarHeader = witness_raw
+            .try_into()
+            .map_err(|e| Error::query(format!("witness StellarHeader try_into failed: {e}")))?;
+
+        stellar_misbehaviour_evidence(update, submitted_header, witness_header, client_state)
     }
 
     fn query_balance(
         &self,
         _key_name: Option<&str>,
-        _denom: Option<&str>,
+        denom: Option<&str>,
     ) -> Result<Balance, Error> {
-        unimplemented!()
+        Ok(Balance {
+            amount: "0".to_string(),
+            denom: denom.unwrap_or("XLM").to_string(),
+        })
     }
 
     fn query_all_balances(&self, _key_name: Option<&str>) -> Result<Vec<Balance>, Error> {
-        unimplemented!()
+        Ok(Vec::new())
     }
 
     fn query_denom_trace(&self, _hash: String) -> Result<DenomTrace, Error> {
-        unimplemented!()
+        tracing::warn!("query_denom_trace: not applicable for Stellar");
+        Err(Error::config(ConfigError::wrong_type()))
     }
 
     fn query_commitment_prefix(&self) -> Result<CommitmentPrefix, Error> {
@@ -748,25 +820,32 @@ impl ChainEndpoint for StellarChainEndpoint {
         _port_id: &PortId,
         _counterparty_payee: &Signer,
     ) -> Result<(), Error> {
-        unimplemented!()
+        tracing::warn!("maybe_register_counterparty_payee: ICS-29 fee middleware is not implemented for Stellar");
+        Ok(())
     }
 
     fn cross_chain_query(
         &self,
         _requests: Vec<CrossChainQueryRequest>,
     ) -> Result<Vec<CrossChainQueryResponse>, Error> {
-        unimplemented!()
+        Err(Error::query(
+            "ICS-31 cross-chain queries are not supported for Stellar".to_string(),
+        ))
     }
 
     fn query_incentivized_packet(
         &self,
         _request: QueryIncentivizedPacketRequest,
     ) -> Result<QueryIncentivizedPacketResponse, Error> {
-        unimplemented!()
+        Err(Error::query(
+            "ICS-29 fee middleware is not supported for Stellar".to_string(),
+        ))
     }
 
     fn query_consumer_chains(&self) -> Result<Vec<ConsumerChain>, Error> {
-        unimplemented!()
+        Err(Error::query(
+            "ICS-28 CCV (Cross-Chain Validation) is not applicable to Stellar".to_string(),
+        ))
     }
 
     fn query_upgrade(
@@ -775,7 +854,9 @@ impl ChainEndpoint for StellarChainEndpoint {
         _height: Height,
         _include_proof: IncludeProof,
     ) -> Result<(Upgrade, Option<MerkleProof>), Error> {
-        unimplemented!()
+        Err(Error::query(
+            "Stellar channel upgrade query is not implemented".to_string(),
+        ))
     }
 
     fn query_upgrade_error(
@@ -784,11 +865,15 @@ impl ChainEndpoint for StellarChainEndpoint {
         _height: Height,
         _include_proof: IncludeProof,
     ) -> Result<(ErrorReceipt, Option<MerkleProof>), Error> {
-        unimplemented!()
+        Err(Error::query(
+            "Stellar channel upgrade error query is not implemented".to_string(),
+        ))
     }
 
     fn query_ccv_consumer_id(&self, _client_id: ClientId) -> Result<ConsumerId, Error> {
-        unimplemented!()
+        Err(Error::query(
+            "ICS-28 CCV (Cross-Chain Validation) is not applicable to Stellar".to_string(),
+        ))
     }
 }
 
@@ -854,36 +939,207 @@ fn ledger_close_time_secs(ledger_header_xdr: &[u8]) -> Result<u64, Error> {
     Ok(header.scp_value.close_time.0)
 }
 
+fn submitted_stellar_update_header(
+    update: &UpdateClient,
+) -> Result<Option<&StellarHeader>, Error> {
+    let Some(any_header) = update.header.as_ref() else {
+        tracing::warn!(
+            "skipping Stellar misbehaviour check for client {} at consensus height {}: \
+             update-client event does not include the submitted header",
+            update.client_id(),
+            update.consensus_height(),
+        );
+        return Ok(None);
+    };
+
+    match any_header {
+        AnyHeader::Stellar(header) => {
+            let target_height = header.height;
+            if target_height != update.consensus_height() {
+                return Err(Error::query(format!(
+                    "update event consensus height {} does not match submitted Stellar header height {} for client {}",
+                    update.consensus_height(),
+                    target_height,
+                    update.client_id()
+                )));
+            }
+            Ok(Some(header))
+        }
+        other => Err(Error::query(format!(
+            "Stellar misbehaviour check received a non-Stellar update header: {:?}",
+            other.client_type()
+        ))),
+    }
+}
+
+fn stellar_headers_conflict(submitted: &StellarHeader, witness: &StellarHeader) -> bool {
+    submitted.ledger_header_xdr != witness.ledger_header_xdr
+        || submitted.ibc_state_root != witness.ibc_state_root
+        || submitted.previous_ledger_hash != witness.previous_ledger_hash
+}
+
+fn stellar_misbehaviour_evidence(
+    update: &UpdateClient,
+    submitted_header: &StellarHeader,
+    witness_header: StellarHeader,
+    _client_state: &AnyClientState,
+) -> Result<Option<MisbehaviourEvidence>, Error> {
+    let target_height = submitted_header.height;
+    if witness_header.height != target_height {
+        return Err(Error::query(format!(
+            "independent Stellar header height mismatch: expected {target_height}, got {}",
+            witness_header.height
+        )));
+    }
+
+    if !stellar_headers_conflict(submitted_header, &witness_header) {
+        return Ok(None);
+    }
+
+    let misbehaviour = AnyMisbehaviour::Stellar(StellarMisbehaviour {
+        client_id: update.client_id().clone(),
+        header1: submitted_header.clone(),
+        header2: witness_header,
+    });
+    Ok(Some(MisbehaviourEvidence {
+        misbehaviour,
+        supporting_headers: vec![],
+    }))
+}
+
+fn sign_stellar_tx(
+    tx_xdr: &[u8],
+    signing_key: &StellarSigningKeyPair,
+    network_passphrase: &str,
+) -> Result<Vec<u8>, Error> {
+    use sha2::{Digest, Sha256};
+    use stellar_xdr::curr::{
+        BytesM, DecoratedSignature, Hash, Limits, ReadXdr, Signature, SignatureHint,
+        TransactionEnvelope, TransactionSignaturePayload,
+        TransactionSignaturePayloadTaggedTransaction, WriteXdr,
+    };
+
+    let mut envelope = TransactionEnvelope::from_xdr(tx_xdr, Limits::none())
+        .map_err(|e| Error::send_tx(format!("decode unsigned tx envelope: {e}")))?;
+
+    let tx = match &envelope {
+        TransactionEnvelope::Tx(env) => env.tx.clone(),
+        _ => {
+            return Err(Error::send_tx(
+                "expected a v1 (Tx) transaction envelope from the gateway".to_string(),
+            ))
+        }
+    };
+
+    let network_id: [u8; 32] = Sha256::digest(network_passphrase.as_bytes()).into();
+    let payload = TransactionSignaturePayload {
+        network_id: Hash(network_id),
+        tagged_transaction: TransactionSignaturePayloadTaggedTransaction::Tx(tx),
+    };
+    let payload_xdr = payload
+        .to_xdr(Limits::none())
+        .map_err(|e| Error::send_tx(format!("encode signature payload: {e}")))?;
+    let tx_hash: [u8; 32] = Sha256::digest(payload_xdr).into();
+
+    let signature = signing_key
+        .sign(&tx_hash)
+        .map_err(|e| Error::send_tx(format!("sign tx hash with relayer key: {e}")))?;
+    let signature: BytesM<64> = signature
+        .try_into()
+        .map_err(|_| Error::send_tx("relayer signature is not 64 bytes".to_string()))?;
+    let decorated = DecoratedSignature {
+        hint: SignatureHint(signing_key.key_hint()),
+        signature: Signature(signature),
+    };
+
+    if let TransactionEnvelope::Tx(env) = &mut envelope {
+        let mut signatures = env.signatures.to_vec();
+        signatures.push(decorated);
+        env.signatures = signatures
+            .try_into()
+            .map_err(|_| Error::send_tx("too many signatures on tx envelope".to_string()))?;
+    }
+
+    envelope
+        .to_xdr(Limits::none())
+        .map_err(|e| Error::send_tx(format!("encode signed tx envelope: {e}")))
+}
+
 async fn dispatch_msg(
     msg_client: &StdMutex<GatewayMsgClient>,
     type_url: &str,
     value: Vec<u8>,
     signer: &str,
+    signing_key: &StellarSigningKeyPair,
+    network_passphrase: &str,
 ) -> Result<(), Error> {
     use ibc_proto::ibc::core::client::v1 as cosmos_client;
     use ibc_relayer_types::clients::ics10_stellar::v2_msgs;
 
     match type_url {
         "/ibc.core.client.v1.MsgCreateClient" => {
+            use ibc_proto::ibc::lightclients::tendermint::v1::ClientState as RawTmClientState;
+            use ibc_relayer_types::clients::ics07_tendermint::client_state::TENDERMINT_CLIENT_STATE_TYPE_URL;
+            use ibc_relayer_types::clients::ics10_stellar::client_state::WASM_CLIENT_STATE_TYPE_URL;
+
             let m = cosmos_client::MsgCreateClient::decode(value.as_slice())
                 .map_err(|e| Error::send_tx(format!("MsgCreateClient decode: {e}")))?;
-            let cs_bytes = m.client_state.map(|a| a.value).unwrap_or_default();
+            let client_state_any = m
+                .client_state
+                .ok_or_else(|| Error::send_tx("MsgCreateClient missing client_state".to_string()))?;
             let cons_bytes = m.consensus_state.map(|a| a.value).unwrap_or_default();
-            let mut guard = msg_client.lock().unwrap();
-            guard
-                .create_client(super::gateway_client::MsgCreateClientRequest {
-                    client_state: cs_bytes,
-                    consensus_state: cons_bytes,
-                    signer: if m.signer.is_empty() {
-                        signer.to_string()
-                    } else {
-                        m.signer
-                    },
-                    client_type: String::new(),
-                    height: 0,
-                })
-                .await
-                .map_err(|e| Error::send_tx(format!("gateway create_client failed: {e}")))?;
+
+            let client_type = match client_state_any.type_url.as_str() {
+                TENDERMINT_CLIENT_STATE_TYPE_URL => "07-tendermint".to_string(),
+                WASM_CLIENT_STATE_TYPE_URL => "08-wasm".to_string(),
+                other => {
+                    return Err(Error::send_tx(format!(
+                        "unsupported client_state type_url for Stellar create_client: {other}"
+                    )))
+                }
+            };
+
+            let height = match client_state_any.type_url.as_str() {
+                TENDERMINT_CLIENT_STATE_TYPE_URL => {
+                    RawTmClientState::decode(client_state_any.value.as_slice())
+                        .map_err(|e| Error::send_tx(format!("tendermint ClientState decode: {e}")))?
+                        .latest_height
+                        .map(|h| h.revision_height)
+                        .unwrap_or_default()
+                }
+                _ => 0,
+            };
+
+            let source = if m.signer.is_empty() {
+                signer.to_string()
+            } else {
+                m.signer
+            };
+            let prepared = {
+                let mut guard = msg_client.lock().unwrap();
+                guard
+                    .create_client(super::gateway_client::MsgCreateClientRequest {
+                        client_state: client_state_any.value,
+                        consensus_state: cons_bytes,
+                        signer: source,
+                        client_type,
+                        height,
+                    })
+                    .await
+                    .map_err(|e| Error::send_tx(format!("gateway create_client (prepare) failed: {e}")))?
+            };
+            let signed = sign_stellar_tx(&prepared.tx_xdr, signing_key, network_passphrase)?;
+            let submitted = {
+                let mut guard = msg_client.lock().unwrap();
+                guard
+                    .submit_signed_tx(super::gateway_client::SubmitSignedTxRequest { tx_xdr: signed })
+                    .await
+                    .map_err(|e| Error::send_tx(format!("gateway submit_signed_tx failed: {e}")))?
+            };
+            tracing::info!(
+                tx_hash = %submitted.tx_hash,
+                "stellar create_client submitted (signed by relayer key)"
+            );
         }
         "/ibc.core.client.v1.MsgUpdateClient" => {
             let m = cosmos_client::MsgUpdateClient::decode(value.as_slice())

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use prost::Message;
 use stellar_xdr::curr::{Limits, ReadXdr, ScVal};
-use tracing::{debug, error_span, info, warn};
+use tracing::{debug, error_span, info, instrument, warn};
 
 use ibc_proto::google::protobuf::Any;
 use ibc_relayer_types::clients::ics10_stellar::v2_msgs::{
@@ -325,23 +325,43 @@ pub fn build_msg_timeout(
     }
 }
 
+#[instrument(level = "debug", skip(absence, signer), fields(
+    src_client = %event.client_id,
+    sequence = event.sequence,
+))]
 pub fn build_msg_timeout_from_event<S: PacketAbsenceProofSource + ?Sized>(
     event: &StellarPacketEvent,
     absence: &S,
     signer: String,
 ) -> Result<Any, BuildTimeoutError> {
     if event.value_xdr.is_empty() {
+        warn!("timeout build: missing value_xdr on event");
         return Err(BuildTimeoutError::MissingValueXdr);
     }
     let packet = decode_packet_from_event_body(&event.value_xdr)?;
     if packet.sequence != event.sequence {
+        warn!(
+            event_seq = event.sequence,
+            decoded_seq = packet.sequence,
+            "timeout build: sequence mismatch between event and decoded packet"
+        );
         return Err(BuildTimeoutError::SequenceMismatch {
             event: event.sequence,
             decoded: packet.sequence,
         });
     }
+    debug!(
+        dest_client = %packet.dest_client,
+        sequence = packet.sequence,
+        "querying packet-receipt absence proof on destination"
+    );
     let (proof_unreceived, proof_height) =
         absence.packet_receipt_absence_proof(&packet.dest_client, packet.sequence)?;
+    debug!(
+        proof_height = %proof_height,
+        proof_bytes = proof_unreceived.len(),
+        "got absence proof"
+    );
     Ok(build_msg_timeout(
         packet,
         proof_unreceived,
@@ -383,23 +403,44 @@ pub fn build_msg_recv_packet(
     }
 }
 
+#[instrument(level = "debug", skip(source, signer), fields(
+    src_client = %event.client_id,
+    sequence = event.sequence,
+))]
 pub fn build_msg_recv_packet_from_event<S: PacketProofSource + ?Sized>(
     event: &StellarPacketEvent,
     source: &S,
     signer: String,
 ) -> Result<Any, BuildMsgError> {
     if event.value_xdr.is_empty() {
+        warn!("recv build: missing value_xdr on event");
         return Err(BuildMsgError::MissingValueXdr);
     }
     let packet = decode_packet_from_event_body(&event.value_xdr)?;
     if packet.sequence != event.sequence {
+        warn!(
+            event_seq = event.sequence,
+            decoded_seq = packet.sequence,
+            "recv build: sequence mismatch between event and decoded packet"
+        );
         return Err(BuildMsgError::SequenceMismatch {
             event: event.sequence,
             decoded: packet.sequence,
         });
     }
+    debug!(
+        dst_client = %packet.dest_client,
+        payloads = packet.payloads.len(),
+        timeout_ts = packet.timeout_timestamp,
+        "querying packet-commitment proof on source"
+    );
     let (proof_commitment, proof_height) =
         source.packet_commitment_proof(&event.client_id, event.sequence)?;
+    debug!(
+        proof_height = %proof_height,
+        proof_bytes = proof_commitment.len(),
+        "got commitment proof"
+    );
     Ok(build_msg_recv_packet(
         packet,
         proof_commitment,
@@ -503,6 +544,12 @@ fn process_batch(chain_id: &ChainId, batch: &EventBatch, deps: &StellarPacketDep
     }
 }
 
+#[instrument(level = "debug", skip(decoded, deps), fields(
+    chain = %chain_id,
+    kind = %packet_ev.kind,
+    client_id = %packet_ev.client_id,
+    sequence = packet_ev.sequence,
+))]
 fn dispatch_send_packet(
     chain_id: &ChainId,
     packet_ev: &StellarPacketEvent,
@@ -512,6 +559,12 @@ fn dispatch_send_packet(
     let now = now_unix_secs();
     if let Some(packet) = decoded {
         if packet.timeout_timestamp > 0 && now > packet.timeout_timestamp {
+            info!(
+                timeout_ts = packet.timeout_timestamp,
+                now,
+                delta_secs = now.saturating_sub(packet.timeout_timestamp),
+                "send_packet already expired, dispatching timeout instead"
+            );
             return relay_timeout(
                 chain_id,
                 packet_ev,
@@ -532,6 +585,11 @@ fn dispatch_send_packet(
     )
 }
 
+#[instrument(level = "debug", skip(proof_source, destination, signer), fields(
+    chain = %chain_id,
+    client_id = %packet_ev.client_id,
+    sequence = packet_ev.sequence,
+))]
 fn relay_send_packet(
     chain_id: &ChainId,
     packet_ev: &StellarPacketEvent,
@@ -540,11 +598,13 @@ fn relay_send_packet(
     signer: &str,
 ) -> String {
     let Some(src) = proof_source else {
+        debug!("recv relay skipped: no proof source configured");
         return "no_proof_source".to_string();
     };
     let any = match build_msg_recv_packet_from_event(packet_ev, src, signer.to_string()) {
         Ok(a) => a,
         Err(e) => {
+            warn!(error = %e, "recv relay: build MsgRecvPacket failed");
             crate::telemetry!(stellar_relay_build_failure, chain_id, "recv");
             return format!("build_failed: {e}");
         }
@@ -554,21 +614,36 @@ fn relay_send_packet(
         any.value.len(),
         any.type_url
     );
+    info!(
+        type_url = %any.type_url,
+        bytes = any.value.len(),
+        "built MsgRecvPacket; submitting to destination"
+    );
     let Some(dst) = destination else {
+        debug!("recv relay: no destination submitter (observer-only mode)");
         return format!("{any_summary} submit=no_destination");
     };
     match dst.submit(vec![any]) {
         Ok(tx_hash) => {
+            info!(%tx_hash, "destination accepted MsgRecvPacket");
             crate::telemetry!(stellar_relay_success, chain_id, "recv");
             format!("{any_summary} submit=ok tx={tx_hash}")
         }
         Err(e) => {
+            warn!(error = %e, "destination rejected MsgRecvPacket");
             crate::telemetry!(stellar_relay_submit_failure, chain_id, "recv");
             format!("{any_summary} submit=failed: {e}")
         }
     }
 }
 
+#[instrument(level = "debug", skip(absence_source, source_submitter, source_signer), fields(
+    chain = %chain_id,
+    client_id = %packet_ev.client_id,
+    sequence = packet_ev.sequence,
+    timeout_ts,
+    now,
+))]
 fn relay_timeout(
     chain_id: &ChainId,
     packet_ev: &StellarPacketEvent,
@@ -580,11 +655,13 @@ fn relay_timeout(
 ) -> String {
     let prefix = format!("timeout(timeout_ts={timeout_ts} now={now})");
     let Some(absence) = absence_source else {
+        debug!("timeout relay skipped: no absence-proof source configured");
         return format!("{prefix} skip=no_absence_source");
     };
     let any = match build_msg_timeout_from_event(packet_ev, absence, source_signer.to_string()) {
         Ok(a) => a,
         Err(e) => {
+            warn!(error = %e, "timeout relay: build MsgTimeout failed");
             crate::telemetry!(stellar_relay_build_failure, chain_id, "timeout");
             return format!("{prefix} build_failed: {e}");
         }
@@ -594,15 +671,23 @@ fn relay_timeout(
         any.value.len(),
         any.type_url
     );
+    info!(
+        type_url = %any.type_url,
+        bytes = any.value.len(),
+        "built MsgTimeout; submitting to source"
+    );
     let Some(submitter) = source_submitter else {
+        debug!("timeout relay: no source submitter (observer-only mode)");
         return format!("{prefix} {any_summary} submit=no_source_submitter");
     };
     match submitter.submit(vec![any]) {
         Ok(tx_hash) => {
+            info!(%tx_hash, "source accepted MsgTimeout");
             crate::telemetry!(stellar_relay_success, chain_id, "timeout");
             format!("{prefix} {any_summary} submit=ok tx={tx_hash}")
         }
         Err(e) => {
+            warn!(error = %e, "source rejected MsgTimeout");
             crate::telemetry!(stellar_relay_submit_failure, chain_id, "timeout");
             format!("{prefix} {any_summary} submit=failed: {e}")
         }
