@@ -159,7 +159,7 @@ impl TryFrom<Any> for ClientState {
             }
             WASM_CLIENT_STATE_TYPE_URL => {
                 let wasm = RawWasmClientState::decode(raw_any.value.deref())
-                    .map_err(|e| Error::decode(e))?;
+                    .map_err(Error::decode)?;
                 let mut inner = decode_state(&wasm.data).map_err(Into::<Ics02Error>::into)?;
                 if !wasm.checksum.is_empty() {
                     inner.wasm_checksum = Some(wasm.checksum);

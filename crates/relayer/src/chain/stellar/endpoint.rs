@@ -1,6 +1,5 @@
 use alloc::sync::Arc;
 use core::str::FromStr;
-use std::borrow::Cow;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
@@ -30,7 +29,7 @@ use ibc_relayer_types::core::ics23_commitment::merkle::MerkleProof;
 use ibc_relayer_types::core::ics24_host::identifier::{
     ChainId, ChannelId, ClientId, ConnectionId, PortId,
 };
-use ibc_relayer_types::events::{IbcEvent, ModuleEvent, ModuleEventAttribute, ModuleId};
+use ibc_relayer_types::events::IbcEvent;
 use ibc_relayer_types::signer::Signer;
 use ibc_relayer_types::timestamp::Timestamp;
 use ibc_relayer_types::Height as ICSHeight;
@@ -58,7 +57,7 @@ use crate::misbehaviour::{AnyMisbehaviour, MisbehaviourEvidence};
 
 use super::config::StellarConfig;
 use super::gateway_client::{
-    self, EventsRequest, GatewayContractEvent, GatewayMsgClient, GatewayQueryClient,
+    self, EventsRequest, GatewayMsgClient, GatewayQueryClient,
     QueryIbcHeaderRequest,
 };
 use super::signing_key_pair::StellarSigningKeyPair;
