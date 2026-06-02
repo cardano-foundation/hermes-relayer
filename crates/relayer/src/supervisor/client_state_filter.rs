@@ -208,7 +208,10 @@ impl FilterPolicy {
             // validated by the client implementation itself.
             None if matches!(
                 state.client_type(),
-                ClientType::CardanoMithril | ClientType::CardanoProbabilistic | ClientType::Stellar
+                ClientType::CardanoMithril
+                    | ClientType::CardanoProbabilistic
+                    | ClientType::Stellar
+                    | ClientType::Wasm
             ) =>
             {
                 Permission::Allow

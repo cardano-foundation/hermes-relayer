@@ -33,6 +33,23 @@ pub struct QueryClientStateResponse {
 }
 
 #[derive(Clone, Message)]
+pub struct QueryClientStatesRequest {}
+
+#[derive(Clone, Message)]
+pub struct IdentifiedClientState {
+    #[prost(string, tag = "1")]
+    pub client_id: String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub client_state: Vec<u8>,
+}
+
+#[derive(Clone, Message)]
+pub struct QueryClientStatesResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub client_states: Vec<IdentifiedClientState>,
+}
+
+#[derive(Clone, Message)]
 pub struct QueryConsensusStateRequest {
     #[prost(string, tag = "1")]
     pub client_id: String,
@@ -367,6 +384,25 @@ impl GatewayQueryClient {
         self.ready().await?;
         let path = http::uri::PathAndQuery::from_static(
             "/stellar.gateway.v1.StellarGatewayQuery/QueryClientState",
+        );
+        self.inner
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
+            .await
+            .map(|r| r.into_inner())
+            .map_err(StellarError::from)
+    }
+
+    pub async fn query_client_states(
+        &mut self,
+        request: QueryClientStatesRequest,
+    ) -> Result<QueryClientStatesResponse, StellarError> {
+        self.ready().await?;
+        let path = http::uri::PathAndQuery::from_static(
+            "/stellar.gateway.v1.StellarGatewayQuery/QueryClientStates",
         );
         self.inner
             .unary(

@@ -522,7 +522,47 @@ impl ChainEndpoint for StellarChainEndpoint {
         &self,
         _request: QueryClientStatesRequest,
     ) -> Result<Vec<IdentifiedAnyClientState>, Error> {
-        Ok(Vec::new())
+        tracing::debug!("querying all clients on the Stellar router");
+
+        let resp = self
+            .rt
+            .block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                guard
+                    .query_client_states(super::gateway_client::QueryClientStatesRequest {})
+                    .await
+            })
+            .map_err(|e| Error::query(format!("Stellar gateway query_client_states failed: {e}")))?;
+
+        let mut clients = Vec::new();
+        for entry in resp.client_states {
+            let client_id = match entry.client_id.parse::<ClientId>() {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(client_id = %entry.client_id, %e, "skipping client: bad id");
+                    continue;
+                }
+            };
+            let any = match ibc_proto::google::protobuf::Any::decode(entry.client_state.as_slice())
+            {
+                Ok(any) => any,
+                Err(e) => {
+                    tracing::warn!(%client_id, %e, "skipping client: Any decode failed");
+                    continue;
+                }
+            };
+            match AnyClientState::try_from(any) {
+                Ok(client_state) => clients.push(IdentifiedAnyClientState {
+                    client_id,
+                    client_state,
+                }),
+                Err(e) => {
+                    tracing::warn!(%client_id, %e, "skipping client: AnyClientState decode failed")
+                }
+            }
+        }
+
+        Ok(clients)
     }
 
     fn query_client_state(
@@ -530,7 +570,7 @@ impl ChainEndpoint for StellarChainEndpoint {
         request: QueryClientStateRequest,
         _include_proof: IncludeProof,
     ) -> Result<(AnyClientState, Option<MerkleProof>), Error> {
-        tracing::debug!("querying all clients");
+        tracing::debug!(client_id = %request.client_id, "querying client state");
 
         let height = match request.height {
             QueryHeight::Latest => self.query_application_status()?.height.revision_height(),
