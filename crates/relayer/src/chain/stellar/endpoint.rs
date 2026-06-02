@@ -29,7 +29,7 @@ use ibc_relayer_types::core::ics23_commitment::merkle::MerkleProof;
 use ibc_relayer_types::core::ics24_host::identifier::{
     ChainId, ChannelId, ClientId, ConnectionId, PortId,
 };
-use ibc_relayer_types::events::IbcEvent;
+use ibc_relayer_types::events::{IbcEvent, ModuleEvent, ModuleEventAttribute, ModuleId};
 use ibc_relayer_types::signer::Signer;
 use ibc_relayer_types::timestamp::Timestamp;
 use ibc_relayer_types::Height as ICSHeight;
@@ -57,8 +57,7 @@ use crate::misbehaviour::{AnyMisbehaviour, MisbehaviourEvidence};
 
 use super::config::StellarConfig;
 use super::gateway_client::{
-    self, EventsRequest, GatewayMsgClient, GatewayQueryClient,
-    QueryIbcHeaderRequest,
+    self, EventsRequest, GatewayMsgClient, GatewayQueryClient, QueryIbcHeaderRequest,
 };
 use super::signing_key_pair::StellarSigningKeyPair;
 
@@ -531,7 +530,9 @@ impl ChainEndpoint for StellarChainEndpoint {
                     .query_client_states(super::gateway_client::QueryClientStatesRequest {})
                     .await
             })
-            .map_err(|e| Error::query(format!("Stellar gateway query_client_states failed: {e}")))?;
+            .map_err(|e| {
+                Error::query(format!("Stellar gateway query_client_states failed: {e}"))
+            })?;
 
         let mut clients = Vec::new();
         for entry in resp.client_states {
@@ -1630,6 +1631,18 @@ fn poll_backoff(base: Duration, consecutive_errors: u32) -> Duration {
     }
 }
 
+fn attr_line<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}=")))
+}
+
+fn module_attr(key: &str, value: &str) -> ModuleEventAttribute {
+    ModuleEventAttribute {
+        key: key.to_string(),
+        value: value.to_string(),
+    }
+}
+
 async fn run_event_polling(
     chain_id: ChainId,
     gateway_url: String,
@@ -1726,7 +1739,13 @@ async fn run_event_polling(
 
         let mut ibc_events: Vec<IbcEventWithHeight> = Vec::new();
         for event in &resp.events {
-            if event.attributes.is_empty() {
+            let Some(kind) = attr_line(&event.attributes, "type") else {
+                continue;
+            };
+            if !matches!(
+                kind,
+                "send_packet" | "recv_packet" | "write_ack" | "ack_packet" | "timeout_packet"
+            ) {
                 continue;
             }
 
@@ -1741,23 +1760,31 @@ async fn run_event_polling(
                 }
             };
 
-            match super::event_parser::parse_event_bytes(event.attributes.as_bytes(), height) {
-                Ok(Some(ibc_event)) => {
-                    tracing::info!(
-                        target: "stellar_events",
-                        "{chain_id}: observed {:?} at {height}",
-                        ibc_event.event.event_type()
-                    );
-                    ibc_events.push(ibc_event);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        target: "stellar_events",
-                        "{chain_id}: failed to parse event: {e}"
-                    );
-                }
-            }
+            let client_id = attr_line(&event.attributes, "packet_src_channel").unwrap_or("");
+            let sequence = attr_line(&event.attributes, "packet_sequence").unwrap_or("0");
+
+            let module_event = ModuleEvent {
+                kind: kind.to_string(),
+                module_name: ModuleId::new("stellaribcrouter".into())
+                    .expect("static module id is valid"),
+                attributes: vec![
+                    module_attr("client_id", client_id),
+                    module_attr("sequence", sequence),
+                    module_attr("value_xdr_hex", &hex::encode(&event.value_xdr)),
+                    module_attr("tx_hash", &event.tx_hash),
+                    module_attr("event_id", &event.id),
+                    module_attr("contract_id", &event.contract_id),
+                ],
+            };
+
+            tracing::info!(
+                target: "stellar_events",
+                "{chain_id}: observed router event {kind} (client={client_id} seq={sequence}) at {height}"
+            );
+            ibc_events.push(IbcEventWithHeight::new(
+                IbcEvent::AppModule(module_event),
+                height,
+            ));
         }
 
         if !ibc_events.is_empty() {

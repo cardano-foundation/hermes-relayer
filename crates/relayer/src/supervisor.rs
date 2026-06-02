@@ -208,6 +208,7 @@ pub fn spawn_supervisor_tasks<Chain: ChainHandle>(
 
     let mut tasks = vec![cmd_task];
     tasks.extend(batch_tasks);
+    tasks.extend(spawn_stellar_packet_workers(&config, &registry));
 
     if let Some(rest_rx) = rest_rx {
         let rest_task = spawn_rest_worker(config, registry, workers.clone(), rest_rx);
@@ -258,6 +259,95 @@ fn spawn_batch_workers<Chain: ChainHandle>(
     }
 
     handles
+}
+
+fn spawn_stellar_packet_workers<Chain: ChainHandle>(
+    config: &Config,
+    registry: &SharedRegistry<Chain>,
+) -> Vec<TaskHandle> {
+    use crate::config::ChainConfig;
+    use crate::worker::stellar_packet::{spawn_stellar_packet_worker, StellarPacketDeps};
+    use crate::worker::stellar_packet_adapters::{ChainHandleDestination, ChainHandleProofSource};
+
+    let stellar_ids: Vec<ChainId> = config
+        .chains
+        .iter()
+        .filter_map(|c| match c {
+            ChainConfig::Stellar(cfg) => Some(cfg.id.clone()),
+            _ => None,
+        })
+        .collect();
+    let cosmos_ids: Vec<ChainId> = config
+        .chains
+        .iter()
+        .filter_map(|c| match c {
+            ChainConfig::CosmosSdk(cfg) => Some(cfg.id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let Some(cosmos_id) = cosmos_ids.first() else {
+        if !stellar_ids.is_empty() {
+            warn!("stellar packet worker not spawned: no CosmosSdk chain configured as counterparty");
+        }
+        return Vec::new();
+    };
+
+    let mut tasks = Vec::new();
+    for stellar_id in stellar_ids {
+        let (stellar, cosmos) = {
+            let mut reg = registry.write();
+            let stellar = match reg.get_or_spawn(&stellar_id) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!("stellar packet worker: cannot spawn {stellar_id}: {e}");
+                    continue;
+                }
+            };
+            let cosmos = match reg.get_or_spawn(cosmos_id) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!("stellar packet worker: cannot spawn {cosmos_id}: {e}");
+                    continue;
+                }
+            };
+            (stellar, cosmos)
+        };
+
+        let subscription = match stellar.subscribe() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("stellar packet worker: subscribe to {stellar_id} failed: {e}");
+                continue;
+            }
+        };
+
+        let signer = cosmos
+            .get_signer()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let source_signer = stellar
+            .get_signer()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let stellar_arc = Arc::new(stellar.clone());
+        let cosmos_arc = Arc::new(cosmos.clone());
+
+        let deps = StellarPacketDeps {
+            proof_source: Some(Arc::new(ChainHandleProofSource::new(stellar_arc.clone()))),
+            destination: Some(Arc::new(ChainHandleDestination::new(cosmos_arc.clone()))),
+            absence_source: Some(Arc::new(ChainHandleProofSource::new(cosmos_arc))),
+            source_submitter: Some(Arc::new(ChainHandleDestination::new(stellar_arc))),
+            signer,
+            source_signer,
+        };
+
+        info!("spawning stellar packet worker: {stellar_id} -> {cosmos_id}");
+        tasks.push(spawn_stellar_packet_worker(stellar.id(), subscription, deps));
+    }
+
+    tasks
 }
 
 pub fn spawn_cmd_worker<Chain: ChainHandle>(

@@ -89,7 +89,18 @@ pub enum PacketDecodeError {
 pub fn decode_packet_from_event_body(value_xdr: &[u8]) -> Result<Packet, PacketDecodeError> {
     let body = ScVal::from_xdr(value_xdr, Limits::none())
         .map_err(|e| PacketDecodeError::Xdr(e.to_string()))?;
-    decode_packet_scval(&body)
+    let packet_val = unwrap_packet_field(&body).unwrap_or(&body);
+    decode_packet_scval(packet_val)
+}
+
+fn unwrap_packet_field(value: &ScVal) -> Option<&ScVal> {
+    let ScVal::Map(Some(m)) = value else {
+        return None;
+    };
+    m.0.iter().find_map(|entry| match &entry.key {
+        ScVal::Symbol(sym) if sym.0.as_slice() == b"packet" => Some(&entry.val),
+        _ => None,
+    })
 }
 
 fn decode_packet_scval(value: &ScVal) -> Result<Packet, PacketDecodeError> {
@@ -617,6 +628,8 @@ fn relay_send_packet(
     info!(
         type_url = %any.type_url,
         bytes = any.value.len(),
+        client_id = %packet_ev.client_id,
+        sequence = packet_ev.sequence,
         "built MsgRecvPacket; submitting to destination"
     );
     let Some(dst) = destination else {
@@ -625,12 +638,12 @@ fn relay_send_packet(
     };
     match dst.submit(vec![any]) {
         Ok(tx_hash) => {
-            info!(%tx_hash, "destination accepted MsgRecvPacket");
+            info!(%tx_hash, sequence = packet_ev.sequence, "Cosmos accepted MsgRecvPacket");
             crate::telemetry!(stellar_relay_success, chain_id, "recv");
             format!("{any_summary} submit=ok tx={tx_hash}")
         }
         Err(e) => {
-            warn!(error = %e, "destination rejected MsgRecvPacket");
+            warn!(error = %e, sequence = packet_ev.sequence, "Cosmos rejected MsgRecvPacket");
             crate::telemetry!(stellar_relay_submit_failure, chain_id, "recv");
             format!("{any_summary} submit=failed: {e}")
         }
@@ -1396,7 +1409,15 @@ mod decoder_tests {
             proof: vec![],
             height: ICSHeight::new(0, 1).unwrap(),
         };
-        let status = relay_timeout(&test_chain_id(), &event, Some(&absence), None, "s", 100, 200);
+        let status = relay_timeout(
+            &test_chain_id(),
+            &event,
+            Some(&absence),
+            None,
+            "s",
+            100,
+            200,
+        );
         assert!(
             status.contains("submit=no_source_submitter"),
             "got: {status}"
@@ -1415,7 +1436,15 @@ mod decoder_tests {
             submitted: std::sync::Mutex::new(Vec::new()),
             tx_hash: "tx".to_string(),
         };
-        let status = relay_timeout(&test_chain_id(), &event, Some(&absence), Some(&dst), "s", 100, 200);
+        let status = relay_timeout(
+            &test_chain_id(),
+            &event,
+            Some(&absence),
+            Some(&dst),
+            "s",
+            100,
+            200,
+        );
         assert!(status.contains("build_failed:"), "got: {status}");
         assert!(dst.submitted.lock().unwrap().is_empty());
     }
@@ -1604,11 +1633,13 @@ mod integration_tests {
         WriteXdr,
     };
 
-    use ibc_relayer_types::events::{ModuleEventAttribute, ModuleId};
     use crate::chain::tracking::TrackingId;
+    use ibc_relayer_types::events::{ModuleEventAttribute, ModuleId};
 
     fn sym(s: &str) -> ScVal {
-        ScVal::Symbol(ScSymbol(StringM::<32>::try_from(s.as_bytes().to_vec()).unwrap()))
+        ScVal::Symbol(ScSymbol(
+            StringM::<32>::try_from(s.as_bytes().to_vec()).unwrap(),
+        ))
     }
     fn string_val(s: &str) -> ScVal {
         ScVal::String(ScString(StringM::try_from(s.as_bytes().to_vec()).unwrap()))
@@ -1619,7 +1650,10 @@ mod integration_tests {
     fn struct_val(entries: Vec<(&str, ScVal)>) -> ScVal {
         let mapped: Vec<ScMapEntry> = entries
             .into_iter()
-            .map(|(k, v)| ScMapEntry { key: sym(k), val: v })
+            .map(|(k, v)| ScMapEntry {
+                key: sym(k),
+                val: v,
+            })
             .collect();
         ScVal::Map(Some(ScMap(VecM::try_from(mapped).unwrap())))
     }
