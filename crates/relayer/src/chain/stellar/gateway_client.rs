@@ -391,19 +391,3 @@ impl GatewayMsgClient {
             .map_err(StellarError::from)
     }
 }
-
-#[derive(Clone, Message)]
-pub struct MsgSubmitMisbehaviourRequest {
-    #[prost(string, tag = "1")]
-    pub client_id: String,
-    #[prost(bytes = "vec", tag = "2")]
-    pub client_message: Vec<u8>,
-    #[prost(string, tag = "3")]
-    pub signer: String,
-}
-
-#[derive(Clone, Message)]
-pub struct MsgSubmitMisbehaviourResponse {
-    #[prost(bytes = "vec", tag = "1")]
-    pub tx_xdr: Vec<u8>,
-}
