@@ -16,7 +16,7 @@ use ibc_relayer_types::clients::ics08_cardano_probabilistic::client_state::{
     ClientState as ProbabilisticClientState, PROBABILISTIC_CLIENT_STATE_TYPE_URL,
 };
 use ibc_relayer_types::clients::ics10_stellar::client_state::{
-    ClientState as StellarClientState, STELLAR_CLIENT_STATE_TYPE_URL,
+    ClientState as StellarClientState, STELLAR_CLIENT_STATE_TYPE_URL, WASM_CLIENT_STATE_TYPE_URL,
 };
 
 use ibc_relayer_types::core::ics02_client::client_state::ClientState;
@@ -135,7 +135,9 @@ impl TryFrom<Any> for AnyClientState {
             PROBABILISTIC_CLIENT_STATE_TYPE_URL => {
                 Ok(AnyClientState::Probabilistic(raw.try_into()?))
             }
-            STELLAR_CLIENT_STATE_TYPE_URL => Ok(AnyClientState::Stellar(raw.try_into()?)),
+            STELLAR_CLIENT_STATE_TYPE_URL | WASM_CLIENT_STATE_TYPE_URL => {
+                Ok(AnyClientState::Stellar(raw.try_into()?))
+            }
 
             _ => Err(Error::unknown_client_state_type(raw.type_url)),
         }

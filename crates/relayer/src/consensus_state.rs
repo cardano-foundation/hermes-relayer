@@ -15,6 +15,7 @@ use ibc_relayer_types::clients::ics08_cardano_probabilistic::consensus_state::{
 };
 use ibc_relayer_types::clients::ics10_stellar::consensus_state::{
     ConsensusState as StellarConsensusState, STELLAR_CONSENSUS_STATE_TYPE_URL,
+    WASM_CONSENSUS_STATE_TYPE_URL,
 };
 
 use ibc_relayer_types::core::ics02_client::client_type::ClientType;
@@ -75,7 +76,7 @@ impl TryFrom<Any> for AnyConsensusState {
             PROBABILISTIC_CONSENSUS_STATE_TYPE_URL => {
                 Ok(AnyConsensusState::Probabilistic(value.try_into()?))
             }
-            STELLAR_CONSENSUS_STATE_TYPE_URL => {
+            STELLAR_CONSENSUS_STATE_TYPE_URL | WASM_CONSENSUS_STATE_TYPE_URL => {
                 Ok(AnyConsensusState::Stellar(value.try_into()?))
             }
 
