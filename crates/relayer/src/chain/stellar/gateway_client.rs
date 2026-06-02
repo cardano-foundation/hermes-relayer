@@ -227,7 +227,10 @@ pub struct MsgUpdateClientRequest {
 }
 
 #[derive(Clone, Message)]
-pub struct MsgUpdateClientResponse {}
+pub struct MsgUpdateClientResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub tx_xdr: Vec<u8>,
+}
 
 #[derive(Clone, Message)]
 pub struct MsgRegisterCounterpartyRequest {
@@ -240,7 +243,10 @@ pub struct MsgRegisterCounterpartyRequest {
 }
 
 #[derive(Clone, Message)]
-pub struct MsgRegisterCounterpartyResponse {}
+pub struct MsgRegisterCounterpartyResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub tx_xdr: Vec<u8>,
+}
 
 #[derive(Clone, Message)]
 pub struct MsgRecvPacketRequest {
@@ -255,7 +261,10 @@ pub struct MsgRecvPacketRequest {
 }
 
 #[derive(Clone, Message)]
-pub struct MsgRecvPacketResponse {}
+pub struct MsgRecvPacketResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub tx_xdr: Vec<u8>,
+}
 
 #[derive(Clone, Message)]
 pub struct MsgAckPacketRequest {
@@ -272,7 +281,10 @@ pub struct MsgAckPacketRequest {
 }
 
 #[derive(Clone, Message)]
-pub struct MsgAckPacketResponse {}
+pub struct MsgAckPacketResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub tx_xdr: Vec<u8>,
+}
 
 #[derive(Clone, Message)]
 pub struct MsgTimeoutPacketRequest {
@@ -287,7 +299,10 @@ pub struct MsgTimeoutPacketRequest {
 }
 
 #[derive(Clone, Message)]
-pub struct MsgTimeoutPacketResponse {}
+pub struct MsgTimeoutPacketResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub tx_xdr: Vec<u8>,
+}
 
 #[derive(Clone, Message)]
 pub struct StellarHeader {
@@ -681,4 +696,7 @@ pub struct MsgSubmitMisbehaviourRequest {
 }
 
 #[derive(Clone, Message)]
-pub struct MsgSubmitMisbehaviourResponse {}
+pub struct MsgSubmitMisbehaviourResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub tx_xdr: Vec<u8>,
+}

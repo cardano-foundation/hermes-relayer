@@ -1208,54 +1208,90 @@ async fn dispatch_msg(
             let m = cosmos_client::MsgUpdateClient::decode(value.as_slice())
                 .map_err(|e| Error::send_tx(format!("MsgUpdateClient decode: {e}")))?;
             let header_bytes = m.client_message.map(|a| a.value).unwrap_or_default();
-            let mut guard = msg_client.lock().unwrap();
-            guard
-                .update_client(super::gateway_client::MsgUpdateClientRequest {
-                    client_id: m.client_id,
-                    header: header_bytes,
-                    signer: if m.signer.is_empty() {
-                        signer.to_string()
-                    } else {
-                        m.signer
-                    },
-                })
-                .await
-                .map_err(|e| Error::send_tx(format!("gateway update_client failed: {e}")))?;
+            let prepared = {
+                let mut guard = msg_client.lock().unwrap();
+                guard
+                    .update_client(super::gateway_client::MsgUpdateClientRequest {
+                        client_id: m.client_id,
+                        header: header_bytes,
+                        signer: if m.signer.is_empty() {
+                            signer.to_string()
+                        } else {
+                            m.signer
+                        },
+                    })
+                    .await
+                    .map_err(|e| {
+                        Error::send_tx(format!("gateway update_client (prepare) failed: {e}"))
+                    })?
+            };
+            sign_and_submit(
+                msg_client,
+                &prepared.tx_xdr,
+                signing_key,
+                network_passphrase,
+                "update_client",
+            )
+            .await?;
         }
         url if url == v2_msgs::TYPE_URL_REGISTER_COUNTERPARTY => {
             let m = v2_msgs::MsgRegisterCounterparty::decode(value.as_slice())
                 .map_err(|e| Error::send_tx(format!("MsgRegisterCounterparty decode: {e}")))?;
-            let mut guard = msg_client.lock().unwrap();
-            guard
-                .register_counterparty(super::gateway_client::MsgRegisterCounterpartyRequest {
-                    client_id: m.client_id,
-                    counterparty_client_id: m.counterparty_client_id,
-                    counterparty_commitment_prefix: m.counterparty_commitment_prefix,
-                })
-                .await
-                .map_err(|e| {
-                    Error::send_tx(format!("gateway register_counterparty failed: {e}"))
-                })?;
+            let prepared = {
+                let mut guard = msg_client.lock().unwrap();
+                guard
+                    .register_counterparty(super::gateway_client::MsgRegisterCounterpartyRequest {
+                        client_id: m.client_id,
+                        counterparty_client_id: m.counterparty_client_id,
+                        counterparty_commitment_prefix: m.counterparty_commitment_prefix,
+                    })
+                    .await
+                    .map_err(|e| {
+                        Error::send_tx(format!(
+                            "gateway register_counterparty (prepare) failed: {e}"
+                        ))
+                    })?
+            };
+            sign_and_submit(
+                msg_client,
+                &prepared.tx_xdr,
+                signing_key,
+                network_passphrase,
+                "register_counterparty",
+            )
+            .await?;
         }
         url if url == v2_msgs::TYPE_URL_RECV_PACKET => {
             let m = v2_msgs::MsgRecvPacket::decode(value.as_slice())
                 .map_err(|e| Error::send_tx(format!("MsgRecvPacket decode: {e}")))?;
             let packet_bytes = m.packet.map(|p| p.encode_to_vec()).unwrap_or_default();
             let proof_height = m.proof_height.map(|h| h.revision_height).unwrap_or(0);
-            let mut guard = msg_client.lock().unwrap();
-            guard
-                .recv_packet(super::gateway_client::MsgRecvPacketRequest {
-                    packet: packet_bytes,
-                    proof: m.proof_commitment,
-                    proof_height,
-                    signer: if m.signer.is_empty() {
-                        signer.to_string()
-                    } else {
-                        m.signer
-                    },
-                })
-                .await
-                .map_err(|e| Error::send_tx(format!("gateway recv_packet failed: {e}")))?;
+            let prepared = {
+                let mut guard = msg_client.lock().unwrap();
+                guard
+                    .recv_packet(super::gateway_client::MsgRecvPacketRequest {
+                        packet: packet_bytes,
+                        proof: m.proof_commitment,
+                        proof_height,
+                        signer: if m.signer.is_empty() {
+                            signer.to_string()
+                        } else {
+                            m.signer
+                        },
+                    })
+                    .await
+                    .map_err(|e| {
+                        Error::send_tx(format!("gateway recv_packet (prepare) failed: {e}"))
+                    })?
+            };
+            sign_and_submit(
+                msg_client,
+                &prepared.tx_xdr,
+                signing_key,
+                network_passphrase,
+                "recv_packet",
+            )
+            .await?;
         }
         url if url == v2_msgs::TYPE_URL_ACKNOWLEDGEMENT => {
             let m = v2_msgs::MsgAcknowledgement::decode(value.as_slice())
@@ -1263,59 +1299,95 @@ async fn dispatch_msg(
             let packet_bytes = m.packet.map(|p| p.encode_to_vec()).unwrap_or_default();
             let ack_bytes = m.acknowledgements.into_iter().next().unwrap_or_default();
             let proof_height = m.proof_height.map(|h| h.revision_height).unwrap_or(0);
-            let mut guard = msg_client.lock().unwrap();
-            guard
-                .ack_packet(super::gateway_client::MsgAckPacketRequest {
-                    packet: packet_bytes,
-                    acknowledgement: ack_bytes,
-                    proof: m.proof_acked,
-                    proof_height,
-                    signer: if m.signer.is_empty() {
-                        signer.to_string()
-                    } else {
-                        m.signer
-                    },
-                })
-                .await
-                .map_err(|e| Error::send_tx(format!("gateway ack_packet failed: {e}")))?;
+            let prepared = {
+                let mut guard = msg_client.lock().unwrap();
+                guard
+                    .ack_packet(super::gateway_client::MsgAckPacketRequest {
+                        packet: packet_bytes,
+                        acknowledgement: ack_bytes,
+                        proof: m.proof_acked,
+                        proof_height,
+                        signer: if m.signer.is_empty() {
+                            signer.to_string()
+                        } else {
+                            m.signer
+                        },
+                    })
+                    .await
+                    .map_err(|e| {
+                        Error::send_tx(format!("gateway ack_packet (prepare) failed: {e}"))
+                    })?
+            };
+            sign_and_submit(
+                msg_client,
+                &prepared.tx_xdr,
+                signing_key,
+                network_passphrase,
+                "ack_packet",
+            )
+            .await?;
         }
         url if url == v2_msgs::TYPE_URL_TIMEOUT => {
             let m = v2_msgs::MsgTimeout::decode(value.as_slice())
                 .map_err(|e| Error::send_tx(format!("MsgTimeout decode: {e}")))?;
             let packet_bytes = m.packet.map(|p| p.encode_to_vec()).unwrap_or_default();
             let proof_height = m.proof_height.map(|h| h.revision_height).unwrap_or(0);
-            let mut guard = msg_client.lock().unwrap();
-            guard
-                .timeout_packet(super::gateway_client::MsgTimeoutPacketRequest {
-                    packet: packet_bytes,
-                    proof: m.proof_unreceived,
-                    proof_height,
-                    signer: if m.signer.is_empty() {
-                        signer.to_string()
-                    } else {
-                        m.signer
-                    },
-                })
-                .await
-                .map_err(|e| Error::send_tx(format!("gateway timeout_packet failed: {e}")))?;
+            let prepared = {
+                let mut guard = msg_client.lock().unwrap();
+                guard
+                    .timeout_packet(super::gateway_client::MsgTimeoutPacketRequest {
+                        packet: packet_bytes,
+                        proof: m.proof_unreceived,
+                        proof_height,
+                        signer: if m.signer.is_empty() {
+                            signer.to_string()
+                        } else {
+                            m.signer
+                        },
+                    })
+                    .await
+                    .map_err(|e| {
+                        Error::send_tx(format!("gateway timeout_packet (prepare) failed: {e}"))
+                    })?
+            };
+            sign_and_submit(
+                msg_client,
+                &prepared.tx_xdr,
+                signing_key,
+                network_passphrase,
+                "timeout_packet",
+            )
+            .await?;
         }
         url if url == v2_msgs::TYPE_URL_SUBMIT_MISBEHAVIOUR => {
             let m = v2_msgs::MsgSubmitMisbehaviour::decode(value.as_slice())
                 .map_err(|e| Error::send_tx(format!("MsgSubmitMisbehaviour decode: {e}")))?;
             let client_message = m.misbehaviour.map(|a| a.value).unwrap_or_default();
-            let mut guard = msg_client.lock().unwrap();
-            guard
-                .submit_misbehaviour(super::gateway_client::MsgSubmitMisbehaviourRequest {
-                    client_id: m.client_id,
-                    client_message,
-                    signer: if m.signer.is_empty() {
-                        signer.to_string()
-                    } else {
-                        m.signer
-                    },
-                })
-                .await
-                .map_err(|e| Error::send_tx(format!("gateway submit_misbehaviour failed: {e}")))?;
+            let prepared = {
+                let mut guard = msg_client.lock().unwrap();
+                guard
+                    .submit_misbehaviour(super::gateway_client::MsgSubmitMisbehaviourRequest {
+                        client_id: m.client_id,
+                        client_message,
+                        signer: if m.signer.is_empty() {
+                            signer.to_string()
+                        } else {
+                            m.signer
+                        },
+                    })
+                    .await
+                    .map_err(|e| {
+                        Error::send_tx(format!("gateway submit_misbehaviour (prepare) failed: {e}"))
+                    })?
+            };
+            sign_and_submit(
+                msg_client,
+                &prepared.tx_xdr,
+                signing_key,
+                network_passphrase,
+                "submit_misbehaviour",
+            )
+            .await?;
         }
         other => {
             return Err(Error::send_tx(format!(
@@ -1325,6 +1397,29 @@ async fn dispatch_msg(
     }
 
     Ok(events)
+}
+
+async fn sign_and_submit(
+    msg_client: &StdMutex<GatewayMsgClient>,
+    tx_xdr: &[u8],
+    signing_key: &StellarSigningKeyPair,
+    network_passphrase: &str,
+    label: &str,
+) -> Result<super::gateway_client::SubmitSignedTxResponse, Error> {
+    let signed = sign_stellar_tx(tx_xdr, signing_key, network_passphrase)?;
+    let submitted = {
+        let mut guard = msg_client.lock().unwrap();
+        guard
+            .submit_signed_tx(super::gateway_client::SubmitSignedTxRequest { tx_xdr: signed })
+            .await
+            .map_err(|e| Error::send_tx(format!("gateway submit_signed_tx failed: {e}")))?
+    };
+    tracing::info!(
+        tx_hash = %submitted.tx_hash,
+        message = %label,
+        "stellar tx submitted (signed by relayer key)"
+    );
+    Ok(submitted)
 }
 
 fn decode_merkle_proof(bytes: &[u8]) -> Result<Option<MerkleProof>, Error> {
