@@ -109,3 +109,7 @@ test-log          = { workspace = true, features = ["trace"] }
 
 # Needed for generating (synthetic) light blocks.
 tendermint-testgen = { workspace = true }
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"

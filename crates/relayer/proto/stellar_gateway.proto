@@ -1,0 +1,240 @@
+syntax = "proto3";
+
+package stellar.gateway.v1;
+
+service StellarGatewayQuery {
+  rpc LatestHeight(LatestHeightRequest) returns (LatestHeightResponse);
+  rpc QueryClientState(QueryClientStateRequest) returns (QueryClientStateResponse);
+  rpc QueryClientStates(QueryClientStatesRequest) returns (QueryClientStatesResponse);
+  rpc QueryConsensusState(QueryConsensusStateRequest) returns (QueryConsensusStateResponse);
+  rpc QueryPacketCommitment(QueryPacketCommitmentRequest) returns (QueryPacketCommitmentResponse);
+  rpc QueryPacketReceipt(QueryPacketReceiptRequest) returns (QueryPacketReceiptResponse);
+  rpc QueryAcknowledgement(QueryAcknowledgementRequest) returns (QueryAcknowledgementResponse);
+  rpc QueryNextSeqRecv(QueryNextSeqRecvRequest) returns (QueryNextSeqRecvResponse);
+  rpc QueryIbcHeader(QueryIbcHeaderRequest) returns (QueryIbcHeaderResponse);
+  rpc Events(EventsRequest) returns (EventsResponse);
+}
+
+service StellarGatewayMsg {
+  rpc SubmitSignedTx(SubmitSignedTxRequest) returns (SubmitSignedTxResponse);
+  rpc CreateClient(MsgCreateClientRequest) returns (MsgCreateClientResponse);
+  rpc UpdateClient(MsgUpdateClientRequest) returns (MsgUpdateClientResponse);
+  rpc RegisterCounterparty(MsgRegisterCounterpartyRequest) returns (MsgRegisterCounterpartyResponse);
+  rpc RecvPacket(MsgRecvPacketRequest) returns (MsgRecvPacketResponse);
+  rpc AckPacket(MsgAckPacketRequest) returns (MsgAckPacketResponse);
+  rpc TimeoutPacket(MsgTimeoutPacketRequest) returns (MsgTimeoutPacketResponse);
+  rpc SubmitMisbehaviour(MsgSubmitMisbehaviourRequest) returns (MsgSubmitMisbehaviourResponse);
+}
+
+message LatestHeightRequest {}
+
+message LatestHeightResponse {
+  uint64 revision_number = 1;
+  uint64 revision_height = 2;
+}
+
+message QueryClientStateRequest {
+  string client_id = 1;
+  uint64 height    = 2;
+}
+
+message QueryClientStateResponse {
+  bytes  client_state  = 1;
+  bytes  proof         = 2;
+  uint64 proof_height  = 3;
+}
+
+message QueryClientStatesRequest {}
+
+message IdentifiedClientState {
+  string client_id    = 1;
+  bytes  client_state = 2;
+}
+
+message QueryClientStatesResponse {
+  repeated IdentifiedClientState client_states = 1;
+}
+
+message QueryConsensusStateRequest {
+  string client_id       = 1;
+  uint64 revision_number = 2;
+  uint64 revision_height = 3;
+}
+
+message QueryConsensusStateResponse {
+  bytes  consensus_state = 1;
+  bytes  proof           = 2;
+  uint64 proof_height    = 3;
+}
+
+message QueryPacketCommitmentRequest {
+  string client_id = 1;
+  uint64 sequence  = 2;
+  uint64 height    = 3;
+}
+
+message QueryPacketCommitmentResponse {
+  bytes  commitment   = 1;
+  bytes  proof        = 2;
+  uint64 proof_height = 3;
+}
+
+message QueryPacketReceiptRequest {
+  string client_id = 1;
+  uint64 sequence  = 2;
+  uint64 height    = 3;
+}
+
+message QueryPacketReceiptResponse {
+  bool   received     = 1;
+  bytes  proof        = 2;
+  uint64 proof_height = 3;
+}
+
+message QueryAcknowledgementRequest {
+  string client_id = 1;
+  uint64 sequence  = 2;
+  uint64 height    = 3;
+}
+
+message QueryAcknowledgementResponse {
+  bytes  acknowledgement = 1;
+  bytes  proof           = 2;
+  uint64 proof_height    = 3;
+}
+
+message QueryNextSeqRecvRequest {
+  string client_id = 1;
+}
+
+message QueryNextSeqRecvResponse {
+  uint64 next_seq_recv = 1;
+  bytes  proof         = 2;
+  uint64 proof_height  = 3;
+}
+
+message QueryIbcHeaderRequest {
+  uint64 height = 1;
+}
+
+message QueryIbcHeaderResponse {
+  bytes header = 1;
+}
+
+message StellarHeader {
+  uint32 ledger_seq        = 1;
+  bytes  ledger_header_xdr = 2;
+  bytes  ibc_state_root    = 3;
+  bytes  scp_node_id       = 4;
+  bytes  scp_signature     = 5;
+  bytes  signed_value_xdr  = 6;
+}
+
+message EventsRequest {
+  uint32 start_ledger = 1;
+  string cursor       = 2;
+  uint32 limit        = 3;
+}
+
+message EventsResponse {
+  uint64 latest_ledger                   = 1;
+  string cursor                          = 2;
+  repeated GatewayContractEvent events   = 3;
+}
+
+message GatewayContractEvent {
+  string id                = 1;
+  uint64 ledger            = 2;
+  string ledger_closed_at  = 3;
+  string contract_id       = 4;
+  string tx_hash           = 5;
+  repeated bytes topics_xdr = 6;
+  bytes  value_xdr         = 7;
+}
+
+message SubmitSignedTxRequest {
+  bytes tx_xdr = 1;
+}
+
+message SubmitSignedTxResponse {
+  string          tx_hash      = 1;
+  repeated bytes  events       = 2;
+  bytes           return_value = 3;
+}
+
+message MsgCreateClientRequest {
+  bytes  client_state    = 1;
+  bytes  consensus_state = 2;
+  string signer          = 3;
+  string client_type     = 4;
+  uint64 height          = 5;
+}
+
+message MsgCreateClientResponse {
+  string client_id = 1;
+  bytes  tx_xdr    = 2;
+}
+
+message MsgUpdateClientRequest {
+  string client_id = 1;
+  bytes  header    = 2;
+  string signer    = 3;
+}
+
+message MsgUpdateClientResponse {
+  bytes tx_xdr = 1;
+}
+
+message MsgRegisterCounterpartyRequest {
+  string client_id                              = 1;
+  string counterparty_client_id                 = 2;
+  repeated bytes counterparty_commitment_prefix = 3;
+}
+
+message MsgRegisterCounterpartyResponse {
+  bytes tx_xdr = 1;
+}
+
+message MsgRecvPacketRequest {
+  bytes  packet       = 1;
+  bytes  proof        = 2;
+  uint64 proof_height = 3;
+  string signer       = 4;
+}
+
+message MsgRecvPacketResponse {
+  bytes tx_xdr = 1;
+}
+
+message MsgAckPacketRequest {
+  bytes  packet          = 1;
+  bytes  acknowledgement = 2;
+  bytes  proof           = 3;
+  uint64 proof_height    = 4;
+  string signer          = 5;
+}
+
+message MsgAckPacketResponse {
+  bytes tx_xdr = 1;
+}
+
+message MsgTimeoutPacketRequest {
+  bytes  packet       = 1;
+  bytes  proof        = 2;
+  uint64 proof_height = 3;
+  string signer       = 4;
+}
+
+message MsgTimeoutPacketResponse {
+  bytes tx_xdr = 1;
+}
+
+message MsgSubmitMisbehaviourRequest {
+  string client_id       = 1;
+  bytes  client_message  = 2;
+  string signer          = 3;
+}
+
+message MsgSubmitMisbehaviourResponse {
+  bytes tx_xdr = 1;
+}
