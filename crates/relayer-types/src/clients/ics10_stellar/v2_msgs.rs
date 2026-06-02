@@ -49,10 +49,10 @@ pub struct Packet {
 pub struct MsgRegisterCounterparty {
     #[prost(string, tag = "1")]
     pub client_id: String,
-    #[prost(string, tag = "2")]
-    pub counterparty_client_id: String,
-    #[prost(bytes = "vec", repeated, tag = "3")]
+    #[prost(bytes = "vec", repeated, tag = "2")]
     pub counterparty_commitment_prefix: Vec<Vec<u8>>,
+    #[prost(string, tag = "3")]
+    pub counterparty_client_id: String,
     #[prost(string, tag = "4")]
     pub signer: String,
 }
