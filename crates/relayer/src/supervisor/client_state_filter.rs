@@ -203,11 +203,12 @@ impl FilterPolicy {
                     Permission::Allow
                 }
             }
-            // Cardano light clients do not expose a Tendermint trust threshold; their
-            // security parameters are validated by the client implementation itself.
+            // Cardano and Stellar light clients do not expose a Tendermint trust
+            // threshold; their security parameters (Ouroboros / SCP quorum) are
+            // validated by the client implementation itself.
             None if matches!(
                 state.client_type(),
-                ClientType::CardanoMithril | ClientType::CardanoProbabilistic
+                ClientType::CardanoMithril | ClientType::CardanoProbabilistic | ClientType::Stellar
             ) =>
             {
                 Permission::Allow

@@ -841,11 +841,13 @@ impl ChainEndpoint for StellarChainEndpoint {
         _settings: ClientSettings,
     ) -> Result<Self::ClientState, Error> {
         let network_id = network_id_from_passphrase(&self.config.network_passphrase);
+        let trusted_validators = self.scp_validators_at(height)?;
+
         Ok(AnyClientState::Stellar(StellarClientState {
             chain_id: self.config.id.clone(),
             latest_height: height,
             frozen_height: None,
-            trusted_validators: Vec::new(),
+            trusted_validators,
             proof_specs: Vec::new(),
             network_id,
             wasm_checksum: self.wasm_checksum_bytes()?,
@@ -1004,6 +1006,33 @@ impl StellarChainEndpoint {
             Error::query(format!("invalid wasm_checksum_hex on Stellar config: {e}"))
         })?;
         Ok(Some(bytes))
+    }
+
+    fn scp_validators_at(&self, height: ICSHeight) -> Result<Vec<Vec<u8>>, Error> {
+        let resp = self
+            .rt
+            .block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                guard
+                    .query_ibc_header(QueryIbcHeaderRequest {
+                        height: height.revision_height(),
+                    })
+                    .await
+            })
+            .map_err(|e| {
+                Error::query(format!(
+                    "Stellar gateway query_ibc_header failed at {height}: {e}"
+                ))
+            })?;
+
+        let wire = gateway_client::StellarHeader::decode(resp.header.as_slice())
+            .map_err(|e| Error::query(format!("StellarHeader decode failed: {e}")))?;
+
+        if wire.scp_node_id.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        Ok(vec![wire.scp_node_id])
     }
 }
 

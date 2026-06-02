@@ -80,9 +80,6 @@ impl TryFrom<RawClientState> for ClientState {
 
         let frozen_height = frozen_height.and_then(|h| h.try_into().ok());
 
-        if trusted_validators.is_empty() {
-            return Err(Error::missing_field("trusted_validators"));
-        }
         for (i, v) in trusted_validators.iter().enumerate() {
             if v.len() != ED25519_PUBLIC_KEY_BYTES {
                 return Err(Error::invalid_field(
