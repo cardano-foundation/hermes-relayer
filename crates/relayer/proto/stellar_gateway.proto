@@ -150,6 +150,7 @@ message GatewayContractEvent {
   string tx_hash           = 5;
   repeated bytes topics_xdr = 6;
   bytes  value_xdr         = 7;
+  string attributes        = 8;
 }
 
 message SubmitSignedTxRequest {

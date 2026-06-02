@@ -43,7 +43,7 @@ use crate::chain::cosmos::version::Specs as CosmosSpecs;
 use crate::chain::endpoint::{ChainEndpoint, ChainStatus, HealthCheck};
 use crate::chain::handle::Subscription;
 use crate::chain::requests::*;
-use crate::chain::tracking::TrackedMsgs;
+use crate::chain::tracking::{TrackedMsgs, TrackingId};
 use crate::chain::version::Specs;
 use crate::client_state::{AnyClientState, IdentifiedAnyClientState};
 use crate::config::{ChainConfig, Error as ConfigError};
@@ -1724,7 +1724,56 @@ async fn run_event_polling(
             start_ledger = resp.latest_ledger as u32;
         }
 
-        // todo: fetch events by router contract address
+        let mut ibc_events: Vec<IbcEventWithHeight> = Vec::new();
+        for event in &resp.events {
+            if event.attributes.is_empty() {
+                continue;
+            }
+
+            let height = match ICSHeight::new(0, event.ledger) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "stellar_events",
+                        "{chain_id}: bad event height {}: {e}", event.ledger
+                    );
+                    continue;
+                }
+            };
+
+            match super::event_parser::parse_event_bytes(event.attributes.as_bytes(), height) {
+                Ok(Some(ibc_event)) => {
+                    tracing::info!(
+                        target: "stellar_events",
+                        "{chain_id}: observed {:?} at {height}",
+                        ibc_event.event.event_type()
+                    );
+                    ibc_events.push(ibc_event);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "stellar_events",
+                        "{chain_id}: failed to parse event: {e}"
+                    );
+                }
+            }
+        }
+
+        if !ibc_events.is_empty() {
+            let height = ibc_events
+                .iter()
+                .map(|e| e.height)
+                .max()
+                .unwrap_or_else(|| ICSHeight::new(0, start_ledger.max(1) as u64).unwrap());
+            let batch = EventBatch {
+                chain_id: chain_id.clone(),
+                tracking_id: TrackingId::new_uuid(),
+                height,
+                events: ibc_events,
+            };
+            let _ = sender.send(Arc::new(Ok(batch)));
+        }
     }
 }
 
