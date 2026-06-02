@@ -1,7 +1,6 @@
 use alloc::sync::Arc;
 use core::str::FromStr;
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
@@ -46,7 +45,6 @@ use crate::chain::endpoint::{ChainEndpoint, ChainStatus, HealthCheck};
 use crate::chain::handle::Subscription;
 use crate::chain::requests::*;
 use crate::chain::tracking::TrackedMsgs;
-use crate::chain::tracking::TrackingId;
 use crate::chain::version::Specs;
 use crate::client_state::{AnyClientState, IdentifiedAnyClientState};
 use crate::config::{ChainConfig, Error as ConfigError};
@@ -108,11 +106,15 @@ impl ChainEndpoint for StellarChainEndpoint {
     fn bootstrap(config: ChainConfig, rt: Arc<TokioRuntime>) -> Result<Self, Error> {
         let stellar_config = match config {
             ChainConfig::Stellar(c) => c,
-            _ => return Err(Error::config(ConfigError::wrong_type())),
+            _ => {
+                tracing::error!("invalid config type provided to stellar bootstrap");
+
+                return Err(Error::config(ConfigError::wrong_type()));
+            }
         };
 
         tracing::info!(
-            "Bootstrapping Stellar chain endpoint id={} gateway={}",
+            "bootstrapping stellar chain endpoint id={} gateway={}",
             stellar_config.id,
             stellar_config.gateway_url,
         );
@@ -125,6 +127,13 @@ impl ChainEndpoint for StellarChainEndpoint {
                 tracing::error!("Stellar gateway query connect failed: {e}");
                 Error::config(ConfigError::wrong_type())
             })?;
+
+        tracing::info!(
+            "stellar gateway query client initialized successfully id={} gateway={}",
+            stellar_config.id,
+            stellar_config.gateway_url,
+        );
+
         let gateway_msg = rt
             .block_on(GatewayMsgClient::connect(
                 stellar_config.gateway_url.clone(),
@@ -134,8 +143,22 @@ impl ChainEndpoint for StellarChainEndpoint {
                 Error::config(ConfigError::wrong_type())
             })?;
 
+        tracing::info!(
+            "stellar gateway message client initialized successfully id={} gateway={}",
+            stellar_config.id,
+            stellar_config.gateway_url,
+        );
+
         let keyring = KeyRing::new(Store::Test, "stellar", &stellar_config.id, &None)
             .map_err(Error::key_base)?;
+
+        tracing::info!(
+            "bootstrapped stellar chain endpoint id={} gateway={}",
+            stellar_config.id,
+            stellar_config.gateway_url,
+        );
+
+        // todo: check for misbehaviour config
 
         Ok(Self {
             config: stellar_config,
@@ -148,6 +171,8 @@ impl ChainEndpoint for StellarChainEndpoint {
     }
 
     fn shutdown(self) -> Result<(), Error> {
+        tracing::info!("shutting down stellar chain endpoint");
+
         Ok(())
     }
 
@@ -156,14 +181,19 @@ impl ChainEndpoint for StellarChainEndpoint {
             .rt
             .block_on(async {
                 let mut guard = self.gateway_query.lock().unwrap();
+
                 guard.latest_height().await
             })
-            .map_err(|e| Error::query(format!("Stellar gateway latest_height failed: {e}")))?;
+            .map_err(|e| Error::query(format!("Stellar gateway latest height failed: {e}")))?;
+
         if resp.revision_height == 0 {
             return Err(Error::query(
                 "Stellar gateway reported revision_height=0".to_string(),
             ));
         }
+
+        tracing::info!("stellar health check with height {}", resp.revision_height);
+
         Ok(HealthCheck::Healthy)
     }
 
@@ -198,11 +228,18 @@ impl ChainEndpoint for StellarChainEndpoint {
             .keyring
             .get_key(&self.config.key_name)
             .map_err(Error::key_base)?;
-        Signer::from_str(&key.account_id()).map_err(|e| {
+
+        tracing::info!("getting stellar signer from keyring");
+
+        let signer = Signer::from_str(&key.account_id()).map_err(|e| {
             Error::key_base(crate::keyring::errors::Error::invalid_mnemonic(
                 anyhow::anyhow!("Invalid Stellar signer address: {e}"),
             ))
-        })
+        });
+
+        tracing::info!("stellar signer from keyring: {}", key.account_id());
+
+        signer
     }
 
     fn get_key(&self) -> Result<Self::SigningKeyPair, Error> {
@@ -212,6 +249,8 @@ impl ChainEndpoint for StellarChainEndpoint {
     }
 
     fn version_specs(&self) -> Result<Specs, Error> {
+        // todo: return stellar protocol version info
+
         Ok(Specs::Cosmos(CosmosSpecs {
             cosmos_sdk: None,
             ibc_go: None,
@@ -223,12 +262,18 @@ impl ChainEndpoint for StellarChainEndpoint {
         &mut self,
         tracked_msgs: TrackedMsgs,
     ) -> Result<Vec<IbcEventWithHeight>, Error> {
+        tracing::info!(
+            "send_messages_and_wait_commit: processing {} messages",
+            tracked_msgs.msgs.len()
+        );
+
         let signer = self.get_signer()?.to_string();
         let signing_key = self.get_key()?;
         let network_passphrase = self.config.network_passphrase.clone();
 
         self.rt.block_on(async {
             let mut events = Vec::new();
+
             for msg in tracked_msgs.msgs.iter() {
                 let msg_events = dispatch_msg(
                     &self.gateway_msg,
@@ -239,8 +284,16 @@ impl ChainEndpoint for StellarChainEndpoint {
                     &network_passphrase,
                 )
                 .await?;
+
+                // todo: get events from tx response
+
+                // todo: check if stellar verified the tx height
+
                 events.extend(msg_events);
             }
+
+            // todo: parse events using event parser + events with height
+
             Ok::<Vec<IbcEventWithHeight>, Error>(events)
         })
     }
@@ -249,23 +302,43 @@ impl ChainEndpoint for StellarChainEndpoint {
         &mut self,
         tracked_msgs: TrackedMsgs,
     ) -> Result<Vec<TxResponse>, Error> {
+        tracing::info!(
+            "send_messages_and_wait_check_tx: processing {} messages",
+            tracked_msgs.msgs.len()
+        );
+
+        // todo: adjust this method so it is non blocking as the commit one
+
         self.send_messages_and_wait_commit(tracked_msgs)?;
+
         Ok(Vec::new())
     }
 
     fn verify_header(
         &mut self,
-        _trusted: ICSHeight,
+        trusted: ICSHeight,
         target: ICSHeight,
         _client_state: &AnyClientState,
     ) -> Result<Self::LightBlock, Error> {
+        // todo: verify proof header
+
+        let height = if trusted < target { trusted } else { target };
+
+        tracing::info!(
+            "stellar verify header with trusted height {}, target height {} and query height {}",
+            trusted,
+            target,
+            height
+        );
+
         let resp = self
             .rt
             .block_on(async {
                 let mut guard = self.gateway_query.lock().unwrap();
+
                 guard
                     .query_ibc_header(QueryIbcHeaderRequest {
-                        height: target.revision_height(),
+                        height: height.revision_height(),
                     })
                     .await
             })
@@ -279,9 +352,18 @@ impl ChainEndpoint for StellarChainEndpoint {
             .map_err(|e| Error::query(format!("StellarHeader decode failed: {e}")))?;
 
         let close_time = ledger_close_time_secs(&wire.ledger_header_xdr)?;
+
         let timestamp = Timestamp::from_nanoseconds(close_time.saturating_mul(1_000_000_000))
             .map_err(|e| Error::query(format!("invalid Stellar close_time: {e}")))?;
+
         let ledger_hash = ledger_previous_hash(&wire.ledger_header_xdr)?;
+
+        tracing::info!(
+            "verified stellar header with trusted height {}, target height {} and query height {}",
+            trusted,
+            target,
+            height
+        );
 
         Ok(StellarLightBlock {
             ledger_seq: wire.ledger_seq as u64,
@@ -364,6 +446,8 @@ impl ChainEndpoint for StellarChainEndpoint {
         _key_name: Option<&str>,
         denom: Option<&str>,
     ) -> Result<Balance, Error> {
+        // todo: add gateway query balance
+
         Ok(Balance {
             amount: "0".to_string(),
             denom: denom.unwrap_or("XLM").to_string(),
@@ -371,6 +455,8 @@ impl ChainEndpoint for StellarChainEndpoint {
     }
 
     fn query_all_balances(&self, _key_name: Option<&str>) -> Result<Vec<Balance>, Error> {
+        // todo: add gateway query balance
+
         Ok(Vec::new())
     }
 
@@ -385,6 +471,8 @@ impl ChainEndpoint for StellarChainEndpoint {
     }
 
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
+        tracing::debug!("querying stellar application status via gateway");
+
         let latest = self
             .rt
             .block_on(async {
@@ -395,6 +483,8 @@ impl ChainEndpoint for StellarChainEndpoint {
 
         let height = ICSHeight::new(latest.revision_number, latest.revision_height)
             .map_err(|e| Error::query(format!("invalid Stellar height from gateway: {e}")))?;
+
+        tracing::info!("stellar chain at height {}", height);
 
         let header_resp = self
             .rt
@@ -419,6 +509,12 @@ impl ChainEndpoint for StellarChainEndpoint {
         let timestamp = Timestamp::from_nanoseconds(close_time_secs.saturating_mul(1_000_000_000))
             .map_err(|e| Error::query(format!("invalid Stellar close_time: {e}")))?;
 
+        tracing::info!(
+            "stellar chain at height {} and timestamp {}",
+            height,
+            timestamp
+        );
+
         Ok(ChainStatus { height, timestamp })
     }
 
@@ -434,10 +530,13 @@ impl ChainEndpoint for StellarChainEndpoint {
         request: QueryClientStateRequest,
         _include_proof: IncludeProof,
     ) -> Result<(AnyClientState, Option<MerkleProof>), Error> {
+        tracing::debug!("querying all clients");
+
         let height = match request.height {
             QueryHeight::Latest => self.query_application_status()?.height.revision_height(),
             QueryHeight::Specific(h) => h.revision_height(),
         };
+
         let resp = self
             .rt
             .block_on(async {
@@ -1073,8 +1172,12 @@ fn sign_stellar_tx(
 fn scval_string_from_xdr(bytes: &[u8]) -> Option<String> {
     use stellar_xdr::curr::{Limits, ReadXdr, ScVal};
     match ScVal::from_xdr(bytes, Limits::none()).ok()? {
-        ScVal::String(s) => core::str::from_utf8(s.0.as_slice()).ok().map(|s| s.to_string()),
-        ScVal::Symbol(s) => core::str::from_utf8(s.0.as_slice()).ok().map(|s| s.to_string()),
+        ScVal::String(s) => core::str::from_utf8(s.0.as_slice())
+            .ok()
+            .map(|s| s.to_string()),
+        ScVal::Symbol(s) => core::str::from_utf8(s.0.as_slice())
+            .ok()
+            .map(|s| s.to_string()),
         _ => None,
     }
 }
@@ -1183,11 +1286,12 @@ async fn dispatch_msg(
                 Attributes as ClientAttributes, CreateClient,
             };
 
-            let client_id_str = scval_string_from_xdr(&submitted.return_value).ok_or_else(|| {
-                Error::send_tx(
-                    "create_client tx returned no client id in its return value".to_string(),
-                )
-            })?;
+            let client_id_str =
+                scval_string_from_xdr(&submitted.return_value).ok_or_else(|| {
+                    Error::send_tx(
+                        "create_client tx returned no client id in its return value".to_string(),
+                    )
+                })?;
             let client_id = ClientId::from_str(&client_id_str)
                 .map_err(|e| Error::send_tx(format!("invalid client id {client_id_str}: {e}")))?;
             let consensus_height = ICSHeight::new(0, height)
@@ -1439,8 +1543,6 @@ fn ledger_previous_hash(ledger_header_xdr: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(header.previous_ledger_hash.0.to_vec())
 }
 
-const STELLAR_ROUTER_MODULE: &str = "stellaribcrouter";
-
 const POLL_RECONNECT_THRESHOLD: u32 = 5;
 const POLL_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -1466,6 +1568,8 @@ async fn run_event_polling(
     sender: crossbeam_channel::Sender<Arc<crate::event::source::Result<EventBatch>>>,
     poll_interval: Duration,
 ) {
+    tracing::info!("initializing stellar event polling");
+
     let mut client = match GatewayQueryClient::connect(gateway_url.clone()).await {
         Ok(c) => c,
         Err(e) => {
@@ -1486,6 +1590,7 @@ async fn run_event_polling(
             1
         }
     };
+
     let mut cursor = String::new();
     let mut consecutive_errors: u32 = 0;
 
@@ -1551,112 +1656,8 @@ async fn run_event_polling(
             start_ledger = resp.latest_ledger as u32;
         }
 
-        let mut by_ledger: BTreeMap<u64, Vec<IbcEventWithHeight>> = BTreeMap::new();
-        for ev in resp.events {
-            let height = match ICSHeight::new(0, ev.ledger) {
-                Ok(h) => h,
-                Err(_) => continue,
-            };
-            if let Some(ibc_ev) = translate_router_event(&ev) {
-                by_ledger
-                    .entry(ev.ledger)
-                    .or_default()
-                    .push(IbcEventWithHeight::new(ibc_ev, height));
-            }
-        }
-
-        for (ledger_seq, events) in by_ledger {
-            let height = match ICSHeight::new(0, ledger_seq) {
-                Ok(h) => h,
-                Err(_) => continue,
-            };
-            let batch = EventBatch {
-                chain_id: chain_id.clone(),
-                tracking_id: TrackingId::new_uuid(),
-                height,
-                events,
-            };
-            if sender.send(Arc::new(Ok(batch))).is_err() {
-                return;
-            }
-        }
+        // todo: fetch events by router contract address
     }
-}
-
-fn translate_router_event(ev: &GatewayContractEvent) -> Option<IbcEvent> {
-    use stellar_xdr::curr::{Limits, ReadXdr, ScVal};
-
-    let topics: Vec<ScVal> = ev
-        .topics_xdr
-        .iter()
-        .filter_map(|t| ScVal::from_xdr(t, Limits::none()).ok())
-        .collect();
-
-    let kind = match topics.first() {
-        Some(ScVal::Symbol(sym)) => core::str::from_utf8(sym.0.as_slice()).ok()?.to_owned(),
-        _ => return None,
-    };
-
-    if !matches!(
-        kind.as_str(),
-        "send_packet" | "recv_packet" | "write_ack" | "ack_packet" | "timeout_packet"
-    ) {
-        return None;
-    }
-
-    let module_name = ModuleId::new(Cow::Borrowed(STELLAR_ROUTER_MODULE)).ok()?;
-
-    let mut attributes = Vec::with_capacity(4);
-    attributes.push(ModuleEventAttribute {
-        key: "tx_hash".to_string(),
-        value: ev.tx_hash.clone(),
-    });
-    attributes.push(ModuleEventAttribute {
-        key: "event_id".to_string(),
-        value: ev.id.clone(),
-    });
-    if let Some(ScVal::String(s)) = topics.get(1) {
-        if let Ok(client_id) = core::str::from_utf8(s.0.as_slice()) {
-            attributes.push(ModuleEventAttribute {
-                key: "client_id".to_string(),
-                value: client_id.to_string(),
-            });
-        }
-    }
-    if let Some(ScVal::U64(seq)) = topics.get(2) {
-        attributes.push(ModuleEventAttribute {
-            key: "sequence".to_string(),
-            value: seq.to_string(),
-        });
-    }
-    if !ev.value_xdr.is_empty() {
-        attributes.push(ModuleEventAttribute {
-            key: "value_xdr_hex".to_string(),
-            value: hex_encode_bytes(&ev.value_xdr),
-        });
-    }
-    if !ev.contract_id.is_empty() {
-        attributes.push(ModuleEventAttribute {
-            key: "contract_id".to_string(),
-            value: ev.contract_id.clone(),
-        });
-    }
-
-    Some(IbcEvent::AppModule(ModuleEvent {
-        kind,
-        module_name,
-        attributes,
-    }))
-}
-
-fn hex_encode_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
 }
 
 #[cfg(test)]

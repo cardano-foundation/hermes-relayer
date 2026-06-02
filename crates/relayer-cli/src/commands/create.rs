@@ -4,16 +4,21 @@ use abscissa_core::{Command, Runnable};
 
 use crate::commands::create::channel::CreateChannelCommand;
 use crate::commands::create::connection::CreateConnectionCommand;
+use crate::commands::create::counterparty::CreateCounterpartyCommand;
 use crate::commands::tx::client::TxCreateClientCmd;
 
 mod channel;
 mod connection;
+mod counterparty;
 
 /// `create` subcommands
 #[derive(Command, Debug, Parser, Runnable)]
 pub enum CreateCmds {
     /// Create a new IBC client
     Client(TxCreateClientCmd),
+
+    /// Register a counterparty for an existing client (IBC v2)
+    Counterparty(CreateCounterpartyCommand),
 
     /// Create a new connection between two chains
     Connection(CreateConnectionCommand),
