@@ -630,7 +630,7 @@ fn relay_send_packet(
         bytes = any.value.len(),
         client_id = %packet_ev.client_id,
         sequence = packet_ev.sequence,
-        "built MsgRecvPacket; submitting to destination"
+        "built recv packet; submitting to destination (cosmos)"
     );
     let Some(dst) = destination else {
         debug!("recv relay: no destination submitter (observer-only mode)");
@@ -638,12 +638,12 @@ fn relay_send_packet(
     };
     match dst.submit(vec![any]) {
         Ok(tx_hash) => {
-            info!(%tx_hash, sequence = packet_ev.sequence, "Cosmos accepted MsgRecvPacket");
+            info!(%tx_hash, sequence = packet_ev.sequence, "cosmos accepted recv packet");
             crate::telemetry!(stellar_relay_success, chain_id, "recv");
             format!("{any_summary} submit=ok tx={tx_hash}")
         }
         Err(e) => {
-            warn!(error = %e, sequence = packet_ev.sequence, "Cosmos rejected MsgRecvPacket");
+            warn!(error = %e, sequence = packet_ev.sequence, "cosmos rejected recv packet");
             crate::telemetry!(stellar_relay_submit_failure, chain_id, "recv");
             format!("{any_summary} submit=failed: {e}")
         }
