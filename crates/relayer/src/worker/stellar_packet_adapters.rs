@@ -4,7 +4,8 @@ use ibc_proto::google::protobuf::Any;
 use ibc_proto::ibc::core::commitment::v1::MerkleProof as RawMerkleProof;
 use ibc_relayer_types::core::ics04_channel::packet::Sequence;
 use ibc_relayer_types::core::ics23_commitment::merkle::MerkleProof;
-use ibc_relayer_types::core::ics24_host::identifier::{ChannelId, PortId};
+use ibc_relayer_types::core::ics24_host::identifier::{ChannelId, ClientId, PortId};
+use ibc_relayer_types::tx_msg::Msg;
 use ibc_relayer_types::Height as ICSHeight;
 use prost::Message;
 
@@ -13,10 +14,11 @@ use crate::chain::requests::{
     IncludeProof, QueryHeight, QueryPacketCommitmentRequest, QueryPacketReceiptRequest,
 };
 use crate::chain::tracking::{TrackedMsgs, TrackingId};
+use crate::foreign_client::ForeignClient;
 
 use super::stellar_packet::{
-    PacketAbsenceProofSource, PacketProofError, PacketProofSource, PacketRelayDestination,
-    SubmitError,
+    ClientUpdater, PacketAbsenceProofSource, PacketProofError, PacketProofSource,
+    PacketRelayDestination, SubmitError,
 };
 
 pub struct ChainHandleProofSource<H: ChainHandle> {
@@ -144,6 +146,38 @@ impl<H: ChainHandle> PacketRelayDestination for ChainHandleDestination<H> {
                 .map(|e| e.height.revision_height())
                 .unwrap_or(0)
         ))
+    }
+}
+
+pub struct ForeignClientUpdater<Dst: ChainHandle, Src: ChainHandle> {
+    dst: Arc<Dst>,
+    src: Arc<Src>,
+}
+
+impl<Dst: ChainHandle, Src: ChainHandle> ForeignClientUpdater<Dst, Src> {
+    pub fn new(dst: Arc<Dst>, src: Arc<Src>) -> Self {
+        Self { dst, src }
+    }
+}
+
+impl<Dst: ChainHandle, Src: ChainHandle> ClientUpdater for ForeignClientUpdater<Dst, Src> {
+    fn build_update(
+        &self,
+        dest_client_id: &str,
+        target_height: ICSHeight,
+    ) -> Result<Vec<Any>, String> {
+        let client_id: ClientId = dest_client_id
+            .parse()
+            .map_err(|e| format!("dest client id parse: {e}"))?;
+
+        let foreign_client =
+            ForeignClient::restore(client_id, (*self.dst).clone(), (*self.src).clone());
+
+        let msgs = foreign_client
+            .build_update_client_with_trusted(target_height, None)
+            .map_err(|e| format!("build update client: {e}"))?;
+
+        Ok(msgs.into_iter().map(|m| m.to_any()).collect())
     }
 }
 

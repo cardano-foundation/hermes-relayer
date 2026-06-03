@@ -267,7 +267,9 @@ fn spawn_stellar_packet_workers<Chain: ChainHandle>(
 ) -> Vec<TaskHandle> {
     use crate::config::ChainConfig;
     use crate::worker::stellar_packet::{spawn_stellar_packet_worker, StellarPacketDeps};
-    use crate::worker::stellar_packet_adapters::{ChainHandleDestination, ChainHandleProofSource};
+    use crate::worker::stellar_packet_adapters::{
+        ChainHandleDestination, ChainHandleProofSource, ForeignClientUpdater,
+    };
 
     let stellar_ids: Vec<ChainId> = config
         .chains
@@ -337,8 +339,12 @@ fn spawn_stellar_packet_workers<Chain: ChainHandle>(
         let deps = StellarPacketDeps {
             proof_source: Some(Arc::new(ChainHandleProofSource::new(stellar_arc.clone()))),
             destination: Some(Arc::new(ChainHandleDestination::new(cosmos_arc.clone()))),
-            absence_source: Some(Arc::new(ChainHandleProofSource::new(cosmos_arc))),
-            source_submitter: Some(Arc::new(ChainHandleDestination::new(stellar_arc))),
+            absence_source: Some(Arc::new(ChainHandleProofSource::new(cosmos_arc.clone()))),
+            source_submitter: Some(Arc::new(ChainHandleDestination::new(stellar_arc.clone()))),
+            client_updater: Some(Arc::new(ForeignClientUpdater::new(
+                cosmos_arc,
+                stellar_arc,
+            ))),
             signer,
             source_signer,
         };
