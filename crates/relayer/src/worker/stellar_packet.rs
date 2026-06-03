@@ -303,6 +303,14 @@ pub trait PacketAbsenceProofSource: Send + Sync {
     ) -> Result<(Vec<u8>, ICSHeight), PacketProofError>;
 }
 
+pub trait ClientUpdater: Send + Sync {
+    fn build_update(
+        &self,
+        dest_client_id: &str,
+        target_height: ICSHeight,
+    ) -> Result<Vec<Any>, String>;
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BuildTimeoutError {
     #[error(transparent)]
@@ -465,6 +473,7 @@ pub struct StellarPacketDeps {
     pub destination: Option<Arc<dyn PacketRelayDestination>>,
     pub absence_source: Option<Arc<dyn PacketAbsenceProofSource>>,
     pub source_submitter: Option<Arc<dyn PacketRelayDestination>>,
+    pub client_updater: Option<Arc<dyn ClientUpdater>>,
     pub signer: String,
     pub source_signer: String,
 }
@@ -476,6 +485,7 @@ impl StellarPacketDeps {
             destination: None,
             absence_source: None,
             source_submitter: None,
+            client_updater: None,
             signer: String::new(),
             source_signer: String::new(),
         }
@@ -592,11 +602,12 @@ fn dispatch_send_packet(
         packet_ev,
         deps.proof_source.as_deref(),
         deps.destination.as_deref(),
+        deps.client_updater.as_deref(),
         &deps.signer,
     )
 }
 
-#[instrument(level = "debug", skip(proof_source, destination, signer), fields(
+#[instrument(level = "debug", skip(proof_source, destination, client_updater, signer), fields(
     chain = %chain_id,
     client_id = %packet_ev.client_id,
     sequence = packet_ev.sequence,
@@ -606,46 +617,79 @@ fn relay_send_packet(
     packet_ev: &StellarPacketEvent,
     proof_source: Option<&dyn PacketProofSource>,
     destination: Option<&dyn PacketRelayDestination>,
+    client_updater: Option<&dyn ClientUpdater>,
     signer: &str,
 ) -> String {
     let Some(src) = proof_source else {
         debug!("recv relay skipped: no proof source configured");
         return "no_proof_source".to_string();
     };
-    let any = match build_msg_recv_packet_from_event(packet_ev, src, signer.to_string()) {
-        Ok(a) => a,
+
+    let packet = match decode_packet_from_event_body(&packet_ev.value_xdr) {
+        Ok(p) => p,
         Err(e) => {
-            warn!(error = %e, "recv relay: build MsgRecvPacket failed");
-            crate::telemetry!(stellar_relay_build_failure, chain_id, "recv");
-            return format!("build_failed: {e}");
+            warn!(error = %e, "recv relay: decode packet failed");
+            return format!("decode_failed: {e}");
         }
     };
-    let any_summary = format!(
-        "built_msg_recv_packet bytes={} type_url={}",
-        any.value.len(),
-        any.type_url
-    );
+
+    let (proof_commitment, proof_height) =
+        match src.packet_commitment_proof(&packet_ev.client_id, packet_ev.sequence) {
+            Ok(x) => x,
+            Err(e) => {
+                warn!(error = %e, "recv relay: commitment proof failed");
+                crate::telemetry!(stellar_relay_build_failure, chain_id, "recv");
+                return format!("build_failed: {e}");
+            }
+        };
+
+    let mut msgs: Vec<Any> = Vec::new();
+
+    if let Some(updater) = client_updater {
+        match updater.build_update(&packet.dest_client, proof_height) {
+            Ok(update_msgs) => {
+                info!(
+                    count = update_msgs.len(),
+                    dest_client = %packet.dest_client,
+                    target_height = %proof_height,
+                    "built client update for destination (cosmos)"
+                );
+                msgs.extend(update_msgs);
+            }
+            Err(e) => {
+                warn!(error = %e, "recv relay: client update build failed");
+                crate::telemetry!(stellar_relay_build_failure, chain_id, "recv");
+                return format!("client_update_failed: {e}");
+            }
+        }
+    }
+
+    let recv = build_msg_recv_packet(packet, proof_commitment, proof_height, signer.to_string());
+    let recv_summary = format!("recv bytes={} type_url={}", recv.value.len(), recv.type_url);
+    msgs.push(recv);
+
     info!(
-        type_url = %any.type_url,
-        bytes = any.value.len(),
+        msgs = msgs.len(),
         client_id = %packet_ev.client_id,
         sequence = packet_ev.sequence,
-        "built recv packet; submitting to destination (cosmos)"
+        "submitting client-update + recv packet to destination (cosmos)"
     );
+
     let Some(dst) = destination else {
         debug!("recv relay: no destination submitter (observer-only mode)");
-        return format!("{any_summary} submit=no_destination");
+        return format!("{recv_summary} submit=no_destination");
     };
-    match dst.submit(vec![any]) {
+
+    match dst.submit(msgs) {
         Ok(tx_hash) => {
             info!(%tx_hash, sequence = packet_ev.sequence, "cosmos accepted recv packet");
             crate::telemetry!(stellar_relay_success, chain_id, "recv");
-            format!("{any_summary} submit=ok tx={tx_hash}")
+            format!("{recv_summary} submit=ok tx={tx_hash}")
         }
         Err(e) => {
             warn!(error = %e, sequence = packet_ev.sequence, "cosmos rejected recv packet");
             crate::telemetry!(stellar_relay_submit_failure, chain_id, "recv");
-            format!("{any_summary} submit=failed: {e}")
+            format!("{recv_summary} submit=failed: {e}")
         }
     }
 }
