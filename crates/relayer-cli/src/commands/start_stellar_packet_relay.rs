@@ -5,10 +5,11 @@ use abscissa_core::{Command, Runnable};
 
 use ibc_relayer::chain::handle::{BaseChainHandle, ChainHandle};
 use ibc_relayer::worker::stellar_packet::{
-    spawn_stellar_packet_worker, PacketProofSource, PacketRelayDestination, StellarPacketDeps,
+    spawn_stellar_packet_worker, ClientUpdater, PacketProofSource, PacketRelayDestination,
+    StellarPacketDeps,
 };
 use ibc_relayer::worker::stellar_packet_adapters::{
-    ChainHandleDestination, ChainHandleProofSource,
+    ChainHandleDestination, ChainHandleProofSource, ForeignClientUpdater,
 };
 use ibc_relayer_types::core::ics24_host::identifier::ChainId;
 
@@ -106,6 +107,10 @@ impl Runnable for StartStellarPacketRelayCmd {
             self.src_chain_id, self.dst_chain_id, signer, source_signer
         );
 
+        let client_updater: Option<Arc<dyn ClientUpdater>> = Some(Arc::new(
+            ForeignClientUpdater::new(Arc::new(dst.clone()), Arc::new(src.clone())),
+        ));
+
         let handle = spawn_stellar_packet_worker(
             self.src_chain_id.clone(),
             subscription,
@@ -114,6 +119,7 @@ impl Runnable for StartStellarPacketRelayCmd {
                 destination: Some(destination),
                 absence_source,
                 source_submitter,
+                client_updater,
                 signer,
                 source_signer,
             },

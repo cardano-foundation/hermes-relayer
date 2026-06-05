@@ -954,9 +954,11 @@ impl ChainEndpoint for StellarChainEndpoint {
             previous_ledger_hash,
         };
 
-        let header: StellarHeader = raw
+        let mut header: StellarHeader = raw
             .try_into()
             .map_err(|e| Error::query(format!("StellarHeader try_into failed: {e}")))?;
+
+        header.wrap_as_wasm = self.is_wasm_wrapped();
 
         Ok((AnyHeader::Stellar(header), vec![]))
     }
@@ -1049,30 +1051,36 @@ impl StellarChainEndpoint {
     }
 
     fn scp_validators_at(&self, height: ICSHeight) -> Result<Vec<Vec<u8>>, Error> {
-        let resp = self
-            .rt
-            .block_on(async {
-                let mut guard = self.gateway_query.lock().unwrap();
-                guard
-                    .query_ibc_header(QueryIbcHeaderRequest {
-                        height: height.revision_height(),
-                    })
-                    .await
-            })
-            .map_err(|e| {
-                Error::query(format!(
-                    "Stellar gateway query_ibc_header failed at {height}: {e}"
-                ))
-            })?;
+        const VALIDATOR_SAMPLE_WINDOW: u64 = 32;
 
-        let wire = gateway_client::StellarHeader::decode(resp.header.as_slice())
-            .map_err(|e| Error::query(format!("StellarHeader decode failed: {e}")))?;
+        let top = height.revision_height();
+        let bottom = top.saturating_sub(VALIDATOR_SAMPLE_WINDOW - 1).max(1);
 
-        if wire.scp_node_id.is_empty() {
-            return Ok(Vec::new());
+        let mut validators: Vec<Vec<u8>> = Vec::new();
+        for h in (bottom..=top).rev() {
+            let resp = self
+                .rt
+                .block_on(async {
+                    let mut guard = self.gateway_query.lock().unwrap();
+                    guard
+                        .query_ibc_header(QueryIbcHeaderRequest { height: h })
+                        .await
+                })
+                .map_err(|e| {
+                    Error::query(format!(
+                        "Stellar gateway query_ibc_header failed at {h}: {e}"
+                    ))
+                })?;
+
+            let wire = gateway_client::StellarHeader::decode(resp.header.as_slice())
+                .map_err(|e| Error::query(format!("StellarHeader decode failed: {e}")))?;
+
+            if !wire.scp_node_id.is_empty() && !validators.contains(&wire.scp_node_id) {
+                validators.push(wire.scp_node_id);
+            }
         }
 
-        Ok(vec![wire.scp_node_id])
+        Ok(validators)
     }
 }
 

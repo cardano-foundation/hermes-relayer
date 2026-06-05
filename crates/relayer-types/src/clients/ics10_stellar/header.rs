@@ -1,5 +1,6 @@
 use bytes::Buf;
 use ibc_proto::google::protobuf::Any;
+use ibc_proto::ibc::lightclients::wasm::v1::ClientMessage as RawWasmClientMessage;
 use ibc_proto::Protobuf;
 use prost::Message;
 use serde_derive::{Deserialize, Serialize};
@@ -12,6 +13,7 @@ use crate::timestamp::Timestamp;
 use crate::Height;
 
 pub const STELLAR_HEADER_TYPE_URL: &str = "/ibc.lightclients.stellar.v1.StellarHeader";
+pub const WASM_CLIENT_MESSAGE_TYPE_URL: &str = "/ibc.lightclients.wasm.v1.ClientMessage";
 
 const SMT_ROOT_BYTES: usize = 32;
 
@@ -27,6 +29,8 @@ pub struct Header {
     pub scp_envelopes: Vec<ScpEnvelope>,
     pub ledger_hash: Vec<u8>,
     pub previous_ledger_hash: Vec<u8>,
+    #[serde(default)]
+    pub wrap_as_wasm: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +131,7 @@ impl TryFrom<RawHeader> for Header {
             scp_envelopes: raw.scp_envelopes.into_iter().map(Into::into).collect(),
             ledger_hash: raw.ledger_hash,
             previous_ledger_hash: raw.previous_ledger_hash,
+            wrap_as_wasm: false,
         })
     }
 }
@@ -160,11 +165,20 @@ impl TryFrom<Any> for Header {
         use core::ops::Deref;
 
         fn decode_header<B: Buf>(buf: B) -> Result<Header, Error> {
+            tracing::info!("converting cosmos header to stellar header",);
+
             RawHeader::decode(buf).map_err(Error::decode)?.try_into()
         }
 
         match raw_any.type_url.as_str() {
             STELLAR_HEADER_TYPE_URL => decode_header(raw_any.value.deref()).map_err(Into::into),
+            WASM_CLIENT_MESSAGE_TYPE_URL => {
+                let wasm = RawWasmClientMessage::decode(raw_any.value.deref())
+                    .map_err(|e| Ics02Error::from(Error::decode(e)))?;
+                let mut inner = decode_header(wasm.data.as_slice())?;
+                inner.wrap_as_wasm = true;
+                Ok(inner)
+            }
             _ => Err(Ics02Error::unknown_header_type(raw_any.type_url)),
         }
     }
@@ -172,6 +186,18 @@ impl TryFrom<Any> for Header {
 
 impl From<Header> for Any {
     fn from(header: Header) -> Self {
+        if header.wrap_as_wasm {
+            let inner_bytes = {
+                let mut without = header.clone();
+                without.wrap_as_wasm = false;
+                Protobuf::<RawHeader>::encode_vec(without)
+            };
+            let wasm = RawWasmClientMessage { data: inner_bytes };
+            return Any {
+                type_url: WASM_CLIENT_MESSAGE_TYPE_URL.to_string(),
+                value: wasm.encode_to_vec(),
+            };
+        }
         Any {
             type_url: STELLAR_HEADER_TYPE_URL.to_string(),
             value: Protobuf::<RawHeader>::encode_vec(header),
@@ -198,6 +224,7 @@ mod tests {
             }],
             ledger_hash: vec![0xaa; 32],
             previous_ledger_hash: vec![0xbb; 32],
+            wrap_as_wasm: false,
         }
     }
 
