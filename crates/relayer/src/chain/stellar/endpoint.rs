@@ -1051,34 +1051,71 @@ impl StellarChainEndpoint {
     }
 
     fn scp_validators_at(&self, height: ICSHeight) -> Result<Vec<Vec<u8>>, Error> {
-        const VALIDATOR_SAMPLE_WINDOW: u64 = 32;
+        const MAX_SAMPLE: u64 = 24;
+        const STALL_LIMIT: usize = 4;
+        const PER_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
         let top = height.revision_height();
-        let bottom = top.saturating_sub(VALIDATOR_SAMPLE_WINDOW - 1).max(1);
+        let bottom = top.saturating_sub(MAX_SAMPLE - 1).max(1);
 
         let mut validators: Vec<Vec<u8>> = Vec::new();
+        let mut stall = 0usize;
         for h in (bottom..=top).rev() {
-            let resp = self
-                .rt
-                .block_on(async {
-                    let mut guard = self.gateway_query.lock().unwrap();
-                    guard
-                        .query_ibc_header(QueryIbcHeaderRequest { height: h })
-                        .await
-                })
-                .map_err(|e| {
-                    Error::query(format!(
-                        "Stellar gateway query_ibc_header failed at {h}: {e}"
-                    ))
-                })?;
+            let result = self.rt.block_on(async {
+                let mut guard = self.gateway_query.lock().unwrap();
+                tokio::time::timeout(
+                    PER_QUERY_TIMEOUT,
+                    guard.query_ibc_header(QueryIbcHeaderRequest { height: h }),
+                )
+                .await
+            });
 
-            let wire = gateway_client::StellarHeader::decode(resp.header.as_slice())
-                .map_err(|e| Error::query(format!("StellarHeader decode failed: {e}")))?;
+            let resp = match result {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    tracing::warn!(height = h, error = %e, "scp validator sample failed; skipping");
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(height = h, "scp validator sample timed out; skipping");
+                    continue;
+                }
+            };
 
-            if !wire.scp_node_id.is_empty() && !validators.contains(&wire.scp_node_id) {
+            let wire = match gateway_client::StellarHeader::decode(resp.header.as_slice()) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(height = h, error = %e, "scp validator sample decode failed; skipping");
+                    continue;
+                }
+            };
+
+            if wire.scp_node_id.is_empty() {
+                continue;
+            }
+
+            if validators.contains(&wire.scp_node_id) {
+                stall += 1;
+                if stall >= STALL_LIMIT {
+                    break;
+                }
+            } else {
                 validators.push(wire.scp_node_id);
+                stall = 0;
             }
         }
+
+        if validators.is_empty() {
+            return Err(Error::query(
+                "could not discover any scp validators while building the stellar client state"
+                    .to_string(),
+            ));
+        }
+
+        tracing::info!(
+            count = validators.len(),
+            "seeded stellar client trusted_validators",
+        );
 
         Ok(validators)
     }
