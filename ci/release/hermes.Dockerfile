@@ -27,7 +27,7 @@ RUN apt update && apt install -y clang libssl-dev pkg-config
 
 COPY . .
 
-RUN cargo build --release
+RUN cargo build --release --bin hermes
 
 FROM ubuntu:latest
 LABEL maintainer="hello@informal.systems"

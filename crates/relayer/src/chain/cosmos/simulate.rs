@@ -7,9 +7,17 @@ use crate::error::Error;
 use crate::util::create_grpc_client;
 
 pub async fn send_tx_simulate(grpc_address: &Uri, tx: Tx) -> Result<SimulateResponse, Error> {
+    tracing::info!("sending tx simulation grpc_address={}", grpc_address.path());
+
     let mut tx_bytes = vec![];
     prost::Message::encode(&tx, &mut tx_bytes)
         .map_err(|e| Error::protobuf_encode(String::from("Transaction"), e))?;
+
+    tracing::info!(
+        "sending tx simulation tx_messages={} tx_signatures={}",
+        tx.body.unwrap().messages.len(),
+        tx.signatures.len()
+    );
 
     let req = SimulateRequest {
         tx_bytes,
@@ -26,6 +34,8 @@ pub async fn send_tx_simulate(grpc_address: &Uri, tx: Tx) -> Result<SimulateResp
         .await
         .map_err(|e| Error::grpc_status(e, "send_tx_simulate".to_owned()))?
         .into_inner();
+
+    tracing::info!("sending tx simulation response={:?}", response.result);
 
     Ok(response)
 }
