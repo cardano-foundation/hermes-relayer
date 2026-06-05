@@ -880,8 +880,18 @@ impl ChainEndpoint for StellarChainEndpoint {
         height: ICSHeight,
         _settings: ClientSettings,
     ) -> Result<Self::ClientState, Error> {
+        tracing::info!(%height, "building stellar client state");
+
         let network_id = network_id_from_passphrase(&self.config.network_passphrase);
         let trusted_validators = self.scp_validators_at(height)?;
+        let wasm_checksum = self.wasm_checksum_bytes()?;
+
+        tracing::info!(
+            %height,
+            trusted_validators = trusted_validators.len(),
+            wasm_wrapped = self.is_wasm_wrapped(),
+            "built stellar client state",
+        );
 
         Ok(AnyClientState::Stellar(StellarClientState {
             chain_id: self.config.id.clone(),
@@ -890,7 +900,7 @@ impl ChainEndpoint for StellarChainEndpoint {
             trusted_validators,
             proof_specs: Vec::new(),
             network_id,
-            wasm_checksum: self.wasm_checksum_bytes()?,
+            wasm_checksum,
         }))
     }
 
@@ -898,6 +908,12 @@ impl ChainEndpoint for StellarChainEndpoint {
         &self,
         light_block: Self::LightBlock,
     ) -> Result<Self::ConsensusState, Error> {
+        tracing::info!(
+            timestamp = light_block.close_time_secs,
+            wasm_wrapped = self.is_wasm_wrapped(),
+            "built stellar consensus state",
+        );
+
         Ok(AnyConsensusState::Stellar(StellarConsensusState {
             root: CommitmentRoot::from_bytes(&light_block.ibc_state_root),
             timestamp: light_block.close_time_secs,
