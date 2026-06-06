@@ -59,10 +59,7 @@ impl TryFrom<RawConsensusState> for ConsensusState {
                 format!("expected {HASH_BYTES} bytes, got {}", raw.root.len()),
             ));
         }
-        if raw.ledger_hash.is_empty() {
-            return Err(Error::missing_field("ledger_hash"));
-        }
-        if raw.ledger_hash.len() != HASH_BYTES {
+        if !raw.ledger_hash.is_empty() && raw.ledger_hash.len() != HASH_BYTES {
             return Err(Error::invalid_field(
                 "ledger_hash",
                 format!("expected {HASH_BYTES} bytes, got {}", raw.ledger_hash.len()),
