@@ -11,13 +11,15 @@ use prost::Message;
 
 use crate::chain::handle::ChainHandle;
 use crate::chain::requests::{
-    IncludeProof, QueryHeight, QueryPacketCommitmentRequest, QueryPacketReceiptRequest,
+    IncludeProof, QueryHeight, QueryPacketAcknowledgementRequest, QueryPacketCommitmentRequest,
+    QueryPacketReceiptRequest,
 };
 use crate::chain::tracking::{TrackedMsgs, TrackingId};
+use crate::event::IbcEventWithHeight;
 use crate::foreign_client::ForeignClient;
 
 use super::stellar_packet::{
-    ClientUpdater, PacketAbsenceProofSource, PacketProofError, PacketProofSource,
+    AckProofSource, ClientUpdater, PacketAbsenceProofSource, PacketProofError, PacketProofSource,
     PacketRelayDestination, SubmitError,
 };
 
@@ -116,6 +118,47 @@ impl<H: ChainHandle> PacketProofSource for ChainHandleProofSource<H> {
     }
 }
 
+impl<H: ChainHandle> AckProofSource for ChainHandleProofSource<H> {
+    fn acknowledgement_proof(
+        &self,
+        dest_client_id: &str,
+        sequence: u64,
+    ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
+        let status = self
+            .handle
+            .query_application_status()
+            .map_err(|e| PacketProofError::QueryFailed(format!("query_application_status: {e}")))?;
+
+        let channel_id: ChannelId = dest_client_id
+            .parse()
+            .map_err(|e| PacketProofError::QueryFailed(format!("dest_client_id parse: {e}")))?;
+        let req = QueryPacketAcknowledgementRequest {
+            port_id: self.port_id.clone(),
+            channel_id,
+            sequence: Sequence::from(sequence),
+            height: QueryHeight::Specific(status.height),
+        };
+        let (ack, proof) = self
+            .handle
+            .query_packet_acknowledgement(req, IncludeProof::Yes)
+            .map_err(|e| {
+                PacketProofError::QueryFailed(format!("query_packet_acknowledgement: {e}"))
+            })?;
+
+        if ack.is_empty() {
+            return Err(PacketProofError::QueryFailed(format!(
+                "acknowledgement absent at {dest_client_id}/{sequence}"
+            )));
+        }
+        let proof = proof.ok_or_else(|| {
+            PacketProofError::QueryFailed(
+                "chain did not return an acknowledgement MerkleProof".to_string(),
+            )
+        })?;
+        Ok((encode_merkle_proof(&proof), status.height))
+    }
+}
+
 pub struct ChainHandleDestination<H: ChainHandle> {
     handle: Arc<H>,
 }
@@ -127,25 +170,14 @@ impl<H: ChainHandle> ChainHandleDestination<H> {
 }
 
 impl<H: ChainHandle> PacketRelayDestination for ChainHandleDestination<H> {
-    fn submit(&self, msgs: Vec<Any>) -> Result<String, SubmitError> {
+    fn submit(&self, msgs: Vec<Any>) -> Result<Vec<IbcEventWithHeight>, SubmitError> {
         let tracked = TrackedMsgs {
             msgs,
             tracking_id: TrackingId::new_static("stellar-packet-relay"),
         };
-        let events = self
-            .handle
+        self.handle
             .send_messages_and_wait_commit(tracked)
-            .map_err(|e| {
-                SubmitError::SubmitFailed(format!("send_messages_and_wait_commit: {e}"))
-            })?;
-        Ok(format!(
-            "committed_with_{}_events_at_h{}",
-            events.len(),
-            events
-                .first()
-                .map(|e| e.height.revision_height())
-                .unwrap_or(0)
-        ))
+            .map_err(|e| SubmitError::SubmitFailed(format!("send_messages_and_wait_commit: {e}")))
     }
 }
 

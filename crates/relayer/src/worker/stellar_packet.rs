@@ -7,7 +7,8 @@ use tracing::{debug, error_span, info, instrument, warn};
 
 use ibc_proto::google::protobuf::Any;
 use ibc_relayer_types::clients::ics10_stellar::v2_msgs::{
-    Height as V2Height, MsgRecvPacket, MsgTimeout, Packet, Payload, TYPE_URL_RECV_PACKET,
+    Height as V2Height, MsgAcknowledgement, MsgRecvPacket, MsgTimeout, Packet, Payload,
+    TYPE_URL_ACKNOWLEDGEMENT, TYPE_URL_RECV_PACKET,
     TYPE_URL_TIMEOUT,
 };
 use ibc_relayer_types::core::ics24_host::identifier::ChainId;
@@ -16,6 +17,7 @@ use ibc_relayer_types::Height as ICSHeight;
 
 use crate::chain::handle::Subscription;
 use crate::event::source::EventBatch;
+use crate::event::IbcEventWithHeight;
 use crate::util::task::{spawn_background_task, Next, TaskError, TaskHandle};
 
 use super::error::RunError;
@@ -292,7 +294,7 @@ pub enum SubmitError {
 }
 
 pub trait PacketRelayDestination: Send + Sync {
-    fn submit(&self, msgs: Vec<Any>) -> Result<String, SubmitError>;
+    fn submit(&self, msgs: Vec<Any>) -> Result<Vec<IbcEventWithHeight>, SubmitError>;
 }
 
 pub trait PacketAbsenceProofSource: Send + Sync {
@@ -309,6 +311,91 @@ pub trait ClientUpdater: Send + Sync {
         dest_client_id: &str,
         target_height: ICSHeight,
     ) -> Result<Vec<Any>, String>;
+}
+
+pub trait AckProofSource: Send + Sync {
+    fn acknowledgement_proof(
+        &self,
+        dest_client_id: &str,
+        sequence: u64,
+    ) -> Result<(Vec<u8>, ICSHeight), PacketProofError>;
+}
+
+fn summarize_events(events: &[IbcEventWithHeight]) -> String {
+    let height = events
+        .first()
+        .map(|e| e.height.revision_height())
+        .unwrap_or(0);
+    format!("committed_with_{}_events_at_h{}", events.len(), height)
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct AckProto {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    app_acknowledgements: Vec<Vec<u8>>,
+}
+
+fn extract_ack_app_bytes(events: &[IbcEventWithHeight], sequence: u64) -> Vec<Vec<u8>> {
+    for ewh in events {
+        match &ewh.event {
+            IbcEvent::WriteAcknowledgement(wa) if u64::from(wa.packet.sequence) == sequence => {
+                debug!(sequence, "ack extract: matched parsed WriteAcknowledgement");
+                return vec![wa.ack.clone()];
+            }
+            IbcEvent::AppModule(m) => {
+                let seq_ok = m
+                    .attributes
+                    .iter()
+                    .any(|a| a.key == "packet_sequence" && a.value == sequence.to_string());
+                if !seq_ok {
+                    continue;
+                }
+                if let Some(hex_attr) = m
+                    .attributes
+                    .iter()
+                    .find(|a| a.key == "encoded_acknowledgement_hex")
+                {
+                    if let Some(bytes) = decode_hex(&hex_attr.value) {
+                        match AckProto::decode(bytes.as_slice()) {
+                            Ok(parsed) if !parsed.app_acknowledgements.is_empty() => {
+                                debug!(
+                                    sequence,
+                                    acks = parsed.app_acknowledgements.len(),
+                                    "ack extract: parsed Acknowledgement proto from AppModule event"
+                                );
+                                return parsed.app_acknowledgements;
+                            }
+                            _ => {
+                                debug!(sequence, "ack extract: AppModule ack hex present but proto parse empty/failed; using raw bytes");
+                                return vec![bytes];
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Vec::new()
+}
+
+fn log_recv_events(events: &[IbcEventWithHeight]) {
+    for ewh in events {
+        match &ewh.event {
+            IbcEvent::AppModule(m) => {
+                let keys: Vec<&str> = m.attributes.iter().map(|a| a.key.as_str()).collect();
+                debug!(
+                    kind = %m.kind,
+                    module = %m.module_name,
+                    attrs = ?keys,
+                    "recv tx event (app module)"
+                );
+            }
+            other => {
+                debug!(event = %other, "recv tx event (typed)");
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -422,6 +509,29 @@ pub fn build_msg_recv_packet(
     }
 }
 
+pub fn build_msg_acknowledgement(
+    packet: Packet,
+    acknowledgements: Vec<Vec<u8>>,
+    proof_acked: Vec<u8>,
+    proof_height: ICSHeight,
+    signer: String,
+) -> Any {
+    let msg = MsgAcknowledgement {
+        packet: Some(packet),
+        acknowledgements,
+        proof_acked,
+        proof_height: Some(V2Height {
+            revision_number: proof_height.revision_number(),
+            revision_height: proof_height.revision_height(),
+        }),
+        signer,
+    };
+    Any {
+        type_url: TYPE_URL_ACKNOWLEDGEMENT.to_string(),
+        value: msg.encode_to_vec(),
+    }
+}
+
 #[instrument(level = "debug", skip(source, signer), fields(
     src_client = %event.client_id,
     sequence = event.sequence,
@@ -474,6 +584,8 @@ pub struct StellarPacketDeps {
     pub absence_source: Option<Arc<dyn PacketAbsenceProofSource>>,
     pub source_submitter: Option<Arc<dyn PacketRelayDestination>>,
     pub client_updater: Option<Arc<dyn ClientUpdater>>,
+    pub ack_source: Option<Arc<dyn AckProofSource>>,
+    pub source_client_updater: Option<Arc<dyn ClientUpdater>>,
     pub signer: String,
     pub source_signer: String,
 }
@@ -486,6 +598,8 @@ impl StellarPacketDeps {
             absence_source: None,
             source_submitter: None,
             client_updater: None,
+            ack_source: None,
+            source_client_updater: None,
             signer: String::new(),
             source_signer: String::new(),
         }
@@ -597,17 +711,10 @@ fn dispatch_send_packet(
             );
         }
     }
-    relay_send_packet(
-        chain_id,
-        packet_ev,
-        deps.proof_source.as_deref(),
-        deps.destination.as_deref(),
-        deps.client_updater.as_deref(),
-        &deps.signer,
-    )
+    relay_send_packet(chain_id, packet_ev, deps)
 }
 
-#[instrument(level = "debug", skip(proof_source, destination, client_updater, signer), fields(
+#[instrument(level = "debug", skip(deps), fields(
     chain = %chain_id,
     client_id = %packet_ev.client_id,
     sequence = packet_ev.sequence,
@@ -615,12 +722,10 @@ fn dispatch_send_packet(
 fn relay_send_packet(
     chain_id: &ChainId,
     packet_ev: &StellarPacketEvent,
-    proof_source: Option<&dyn PacketProofSource>,
-    destination: Option<&dyn PacketRelayDestination>,
-    client_updater: Option<&dyn ClientUpdater>,
-    signer: &str,
+    deps: &StellarPacketDeps,
 ) -> String {
-    let Some(src) = proof_source else {
+    let signer = deps.signer.as_str();
+    let Some(src) = deps.proof_source.as_deref() else {
         debug!("recv relay skipped: no proof source configured");
         return "no_proof_source".to_string();
     };
@@ -645,7 +750,7 @@ fn relay_send_packet(
 
     let mut msgs: Vec<Any> = Vec::new();
 
-    if let Some(updater) = client_updater {
+    if let Some(updater) = deps.client_updater.as_deref() {
         match updater.build_update(&packet.dest_client, proof_height) {
             Ok(update_msgs) => {
                 info!(
@@ -664,6 +769,7 @@ fn relay_send_packet(
         }
     }
 
+    let packet_for_ack = packet.clone();
     let recv = build_msg_recv_packet(packet, proof_commitment, proof_height, signer.to_string());
     let recv_summary = format!("recv bytes={} type_url={}", recv.value.len(), recv.type_url);
     msgs.push(recv);
@@ -675,21 +781,107 @@ fn relay_send_packet(
         "submitting client-update + recv packet to destination (cosmos)"
     );
 
-    let Some(dst) = destination else {
+    let Some(dst) = deps.destination.as_deref() else {
         debug!("recv relay: no destination submitter (observer-only mode)");
         return format!("{recv_summary} submit=no_destination");
     };
 
     match dst.submit(msgs) {
-        Ok(tx_hash) => {
-            info!(%tx_hash, sequence = packet_ev.sequence, "cosmos accepted recv packet");
+        Ok(events) => {
+            let summary = summarize_events(&events);
+            info!(%summary, sequence = packet_ev.sequence, "cosmos accepted recv packet");
             crate::telemetry!(stellar_relay_success, chain_id, "recv");
-            format!("{recv_summary} submit=ok tx={tx_hash}")
+            log_recv_events(&events);
+            let acks = extract_ack_app_bytes(&events, packet_for_ack.sequence);
+            let ack_status = relay_ack_packet(chain_id, &packet_for_ack, acks, deps);
+            format!("{recv_summary} submit=ok {summary} {ack_status}")
         }
         Err(e) => {
             warn!(error = %e, sequence = packet_ev.sequence, "cosmos rejected recv packet");
             crate::telemetry!(stellar_relay_submit_failure, chain_id, "recv");
             format!("{recv_summary} submit=failed: {e}")
+        }
+    }
+}
+
+#[instrument(level = "debug", skip(packet, acknowledgements, deps), fields(
+    chain = %chain_id,
+    source_client = %packet.source_client,
+    dest_client = %packet.dest_client,
+    sequence = packet.sequence,
+))]
+fn relay_ack_packet(
+    chain_id: &ChainId,
+    packet: &Packet,
+    acknowledgements: Vec<Vec<u8>>,
+    deps: &StellarPacketDeps,
+) -> String {
+    if acknowledgements.is_empty() {
+        debug!("ack relay skipped: no acknowledgement bytes extracted from recv events");
+        return "ack=no_raw_ack".to_string();
+    }
+
+    let Some(ack_src) = deps.ack_source.as_deref() else {
+        debug!("ack relay skipped: no ack source configured");
+        return "ack=no_ack_source".to_string();
+    };
+
+    let (proof_acked, proof_height) =
+        match ack_src.acknowledgement_proof(&packet.dest_client, packet.sequence) {
+            Ok(x) => x,
+            Err(e) => {
+                warn!(error = %e, "ack relay: acknowledgement proof failed");
+                crate::telemetry!(stellar_relay_build_failure, chain_id, "ack");
+                return format!("ack=build_failed: {e}");
+            }
+        };
+
+    let mut msgs: Vec<Any> = Vec::new();
+
+    if let Some(updater) = deps.source_client_updater.as_deref() {
+        match updater.build_update(&packet.source_client, proof_height) {
+            Ok(update_msgs) => {
+                info!(
+                    count = update_msgs.len(),
+                    source_client = %packet.source_client,
+                    target_height = %proof_height,
+                    "built client update for source (stellar)"
+                );
+                msgs.extend(update_msgs);
+            }
+            Err(e) => {
+                warn!(error = %e, "ack relay: source client update build failed");
+                crate::telemetry!(stellar_relay_build_failure, chain_id, "ack");
+                return format!("ack=client_update_failed: {e}");
+            }
+        }
+    }
+
+    let ack = build_msg_acknowledgement(
+        packet.clone(),
+        acknowledgements,
+        proof_acked,
+        proof_height,
+        deps.source_signer.clone(),
+    );
+    msgs.push(ack);
+
+    let Some(submitter) = deps.source_submitter.as_deref() else {
+        debug!("ack relay: no source submitter (observer-only mode)");
+        return "ack=no_source_submitter".to_string();
+    };
+
+    match submitter.submit(msgs) {
+        Ok(events) => {
+            let summary = summarize_events(&events);
+            info!(%summary, sequence = packet.sequence, "stellar accepted ack packet");
+            crate::telemetry!(stellar_relay_success, chain_id, "ack");
+            format!("ack=ok {summary}")
+        }
+        Err(e) => {
+            warn!(error = %e, sequence = packet.sequence, "stellar rejected ack packet");
+            crate::telemetry!(stellar_relay_submit_failure, chain_id, "ack");
+            format!("ack=submit_failed: {e}")
         }
     }
 }
@@ -738,10 +930,11 @@ fn relay_timeout(
         return format!("{prefix} {any_summary} submit=no_source_submitter");
     };
     match submitter.submit(vec![any]) {
-        Ok(tx_hash) => {
-            info!(%tx_hash, "source accepted MsgTimeout");
+        Ok(events) => {
+            let summary = summarize_events(&events);
+            info!(%summary, "source accepted MsgTimeout");
             crate::telemetry!(stellar_relay_success, chain_id, "timeout");
-            format!("{prefix} {any_summary} submit=ok tx={tx_hash}")
+            format!("{prefix} {any_summary} submit=ok {summary}")
         }
         Err(e) => {
             warn!(error = %e, "source rejected MsgTimeout");

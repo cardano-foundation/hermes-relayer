@@ -342,8 +342,13 @@ fn spawn_stellar_packet_workers<Chain: ChainHandle>(
             absence_source: Some(Arc::new(ChainHandleProofSource::new(cosmos_arc.clone()))),
             source_submitter: Some(Arc::new(ChainHandleDestination::new(stellar_arc.clone()))),
             client_updater: Some(Arc::new(ForeignClientUpdater::new(
-                cosmos_arc,
+                cosmos_arc.clone(),
+                stellar_arc.clone(),
+            ))),
+            ack_source: Some(Arc::new(ChainHandleProofSource::new(cosmos_arc.clone()))),
+            source_client_updater: Some(Arc::new(ForeignClientUpdater::new(
                 stellar_arc,
+                cosmos_arc,
             ))),
             signer,
             source_signer,

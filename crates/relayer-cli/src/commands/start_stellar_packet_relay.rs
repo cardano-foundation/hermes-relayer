@@ -120,6 +120,8 @@ impl Runnable for StartStellarPacketRelayCmd {
                 absence_source,
                 source_submitter,
                 client_updater,
+                ack_source: None,
+                source_client_updater: None,
                 signer,
                 source_signer,
             },
