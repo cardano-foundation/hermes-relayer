@@ -292,7 +292,7 @@ fn spawn_stellar_packet_workers<Chain: ChainHandle>(
 
     let Some(cosmos_id) = cosmos_ids.first() else {
         if !stellar_ids.is_empty() {
-            warn!("stellar packet worker not spawned: no CosmosSdk chain configured as counterparty");
+            warn!("[stellar] packet relay worker not started — no Cosmos counterparty configured");
         }
         return Vec::new();
     };
@@ -304,14 +304,14 @@ fn spawn_stellar_packet_workers<Chain: ChainHandle>(
             let stellar = match reg.get_or_spawn(&stellar_id) {
                 Ok(h) => h,
                 Err(e) => {
-                    warn!("stellar packet worker: cannot spawn {stellar_id}: {e}");
+                    warn!("[stellar] packet relay worker: cannot spawn {stellar_id}: {e}");
                     continue;
                 }
             };
             let cosmos = match reg.get_or_spawn(cosmos_id) {
                 Ok(h) => h,
                 Err(e) => {
-                    warn!("stellar packet worker: cannot spawn {cosmos_id}: {e}");
+                    warn!("[stellar] packet relay worker: cannot spawn {cosmos_id}: {e}");
                     continue;
                 }
             };
@@ -321,7 +321,7 @@ fn spawn_stellar_packet_workers<Chain: ChainHandle>(
         let subscription = match stellar.subscribe() {
             Ok(s) => s,
             Err(e) => {
-                warn!("stellar packet worker: subscribe to {stellar_id} failed: {e}");
+                warn!("[stellar] packet relay worker: subscribe to {stellar_id} failed: {e}");
                 continue;
             }
         };
@@ -342,7 +342,7 @@ fn spawn_stellar_packet_workers<Chain: ChainHandle>(
             match CosmosV2AckSource::new(cosmos_arc.clone()) {
                 Ok(src) => Some(Arc::new(src)),
                 Err(e) => {
-                    warn!("stellar packet worker: cannot build v2 ack source: {e}");
+                    warn!("[stellar] packet relay worker: cannot build v2 ack source: {e}");
                     None
                 }
             };
@@ -365,7 +365,7 @@ fn spawn_stellar_packet_workers<Chain: ChainHandle>(
             source_signer,
         };
 
-        info!("spawning stellar packet worker: {stellar_id} -> {cosmos_id}");
+        info!("[stellar→cosmos] packet relay worker started ({stellar_id} → {cosmos_id})");
         tasks.push(spawn_stellar_packet_worker(stellar.id(), subscription, deps));
     }
 

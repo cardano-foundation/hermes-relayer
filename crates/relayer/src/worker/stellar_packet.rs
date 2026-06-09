@@ -623,7 +623,7 @@ pub fn spawn_stellar_packet_worker(
                     Ok(Next::Continue)
                 }
                 Err(err) => {
-                    warn!("stellar packet worker received error from subscription: {err}");
+                    warn!("[stellar] packet worker: subscription error: {err}");
                     Ok(Next::Continue)
                 }
             },
@@ -661,7 +661,7 @@ fn process_batch(chain_id: &ChainId, batch: &EventBatch, deps: &StellarPacketDep
                 } else {
                     "n/a".to_string()
                 };
-                info!(
+                debug!(
                     target: "stellar_packet",
                     chain = %chain_id,
                     kind = %packet_ev.kind,
@@ -672,7 +672,7 @@ fn process_batch(chain_id: &ChainId, batch: &EventBatch, deps: &StellarPacketDep
                     ledger = height.revision_height(),
                     payload = %payload_summary,
                     relay = %relay_status,
-                    "observed stellar router event"
+                    "router event processed"
                 );
             }
         }
@@ -753,7 +753,7 @@ fn relay_send_packet(
     if let Some(updater) = deps.client_updater.as_deref() {
         match updater.build_update(&packet.dest_client, proof_height) {
             Ok(update_msgs) => {
-                info!(
+                debug!(
                     count = update_msgs.len(),
                     dest_client = %packet.dest_client,
                     target_height = %proof_height,
@@ -775,10 +775,9 @@ fn relay_send_packet(
     msgs.push(recv);
 
     info!(
-        msgs = msgs.len(),
-        client_id = %packet_ev.client_id,
         sequence = packet_ev.sequence,
-        "submitting client-update + recv packet to destination (cosmos)"
+        dest_client = %packet_for_ack.dest_client,
+        "[stellar→cosmos] 1/3  relaying recv packet to cosmos"
     );
 
     let Some(dst) = deps.destination.as_deref() else {
@@ -789,7 +788,11 @@ fn relay_send_packet(
     match dst.submit(msgs) {
         Ok(events) => {
             let summary = summarize_events(&events);
-            info!(%summary, sequence = packet_ev.sequence, "cosmos accepted recv packet");
+            info!(
+                sequence = packet_ev.sequence,
+                %summary,
+                "[stellar→cosmos] 2/3  recv accepted — 08-wasm verified the proof on-chain"
+            );
             crate::telemetry!(stellar_relay_success, chain_id, "recv");
             log_recv_events(&events);
             let acks = extract_ack_app_bytes(&events, packet_for_ack.sequence);
@@ -797,7 +800,7 @@ fn relay_send_packet(
             format!("{recv_summary} submit=ok {summary} {ack_status}")
         }
         Err(e) => {
-            warn!(error = %e, sequence = packet_ev.sequence, "cosmos rejected recv packet");
+            warn!(error = %e, sequence = packet_ev.sequence, "[stellar→cosmos] recv rejected by cosmos");
             crate::telemetry!(stellar_relay_submit_failure, chain_id, "recv");
             format!("{recv_summary} submit=failed: {e}")
         }
@@ -841,7 +844,7 @@ fn relay_ack_packet(
     if let Some(updater) = deps.source_client_updater.as_deref() {
         match updater.build_update(&packet.source_client, proof_height) {
             Ok(update_msgs) => {
-                info!(
+                debug!(
                     count = update_msgs.len(),
                     source_client = %packet.source_client,
                     target_height = %proof_height,
@@ -874,12 +877,16 @@ fn relay_ack_packet(
     match submitter.submit(msgs) {
         Ok(events) => {
             let summary = summarize_events(&events);
-            info!(%summary, sequence = packet.sequence, "stellar accepted ack packet");
+            info!(
+                sequence = packet.sequence,
+                %summary,
+                "[cosmos→stellar] 3/3  ack accepted — round trip closed ✓"
+            );
             crate::telemetry!(stellar_relay_success, chain_id, "ack");
             format!("ack=ok {summary}")
         }
         Err(e) => {
-            warn!(error = %e, sequence = packet.sequence, "stellar rejected ack packet");
+            warn!(error = %e, sequence = packet.sequence, "[cosmos→stellar] ack rejected by stellar");
             crate::telemetry!(stellar_relay_submit_failure, chain_id, "ack");
             format!("ack=submit_failed: {e}")
         }
@@ -921,9 +928,8 @@ fn relay_timeout(
         any.type_url
     );
     info!(
-        type_url = %any.type_url,
-        bytes = any.value.len(),
-        "built MsgTimeout; submitting to source"
+        sequence = packet_ev.sequence,
+        "[stellar→cosmos] timeout — submitting refund to stellar"
     );
     let Some(submitter) = source_submitter else {
         debug!("timeout relay: no source submitter (observer-only mode)");
@@ -932,12 +938,12 @@ fn relay_timeout(
     match submitter.submit(vec![any]) {
         Ok(events) => {
             let summary = summarize_events(&events);
-            info!(%summary, "source accepted MsgTimeout");
+            info!(sequence = packet_ev.sequence, %summary, "[stellar] timeout accepted — escrow refunded");
             crate::telemetry!(stellar_relay_success, chain_id, "timeout");
             format!("{prefix} {any_summary} submit=ok {summary}")
         }
         Err(e) => {
-            warn!(error = %e, "source rejected MsgTimeout");
+            warn!(error = %e, sequence = packet_ev.sequence, "[stellar] timeout rejected");
             crate::telemetry!(stellar_relay_submit_failure, chain_id, "timeout");
             format!("{prefix} {any_summary} submit=failed: {e}")
         }
