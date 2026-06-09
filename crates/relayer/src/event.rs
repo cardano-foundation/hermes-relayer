@@ -637,11 +637,35 @@ pub fn extract_packet_and_write_ack_from_tx(
                 write_ack = hex::decode(value.to_lowercase())
                     .map_err(|_| ChannelError::invalid_packet_ack(value.to_string()))?;
             }
+            "encoded_acknowledgement_hex" if write_ack.is_empty() => {
+                let raw = hex::decode(value.to_lowercase())
+                    .map_err(|_| ChannelError::invalid_packet_ack(value.to_string()))?;
+                write_ack = decode_v2_app_acknowledgement(&raw);
+            }
             _ => {}
         }
     }
 
     Ok((packet, write_ack))
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct V2Acknowledgement {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    app_acknowledgements: Vec<Vec<u8>>,
+}
+
+fn decode_v2_app_acknowledgement(bytes: &[u8]) -> Vec<u8> {
+    use prost::Message;
+
+    match V2Acknowledgement::decode(bytes) {
+        Ok(ack) => ack
+            .app_acknowledgements
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| bytes.to_vec()),
+        Err(_) => bytes.to_vec(),
+    }
 }
 
 /// Parse a string into a timeout height expected to be stored in

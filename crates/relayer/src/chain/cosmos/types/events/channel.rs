@@ -126,15 +126,50 @@ impl_try_from_raw_obj_for_packet!(
     TimeoutOnClosePacket
 );
 
+#[derive(Clone, PartialEq, prost::Message)]
+struct V2Acknowledgement {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    app_acknowledgements: Vec<Vec<u8>>,
+}
+
+fn decode_v2_app_acknowledgement(bytes: &[u8]) -> Vec<u8> {
+    use prost::Message;
+
+    match V2Acknowledgement::decode(bytes) {
+        Ok(ack) => ack
+            .app_acknowledgements
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| bytes.to_vec()),
+        Err(_) => bytes.to_vec(),
+    }
+}
+
 impl TryFrom<RawObject<'_>> for WriteAcknowledgement {
     type Error = EventError;
 
     fn try_from(obj: RawObject<'_>) -> Result<Self, Self::Error> {
-        let ack_str =
-            extract_attribute(&obj, &format!("{}.{}", obj.action, PKT_ACK_ATTRIBUTE_KEY))?;
+        let v1_ack =
+            maybe_extract_attribute(&obj, &format!("{}.{}", obj.action, PKT_ACK_ATTRIBUTE_KEY))
+                .filter(|s| !s.is_empty());
 
-        let ack = hex::decode(ack_str.to_lowercase())
-            .map_err(|_| EventError::invalid_packet_ack(ack_str))?;
+        let ack = match v1_ack {
+            Some(ack_str) => hex::decode(ack_str.to_lowercase())
+                .map_err(|_| EventError::invalid_packet_ack(ack_str))?,
+            None => match maybe_extract_attribute(
+                &obj,
+                &format!("{}.encoded_acknowledgement_hex", obj.action),
+            )
+            .filter(|s| !s.is_empty())
+            {
+                Some(hex_str) => {
+                    let raw = hex::decode(hex_str.to_lowercase())
+                        .map_err(|_| EventError::invalid_packet_ack(hex_str))?;
+                    decode_v2_app_acknowledgement(&raw)
+                }
+                None => Vec::new(),
+            },
+        };
 
         let packet = Packet::try_from(obj)?;
 
