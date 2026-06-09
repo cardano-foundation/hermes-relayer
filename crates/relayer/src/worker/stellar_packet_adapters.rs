@@ -9,12 +9,16 @@ use ibc_relayer_types::tx_msg::Msg;
 use ibc_relayer_types::Height as ICSHeight;
 use prost::Message;
 
+use tendermint_rpc::{HttpClient, Url};
+
+use crate::chain::cosmos::query::abci_query;
 use crate::chain::handle::ChainHandle;
 use crate::chain::requests::{
     IncludeProof, QueryHeight, QueryPacketAcknowledgementRequest, QueryPacketCommitmentRequest,
     QueryPacketReceiptRequest,
 };
 use crate::chain::tracking::{TrackedMsgs, TrackingId};
+use crate::config::ChainConfig;
 use crate::event::IbcEventWithHeight;
 use crate::foreign_client::ForeignClient;
 
@@ -155,6 +159,86 @@ impl<H: ChainHandle> AckProofSource for ChainHandleProofSource<H> {
                 "chain did not return an acknowledgement MerkleProof".to_string(),
             )
         })?;
+        Ok((encode_merkle_proof(&proof), status.height))
+    }
+}
+
+pub struct CosmosV2AckSource<H: ChainHandle> {
+    handle: Arc<H>,
+    rpc_client: HttpClient,
+    rpc_address: Url,
+    rt: Arc<tokio::runtime::Runtime>,
+}
+
+impl<H: ChainHandle> CosmosV2AckSource<H> {
+    pub fn new(handle: Arc<H>) -> Result<Self, String> {
+        let cfg = handle.config().map_err(|e| format!("config: {e}"))?;
+
+        let rpc_address = match cfg {
+            ChainConfig::CosmosSdk(c) => c.rpc_addr,
+            other => {
+                return Err(format!(
+                    "v2 ack source requires a CosmosSdk chain, got {}",
+                    other.id()
+                ))
+            }
+        };
+
+        let rpc_client =
+            HttpClient::new(rpc_address.clone()).map_err(|e| format!("rpc client: {e}"))?;
+        let rt = tokio::runtime::Runtime::new().map_err(|e| format!("runtime: {e}"))?;
+
+        Ok(Self {
+            handle,
+            rpc_client,
+            rpc_address,
+            rt: Arc::new(rt),
+        })
+    }
+}
+
+impl<H: ChainHandle> AckProofSource for CosmosV2AckSource<H> {
+    fn acknowledgement_proof(
+        &self,
+        dest_client_id: &str,
+        sequence: u64,
+    ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
+        let status = self
+            .handle
+            .query_application_status()
+            .map_err(|e| PacketProofError::QueryFailed(format!("query_application_status: {e}")))?;
+
+        let mut key = dest_client_id.as_bytes().to_vec();
+        key.push(0x03);
+        key.extend_from_slice(&sequence.to_be_bytes());
+
+        let key = String::from_utf8(key)
+            .map_err(|e| PacketProofError::QueryFailed(format!("v2 ack key not utf8: {e}")))?;
+
+        let response = self
+            .rt
+            .block_on(abci_query(
+                &self.rpc_client,
+                &self.rpc_address,
+                "store/ibc/key".to_string(),
+                key,
+                QueryHeight::Specific(status.height).into(),
+                true,
+            ))
+            .map_err(|e| PacketProofError::QueryFailed(format!("abci_query ack: {e}")))?;
+
+        if response.value.is_empty() {
+            return Err(PacketProofError::QueryFailed(format!(
+                "acknowledgement absent at {dest_client_id}/{sequence} (v2 key)"
+            )));
+        }
+
+        let proof = response.proof.ok_or_else(|| {
+            PacketProofError::QueryFailed(
+                "chain did not return an acknowledgement MerkleProof".to_string(),
+            )
+        })?;
+
         Ok((encode_merkle_proof(&proof), status.height))
     }
 }

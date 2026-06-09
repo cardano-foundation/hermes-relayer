@@ -266,9 +266,11 @@ fn spawn_stellar_packet_workers<Chain: ChainHandle>(
     registry: &SharedRegistry<Chain>,
 ) -> Vec<TaskHandle> {
     use crate::config::ChainConfig;
-    use crate::worker::stellar_packet::{spawn_stellar_packet_worker, StellarPacketDeps};
+    use crate::worker::stellar_packet::{
+        spawn_stellar_packet_worker, AckProofSource, StellarPacketDeps,
+    };
     use crate::worker::stellar_packet_adapters::{
-        ChainHandleDestination, ChainHandleProofSource, ForeignClientUpdater,
+        ChainHandleDestination, ChainHandleProofSource, CosmosV2AckSource, ForeignClientUpdater,
     };
 
     let stellar_ids: Vec<ChainId> = config
@@ -336,6 +338,15 @@ fn spawn_stellar_packet_workers<Chain: ChainHandle>(
         let stellar_arc = Arc::new(stellar.clone());
         let cosmos_arc = Arc::new(cosmos.clone());
 
+        let ack_source: Option<Arc<dyn AckProofSource>> =
+            match CosmosV2AckSource::new(cosmos_arc.clone()) {
+                Ok(src) => Some(Arc::new(src)),
+                Err(e) => {
+                    warn!("stellar packet worker: cannot build v2 ack source: {e}");
+                    None
+                }
+            };
+
         let deps = StellarPacketDeps {
             proof_source: Some(Arc::new(ChainHandleProofSource::new(stellar_arc.clone()))),
             destination: Some(Arc::new(ChainHandleDestination::new(cosmos_arc.clone()))),
@@ -345,7 +356,7 @@ fn spawn_stellar_packet_workers<Chain: ChainHandle>(
                 cosmos_arc.clone(),
                 stellar_arc.clone(),
             ))),
-            ack_source: Some(Arc::new(ChainHandleProofSource::new(cosmos_arc.clone()))),
+            ack_source,
             source_client_updater: Some(Arc::new(ForeignClientUpdater::new(
                 stellar_arc,
                 cosmos_arc,
