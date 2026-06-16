@@ -1537,6 +1537,11 @@ async fn dispatch_msg(
                         client_id: m.client_id,
                         counterparty_client_id: m.counterparty_client_id,
                         counterparty_commitment_prefix: m.counterparty_commitment_prefix,
+                        signer: if m.signer.is_empty() {
+                            signer.to_string()
+                        } else {
+                            m.signer
+                        },
                     })
                     .await
                     .map_err(|e| {

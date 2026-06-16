@@ -190,6 +190,7 @@ message MsgRegisterCounterpartyRequest {
   string client_id                              = 1;
   string counterparty_client_id                 = 2;
   repeated bytes counterparty_commitment_prefix = 3;
+  string signer                                 = 4;
 }
 
 message MsgRegisterCounterpartyResponse {
