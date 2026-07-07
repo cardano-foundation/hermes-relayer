@@ -243,7 +243,7 @@ fn scval_variant_name(value: &ScVal) -> &'static str {
     }
 }
 
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim().trim_start_matches("0x");
     if s.len() % 2 != 0 {
         return None;
@@ -335,7 +335,7 @@ struct AckProto {
     app_acknowledgements: Vec<Vec<u8>>,
 }
 
-fn extract_ack_app_bytes(events: &[IbcEventWithHeight], sequence: u64) -> Vec<Vec<u8>> {
+pub(crate) fn extract_ack_app_bytes(events: &[IbcEventWithHeight], sequence: u64) -> Vec<Vec<u8>> {
     for ewh in events {
         match &ewh.event {
             IbcEvent::WriteAcknowledgement(wa) if u64::from(wa.packet.sequence) == sequence => {
@@ -813,7 +813,7 @@ fn relay_send_packet(
     dest_client = %packet.dest_client,
     sequence = packet.sequence,
 ))]
-fn relay_ack_packet(
+pub(crate) fn relay_ack_packet(
     chain_id: &ChainId,
     packet: &Packet,
     acknowledgements: Vec<Vec<u8>>,

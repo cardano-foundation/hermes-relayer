@@ -297,6 +297,85 @@ impl<Dst: ChainHandle, Src: ChainHandle> ClientUpdater for ForeignClientUpdater<
     }
 }
 
+pub struct CosmosV2CommitmentSource<H: ChainHandle> {
+    handle: Arc<H>,
+    rpc_client: HttpClient,
+    rpc_address: Url,
+    rt: Arc<tokio::runtime::Runtime>,
+}
+
+impl<H: ChainHandle> CosmosV2CommitmentSource<H> {
+    pub fn new(handle: Arc<H>) -> Result<Self, String> {
+        let cfg = handle.config().map_err(|e| format!("config: {e}"))?;
+
+        let rpc_address = match cfg {
+            ChainConfig::CosmosSdk(c) => c.rpc_addr,
+            other => {
+                return Err(format!(
+                    "v2 commitment source requires a CosmosSdk chain, got {}",
+                    other.id()
+                ))
+            }
+        };
+
+        let rpc_client =
+            HttpClient::new(rpc_address.clone()).map_err(|e| format!("rpc client: {e}"))?;
+        let rt = tokio::runtime::Runtime::new().map_err(|e| format!("runtime: {e}"))?;
+
+        Ok(Self {
+            handle,
+            rpc_client,
+            rpc_address,
+            rt: Arc::new(rt),
+        })
+    }
+}
+
+impl<H: ChainHandle> PacketProofSource for CosmosV2CommitmentSource<H> {
+    fn packet_commitment_proof(
+        &self,
+        client_id: &str,
+        sequence: u64,
+    ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
+        let status = self
+            .handle
+            .query_application_status()
+            .map_err(|e| PacketProofError::QueryFailed(format!("query_application_status: {e}")))?;
+
+        let mut key = client_id.as_bytes().to_vec();
+        key.push(0x01);
+        key.extend_from_slice(&sequence.to_be_bytes());
+
+        let key = String::from_utf8(key).map_err(|e| {
+            PacketProofError::QueryFailed(format!("v2 commitment key not utf8: {e}"))
+        })?;
+
+        let response = self
+            .rt
+            .block_on(abci_query(
+                &self.rpc_client,
+                &self.rpc_address,
+                "store/ibc/key".to_string(),
+                key,
+                QueryHeight::Specific(status.height).into(),
+                true,
+            ))
+            .map_err(|e| PacketProofError::QueryFailed(format!("abci_query commitment: {e}")))?;
+
+        if response.value.is_empty() {
+            return Err(PacketProofError::QueryFailed(format!(
+                "commitment absent at {client_id}/{sequence} (v2 key)"
+            )));
+        }
+
+        let proof = response.proof.ok_or_else(|| {
+            PacketProofError::QueryFailed("chain did not return a commitment MerkleProof".to_string())
+        })?;
+
+        Ok((encode_merkle_proof(&proof), status.height))
+    }
+}
+
 fn encode_merkle_proof(proof: &MerkleProof) -> Vec<u8> {
     let raw: RawMerkleProof = proof.clone().into();
     raw.encode_to_vec()

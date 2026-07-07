@@ -209,6 +209,7 @@ pub fn spawn_supervisor_tasks<Chain: ChainHandle>(
     let mut tasks = vec![cmd_task];
     tasks.extend(batch_tasks);
     tasks.extend(spawn_stellar_packet_workers(&config, &registry));
+    tasks.extend(spawn_cosmos_packet_workers(&config, &registry));
 
     if let Some(rest_rx) = rest_rx {
         let rest_task = spawn_rest_worker(config, registry, workers.clone(), rest_rx);
@@ -367,6 +368,117 @@ fn spawn_stellar_packet_workers<Chain: ChainHandle>(
 
         info!("[stellar→cosmos] packet relay worker started ({stellar_id} → {cosmos_id})");
         tasks.push(spawn_stellar_packet_worker(stellar.id(), subscription, deps));
+    }
+
+    tasks
+}
+
+fn spawn_cosmos_packet_workers<Chain: ChainHandle>(
+    config: &Config,
+    registry: &SharedRegistry<Chain>,
+) -> Vec<TaskHandle> {
+    use crate::config::ChainConfig;
+    use crate::worker::cosmos_packet::spawn_cosmos_packet_worker;
+    use crate::worker::stellar_packet::{PacketProofSource, StellarPacketDeps};
+    use crate::worker::stellar_packet_adapters::{
+        ChainHandleDestination, ChainHandleProofSource, CosmosV2CommitmentSource,
+        ForeignClientUpdater,
+    };
+
+    let stellar_ids: Vec<ChainId> = config
+        .chains
+        .iter()
+        .filter_map(|c| match c {
+            ChainConfig::Stellar(cfg) => Some(cfg.id.clone()),
+            _ => None,
+        })
+        .collect();
+    let cosmos_ids: Vec<ChainId> = config
+        .chains
+        .iter()
+        .filter_map(|c| match c {
+            ChainConfig::CosmosSdk(cfg) => Some(cfg.id.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let Some(stellar_id) = stellar_ids.first() else {
+        if !cosmos_ids.is_empty() {
+            warn!("[cosmos] packet relay worker not started — no Stellar counterparty configured");
+        }
+        return Vec::new();
+    };
+
+    let mut tasks = Vec::new();
+    for cosmos_id in cosmos_ids {
+        let (cosmos, stellar) = {
+            let mut reg = registry.write();
+            let cosmos = match reg.get_or_spawn(&cosmos_id) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!("[cosmos] packet relay worker: cannot spawn {cosmos_id}: {e}");
+                    continue;
+                }
+            };
+            let stellar = match reg.get_or_spawn(stellar_id) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!("[cosmos] packet relay worker: cannot spawn {stellar_id}: {e}");
+                    continue;
+                }
+            };
+            (cosmos, stellar)
+        };
+
+        let subscription = match cosmos.subscribe() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("[cosmos] packet relay worker: subscribe to {cosmos_id} failed: {e}");
+                continue;
+            }
+        };
+
+        let signer = stellar
+            .get_signer()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let source_signer = cosmos
+            .get_signer()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let stellar_arc = Arc::new(stellar.clone());
+        let cosmos_arc = Arc::new(cosmos.clone());
+
+        let proof_source: Option<Arc<dyn PacketProofSource>> =
+            match CosmosV2CommitmentSource::new(cosmos_arc.clone()) {
+                Ok(src) => Some(Arc::new(src)),
+                Err(e) => {
+                    warn!("[cosmos] packet relay worker: cannot build v2 commitment source: {e}");
+                    None
+                }
+            };
+
+        let deps = StellarPacketDeps {
+            proof_source,
+            destination: Some(Arc::new(ChainHandleDestination::new(stellar_arc.clone()))),
+            absence_source: Some(Arc::new(ChainHandleProofSource::new(stellar_arc.clone()))),
+            source_submitter: Some(Arc::new(ChainHandleDestination::new(cosmos_arc.clone()))),
+            client_updater: Some(Arc::new(ForeignClientUpdater::new(
+                stellar_arc.clone(),
+                cosmos_arc.clone(),
+            ))),
+            ack_source: Some(Arc::new(ChainHandleProofSource::new(stellar_arc.clone()))),
+            source_client_updater: Some(Arc::new(ForeignClientUpdater::new(
+                cosmos_arc.clone(),
+                stellar_arc,
+            ))),
+            signer,
+            source_signer,
+        };
+
+        info!("[cosmos→stellar] packet relay worker started ({cosmos_id} → {stellar_id})");
+        tasks.push(spawn_cosmos_packet_worker(cosmos.id(), subscription, deps));
     }
 
     tasks

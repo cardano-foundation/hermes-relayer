@@ -32,6 +32,7 @@ pub mod client;
 pub mod connection;
 pub mod cross_chain_query;
 pub mod packet;
+pub mod cosmos_packet;
 pub mod stellar_packet;
 pub mod stellar_packet_adapters;
 pub mod wallet;
