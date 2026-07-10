@@ -163,9 +163,9 @@ impl OperationalData {
             // Hermes normally updates the on-chain light client to `proof_height + 1` before
             // sending proof-bearing messages (connection/channel/packet).
             //
-            // For Cardano↔Cosmos (Mithril) in our system, proofs are verified against the
+            // For Cardano-tracking clients, proofs are verified against the
             // consensus state stored at the exact `proof_height` returned by the Gateway.
-            // If we update to `proof_height + 1` first, the Mithril client will not have a
+            // If we update to `proof_height + 1` first, the client will not have a
             // consensus state stored at `proof_height`, and verification fails with:
             // "consensus state not found".
             //

@@ -1,7 +1,7 @@
 //! Event parsing for Cardano Gateway events -> Hermes `IbcEvent` conversion.
 //!
 //! The Gateway returns events in the format:
-//! `Event { type: "create_client", attributes: [{ key: "client_id", value: "08-cardano-mithril-0" }, ...] }`
+//! `Event { type: "create_client", attributes: [{ key: "client_id", value: "08-cardano-probabilistic-0" }, ...] }`
 //!
 //! This module converts them into Hermes' `IbcEvent` enum variants.
 

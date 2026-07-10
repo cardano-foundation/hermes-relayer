@@ -1,4 +1,4 @@
-//! Cardano keyring implementation with CIP-1852 derivation
+//! Cardano keyring using Hermes-specific SLIP-0010 Ed25519 derivation.
 
 use super::error::Error;
 use blake2::digest::{Update, VariableOutput};
@@ -54,8 +54,11 @@ impl CardanoKeyring {
         })
     }
 
-    /// Create a new keyring from a mnemonic phrase
-    /// Uses CIP-1852 derivation: m/1852'/1815'/account'/2'/0'
+    /// Create a new keyring from a mnemonic phrase.
+    ///
+    /// Uses the Hermes-specific path `m/1852'/1815'/account'/2'/0'` with
+    /// SLIP-0010 Ed25519. This is not CIP-1852 wallet derivation, which uses
+    /// Ed25519-BIP32 and non-hardened role/address indices.
     pub fn from_mnemonic(mnemonic: &str, account: u32) -> Result<Self, Error> {
         // Parse mnemonic using tiny-bip39 crate (hyphenated crate name, underscore in code)
         let mnemonic = bip39::Mnemonic::from_phrase(mnemonic, bip39::Language::English)
@@ -65,8 +68,8 @@ impl CardanoKeyring {
         let seed = bip39::Seed::new(&mnemonic, "");
         let seed_bytes = seed.as_bytes();
 
-        // CIP-1852 path: m/1852'/1815'/account'/2'/0'
-        // 1852' = purpose (CIP-1852), 1815' = coin type (Cardano), 2' = payment key role
+        // Hermes-specific Cardano-shaped path. In CIP-1852, role 2 is the staking role;
+        // this fully hardened SLIP-0010 path is retained for compatibility with Hermes keys.
         let path = BIP32Path::from_str(&format!("m/1852'/1815'/{}'/2'/0'", account))
             .map_err(|e| Error::Keyring(format!("Invalid derivation path: {:?}", e)))?;
 

@@ -945,9 +945,9 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
             ChainConfig::Cardano(_)
         );
 
-        // Cardano query_latest_height is Mithril-certified snapshot height, not raw tip.
+        // Cardano query_latest_height is the latest Gateway-accepted proof height, not the raw tip.
         // A strict pre-wait on this value can deadlock the handshake before we submit the tx
-        // that would advance certified state.
+        // that would advance accepted state.
         if dst_chain_is_cardano {
             debug!(
                 "skipping destination-height pre-wait for Cardano (required consensus proof height: {})",
@@ -1000,7 +1000,7 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
         // height can query before the just-submitted handshake event exists.
         //
         // This is required for Cardano's accepted HostState view, and it also avoids
-        // "bad connection state" when opening Entrypoint<->Injective connections with
+        // "bad connection state" when opening direct Cardano<->Injective connections with
         // pre-existing clients.
         let query_height = src_latest_height;
 

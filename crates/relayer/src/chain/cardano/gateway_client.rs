@@ -1511,19 +1511,11 @@ impl GatewayClient {
         &self.endpoint
     }
 
-    /// Fetch a Mithril certificate for a specific chain point
+    /// Legacy Mithril certificate hook retained for API compatibility.
     ///
-    /// This should query the Gateway's Mithril aggregator endpoint to get:
-    /// 1. The latest Mithril certificate covering the requested slot/epoch
-    /// 2. The certificate chain back to genesis (if needed)
-    /// 3. The multi-signature proof
-    ///
-    /// The certificate is used by the light client to verify Cardano block headers
-    /// without needing to sync the full chain.
-    ///
-    /// TODO: Add custom proto for Mithril certificate query
-    /// TODO: Implement certificate chain verification
-    /// TODO: Cache certificates to avoid redundant queries
+    /// The active probabilistic client does not call this method. The historical
+    /// Mithril path never gained a certificate-query protobuf, so this compatibility
+    /// stub returns an empty payload.
     pub async fn fetch_mithril_certificate(&self, slot: u64, epoch: u64) -> Result<Vec<u8>, Error> {
         tracing::info!(
             "Fetching Mithril certificate for slot={}, epoch={}",
@@ -1531,9 +1523,9 @@ impl GatewayClient {
             epoch
         );
 
-        // Stub implementation - requires custom Mithril proto
+        // Retained for callers compiled against the historical API.
         tracing::warn!(
-            "fetch_mithril_certificate: requires custom proto for Mithril aggregator endpoint"
+            "fetch_mithril_certificate: deprecated compatibility stub has no certificate-query protobuf; returning an empty payload"
         );
         Ok(vec![])
     }

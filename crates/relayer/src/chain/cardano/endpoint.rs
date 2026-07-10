@@ -292,12 +292,11 @@ impl CardanoChainEndpoint {
     /// Cardano transaction inclusion height.
     ///
     /// Why this exists:
-    /// - The Gateway returns a transaction `height` in `submit_signed_tx` based on `db-sync`'s
-    ///   `block_no` for the block that included the transaction.
+    /// - The Gateway returns the transaction's Cardano block number from its Yaci-backed
+    ///   bridge history.
     /// - Separately, for Cardano↔Cosmos IBC, the Cosmos-side light client only accepts heights
-    ///   that satisfy the active Gateway light-client mode. In Mithril mode this is a certified
-    ///   transaction snapshot block number; in probabilistic mode it is a heuristically accepted
-    ///   Cardano block number.
+    ///   that satisfy the active Gateway light-client mode. In the active probabilistic mode,
+    ///   this is an accepted Cardano anchor block number.
     ///
     /// If Hermes proceeds immediately after inclusion, it may query proofs at a height that the
     /// Cosmos-side client has not yet been updated to, or worse: it may receive proofs that are
@@ -365,7 +364,7 @@ impl CardanoChainEndpoint {
             if elapsed >= timeout {
                 return Err(Error::send_tx(format!(
                     "timed out waiting for Gateway-accepted height >= {} (latest={}). \
-                     Note: for Cardano, Height.revision_height is a block-number based height in both Mithril and probabilistic modes.",
+                     Note: for Cardano, Height.revision_height is a block number, not a slot.",
                     included_height, latest,
                 )));
             }
@@ -677,15 +676,15 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
                 // Ensure the transaction is also accepted by the active Cardano light-client mode
                 // before we treat it as "committed" from the perspective of IBC relaying.
-                let certified_height = self
+                let accepted_height = self
                     .wait_for_gateway_accepted_height(included_height)
                     .await?;
-                if certified_height.revision_height() != included_height.revision_height() {
+                if accepted_height.revision_height() != included_height.revision_height() {
                     tracing::info!(
-                        "Transaction {} inclusion height {} is now certified at {}",
+                        "Transaction {} inclusion height {} is now accepted at {}",
                         tx_response.tx_hash,
                         included_height,
-                        certified_height
+                        accepted_height
                     );
                 }
 
@@ -719,12 +718,12 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
                 // Parse Gateway events into Hermes IbcEvent types
                 let parsed_events =
-                    super::event_parser::parse_events(proto_events, certified_height).map_err(
+                    super::event_parser::parse_events(proto_events, accepted_height).map_err(
                         |e| {
                             tracing::warn!(
                                 "Failed to parse IBC events from transaction {} at {}: {}",
                                 tx_hash,
-                                certified_height,
+                                accepted_height,
                                 e
                             );
                             Error::send_tx(format!("Failed to parse events: {}", e))
@@ -735,7 +734,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     tracing::warn!(
                         "Parsed 0 IBC events from transaction {} at {}",
                         tx_hash,
-                        certified_height
+                        accepted_height
                     );
                 } else {
                     tracing::info!(
@@ -748,7 +747,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 // Wrap events with height
                 let events_with_height: Vec<IbcEventWithHeight> = parsed_events
                     .into_iter()
-                    .map(|event| IbcEventWithHeight::new(event, certified_height))
+                    .map(|event| IbcEventWithHeight::new(event, accepted_height))
                     .collect();
 
                 // Add parsed events to result
@@ -803,15 +802,15 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     ))
                 })?;
 
-                let certified_height = self
+                let accepted_height = self
                     .wait_for_gateway_accepted_height(included_height)
                     .await?;
-                if certified_height.revision_height() != included_height.revision_height() {
+                if accepted_height.revision_height() != included_height.revision_height() {
                     tracing::info!(
-                        "Transaction {} inclusion height {} is now certified at {}",
+                        "Transaction {} inclusion height {} is now accepted at {}",
                         tx_response.tx_hash,
                         included_height,
-                        certified_height
+                        accepted_height
                     );
                 }
 
@@ -851,8 +850,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // For Cardano, we rely on on-chain verification in the Cosmos-side Cardano light client
         // implementation (the chain rejects invalid headers and proofs for the active client type).
         //
-        // To keep Hermes functional without coupling it to the full Mithril verification stack
-        // (which is already implemented in the on-chain client), we treat this as a best-effort
+        // To keep Hermes functional without duplicating the client-specific verification stack
+        // (which is implemented in the on-chain client), we treat this as a best-effort
         // fetch + structural validation step:
         // - fetch the Cardano header for `target` from the Gateway
         // - return it as a CardanoLightBlock so the relayer can proceed
@@ -2566,17 +2565,16 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // On Tendermint chains this is fine because heights are contiguous and the Tendermint
         // header builder can return intermediate "support" headers (including the proof height).
         //
-        // For Cardano/Mithril, however, headers only exist at Mithril-certified transaction snapshot
-        // heights (e.g. every ~15 blocks in our devnet setup). That means a height like `H + 1`
-        // may not exist at all even if the chain has advanced well beyond it.
+        // For Cardano, however, headers exist only at Gateway-accepted anchor heights. A height
+        // such as `H + 1` may not be accepted even when the chain has advanced beyond it.
         //
         // If the exact `target_height` is not available, we still want to:
         // - install a consensus state at `target_height - 1` (the proof height), so proofs verify, and
-        // - also advance the client to the latest available snapshot height.
+        // - also advance the client to the latest available accepted anchor height.
         //
         // We do this by returning:
         // - `support` header at `target_height - 1`, and
-        // - a final header at the latest snapshot height.
+        // - a final header at the latest accepted anchor height.
         let effective_trusted_height =
             normalize_header_query_trusted_height(trusted_height, target_height)?;
         tracing::info!(
@@ -2644,7 +2642,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         Err(search_error) => {
                             if !is_recoverable_gateway_header_height_error(&search_error) {
                                 return Err(Error::query(format!(
-                                    "Gateway query_header failed while searching for a certified height at/after {target_height} (candidate {candidate_ics_height}): {search_error}"
+                                    "Gateway query_header failed while searching for an accepted height at/after {target_height} (candidate {candidate_ics_height}): {search_error}"
                                 )));
                             }
                         }

@@ -38,7 +38,7 @@ pub struct CardanoConfig {
     /// Optional path to keystore folder
     pub key_store_folder: Option<PathBuf>,
 
-    /// Account index for CIP-1852 derivation
+    /// Account index for Hermes' Cardano-shaped SLIP-0010 Ed25519 derivation.
     #[serde(default)]
     pub account: u32,
 
@@ -82,30 +82,25 @@ pub struct CardanoConfig {
     #[serde(default = "default_event_replay_window")]
     pub event_replay_window: u64,
 
-    /// Maximum amount of time Hermes will wait after a Cardano transaction is included
-    /// until it is also "Mithril-certified".
+    /// Maximum time Hermes waits after Cardano transaction inclusion for the Gateway
+    /// to accept a light-client anchor at or after the inclusion block.
     ///
-    /// Important nuance about "height":
-    /// In this Cardano↔Cosmos integration, `Height.revision_height` is treated as a Cardano
-    /// *block number* (as surfaced by `db-sync` and by Mithril's `cardano-transactions`
-    /// snapshots). It is not a Cardano *slot number*.
+    /// `Height.revision_height` is a Cardano block number reported by the Gateway's
+    /// Yaci-backed bridge history. It is not a Cardano slot number.
     ///
-    /// When Hermes submits a transaction on Cardano, the Gateway returns the inclusion
-    /// block number. Hermes then waits until the Gateway reports a Mithril snapshot
-    /// whose `block_number` is >= that inclusion block number, before proceeding to the
-    /// next IBC step. Without this, Hermes can race ahead and build proofs at a height
-    /// that the Cosmos-side Mithril light client cannot yet verify.
+    /// The `mithril_*` field names are retained for configuration compatibility, but
+    /// these controls apply to the active Gateway light-client mode as well.
     #[serde(
         default = "default_mithril_certification_timeout",
         with = "humantime_serde"
     )]
     pub mithril_certification_timeout: Duration,
 
-    /// Polling interval while waiting for Mithril snapshots to catch up.
+    /// Polling interval while waiting for the Gateway's accepted height to catch up.
     #[serde(default = "default_mithril_poll_interval", with = "humantime_serde")]
     pub mithril_poll_interval: Duration,
 
-    /// How often to log progress while waiting for Mithril snapshot catch-up.
+    /// How often to log progress while waiting for Gateway height acceptance.
     ///
     /// This is intentionally an `INFO`-level log, because in many environments the default
     /// log level is `info` (so `debug` would be invisible and the process would look hung).
