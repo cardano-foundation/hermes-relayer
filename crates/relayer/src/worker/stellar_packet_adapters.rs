@@ -78,7 +78,7 @@ impl<H: ChainHandle> PacketAbsenceProofSource for ChainHandleProofSource<H> {
                 "chain did not return a non-membership MerkleProof".to_string(),
             )
         })?;
-        Ok((encode_merkle_proof(&proof), status.height))
+        Ok((encode_merkle_proof(&proof), status.height.increment()))
     }
 }
 
@@ -118,7 +118,7 @@ impl<H: ChainHandle> PacketProofSource for ChainHandleProofSource<H> {
             PacketProofError::QueryFailed("chain did not return a MerkleProof".to_string())
         })?;
         let proof_bytes = encode_merkle_proof(&proof);
-        Ok((proof_bytes, status.height))
+        Ok((proof_bytes, status.height.increment()))
     }
 }
 
@@ -159,7 +159,7 @@ impl<H: ChainHandle> AckProofSource for ChainHandleProofSource<H> {
                 "chain did not return an acknowledgement MerkleProof".to_string(),
             )
         })?;
-        Ok((encode_merkle_proof(&proof), status.height))
+        Ok((encode_merkle_proof(&proof), status.height.increment()))
     }
 }
 
@@ -239,7 +239,7 @@ impl<H: ChainHandle> AckProofSource for CosmosV2AckSource<H> {
             )
         })?;
 
-        Ok((encode_merkle_proof(&proof), status.height))
+        Ok((encode_merkle_proof(&proof), status.height.increment()))
     }
 }
 
@@ -372,7 +372,7 @@ impl<H: ChainHandle> PacketProofSource for CosmosV2CommitmentSource<H> {
             PacketProofError::QueryFailed("chain did not return a commitment MerkleProof".to_string())
         })?;
 
-        Ok((encode_merkle_proof(&proof), status.height))
+        Ok((encode_merkle_proof(&proof), status.height.increment()))
     }
 }
 

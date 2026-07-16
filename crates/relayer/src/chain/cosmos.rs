@@ -989,6 +989,7 @@ impl ChainEndpoint for CosmosSdkChain {
             Some(tx_monitor_cmd) => tx_monitor_cmd,
             None => {
                 let tx_monitor_cmd = self.init_event_source()?;
+                tracing::info!("[cosmos] event polling started");
                 self.tx_monitor_cmd = Some(tx_monitor_cmd);
                 self.tx_monitor_cmd.as_ref().unwrap()
             }
