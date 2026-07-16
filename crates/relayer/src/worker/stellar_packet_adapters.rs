@@ -286,6 +286,21 @@ impl<Dst: ChainHandle, Src: ChainHandle> ClientUpdater for ForeignClientUpdater<
             .parse()
             .map_err(|e| format!("dest client id parse: {e}"))?;
 
+        // target_height is the proof height (source latest + 1, since block H's app
+        // hash lands in block H+1), so it may not have been produced yet. Wait for the
+        // source chain to reach it before building the header, otherwise the light
+        // client fails with "height is higher than latest height".
+        for _ in 0..15 {
+            let status = self
+                .src
+                .query_application_status()
+                .map_err(|e| format!("query source status: {e}"))?;
+            if status.height.revision_height() >= target_height.revision_height() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+
         let foreign_client =
             ForeignClient::restore(client_id, (*self.dst).clone(), (*self.src).clone());
 
