@@ -2,6 +2,7 @@ use alloc::collections::BTreeMap as HashMap;
 use ibc_relayer_types::applications::ics29_fee::events::DistributionType;
 
 use ibc_relayer_types::applications::ics31_icq;
+use tendermint::abci::Event as AbciEvent;
 use tendermint_rpc::{event::Event as RpcEvent, event::EventData as RpcEventData};
 
 use ibc_relayer_types::applications::ics31_icq::events::CrossChainQueryPacket;
@@ -9,7 +10,7 @@ use ibc_relayer_types::core::ics02_client::{events as ClientEvents, height::Heig
 use ibc_relayer_types::core::ics03_connection::events as ConnectionEvents;
 use ibc_relayer_types::core::ics04_channel::events as ChannelEvents;
 use ibc_relayer_types::core::ics24_host::identifier::ChainId;
-use ibc_relayer_types::events::IbcEvent;
+use ibc_relayer_types::events::{IbcEvent, ModuleEvent, ModuleEventAttribute};
 
 use crate::chain::cosmos::types::events::raw_object::RawObject;
 use crate::event::source::queries;
@@ -153,6 +154,15 @@ pub fn extract_events(
             .map_err(|_| String::from("tx_result.height: invalid header height of 0"))?;
 
             for abci_event in &tx_result.result.events {
+                if query == queries::ibc_channel_v2().to_string() {
+                    if let Some(module_event) = v2_packet_module_event(abci_event) {
+                        events_with_height.push(IbcEventWithHeight::new(
+                            IbcEvent::AppModule(module_event),
+                            height,
+                        ));
+                    }
+                    continue;
+                }
                 if let Ok(ibc_event) = ibc_event_try_from_abci_event(abci_event) {
                     if query == queries::ibc_client().to_string()
                         && event_is_type_client(&ibc_event)
@@ -205,6 +215,40 @@ pub fn extract_events(
     }
 
     Ok(events_with_height)
+}
+
+/// Wrap an IBC v2 (channel-v2 / Eureka) packet event as an `AppModule` event. The v1
+/// typed parsers reject the v2 attribute set (client-based, `encoded_packet_hex`), so
+/// the v2 packet workers consume these as raw module events.
+fn v2_packet_module_event(abci_event: &AbciEvent) -> Option<ModuleEvent> {
+    const V2_PACKET_EVENTS: [&str; 5] = [
+        "send_packet",
+        "recv_packet",
+        "write_acknowledgement",
+        "acknowledge_packet",
+        "timeout_packet",
+    ];
+
+    if !V2_PACKET_EVENTS.contains(&abci_event.kind.as_str()) {
+        return None;
+    }
+
+    let attributes = abci_event
+        .attributes
+        .iter()
+        .filter_map(|attr| {
+            Some(ModuleEventAttribute {
+                key: attr.key_str().ok()?.to_string(),
+                value: attr.value_str().ok()?.to_string(),
+            })
+        })
+        .collect();
+
+    Some(ModuleEvent {
+        kind: abci_event.kind.clone(),
+        module_name: "ibc".parse().expect("valid module id"),
+        attributes,
+    })
 }
 
 fn event_is_type_client(ev: &IbcEvent) -> bool {

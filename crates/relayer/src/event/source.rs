@@ -122,7 +122,7 @@ pub mod queries {
             ibc_client(),
             ibc_connection(),
             ibc_channel(),
-            ibc_query(),
+            ibc_channel_v2(),
             // This will be needed when we send misbehavior evidence to full node
             // Query::eq("message.module", "evidence"),
         ]
@@ -142,6 +142,10 @@ pub mod queries {
 
     pub fn ibc_channel() -> Query {
         Query::eq("message.module", "ibc_channel")
+    }
+
+    pub fn ibc_channel_v2() -> Query {
+        Query::eq("message.module", "ibc_channelv2")
     }
 
     pub fn ibc_query() -> Query {
