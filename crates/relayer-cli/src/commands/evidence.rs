@@ -534,17 +534,40 @@ fn submit_light_client_attack_evidence(
         Vec::new()
     } else {
         match counterparty_client.wait_and_build_update_client(common_height) {
-            Ok(msgs) => msgs,
+            Ok(msgs) if !msgs.is_empty() => msgs,
 
-            Err(e) => {
+            // Another relayer may have filled the historical consensus state
+            // between the initial query and the update attempt.
+            Ok(msgs)
+                if has_consensus_state(counterparty, &counterparty_client_id, common_height) =>
+            {
+                msgs
+            }
+
+            Ok(_) => {
                 warn!(
-                    "skipping UpdateClient message for client `{}` on counterparty chain `{}`",
+                    "cannot submit light client attack evidence to client `{}` on counterparty chain `{}`",
                     counterparty_client_id,
                     counterparty.id()
                 );
-                warn!("reason: failed to build UpdateClient message: {e}");
+                warn!("reason: no update message was built and the client does not have a consensus state at height {common_height}");
 
-                Vec::new()
+                return Ok(());
+            }
+
+            Err(e) => {
+                warn!(
+                    "cannot submit light client attack evidence to client `{}` on counterparty chain `{}`",
+                    counterparty_client_id,
+                    counterparty.id()
+                );
+                if counterparty_client_is_frozen {
+                    warn!("reason: client is frozen and does not have a consensus state at height {common_height}");
+                } else {
+                    warn!("reason: failed to build the required UpdateClient message: {e}");
+                }
+
+                return Ok(());
             }
         }
     };

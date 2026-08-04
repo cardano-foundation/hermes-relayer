@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 use core::fmt::{Display, Error as FmtError, Formatter};
+use crossbeam_channel::Sender;
 use ibc_relayer_types::core::ics04_channel::channel::Ordering;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -11,6 +12,7 @@ use crate::{
     chain::handle::{ChainHandle, ChainHandlePair},
     config::Config,
     object::Object,
+    util::task::TaskHandle,
 };
 
 pub mod retry_strategy;
@@ -60,6 +62,17 @@ pub fn spawn_worker_tasks<ChainA: ChainHandle, ChainB: ChainHandle>(
     object: Object,
     config: &Config,
 ) -> WorkerHandle {
+    let fallback_object = object.clone();
+    try_spawn_worker_tasks(chains, id, object, config)
+        .unwrap_or_else(|| WorkerHandle::new(id, fallback_object, None, None, Vec::new()))
+}
+
+fn try_spawn_worker_tasks<ChainA: ChainHandle, ChainB: ChainHandle>(
+    chains: ChainHandlePair<ChainA, ChainB>,
+    id: WorkerId,
+    object: Object,
+    config: &Config,
+) -> Option<WorkerHandle> {
     let mut task_handles = Vec::new();
 
     let (cmd_tx, data) = match &object {
@@ -247,7 +260,17 @@ pub fn spawn_worker_tasks<ChainA: ChainHandle, ChainB: ChainHandle>(
         }
     };
 
-    WorkerHandle::new(id, object, data, cmd_tx, task_handles)
+    finish_worker_handle(id, object, data, cmd_tx, task_handles)
+}
+
+fn finish_worker_handle(
+    id: WorkerId,
+    object: Object,
+    data: Option<WorkerData>,
+    cmd_tx: Option<Sender<WorkerCmd>>,
+    task_handles: Vec<TaskHandle>,
+) -> Option<WorkerHandle> {
+    (!task_handles.is_empty()).then(|| WorkerHandle::new(id, object, data, cmd_tx, task_handles))
 }
 
 fn should_clear_on_start(config: &crate::config::Packets, channel_ordering: Ordering) -> bool {
@@ -281,9 +304,24 @@ fn validate_cardano_packet_clearing(
 
 #[cfg(test)]
 mod tests {
-    use crate::{chain::cardano::CardanoConfig, config::ChainConfig};
+    use ibc_relayer_types::core::ics24_host::identifier::ChainId;
 
-    use super::validate_cardano_packet_clearing;
+    use crate::{
+        chain::cardano::CardanoConfig,
+        config::ChainConfig,
+        object::{Object, Wallet},
+    };
+
+    use super::{finish_worker_handle, validate_cardano_packet_clearing, WorkerId};
+
+    #[test]
+    fn worker_initialization_without_tasks_is_rejected() {
+        let object = Object::Wallet(Wallet {
+            chain_id: ChainId::from_string("chain-a"),
+        });
+
+        assert!(finish_worker_handle(WorkerId::new(1), object, None, None, Vec::new()).is_none());
+    }
 
     #[test]
     fn cardano_packet_clearing_disabled_is_rejected() {

@@ -2,7 +2,7 @@ use tracing::{error, info};
 
 use ibc_relayer_types::core::{
     ics03_connection::connection::IdentifiedConnectionEnd,
-    ics04_channel::channel::State as ChannelState,
+    ics04_channel::channel::State as ChannelState, ics24_host::identifier::ChainId,
 };
 
 use crate::{
@@ -41,18 +41,28 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
         }
     }
 
-    pub fn spawn_workers(&mut self, scan: ChainsScan) {
+    /// Spawn all workers represented by a scan and return the chain ids whose
+    /// worker creation encountered a transient query/runtime failure.
+    pub fn spawn_workers(&mut self, scan: ChainsScan) -> Vec<ChainId> {
         let _span = tracing::error_span!("spawn").entered();
+        let mut incomplete_chain_ids = Vec::new();
 
         for chain_scan in scan.chains {
             match chain_scan {
-                Ok(chain_scan) => self.spawn_workers_for_chain(chain_scan),
+                Ok(chain_scan) => {
+                    let chain_id = chain_scan.chain_id.clone();
+                    if !self.spawn_workers_for_chain(chain_scan) {
+                        incomplete_chain_ids.push(chain_id);
+                    }
+                }
                 Err(e) => error!("failed to spawn worker for a chain, reason: {}", e), // TODO: Show chain id
             }
         }
+
+        incomplete_chain_ids
     }
 
-    pub fn spawn_workers_for_chain(&mut self, scan: ChainScan) {
+    pub fn spawn_workers_for_chain(&mut self, scan: ChainScan) -> bool {
         let _span = tracing::error_span!("chain", chain = %scan.chain_id).entered();
 
         let chain = match self.registry.get_or_spawn(&scan.chain_id) {
@@ -63,18 +73,21 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
                     e
                 );
 
-                return;
+                return false;
             }
         };
 
+        let mut complete = true;
         for (_, client_scan) in scan.clients {
-            self.spawn_workers_for_client(chain.clone(), client_scan);
+            complete &= self.spawn_workers_for_client(chain.clone(), client_scan);
         }
 
         // Let's only spawn the wallet worker if telemetry is enabled,
         // otherwise the worker just ends up issuing queries to the node
         // without making anything of the result
         telemetry!(self.spawn_wallet_worker(chain));
+
+        complete
     }
 
     pub fn spawn_wallet_worker(&mut self, chain: Chain) {
@@ -89,12 +102,19 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
             });
     }
 
-    pub fn spawn_workers_for_client(&mut self, chain: Chain, client_scan: ClientScan) {
+    pub fn spawn_workers_for_client(&mut self, chain: Chain, client_scan: ClientScan) -> bool {
         let _span = tracing::error_span!("client", client = %client_scan.id()).entered();
 
+        let mut complete = true;
         for (_, connection_scan) in client_scan.connections {
-            self.spawn_workers_for_connection(chain.clone(), &client_scan.client, connection_scan);
+            complete &= self.spawn_workers_for_connection(
+                chain.clone(),
+                &client_scan.client,
+                connection_scan,
+            );
         }
+
+        complete
     }
 
     pub fn spawn_workers_for_connection(
@@ -102,12 +122,13 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
         chain: Chain,
         client: &IdentifiedAnyClientState,
         connection_scan: ConnectionScan,
-    ) {
+    ) -> bool {
         let _span =
             tracing::error_span!("connection", connection = %connection_scan.id()).entered();
 
         let connection_id = connection_scan.id().clone();
 
+        let mut complete = true;
         match self.spawn_connection_workers(
             chain.clone(),
             client.clone(),
@@ -123,12 +144,15 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
                 connection = %connection_id,
                 "no connection workers were spawn",
             ),
-            Err(e) => error!(
-                chain = %chain.id(),
-                connection = %connection_id,
-                "skipped connection workers, reason: {}",
-                e
-            ),
+            Err(e) => {
+                complete = false;
+                error!(
+                    chain = %chain.id(),
+                    connection = %connection_id,
+                    "skipped connection workers, reason: {}",
+                    e
+                );
+            }
         }
 
         for (channel_id, channel_scan) in connection_scan.channels {
@@ -143,14 +167,19 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
                     channel = %channel_id,
                     "no channel workers were spawned",
                 ),
-                Err(e) => error!(
-                    chain = %chain.id(),
-                    channel = %channel_id,
-                    "skipped channel workers, reason: {}",
-                    e
-                ),
+                Err(e) => {
+                    complete = false;
+                    error!(
+                        chain = %chain.id(),
+                        channel = %channel_id,
+                        "skipped channel workers, reason: {}",
+                        e
+                    );
+                }
             }
         }
+
+        complete
     }
 
     fn spawn_connection_workers(
@@ -197,14 +226,18 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
                 src_connection_id: connection.connection_id,
             });
 
-            self.workers
-                .spawn(chain, counterparty_chain, &connection_object, self.config)
-                .then(|| {
-                    info!(
-                        "spawning Connection worker: {}",
-                        connection_object.short_name()
-                    );
-                });
+            let spawned =
+                self.workers
+                    .spawn(chain, counterparty_chain, &connection_object, self.config);
+            spawned.then(|| {
+                info!(
+                    "spawning Connection worker: {}",
+                    connection_object.short_name()
+                );
+            });
+            if !spawned && !self.workers.contains(&connection_object) {
+                return Err(Error::worker_spawn(connection_object.short_name()));
+            }
 
             Ok(true)
         } else {
@@ -270,22 +303,25 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
             }
 
             if mode.packets.enabled {
-                let has_packets = || {
-                    !channel_scan
-                        .unreceived_packets_on_counterparty(&chain, &counterparty_chain)
-                        .unwrap_or_default()
-                        .is_empty()
-                };
+                let has_packets = !channel_scan
+                    .unreceived_packets_on_counterparty(&chain, &counterparty_chain)?
+                    .unwrap_or_default()
+                    .is_empty();
 
-                let has_acks = || {
+                // Preserve the previous short-circuit behavior: once pending
+                // packets prove that a worker is needed, an unrelated ack
+                // query must not delay packet delivery or timeout handling.
+                let has_acks = if has_packets {
+                    false
+                } else {
                     !channel_scan
-                        .unreceived_acknowledgements_on_counterparty(&chain, &counterparty_chain)
+                        .unreceived_acknowledgements_on_counterparty(&chain, &counterparty_chain)?
                         .unwrap_or_default()
                         .is_empty()
                 };
 
                 // If there are any outstanding packets or acks to send, spawn the worker
-                if has_packets() || has_acks() {
+                if has_packets || has_acks {
                     // Create the Packet object and spawn worker
                     let path_object = Object::Packet(Packet {
                         dst_chain_id: counterparty_chain.id(),
@@ -294,25 +330,25 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
                         src_port_id: channel_scan.channel.port_id.clone(),
                     });
 
-                    self.workers
-                        .spawn(
-                            chain.clone(),
-                            counterparty_chain.clone(),
-                            &path_object,
-                            self.config,
-                        )
-                        .then(|| info!("spawned packet worker: {}", path_object.short_name()));
+                    let spawned = self.workers.spawn(
+                        chain.clone(),
+                        counterparty_chain.clone(),
+                        &path_object,
+                        self.config,
+                    );
+                    spawned.then(|| info!("spawned packet worker: {}", path_object.short_name()));
+                    if !spawned && !self.workers.contains(&path_object) {
+                        return Err(Error::worker_spawn(path_object.short_name()));
+                    }
                 }
             }
 
             Ok(mode.clients.enabled)
         } else if mode.channels.enabled && !is_channel_upgrading {
-            let has_packets = || {
-                !channel_scan
-                    .unreceived_packets_on_counterparty(&counterparty_chain, &chain)
-                    .unwrap_or_default()
-                    .is_empty()
-            };
+            let has_packets = !channel_scan
+                .unreceived_packets_on_counterparty(&counterparty_chain, &chain)?
+                .unwrap_or_default()
+                .is_empty();
 
             // Determine if open handshake is required
             let open_handshake = chan_state_dst.less_or_equal_progress(ChannelState::TryOpen)
@@ -323,7 +359,7 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
             // If there are pending packets on destination then we let the packet worker clear the
             // packets and we do not finish the channel handshake.
             let close_handshake =
-                chan_state_src.is_closed() && !chan_state_dst.is_closed() && !has_packets();
+                chan_state_src.is_closed() && !chan_state_dst.is_closed() && !has_packets;
 
             if open_handshake || close_handshake {
                 // create worker for channel handshake that will advance the counterparty state
@@ -334,9 +370,13 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
                     src_port_id: channel_scan.channel.port_id,
                 });
 
-                self.workers
-                    .spawn(chain, counterparty_chain, &channel_object, self.config)
-                    .then(|| info!("spawned channel worker: {}", channel_object.short_name()));
+                let spawned =
+                    self.workers
+                        .spawn(chain, counterparty_chain, &channel_object, self.config);
+                spawned.then(|| info!("spawned channel worker: {}", channel_object.short_name()));
+                if !spawned && !self.workers.contains(&channel_object) {
+                    return Err(Error::worker_spawn(channel_object.short_name()));
+                }
 
                 Ok(true)
             } else {
@@ -350,14 +390,16 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
                 src_port_id: channel_scan.channel.port_id.clone(),
             });
 
-            self.workers
-                .spawn(
-                    chain.clone(),
-                    counterparty_chain.clone(),
-                    &path_object,
-                    self.config,
-                )
-                .then(|| info!("spawned packet worker: {}", path_object.short_name()));
+            let packet_spawned = self.workers.spawn(
+                chain.clone(),
+                counterparty_chain.clone(),
+                &path_object,
+                self.config,
+            );
+            packet_spawned.then(|| info!("spawned packet worker: {}", path_object.short_name()));
+            if !packet_spawned && !self.workers.contains(&path_object) {
+                return Err(Error::worker_spawn(path_object.short_name()));
+            }
 
             let channel_object = Object::Channel(Channel {
                 dst_chain_id: counterparty_chain.id(),
@@ -366,9 +408,14 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
                 src_port_id: channel_scan.channel.port_id,
             });
 
-            self.workers
-                .spawn(chain, counterparty_chain, &channel_object, self.config)
+            let channel_spawned =
+                self.workers
+                    .spawn(chain, counterparty_chain, &channel_object, self.config);
+            channel_spawned
                 .then(|| info!("spawned channel worker: {}", channel_object.short_name()));
+            if !channel_spawned && !self.workers.contains(&channel_object) {
+                return Err(Error::worker_spawn(channel_object.short_name()));
+            }
 
             Ok(true)
         } else {

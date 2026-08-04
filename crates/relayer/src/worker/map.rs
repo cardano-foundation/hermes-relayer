@@ -13,7 +13,7 @@ use crate::{
     telemetry,
 };
 
-use super::{spawn_worker_tasks, WorkerHandle, WorkerId};
+use super::{spawn_worker_tasks, try_spawn_worker_tasks, WorkerHandle, WorkerId};
 
 /// Manage the lifecycle of [`WorkerHandle`]s associated with [`Object`]s.
 #[derive(Debug)]
@@ -130,16 +130,41 @@ impl WorkerMap {
                     self.workers[&object].id(),
                     self.workers[&object].object().clone(),
                 );
-
-                let worker = self.spawn_worker(src, dst, &object, config);
-                self.workers.entry(object).or_insert(worker)
             } else {
-                &self.workers[&object]
+                return &self.workers[&object];
             }
-        } else {
-            let worker = self.spawn_worker(src, dst, &object, config);
-            self.workers.entry(object).or_insert(worker)
         }
+
+        // Preserve the established public API and behavior for external
+        // callers. Supervisor recovery uses `try_get_or_spawn` below so a
+        // zero-task handle is never mistaken for a functioning worker.
+        let worker = self.spawn_worker_unchecked(src, dst, &object, config);
+        self.workers.entry(object).or_insert(worker)
+    }
+
+    /// Attempt to get or spawn a live worker, returning `None` when worker
+    /// initialization did not create any background tasks.
+    pub fn try_get_or_spawn<Chain: ChainHandle>(
+        &mut self,
+        object: Object,
+        src: Chain,
+        dst: Chain,
+        config: &Config,
+    ) -> Option<&WorkerHandle> {
+        if self.workers.contains_key(&object) {
+            if self.workers[&object].shutdown_stopped_tasks() {
+                self.remove_stopped(
+                    self.workers[&object].id(),
+                    self.workers[&object].object().clone(),
+                );
+            } else {
+                return self.workers.get(&object);
+            }
+        }
+
+        let worker = self.spawn_worker(src, dst, &object, config)?;
+        self.workers.insert(object.clone(), worker);
+        self.workers.get(&object)
     }
 
     /// Spawn a new [`WorkerHandle`], only if one does not exists already.
@@ -152,9 +177,17 @@ impl WorkerMap {
         object: &Object,
         config: &Config,
     ) -> bool {
-        if !self.workers.contains_key(object) {
-            let worker = self.spawn_worker(src, dst, object, config);
-            self.workers.entry(object.clone()).or_insert(worker);
+        if let Some(worker) = self.workers.get(object) {
+            if worker.shutdown_stopped_tasks() {
+                let id = worker.id();
+                self.remove_stopped(id, object.clone());
+            } else {
+                return false;
+            }
+        }
+
+        if let Some(worker) = self.spawn_worker(src, dst, object, config) {
+            self.workers.insert(object.clone(), worker);
             true
         } else {
             false
@@ -163,6 +196,28 @@ impl WorkerMap {
 
     /// Force spawn a worker for the given [`Object`].
     fn spawn_worker<Chain: ChainHandle>(
+        &mut self,
+        src: Chain,
+        dst: Chain,
+        object: &Object,
+        config: &Config,
+    ) -> Option<WorkerHandle> {
+        let worker = try_spawn_worker_tasks(
+            ChainHandlePair { a: src, b: dst },
+            self.next_worker_id(),
+            object.clone(),
+            config,
+        )?;
+
+        if worker.is_stopped() {
+            return None;
+        }
+
+        telemetry!(worker, metric_type(object), 1);
+        Some(worker)
+    }
+
+    fn spawn_worker_unchecked<Chain: ChainHandle>(
         &mut self,
         src: Chain,
         dst: Chain,
