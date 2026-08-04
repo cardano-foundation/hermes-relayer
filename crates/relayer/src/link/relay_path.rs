@@ -47,6 +47,7 @@ use crate::channel::error::ChannelError;
 use crate::channel::Channel;
 use crate::config::types::ics20_field_size_limit::Ics20FieldSizeLimit;
 use crate::config::types::ics20_field_size_limit::ValidationResult;
+use crate::config::ChainConfig;
 use crate::event::source::EventBatch;
 use crate::event::IbcEventWithHeight;
 use crate::foreign_client::{ForeignClient, ForeignClientError};
@@ -1207,7 +1208,18 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
             .collect();
         raw_sequences.sort();
 
-        let raw_sequences = if self.ordered_channel() && raw_sequences.len() > 1 {
+        let source_is_cardano = self.ordered_channel()
+            && raw_sequences.len() > 1
+            && matches!(
+                self.src_chain().config().map_err(LinkError::relayer)?,
+                ChainConfig::Cardano(_)
+            );
+
+        let raw_sequences = if should_clear_earliest_sequence_only(
+            self.ordered_channel(),
+            source_is_cardano,
+            raw_sequences.len(),
+        ) {
             let earliest = raw_sequences[0];
             let blocked = &raw_sequences[1..];
             warn!(
@@ -2031,6 +2043,14 @@ fn cap_packet_clearing_height_to_latest(clear_height: Height, latest_src_height:
     }
 }
 
+fn should_clear_earliest_sequence_only(
+    ordered: bool,
+    source_is_cardano: bool,
+    sequence_count: usize,
+) -> bool {
+    ordered && source_is_cardano && sequence_count > 1
+}
+
 #[tracing::instrument(skip_all)]
 fn check_ics20_fields_size(
     data: &[u8],
@@ -2088,5 +2108,20 @@ mod tests {
             cap_packet_clearing_height_to_latest(height(5), height(10)),
             height(5)
         );
+    }
+
+    #[test]
+    fn ordered_cosmos_packet_clearing_keeps_all_sequences() {
+        assert!(!should_clear_earliest_sequence_only(true, false, 3));
+    }
+
+    #[test]
+    fn ordered_cardano_packet_clearing_starts_with_earliest_sequence() {
+        assert!(should_clear_earliest_sequence_only(true, true, 3));
+    }
+
+    #[test]
+    fn unordered_cardano_packet_clearing_keeps_all_sequences() {
+        assert!(!should_clear_earliest_sequence_only(false, true, 3));
     }
 }
