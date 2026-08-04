@@ -19,11 +19,12 @@ use crate::{
 /// Registry for keeping track of [`ChainHandle`]s indexed by a `ChainId`.
 ///
 /// The purpose of this type is to avoid spawning multiple runtimes for a single `ChainId`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Registry<Chain: ChainHandle> {
     config: Config,
     handles: HashMap<ChainId, Chain>,
     rt: Arc<TokioRuntime>,
+    spawn_missing: bool,
 }
 
 #[derive(Clone)]
@@ -38,12 +39,24 @@ impl<Chain: ChainHandle> Registry<Chain> {
             config,
             handles: HashMap::new(),
             rt: Arc::new(TokioRuntime::new().unwrap()),
+            spawn_missing: true,
         }
     }
 
     /// Return the size of the registry, i.e., the number of distinct chain runtimes.
     pub fn size(&self) -> usize {
         self.handles.len()
+    }
+
+    /// Clone the currently registered handles into a registry which will not
+    /// spawn missing runtimes. This is useful for long-running scans: the scan
+    /// can proceed without holding the shared registry lock, while any route
+    /// which references an unavailable runtime is reported as incomplete
+    /// instead of creating a detached runtime with no event subscription.
+    pub fn snapshot(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.spawn_missing = false;
+        snapshot
     }
 
     /// Return an iterator overall the chain handles managed by the registry.
@@ -72,6 +85,10 @@ impl<Chain: ChainHandle> Registry<Chain> {
     /// Returns whether or not the runtime was actually spawned.
     pub fn spawn(&mut self, chain_id: &ChainId) -> Result<bool, SpawnError> {
         if !self.handles.contains_key(chain_id) {
+            if !self.spawn_missing {
+                return Err(SpawnError::runtime_not_found());
+            }
+
             let handle = spawn_chain_runtime(&self.config, chain_id, self.rt.clone())?;
             self.handles.insert(chain_id.clone(), handle);
             trace!(chain = %chain_id, "spawned chain runtime");

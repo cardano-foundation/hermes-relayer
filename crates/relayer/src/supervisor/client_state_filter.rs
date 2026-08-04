@@ -77,7 +77,7 @@ impl FilterError {
 
 /// A cache storing filtering status (allow or deny) for
 /// arbitrary identifiers.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct FilterPolicy {
     /// A cache associating a generic identifying key, such as
     /// client id, channel id, or connection id, with an
@@ -86,6 +86,11 @@ pub struct FilterPolicy {
 }
 
 impl FilterPolicy {
+    /// Merge permissions learned by a scan performed against a snapshot.
+    pub fn merge(&mut self, other: Self) {
+        self.permission_cache.extend(other.permission_cache);
+    }
+
     /// Given a connection end and the underlying client for that
     /// connection, controls both the client as well as the
     /// client on the counterparty chain.

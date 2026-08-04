@@ -4,6 +4,7 @@ use core::convert::Infallible;
 use core::ops::Deref;
 use core::time::Duration;
 use std::sync::RwLock;
+use std::time::Instant;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use itertools::Itertools;
@@ -53,6 +54,10 @@ use self::{scan::ChainScanner, spawn::SpawnContext};
 
 type ArcBatch = Arc<source::Result<EventBatch>>;
 type Subscription = Receiver<ArcBatch>;
+
+const DISCOVERY_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
+const DISCOVERY_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
+const DISCOVERY_RETRY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /**
     A wrapper around the SupervisorCmd sender so that we can
@@ -172,6 +177,12 @@ pub fn spawn_supervisor_tasks<Chain: ChainHandle>(
 
     let workers = Arc::new(RwLock::new(WorkerMap::new()));
     let client_state_filter = Arc::new(RwLock::new(FilterPolicy::default()));
+    let mut incomplete_chain_ids = Vec::new();
+    let scan_mode = if options.force_full_scan {
+        ScanMode::Full
+    } else {
+        ScanMode::Auto
+    };
 
     // Only scan when needed
     if should_scan(&config, &options) {
@@ -179,19 +190,23 @@ pub fn spawn_supervisor_tasks<Chain: ChainHandle>(
             &config,
             &mut registry.write(),
             &mut client_state_filter.acquire_write(),
-            if options.force_full_scan {
-                ScanMode::Full
-            } else {
-                ScanMode::Auto
-            },
+            scan_mode,
         )
         .scan_chains();
 
         info!("scanned chains:");
         info!("{}", scan);
 
-        spawn_context(&config, &mut registry.write(), &mut workers.acquire_write())
-            .spawn_workers(scan);
+        incomplete_chain_ids = scan.incomplete_chain_ids(&config);
+
+        let spawn_incomplete =
+            spawn_context(&config, &mut registry.write(), &mut workers.acquire_write())
+                .spawn_workers(scan);
+        for chain_id in spawn_incomplete {
+            if !incomplete_chain_ids.contains(&chain_id) {
+                incomplete_chain_ids.push(chain_id);
+            }
+        }
     }
 
     let subscriptions = init_subscriptions(&config, &mut registry.write())?;
@@ -199,7 +214,7 @@ pub fn spawn_supervisor_tasks<Chain: ChainHandle>(
     let batch_tasks = spawn_batch_workers(
         &config,
         registry.clone(),
-        client_state_filter,
+        client_state_filter.clone(),
         workers.clone(),
         subscriptions,
     );
@@ -208,6 +223,17 @@ pub fn spawn_supervisor_tasks<Chain: ChainHandle>(
 
     let mut tasks = vec![cmd_task];
     tasks.extend(batch_tasks);
+
+    if !incomplete_chain_ids.is_empty() {
+        tasks.push(spawn_discovery_retry_worker(
+            config.clone(),
+            registry.clone(),
+            client_state_filter,
+            workers.clone(),
+            scan_mode,
+            incomplete_chain_ids,
+        ));
+    }
 
     if let Some(rest_rx) = rest_rx {
         let rest_task = spawn_rest_worker(config, registry, workers.clone(), rest_rx);
@@ -218,6 +244,157 @@ pub fn spawn_supervisor_tasks<Chain: ChainHandle>(
     tasks.push(cleanup_task);
 
     Ok(tasks)
+}
+
+#[derive(Debug)]
+struct DiscoveryRetryBackoff {
+    next_delay: Duration,
+}
+
+impl DiscoveryRetryBackoff {
+    fn new() -> Self {
+        Self {
+            next_delay: DISCOVERY_RETRY_INITIAL_DELAY,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next_delay;
+        self.next_delay = self
+            .next_delay
+            .checked_mul(2)
+            .unwrap_or(DISCOVERY_RETRY_MAX_DELAY)
+            .min(DISCOVERY_RETRY_MAX_DELAY);
+        delay
+    }
+}
+
+fn spawn_discovery_retry_worker<Chain: ChainHandle>(
+    config: Config,
+    registry: SharedRegistry<Chain>,
+    client_state_filter: Arc<RwLock<FilterPolicy>>,
+    workers: Arc<RwLock<WorkerMap>>,
+    scan_mode: ScanMode,
+    mut incomplete_chain_ids: Vec<ChainId>,
+) -> TaskHandle {
+    let mut backoff = DiscoveryRetryBackoff::new();
+    let mut attempt = 0_u64;
+    let mut next_attempt_at = Instant::now() + backoff.next_delay();
+
+    warn!(
+        chains = ?incomplete_chain_ids,
+        "initial worker discovery was incomplete; scheduling retries"
+    );
+
+    spawn_background_task(
+        error_span!("worker.discovery_retry"),
+        Some(DISCOVERY_RETRY_POLL_INTERVAL),
+        move || -> Result<Next, TaskError<Infallible>> {
+            if Instant::now() < next_attempt_at {
+                return Ok(Next::Continue);
+            }
+
+            attempt += 1;
+            info!(
+                attempt,
+                chains = ?incomplete_chain_ids,
+                "retrying incomplete worker discovery"
+            );
+
+            retry_incomplete_chain_ids(&mut incomplete_chain_ids, |chain_id| {
+                retry_chain_discovery(
+                    &config,
+                    &registry,
+                    &client_state_filter,
+                    &workers,
+                    scan_mode,
+                    chain_id,
+                )
+            });
+
+            if incomplete_chain_ids.is_empty() {
+                info!(
+                    attempt,
+                    "worker discovery recovered; all configured workers are available"
+                );
+                return Ok(Next::Abort);
+            }
+
+            let delay = backoff.next_delay();
+            warn!(
+                attempt,
+                chains = ?incomplete_chain_ids,
+                retry_after = ?delay,
+                "worker discovery remains incomplete"
+            );
+            next_attempt_at = Instant::now() + delay;
+
+            Ok(Next::Continue)
+        },
+    )
+}
+
+fn retry_incomplete_chain_ids(
+    incomplete_chain_ids: &mut Vec<ChainId>,
+    mut retry: impl FnMut(&ChainId) -> bool,
+) {
+    incomplete_chain_ids.retain(|chain_id| !retry(chain_id));
+}
+
+fn retry_chain_discovery<Chain: ChainHandle>(
+    config: &Config,
+    registry: &SharedRegistry<Chain>,
+    client_state_filter: &Arc<RwLock<FilterPolicy>>,
+    workers: &Arc<RwLock<WorkerMap>>,
+    scan_mode: ScanMode,
+    chain_id: &ChainId,
+) -> bool {
+    let Some(chain_config) = config
+        .chains
+        .iter()
+        .find(|chain_config| chain_config.id() == chain_id)
+    else {
+        error!(chain = %chain_id, "cannot retry discovery because the chain is no longer configured");
+        return true;
+    };
+
+    // The scanner performs network RPCs. Work against snapshots of the
+    // already-initialized handles and filter cache so a slow recovery scan
+    // does not hold the supervisor's global registry/filter write locks and
+    // pause event processing for its full duration.
+    let mut registry_snapshot = registry.read().snapshot();
+    let mut client_state_filter_snapshot = client_state_filter.acquire_read().clone();
+    let scan = chain_scanner(
+        config,
+        &mut registry_snapshot,
+        &mut client_state_filter_snapshot,
+        scan_mode,
+    )
+    .scan_chain(chain_config);
+    client_state_filter
+        .acquire_write()
+        .merge(client_state_filter_snapshot);
+
+    match scan {
+        Ok(scan) => {
+            let scan_complete = scan.is_complete();
+            let spawn_complete =
+                spawn_context(config, &mut registry_snapshot, &mut workers.acquire_write())
+                    .spawn_workers_for_chain(scan);
+            let complete = scan_complete && spawn_complete;
+            info!(
+                chain = %chain_id,
+                scan_complete,
+                spawn_complete,
+                "rescanned chain for missing workers"
+            );
+            complete
+        }
+        Err(e) => {
+            warn!(chain = %chain_id, "worker discovery retry failed: {}", e);
+            false
+        }
+    }
 }
 
 fn spawn_batch_workers<Chain: ChainHandle>(
@@ -867,7 +1044,14 @@ fn process_batch<Chain: ChainHandle>(
             ));
         }
 
-        let worker = workers.get_or_spawn(object, src_chain, dst_chain, config);
+        let Some(worker) = workers.try_get_or_spawn(object.clone(), src_chain, dst_chain, config)
+        else {
+            error!(
+                worker = %object.short_name(),
+                "failed to initialize worker for event batch"
+            );
+            continue;
+        };
 
         worker.send_events(
             batch.height,
@@ -1006,5 +1190,37 @@ impl CollectedEvents {
     /// [`NewBlock`](ibc_relayer_types::events::IbcEventType::NewBlock) event.
     pub fn has_new_block(&self) -> bool {
         self.new_block.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_retry_backoff_is_exponential_and_capped() {
+        let mut backoff = DiscoveryRetryBackoff::new();
+
+        assert_eq!(backoff.next_delay(), Duration::from_secs(5));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(10));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(20));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(40));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(80));
+        assert_eq!(backoff.next_delay(), Duration::from_secs(160));
+        assert_eq!(backoff.next_delay(), DISCOVERY_RETRY_MAX_DELAY);
+        assert_eq!(backoff.next_delay(), DISCOVERY_RETRY_MAX_DELAY);
+    }
+
+    #[test]
+    fn incomplete_discovery_is_retained_until_a_retry_recovers() {
+        let chain_a = ChainId::from_string("chain-a");
+        let chain_b = ChainId::from_string("chain-b");
+        let mut incomplete = vec![chain_a.clone(), chain_b.clone()];
+
+        retry_incomplete_chain_ids(&mut incomplete, |chain_id| chain_id == &chain_b);
+        assert_eq!(incomplete, vec![chain_a]);
+
+        retry_incomplete_chain_ids(&mut incomplete, |_| true);
+        assert!(incomplete.is_empty());
     }
 }

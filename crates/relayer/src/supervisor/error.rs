@@ -70,6 +70,10 @@ define_error! {
             [ ScanError ]
             |_| { "supervisor encountered an error when scanning chains" },
 
+        WorkerSpawn
+            { object: String }
+            |e| { format_args!("supervisor failed to initialize worker {}", e.object) },
+
         HandleSend
             |_| { "failed to send a command to the supervisor through a channel" },
 

@@ -1,7 +1,6 @@
 use core::fmt::{Display, Error as FmtError, Formatter};
 use std::collections::BTreeMap;
 
-use itertools::Itertools;
 use tracing::{debug, error, error_span, info, warn};
 
 use ibc_relayer_types::core::{
@@ -30,7 +29,7 @@ use crate::{
     },
     path::PathIdentifiers,
     registry::Registry,
-    supervisor::client_state_filter::{FilterPolicy, Permission},
+    supervisor::client_state_filter::{FilterError, FilterPolicy, Permission},
 };
 
 use crate::chain::counterparty::{unreceived_acknowledgements, unreceived_packets};
@@ -49,6 +48,14 @@ flex_error::define_error! {
         Query
             [ RelayerError ]
             |_| { "query" },
+
+        Filter
+            [ FilterError ]
+            |_| { "client state filter" },
+
+        CounterpartyQuery
+            { reason: String }
+            |e| { format_args!("counterparty query failed: {}", e.reason) },
 
         MissingConnectionHop
             {
@@ -135,10 +142,28 @@ impl Display for ChainsScan {
     }
 }
 
+impl ChainsScan {
+    /// Return the configured chain identifiers whose discovery either failed
+    /// outright or completed only after dropping an object because a query
+    /// failed.
+    pub fn incomplete_chain_ids(&self, config: &Config) -> Vec<ChainId> {
+        config
+            .chains
+            .iter()
+            .zip(&self.chains)
+            .filter_map(|(chain_config, result)| match result {
+                Ok(scan) if scan.is_complete() => None,
+                Ok(_) | Err(_) => Some(chain_config.id().clone()),
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ChainScan {
     pub chain_id: ChainId,
     pub clients: BTreeMap<ClientId, ClientScan>,
+    complete: bool,
 }
 
 impl ChainScan {
@@ -146,7 +171,18 @@ impl ChainScan {
         Self {
             chain_id,
             clients: BTreeMap::new(),
+            complete: true,
         }
+    }
+
+    /// Whether discovery completed without dropping any clients, connections,
+    /// or channels because of a transient query failure.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    fn mark_incomplete(&mut self) {
+        self.complete = false;
     }
 }
 
@@ -154,6 +190,7 @@ impl ChainScan {
 pub struct ClientScan {
     pub client: IdentifiedAnyClientState,
     pub connections: BTreeMap<ConnectionId, ConnectionScan>,
+    complete: bool,
 }
 
 impl ClientScan {
@@ -161,7 +198,16 @@ impl ClientScan {
         Self {
             client,
             connections: BTreeMap::new(),
+            complete: true,
         }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    fn mark_incomplete(&mut self) {
+        self.complete = false;
     }
 
     pub fn id(&self) -> &ClientId {
@@ -178,6 +224,7 @@ pub struct ConnectionScan {
     pub connection: IdentifiedConnectionEnd,
     pub counterparty_state: Option<ConnectionState>,
     pub channels: BTreeMap<ChannelId, ChannelScan>,
+    complete: bool,
 }
 
 impl ConnectionScan {
@@ -189,7 +236,16 @@ impl ConnectionScan {
             connection,
             counterparty_state,
             channels: BTreeMap::new(),
+            complete: true,
         }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    fn mark_incomplete(&mut self) {
+        self.complete = false;
     }
 
     pub fn id(&self) -> &ConnectionId {
@@ -231,36 +287,16 @@ impl ChannelScan {
         &self,
         chain: &impl ChainHandle,
         counterparty_chain: &impl ChainHandle,
-    ) -> Option<Vec<Sequence>> {
-        self.counterparty
-            .as_ref()
-            .and_then(|c| PathIdentifiers::from_channel_end(c.clone()))
-            .map(|ids| {
-                unreceived_packets(
-                    counterparty_chain,
-                    chain,
-                    &ids,
-                    Paginate::PerPage {
-                        per_page: 1,
-                        total: 1,
-                    },
-                )
-                .map(|(seq, _)| seq)
-                .unwrap_or_default()
-            })
-    }
-
-    pub fn unreceived_acknowledgements_on_counterparty(
-        &self,
-        chain: &impl ChainHandle,
-        counterparty_chain: &impl ChainHandle,
-    ) -> Option<Vec<Sequence>> {
-        let ids = self
+    ) -> Result<Option<Vec<Sequence>>, crate::supervisor::Error> {
+        let Some(ids) = self
             .counterparty
             .as_ref()
-            .and_then(|c| PathIdentifiers::from_channel_end(c.clone()))?;
+            .and_then(|c| PathIdentifiers::from_channel_end(c.clone()))
+        else {
+            return Ok(None);
+        };
 
-        let acks = unreceived_acknowledgements(
+        unreceived_packets(
             counterparty_chain,
             chain,
             &ids,
@@ -269,10 +305,32 @@ impl ChannelScan {
                 total: 1,
             },
         )
-        .map(|sns| sns.map_or(vec![], |(sns, _)| sns))
-        .unwrap_or_default();
+        .map(|(sequences, _)| Some(sequences))
+    }
 
-        Some(acks)
+    pub fn unreceived_acknowledgements_on_counterparty(
+        &self,
+        chain: &impl ChainHandle,
+        counterparty_chain: &impl ChainHandle,
+    ) -> Result<Option<Vec<Sequence>>, crate::supervisor::Error> {
+        let Some(ids) = self
+            .counterparty
+            .as_ref()
+            .and_then(|c| PathIdentifiers::from_channel_end(c.clone()))
+        else {
+            return Ok(None);
+        };
+
+        unreceived_acknowledgements(
+            counterparty_chain,
+            chain,
+            &ids,
+            Paginate::PerPage {
+                per_page: 1,
+                total: 1,
+            },
+        )
+        .map(|result| Some(result.map_or_else(Vec::new, |(sequences, _)| sequences)))
     }
 }
 
@@ -406,7 +464,10 @@ impl<'a, Chain: ChainHandle> ChainScanner<'a, Chain> {
                         .entry(channel.channel_id.clone())
                         .or_insert_with(|| ChannelScan::new(channel, counterparty_channel));
                 }
-                Err(e) => error!(channel = %channel_id, "failed to scan channel, reason: {}", e),
+                Err(e) => {
+                    scan.mark_incomplete();
+                    error!(channel = %channel_id, "failed to scan channel, reason: {}; scheduling discovery retry", e);
+                }
             }
         }
 
@@ -419,7 +480,23 @@ impl<'a, Chain: ChainHandle> ChainScanner<'a, Chain> {
         let clients = query_all_clients(chain)?;
 
         for client in clients {
-            if let Some(client_scan) = self.scan_client(chain, client)? {
+            let client_scan = match self.scan_client(chain, client) {
+                Ok(client_scan) => client_scan,
+                Err(e) => {
+                    scan.mark_incomplete();
+                    error!(
+                        "failed to scan client, reason: {}; scheduling discovery retry",
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            if let Some(client_scan) = client_scan {
+                if !client_scan.is_complete() {
+                    scan.mark_incomplete();
+                }
+
                 if self.config.telemetry.enabled {
                     // discovery phase : query every chain, connections and channels
                     let connection_scans = client_scan.connections.values();
@@ -481,16 +558,31 @@ impl<'a, Chain: ChainHandle> ChainScanner<'a, Chain> {
             return Ok(None);
         }
 
-        let client_connections_ids = query_client_connections(chain, &client.client_id)?;
+        let (client_connections, connections_complete) =
+            query_client_connections(chain, &client.client_id)?;
 
         let mut scan = ClientScan::new(client);
+        if !connections_complete {
+            scan.mark_incomplete();
+        }
 
-        for connection_end in client_connections_ids {
-            if let Some(connection_scan) =
-                self.scan_connection(chain, &scan.client, connection_end)?
-            {
-                scan.connections
-                    .insert(connection_scan.id().clone(), connection_scan);
+        for connection_end in client_connections {
+            match self.scan_connection(chain, &scan.client, connection_end) {
+                Ok(Some(connection_scan)) => {
+                    if !connection_scan.is_complete() {
+                        scan.mark_incomplete();
+                    }
+                    scan.connections
+                        .insert(connection_scan.id().clone(), connection_scan);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    scan.mark_incomplete();
+                    error!(
+                        "failed to scan connection, reason: {}; scheduling discovery retry",
+                        e
+                    );
+                }
             }
         }
 
@@ -508,7 +600,7 @@ impl<'a, Chain: ChainHandle> ChainScanner<'a, Chain> {
 
         info!("scanning connection...");
 
-        if !self.connection_allowed(chain, client, &connection) {
+        if !self.connection_allowed(chain, client, &connection)? {
             warn!("skipping connection, reason: connection is not allowed");
             return Ok(None);
         }
@@ -528,46 +620,38 @@ impl<'a, Chain: ChainHandle> ChainScanner<'a, Chain> {
                 warn!("counterparty connection is not open, skipping scan of channels over this connection");
                 return Ok(Some(scan));
             }
-            Err(e) => {
-                error!("error fetching counterparty connection state: {}", e);
-                return Ok(None);
-            }
+            Err(e) => return Err(e),
             Ok(state) => state,
         };
 
         scan.counterparty_state = Some(counterparty_state);
 
-        let channels = match query_connection_channels(chain, scan.connection.id()) {
-            Ok(channels) => channels,
-            Err(e) => {
-                error!("failed to fetch connection channels: {}", e);
-                Vec::new()
-            }
-        };
+        let channels = query_connection_channels(chain, scan.connection.id())?;
 
         let counterparty_chain = self
             .registry
             .get_or_spawn(&client.client_state.chain_id())
             .map_err(Error::spawn)?;
 
-        let channels = channels
+        for channel in channels
             .into_iter()
             .filter(|channel| self.channel_allowed(chain, channel))
-            .map(|channel| {
-                let counterparty =
-                    channel_on_destination(&channel, &scan.connection, &counterparty_chain)
-                        .unwrap_or_default();
-
-                let scan = ChannelScan {
-                    channel,
-                    counterparty,
-                };
-
-                (scan.id().clone(), scan)
-            })
-            .collect();
-
-        scan.channels = channels;
+        {
+            match channel_on_destination(&channel, &scan.connection, &counterparty_chain) {
+                Ok(counterparty) => {
+                    let channel_scan = ChannelScan {
+                        channel,
+                        counterparty,
+                    };
+                    scan.channels
+                        .insert(channel_scan.id().clone(), channel_scan);
+                }
+                Err(e) => {
+                    scan.mark_incomplete();
+                    error!("failed to query counterparty channel, reason: {}; scheduling discovery retry", e);
+                }
+            }
+        }
 
         Ok(Some(scan))
     }
@@ -629,9 +713,9 @@ impl<'a, Chain: ChainHandle> ChainScanner<'a, Chain> {
         chain: &Chain,
         client: &IdentifiedAnyClientState,
         connection: &IdentifiedConnectionEnd,
-    ) -> bool {
+    ) -> Result<bool, Error> {
         if !self.filtering_enabled() {
-            return true;
+            return Ok(true);
         }
 
         let permission = self.client_state_filter.control_connection_end_and_client(
@@ -652,20 +736,10 @@ impl<'a, Chain: ChainHandle> ChainScanner<'a, Chain> {
                     connection.connection_id
                 );
 
-                false
+                Ok(false)
             }
-            Err(e) => {
-                error!(
-                    "skipping workers for chain {}, client {} & conn {}, reason: {}",
-                    chain.id(),
-                    client.client_id,
-                    connection.connection_id,
-                    e
-                );
-
-                false
-            }
-            _ => true,
+            Err(e) => Err(Error::filter(e)),
+            _ => Ok(true),
         }
     }
 
@@ -729,8 +803,8 @@ fn scan_allowed_channel<Chain: ChainHandle>(
         .get_or_spawn(&counterparty_chain_id)
         .map_err(Error::spawn)?;
 
-    let counterparty_channel =
-        channel_on_destination(&channel, &connection, &counterparty_chain).unwrap_or_default();
+    let counterparty_channel = channel_on_destination(&channel, &connection, &counterparty_chain)
+        .map_err(|e| Error::counterparty_query(e.to_string()))?;
 
     let counterparty_channel_name = counterparty_channel
         .as_ref()
@@ -745,7 +819,7 @@ fn scan_allowed_channel<Chain: ChainHandle>(
     let counterparty_connection_state =
         connection_state_on_destination(&connection, &counterparty_chain)
             .map(Some)
-            .unwrap_or_default();
+            .map_err(|e| Error::counterparty_query(e.to_string()))?;
 
     let counterparty_connection_name = counterparty_connection_state
         .as_ref()
@@ -839,23 +913,27 @@ fn query_all_clients<Chain: ChainHandle>(
 fn query_client_connections<Chain: ChainHandle>(
     chain: &Chain,
     client_id: &ClientId,
-) -> Result<Vec<IdentifiedConnectionEnd>, Error> {
+) -> Result<(Vec<IdentifiedConnectionEnd>, bool), Error> {
     let ids = chain
         .query_client_connections(QueryClientConnectionsRequest {
             client_id: client_id.clone(),
         })
         .map_err(Error::query)?;
 
+    let mut complete = true;
     let connections = ids
         .into_iter()
-        .filter_map(|id| {
-            query_connection(chain, &id)
-                .map_err(|e| error!("failed to query connection: {}", e))
-                .ok()
+        .filter_map(|id| match query_connection(chain, &id) {
+            Ok(connection) => Some(connection),
+            Err(e) => {
+                complete = false;
+                error!(connection = %id, "failed to query connection, reason: {}; scheduling discovery retry", e);
+                None
+            }
         })
-        .collect_vec();
+        .collect();
 
-    Ok(connections)
+    Ok((connections, complete))
 }
 
 fn query_connection<Chain: ChainHandle>(
