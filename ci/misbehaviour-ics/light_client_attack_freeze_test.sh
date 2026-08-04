@@ -329,10 +329,36 @@ interchain-security-pd tx gov submit-proposal ${PROV_NODE_DIR}/consumer_prop.jso
     --node tcp://${NODE_IP}:26658 \
     -o json -y
 
-waiting 3 "for proposal to be submitted"
+PROPOSAL_READY=false
+for _ in $(seq 1 20); do
+    if interchain-security-pd query gov proposal "${PROP_ID}" \
+        --home "${PROV_NODE_DIR}" \
+        --node tcp://${NODE_IP}:26658 \
+        --output json > /dev/null 2>&1; then
+        PROPOSAL_READY=true
+        break
+    fi
+    sleep 1
+done
+
+if [ "${PROPOSAL_READY}" != "true" ]; then
+    echo "[ERROR] Proposal ${PROP_ID} was not committed before the vote"
+    exit 1
+fi
 
 # Vote yes to proposal
-interchain-security-pd tx gov vote 1 yes --from $PROV_KEY --chain-id provider --home ${PROV_NODE_DIR} -y --keyring-backend test
+VOTE_RES=$(interchain-security-pd tx gov vote "${PROP_ID}" yes \
+    --from "${PROV_KEY}" \
+    --chain-id provider \
+    --home "${PROV_NODE_DIR}" \
+    --node tcp://${NODE_IP}:26658 \
+    --keyring-backend test \
+    --output json -y)
+
+if [ "$(printf '%s' "${VOTE_RES}" | jq -r '.code')" != "0" ]; then
+    echo "[ERROR] Vote transaction failed: ${VOTE_RES}"
+    exit 1
+fi
 
 # CONSUMER CHAIN ##
 
@@ -344,7 +370,7 @@ TRIES=0
 cat ${PROV_NODE_DIR}/config/genesis.json | grep "period"
 
 while [ $TRIES -lt $MAX_TRIES ]; do
-    output=$(interchain-security-pd query gov proposal 1 --home ${PROV_NODE_DIR} --node tcp://${NODE_IP}:26658 --output json)
+    output=$(interchain-security-pd query gov proposal "${PROP_ID}" --home ${PROV_NODE_DIR} --node tcp://${NODE_IP}:26658 --output json)
 
     proposal_status=$(echo "$output" | grep -o '"status": "[^"]*' | awk -F ': "' '{print $2}')
     if [ "$proposal_status" = "$PROPOSAL_STATUS_PASSED" ]; then
