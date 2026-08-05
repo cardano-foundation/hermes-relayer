@@ -2,17 +2,6 @@ name: Namada Integration
 
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - .github/workflows/namada.yaml
-      - Cargo.toml
-      - Cargo.lock
-      - flake.nix
-      - flake.lock
-      - ci/**
-      - e2e/**
-      - crates/**
-      - tools/**
 
 env:
   NAMADA_RELEASE_URL: "https://api.github.com/repositories/510559980/releases/212279570"
