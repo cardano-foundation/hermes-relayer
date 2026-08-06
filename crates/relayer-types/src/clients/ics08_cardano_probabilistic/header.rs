@@ -27,6 +27,7 @@ pub struct Header {
     pub host_state_tx_hash: String,
     pub host_state_tx_output_index: u32,
     pub new_epoch_context: Option<raw::EpochContext>,
+    pub is_checkpoint: bool,
 }
 
 impl crate::core::ics02_client::header::Header for Header {
@@ -77,6 +78,7 @@ impl TryFrom<RawHeader> for Header {
             host_state_tx_hash: raw.host_state_tx_hash,
             host_state_tx_output_index: raw.host_state_tx_output_index,
             new_epoch_context: raw.new_epoch_context,
+            is_checkpoint: raw.is_checkpoint,
         })
     }
 }
@@ -91,6 +93,7 @@ impl From<Header> for RawHeader {
             host_state_tx_hash: value.host_state_tx_hash,
             host_state_tx_output_index: value.host_state_tx_output_index,
             new_epoch_context: value.new_epoch_context,
+            is_checkpoint: value.is_checkpoint,
         }
     }
 }
