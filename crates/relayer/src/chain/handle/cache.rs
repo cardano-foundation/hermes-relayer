@@ -30,7 +30,7 @@ use ibc_relayer_types::Height;
 use crate::account::Balance;
 use crate::cache::{Cache, CacheStatus};
 use crate::chain::client::ClientSettings;
-use crate::chain::endpoint::{ChainStatus, HealthCheck};
+use crate::chain::endpoint::{ChainStatus, HealthCheck, HostStateHeartbeatOutcome};
 use crate::chain::handle::{ChainHandle, ChainRequest, Subscription};
 use crate::chain::requests::*;
 use crate::chain::tracking::TrackedMsgs;
@@ -110,6 +110,10 @@ impl<Handle: ChainHandle> ChainHandle for CachingChainHandle<Handle> {
         tracked_msgs: TrackedMsgs,
     ) -> Result<Vec<tendermint_rpc::endpoint::broadcast::tx_sync::Response>, Error> {
         self.inner().send_messages_and_wait_check_tx(tracked_msgs)
+    }
+
+    fn submit_host_state_heartbeat(&self) -> Result<HostStateHeartbeatOutcome, Error> {
+        self.inner().submit_host_state_heartbeat()
     }
 
     fn get_signer(&self) -> Result<Signer, Error> {

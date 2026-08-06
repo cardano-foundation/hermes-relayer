@@ -33,6 +33,7 @@ pub mod channel;
 pub mod client;
 pub mod connection;
 pub mod cross_chain_query;
+pub mod heartbeat;
 pub mod packet;
 pub mod wallet;
 
@@ -231,6 +232,17 @@ fn try_spawn_worker_tasks<ChainA: ChainHandle, ChainB: ChainHandle>(
 
         Object::Wallet(wallet) => {
             assert_eq!(wallet.chain_id, chains.a.id());
+
+            if let Some(crate::config::ChainConfig::Cardano(cardano_config)) =
+                config.find_chain(&wallet.chain_id)
+            {
+                if let Some(interval) = cardano_config.host_state_heartbeat_interval {
+                    task_handles.push(heartbeat::spawn_host_state_heartbeat_worker(
+                        chains.a.clone(),
+                        interval,
+                    ));
+                }
+            }
 
             let wallet_task = wallet::spawn_wallet_worker(chains.a);
             task_handles.push(wallet_task);

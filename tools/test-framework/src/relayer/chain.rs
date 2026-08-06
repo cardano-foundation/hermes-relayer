@@ -32,7 +32,7 @@ use ibc_proto::ibc::apps::fee::v1::{
 };
 use ibc_relayer::account::Balance;
 use ibc_relayer::chain::client::ClientSettings;
-use ibc_relayer::chain::endpoint::{ChainStatus, HealthCheck};
+use ibc_relayer::chain::endpoint::{ChainStatus, HealthCheck, HostStateHeartbeatOutcome};
 use ibc_relayer::chain::handle::{ChainHandle, ChainRequest, Subscription};
 use ibc_relayer::chain::requests::*;
 use ibc_relayer::chain::tracking::TrackedMsgs;
@@ -107,6 +107,10 @@ where
         tracked_msgs: TrackedMsgs,
     ) -> Result<Vec<tendermint_rpc::endpoint::broadcast::tx_sync::Response>, Error> {
         self.value().send_messages_and_wait_check_tx(tracked_msgs)
+    }
+
+    fn submit_host_state_heartbeat(&self) -> Result<HostStateHeartbeatOutcome, Error> {
+        self.value().submit_host_state_heartbeat()
     }
 
     fn get_signer(&self) -> Result<Signer, Error> {

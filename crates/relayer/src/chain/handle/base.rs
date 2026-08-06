@@ -34,7 +34,10 @@ use ibc_relayer_types::{
 use crate::{
     account::Balance,
     chain::{
-        client::ClientSettings, endpoint::ChainStatus, requests::*, tracking::TrackedMsgs,
+        client::ClientSettings,
+        endpoint::{ChainStatus, HostStateHeartbeatOutcome},
+        requests::*,
+        tracking::TrackedMsgs,
         version::Specs,
     },
     client_state::{AnyClientState, IdentifiedAnyClientState},
@@ -132,6 +135,10 @@ impl ChainHandle for BaseChainHandle {
             tracked_msgs,
             reply_to,
         })
+    }
+
+    fn submit_host_state_heartbeat(&self) -> Result<HostStateHeartbeatOutcome, Error> {
+        self.send(|reply_to| ChainRequest::SubmitHostStateHeartbeat { reply_to })
     }
 
     fn get_signer(&self) -> Result<Signer, Error> {

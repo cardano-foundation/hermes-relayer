@@ -48,7 +48,7 @@ use crate::{
 
 use super::{
     client::ClientSettings,
-    endpoint::{ChainStatus, HealthCheck},
+    endpoint::{ChainStatus, HealthCheck, HostStateHeartbeatOutcome},
     requests::*,
     tracking::TrackedMsgs,
     version::Specs,
@@ -124,6 +124,10 @@ pub enum ChainRequest {
     SendMessagesAndWaitCheckTx {
         tracked_msgs: TrackedMsgs,
         reply_to: ReplyTo<Vec<tendermint_rpc::endpoint::broadcast::tx_sync::Response>>,
+    },
+
+    SubmitHostStateHeartbeat {
+        reply_to: ReplyTo<HostStateHeartbeatOutcome>,
     },
 
     Config {
@@ -425,6 +429,8 @@ pub trait ChainHandle: Clone + Display + Send + Sync + Debug + 'static {
         &self,
         tracked_msgs: TrackedMsgs,
     ) -> Result<Vec<tendermint_rpc::endpoint::broadcast::tx_sync::Response>, Error>;
+
+    fn submit_host_state_heartbeat(&self) -> Result<HostStateHeartbeatOutcome, Error>;
 
     fn get_signer(&self) -> Result<Signer, Error>;
 

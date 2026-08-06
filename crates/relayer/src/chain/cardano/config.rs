@@ -82,6 +82,13 @@ pub struct CardanoConfig {
     #[serde(default = "default_event_replay_window")]
     pub event_replay_window: u64,
 
+    /// How often Hermes checks whether the current Cardano epoch is missing a
+    /// HostState anchor. `None` disables proactive heartbeats. The Gateway is
+    /// authoritative about whether a heartbeat is required, so polling never
+    /// creates more than one successful heartbeat per epoch.
+    #[serde(default, with = "humantime_serde")]
+    pub host_state_heartbeat_interval: Option<Duration>,
+
     /// Maximum amount of time Hermes will wait after a Cardano transaction is included
     /// until it is also "Mithril-certified".
     ///
@@ -169,6 +176,7 @@ impl Default for CardanoConfig {
             client_refresh_rate: default::client_refresh_rate(),
             event_poll_interval: default_event_poll_interval(),
             event_replay_window: default_event_replay_window(),
+            host_state_heartbeat_interval: None,
             mithril_certification_timeout: default_mithril_certification_timeout(),
             mithril_poll_interval: default_mithril_poll_interval(),
             mithril_wait_log_interval: default_mithril_wait_log_interval(),
@@ -179,9 +187,32 @@ impl Default for CardanoConfig {
 #[cfg(test)]
 mod tests {
     use super::CardanoConfig;
+    use std::time::Duration;
 
     #[test]
     fn default_event_replay_window_is_100_blocks() {
         assert_eq!(CardanoConfig::default().event_replay_window, 100);
+    }
+
+    #[test]
+    fn host_state_heartbeat_is_opt_in() {
+        assert_eq!(CardanoConfig::default().host_state_heartbeat_interval, None);
+    }
+
+    #[test]
+    fn host_state_heartbeat_interval_round_trips_as_human_time() {
+        let config = CardanoConfig {
+            host_state_heartbeat_interval: Some(Duration::from_secs(60)),
+            ..CardanoConfig::default()
+        };
+
+        let encoded = toml::to_string(&config).expect("Cardano config should serialize");
+        let decoded: CardanoConfig =
+            toml::from_str(&encoded).expect("Cardano config should deserialize");
+
+        assert_eq!(
+            decoded.host_state_heartbeat_interval,
+            Some(Duration::from_secs(60))
+        );
     }
 }

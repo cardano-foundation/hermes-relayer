@@ -48,7 +48,7 @@ use crate::{
 
 use super::{
     client::ClientSettings,
-    endpoint::{ChainEndpoint, ChainStatus, HealthCheck},
+    endpoint::{ChainEndpoint, ChainStatus, HealthCheck, HostStateHeartbeatOutcome},
     handle::{ChainHandle, ChainRequest, ReplyTo, Subscription},
     requests::*,
     tracking::TrackedMsgs,
@@ -172,6 +172,10 @@ where
 
                         ChainRequest::SendMessagesAndWaitCheckTx { tracked_msgs, reply_to } => {
                             self.send_messages_and_wait_check_tx(tracked_msgs, reply_to)?
+                        },
+
+                        ChainRequest::SubmitHostStateHeartbeat { reply_to } => {
+                            self.submit_host_state_heartbeat(reply_to)?
                         },
 
                         ChainRequest::Signer { reply_to } => {
@@ -402,6 +406,14 @@ where
         reply_to: ReplyTo<Vec<tendermint_rpc::endpoint::broadcast::tx_sync::Response>>,
     ) -> Result<(), Error> {
         let result = self.chain.send_messages_and_wait_check_tx(tracked_msgs);
+        reply_to.send(result).map_err(Error::send)
+    }
+
+    fn submit_host_state_heartbeat(
+        &mut self,
+        reply_to: ReplyTo<HostStateHeartbeatOutcome>,
+    ) -> Result<(), Error> {
+        let result = self.chain.submit_host_state_heartbeat();
         reply_to.send(result).map_err(Error::send)
     }
 
