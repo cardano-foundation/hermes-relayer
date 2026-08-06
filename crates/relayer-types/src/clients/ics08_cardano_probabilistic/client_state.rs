@@ -39,6 +39,17 @@ pub struct ClientState {
     pub slot_length_ns: u64,
     pub epoch_contexts: Vec<raw::EpochContext>,
     pub pool_registration_cutoff_slot_exclusive: u64,
+    pub latest_checkpoint_height: Option<Height>,
+    pub latest_checkpoint_block_hash: String,
+    pub latest_checkpoint_epoch: u64,
+}
+
+impl ClientState {
+    /// Latest Cardano block whose chain progression has been authenticated.
+    /// This can be ahead of `latest_height`, but it has no IBC commitment root.
+    pub fn latest_verified_height(&self) -> Height {
+        self.latest_checkpoint_height.unwrap_or(self.latest_height)
+    }
 }
 
 impl Ics2ClientState for ClientState {
@@ -87,6 +98,9 @@ impl TryFrom<RawClientState> for ClientState {
             slot_length_ns,
             epoch_contexts,
             pool_registration_cutoff_slot_exclusive,
+            latest_checkpoint_height,
+            latest_checkpoint_block_hash,
+            latest_checkpoint_epoch,
         } = raw;
 
         let chain_id = ChainId::from_string(&raw_chain_id);
@@ -96,6 +110,29 @@ impl TryFrom<RawClientState> for ClientState {
             .try_into()?;
 
         let frozen_height = frozen_height.and_then(|h| h.try_into().ok());
+
+        let latest_checkpoint_height = latest_checkpoint_height
+            .map(TryInto::try_into)
+            .transpose()?;
+
+        if let Some(checkpoint_height) = latest_checkpoint_height {
+            if checkpoint_height < latest_height {
+                return Err(Error::invalid_field(
+                    "latest_checkpoint_height",
+                    format!(
+                        "must not be older than latest_height ({latest_height}), got {checkpoint_height}"
+                    ),
+                ));
+            }
+            if latest_checkpoint_block_hash.trim().is_empty() {
+                return Err(Error::missing_field("latest_checkpoint_block_hash"));
+            }
+        } else if !latest_checkpoint_block_hash.is_empty() || latest_checkpoint_epoch != 0 {
+            return Err(Error::invalid_field(
+                "latest_checkpoint_height",
+                "checkpoint hash and epoch require a checkpoint height".to_string(),
+            ));
+        }
 
         let trusting_period = trusting_period
             .and_then(|d| duration_from_proto(d).ok())
@@ -160,6 +197,9 @@ impl TryFrom<RawClientState> for ClientState {
             slot_length_ns,
             epoch_contexts,
             pool_registration_cutoff_slot_exclusive,
+            latest_checkpoint_height,
+            latest_checkpoint_block_hash,
+            latest_checkpoint_epoch,
         })
     }
 }
@@ -184,6 +224,9 @@ impl From<ClientState> for RawClientState {
             slot_length_ns: value.slot_length_ns,
             epoch_contexts: value.epoch_contexts,
             pool_registration_cutoff_slot_exclusive: value.pool_registration_cutoff_slot_exclusive,
+            latest_checkpoint_height: value.latest_checkpoint_height.map(Into::into),
+            latest_checkpoint_block_hash: value.latest_checkpoint_block_hash,
+            latest_checkpoint_epoch: value.latest_checkpoint_epoch,
         }
     }
 }
@@ -256,5 +299,53 @@ impl From<ClientState> for Any {
             type_url: PROBABILISTIC_CLIENT_STATE_TYPE_URL.to_string(),
             value: Protobuf::<RawClientState>::encode_vec(value),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_client_state() -> RawClientState {
+        RawClientState {
+            chain_id: "cardano-preprod".to_string(),
+            latest_height: Some(RawHeight {
+                revision_number: 0,
+                revision_height: 10,
+            }),
+            trusting_period: Some(ibc_proto::google::protobuf::Duration {
+                seconds: 86_400,
+                nanos: 0,
+            }),
+            host_state_nft_policy_id: vec![1; 28],
+            epoch_nonce: vec![2; 32],
+            slots_per_kes_period: 129_600,
+            current_epoch_start_slot: 1,
+            current_epoch_end_slot_exclusive: 2,
+            system_start_unix_ns: 1,
+            slot_length_ns: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn legacy_state_uses_latest_consensus_height_as_verified_height() {
+        let state = ClientState::try_from(raw_client_state()).unwrap();
+        assert_eq!(state.latest_verified_height(), state.latest_height);
+    }
+
+    #[test]
+    fn checkpoint_state_uses_newer_verified_height_without_changing_latest_height() {
+        let mut raw = raw_client_state();
+        raw.latest_checkpoint_height = Some(RawHeight {
+            revision_number: 0,
+            revision_height: 20,
+        });
+        raw.latest_checkpoint_block_hash = "checkpoint-20".to_string();
+        raw.latest_checkpoint_epoch = 8;
+
+        let state = ClientState::try_from(raw).unwrap();
+        assert_eq!(state.latest_height.revision_height(), 10);
+        assert_eq!(state.latest_verified_height().revision_height(), 20);
     }
 }

@@ -51,6 +51,15 @@ impl AnyClientState {
         }
     }
 
+    /// Latest height usable as a Cardano chain-continuity cursor. For all
+    /// root-bearing clients this is identical to `latest_height`.
+    pub fn latest_verified_height(&self) -> Height {
+        match self {
+            Self::Probabilistic(state) => state.latest_verified_height(),
+            _ => self.latest_height(),
+        }
+    }
+
     pub fn frozen_height(&self) -> Option<Height> {
         match self {
             Self::Tendermint(tm_state) => tm_state.frozen_height(),

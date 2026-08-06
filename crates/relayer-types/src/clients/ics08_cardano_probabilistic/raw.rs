@@ -74,6 +74,12 @@ pub struct ClientState {
     pub epoch_contexts: ::prost::alloc::vec::Vec<EpochContext>,
     #[prost(uint64, tag = "18")]
     pub pool_registration_cutoff_slot_exclusive: u64,
+    #[prost(message, optional, tag = "19")]
+    pub latest_checkpoint_height: ::core::option::Option<Height>,
+    #[prost(string, tag = "20")]
+    pub latest_checkpoint_block_hash: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "21")]
+    pub latest_checkpoint_epoch: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
@@ -136,4 +142,6 @@ pub struct ProbabilisticHeader {
     pub bridge_blocks: ::prost::alloc::vec::Vec<ProbabilisticBlock>,
     #[prost(message, optional, tag = "11")]
     pub new_epoch_context: ::core::option::Option<EpochContext>,
+    #[prost(bool, tag = "12")]
+    pub is_checkpoint: bool,
 }
