@@ -5,7 +5,8 @@
 
 use super::error::Error;
 use super::generated::ibc::cardano::v1::{
-    cardano_msg_client::CardanoMsgClient, SubmitSignedTxRequest, SubmitSignedTxResponse,
+    cardano_msg_client::CardanoMsgClient, BuildHostStateHeartbeatRequest,
+    BuildHostStateHeartbeatResponse, SubmitSignedTxRequest, SubmitSignedTxResponse,
 };
 use super::generated::ibc::core::channel::v1::msg_client::MsgClient as GenChannelMsgClient;
 use super::generated::ibc::core::client::v1::msg_client::MsgClient as GenClientMsgClient;
@@ -60,6 +61,14 @@ pub struct TxSubmitResponse {
     pub tx_hash: String,
     pub height: Option<Height>,
     pub events: Vec<IbcEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HostStateHeartbeatBuild {
+    pub heartbeat_required: bool,
+    pub current_epoch: u64,
+    pub host_state_epoch: u64,
+    pub unsigned_tx: Option<UnsignedTx>,
 }
 
 /// Simplified IBC event structure for Gateway responses
@@ -1468,6 +1477,47 @@ impl GatewayClient {
         Ok(UnsignedTx {
             cbor_hex,
             description: format!("MsgTimeoutOnClose (sequence: {})", sequence),
+        })
+    }
+
+    /// Ask the Gateway to build a HostState heartbeat only if the current
+    /// Cardano epoch does not already contain a HostState anchor.
+    pub async fn build_host_state_heartbeat(
+        &self,
+        signer: &str,
+    ) -> Result<HostStateHeartbeatBuild, Error> {
+        let mut client = CardanoMsgClient::new(self.channel.clone());
+        let response: BuildHostStateHeartbeatResponse = client
+            .build_host_state_heartbeat(tonic::Request::new(BuildHostStateHeartbeatRequest {
+                signer: signer.to_string(),
+            }))
+            .await?
+            .into_inner();
+
+        let unsigned_tx = response
+            .unsigned_tx
+            .map(|tx| {
+                String::from_utf8(tx.value)
+                    .map(|cbor_hex| UnsignedTx {
+                        cbor_hex,
+                        description: format!(
+                            "HostState heartbeat for Cardano epoch {}",
+                            response.current_epoch
+                        ),
+                    })
+                    .map_err(|e| {
+                        Error::Transaction(format!(
+                            "Invalid UTF-8 in HostState heartbeat unsigned_tx: {e}"
+                        ))
+                    })
+            })
+            .transpose()?;
+
+        Ok(HostStateHeartbeatBuild {
+            heartbeat_required: response.heartbeat_required,
+            current_epoch: response.current_epoch,
+            host_state_epoch: response.host_state_epoch,
+            unsigned_tx,
         })
     }
 

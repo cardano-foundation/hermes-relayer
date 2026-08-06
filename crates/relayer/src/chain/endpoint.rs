@@ -64,6 +64,24 @@ pub struct ChainStatus {
     pub timestamp: Timestamp,
 }
 
+/// Result of a chain-level HostState heartbeat attempt. Non-Cardano endpoints
+/// use `Unsupported`; Cardano reports whether an anchor already existed or a
+/// heartbeat transaction was submitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostStateHeartbeatOutcome {
+    Unsupported,
+    NotRequired {
+        current_epoch: u64,
+        host_state_epoch: u64,
+    },
+    Submitted {
+        tx_hash: String,
+        height: Option<ICSHeight>,
+        current_epoch: u64,
+        previous_host_state_epoch: u64,
+    },
+}
+
 /// Defines a blockchain as understood by the relayer
 pub trait ChainEndpoint: Sized {
     /// Type of light blocks for this chain
@@ -145,6 +163,11 @@ pub trait ChainEndpoint: Sized {
         &mut self,
         tracked_msgs: TrackedMsgs,
     ) -> Result<Vec<TxResponse>, Error>;
+
+    /// Submit a HostState-only liveness heartbeat when required by the chain.
+    fn submit_host_state_heartbeat(&mut self) -> Result<HostStateHeartbeatOutcome, Error> {
+        Ok(HostStateHeartbeatOutcome::Unsupported)
+    }
 
     /// Fetch a header from the chain at the given height and verify it.
     fn verify_header(

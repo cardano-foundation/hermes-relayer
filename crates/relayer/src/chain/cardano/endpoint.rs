@@ -14,7 +14,7 @@ use ibc_relayer_types::clients::ics08_cardano_probabilistic::misbehaviour::Misbe
 use crate::account::Balance;
 use crate::chain::client::ClientSettings;
 use crate::chain::cosmos::version::Specs as CosmosSpecs;
-use crate::chain::endpoint::{ChainEndpoint, ChainStatus, HealthCheck};
+use crate::chain::endpoint::{ChainEndpoint, ChainStatus, HealthCheck, HostStateHeartbeatOutcome};
 use crate::chain::handle::Subscription;
 use crate::chain::requests::{
     CrossChainQueryRequest, IncludeProof, QueryChannelClientStateRequest, QueryChannelRequest,
@@ -836,6 +836,49 @@ impl ChainEndpoint for CardanoChainEndpoint {
             }
 
             Ok(responses)
+        })
+    }
+
+    fn submit_host_state_heartbeat(&mut self) -> Result<HostStateHeartbeatOutcome, Error> {
+        let signer = self.get_signer()?.to_string();
+
+        self.rt.block_on(async {
+            let build = self
+                .gateway_client
+                .build_host_state_heartbeat(&signer)
+                .await
+                .map_err(|e| {
+                    Error::send_tx(format!("Failed to build HostState heartbeat: {e}"))
+                })?;
+
+            if !build.heartbeat_required {
+                return Ok(HostStateHeartbeatOutcome::NotRequired {
+                    current_epoch: build.current_epoch,
+                    host_state_epoch: build.host_state_epoch,
+                });
+            }
+
+            let unsigned_tx = build.unsigned_tx.ok_or_else(|| {
+                Error::send_tx(format!(
+                    "Gateway requires a HostState heartbeat for epoch {} but returned no unsigned transaction",
+                    build.current_epoch
+                ))
+            })?;
+            let signed_cbor_hex = self.sign_transaction_helper(&unsigned_tx.cbor_hex)?;
+            let response = self
+                .gateway_client
+                .submit_signed_tx(&signed_cbor_hex)
+                .await
+                .map_err(|e| {
+                    Error::send_tx(format!("Failed to submit HostState heartbeat: {e}"))
+                })?;
+
+            Ok(HostStateHeartbeatOutcome::Submitted {
+                tx_hash: response.tx_hash,
+                height: response.height,
+                current_epoch: build.current_epoch,
+                previous_host_state_epoch: build.host_state_epoch,
+            })
         })
     }
 
