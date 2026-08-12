@@ -4,6 +4,7 @@
 //! as Cosmos and Penumbra implementations in Hermes.
 
 pub mod chain_handle;
+pub(crate) mod checkpoint;
 pub mod config;
 pub mod endpoint;
 pub mod error;

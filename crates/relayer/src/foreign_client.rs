@@ -31,6 +31,7 @@ use ibc_relayer_types::timestamp::{Timestamp, TimestampOverflowError};
 use ibc_relayer_types::tx_msg::Msg;
 use ibc_relayer_types::Height;
 
+use crate::chain::cardano::checkpoint::is_probabilistic_checkpoint_update;
 use crate::chain::client::ClientSettings;
 use crate::chain::handle::ChainHandle;
 use crate::chain::requests::*;
@@ -50,6 +51,7 @@ const MAX_MISBEHAVIOUR_CHECK_DURATION: Duration = Duration::from_secs(120);
 const MAX_RETRIES: usize = 5;
 const CREATE_CLIENT_DISCOVERY_MAX_RETRIES: usize = 30;
 const CREATE_CLIENT_DISCOVERY_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_PROBABILISTIC_CHECKPOINT_UPDATES: usize = 4_096;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExpiredOrFrozen {
@@ -106,6 +108,15 @@ define_error! {
             [ RelayerError ]
             |e| {
                 format_args!("error raised while updating client on chain {0}: {1}", e.chain_id, e.description)
+            },
+
+        CheckpointUpdate
+            {
+                chain_id: ChainId,
+                description: String
+            }
+            |e| {
+                format_args!("error while advancing probabilistic checkpoints on chain {0}: {1}", e.chain_id, e.description)
             },
 
         ClientUpdateTiming
@@ -1080,7 +1091,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         target_height: Height,
         client_state: &AnyClientState,
     ) -> Result<Height, ForeignClientError> {
-        let client_latest_height = client_state.latest_height();
+        let client_latest_height = client_state.latest_verified_height();
 
         if client_latest_height < target_height {
             // If the latest height of the client is already lower than the
@@ -1135,7 +1146,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         trusted_height: Height,
         client_state: &AnyClientState,
     ) -> Result<(), ForeignClientError> {
-        if client_state.latest_height() != trusted_height {
+        if client_state.latest_verified_height() != trusted_height {
             // There should be no need to validate a trusted height in production,
             // Since it is always fetched from some client state. The only use is
             // from the command line when the trusted height is manually specified.
@@ -1381,7 +1392,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         // at-or-below-latest guard for them.
         if should_skip_client_update(
             client_state.client_type(),
-            client_state.latest_height(),
+            client_state.latest_verified_height(),
             target_height,
         ) {
             debug!(
@@ -1409,7 +1420,9 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             None => self.solve_trusted_height(target_height, &client_state)?,
         };
 
-        if trusted_height != client_state.latest_height() {
+        if trusted_height != client_state.latest_height()
+            && trusted_height != client_state.latest_verified_height()
+        {
             // If we're using a trusted height that is different from the client latest height,
             // then check if the consensus state at `trusted_height` is within trusting period
             if let ConsensusStateTrusted::NotTrusted {
@@ -1527,31 +1540,110 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             QueryHeight::Specific(height) => height,
         };
 
-        let new_msgs =
-            self.wait_and_build_update_client_with_trusted(target_height, trusted_height)?;
+        let mut all_events = Vec::new();
+        let mut submitted_checkpoint = false;
+        let mut next_trusted_height = trusted_height;
 
-        if new_msgs.is_empty() {
-            return Err(ForeignClientError::client_already_up_to_date(
-                self.id.clone(),
-                self.src_chain.id(),
-                target_height,
-            ));
+        for _ in 0..MAX_PROBABILISTIC_CHECKPOINT_UPDATES {
+            let new_msgs =
+                self.wait_and_build_update_client_with_trusted(target_height, next_trusted_height)?;
+
+            if new_msgs.is_empty() {
+                if submitted_checkpoint {
+                    return Ok(all_events);
+                }
+                return Err(ForeignClientError::client_already_up_to_date(
+                    self.id.clone(),
+                    self.src_chain.id(),
+                    target_height,
+                ));
+            }
+
+            let checkpoint_positions = new_msgs
+                .iter()
+                .enumerate()
+                .filter_map(
+                    |(index, message)| match is_probabilistic_checkpoint_update(message) {
+                        Ok(true) => Some(Ok(index)),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    },
+                )
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    ForeignClientError::checkpoint_update(self.dst_chain.id(), error)
+                })?;
+
+            if let Some(&checkpoint_index) = checkpoint_positions.first() {
+                if checkpoint_index != 0 {
+                    return Err(ForeignClientError::checkpoint_update(
+                        self.dst_chain.id(),
+                        "checkpoint update must precede all root-bearing client updates"
+                            .to_string(),
+                    ));
+                }
+
+                let before_height = self.validated_client_state()?.0.latest_verified_height();
+                let checkpoint_message =
+                    new_msgs.into_iter().next().expect("non-empty update list");
+                let events = self
+                    .dst_chain()
+                    .send_messages_and_wait_commit(TrackedMsgs::new_single(
+                        checkpoint_message,
+                        "probabilistic checkpoint",
+                    ))
+                    .map_err(|error| {
+                        ForeignClientError::client_update(
+                            self.dst_chain.id(),
+                            "failed sending probabilistic checkpoint to destination chain"
+                                .to_string(),
+                            error,
+                        )
+                    })?;
+                all_events.extend(events.into_iter().map(|event| event.event));
+                submitted_checkpoint = true;
+
+                let after_height = self.validated_client_state()?.0.latest_verified_height();
+                if after_height <= before_height {
+                    return Err(ForeignClientError::checkpoint_update(
+                        self.dst_chain.id(),
+                        format!(
+                            "checkpoint transaction committed without advancing the authenticated cursor beyond {before_height}"
+                        ),
+                    ));
+                }
+
+                info!(
+                    client_id = %self.id,
+                    %before_height,
+                    %after_height,
+                    %target_height,
+                    "probabilistic checkpoint committed; rebuilding the next catch-up step"
+                );
+                next_trusted_height = None;
+                continue;
+            }
+
+            let events = self
+                .dst_chain()
+                .send_messages_and_wait_commit(TrackedMsgs::new_static(new_msgs, "update client"))
+                .map_err(|error| {
+                    ForeignClientError::client_update(
+                        self.dst_chain.id(),
+                        "failed sending message to dst chain".to_string(),
+                        error,
+                    )
+                })?;
+            all_events.extend(events.into_iter().map(|event| event.event));
+            return Ok(all_events);
         }
 
-        let tm = TrackedMsgs::new_static(new_msgs, "update client");
-
-        let events = self
-            .dst_chain()
-            .send_messages_and_wait_commit(tm)
-            .map_err(|e| {
-                ForeignClientError::client_update(
-                    self.dst_chain.id(),
-                    "failed sending message to dst chain".to_string(),
-                    e,
-                )
-            })?;
-
-        Ok(events.into_iter().map(|ev| ev.event).collect())
+        Err(ForeignClientError::checkpoint_update(
+            self.dst_chain.id(),
+            format!(
+                "exceeded {MAX_PROBABILISTIC_CHECKPOINT_UPDATES} checkpoint transactions while catching up to {target_height}"
+            ),
+        ))
     }
 
     /// Attempts to update a client using header from the latest height of its source chain.

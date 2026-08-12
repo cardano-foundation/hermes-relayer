@@ -915,6 +915,7 @@ mod tests {
             host_state_tx_output_index: 0,
             bridge_blocks: vec![],
             new_epoch_context: None,
+            is_checkpoint: false,
         }
     }
 

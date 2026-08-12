@@ -9,6 +9,7 @@ use ibc_proto::ibc::applications::transfer::v2::FungibleTokenPacketData as RawPa
 use itertools::Itertools;
 use tracing::{debug, error, info, span, trace, warn, Level};
 
+use ibc_relayer_types::core::ics02_client::client_type::ClientType;
 use ibc_relayer_types::core::ics02_client::events::ClientMisbehaviour as ClientMisbehaviourEvent;
 use ibc_relayer_types::core::ics04_channel::channel::{
     ChannelEnd, Ordering, State as ChannelState,
@@ -26,6 +27,7 @@ use ibc_relayer_types::timestamp::Timestamp;
 use ibc_relayer_types::tx_msg::Msg;
 use ibc_relayer_types::Height;
 
+use crate::chain::cardano::checkpoint::is_probabilistic_checkpoint_update;
 use crate::chain::counterparty::unreceived_acknowledgements;
 use crate::chain::counterparty::unreceived_packets;
 use crate::chain::endpoint::ChainStatus;
@@ -33,6 +35,7 @@ use crate::chain::handle::ChainHandle;
 use crate::chain::requests::Paginate;
 use crate::chain::requests::QueryChannelRequest;
 use crate::chain::requests::QueryClientEventRequest;
+use crate::chain::requests::QueryClientStateRequest;
 use crate::chain::requests::QueryHeight;
 use crate::chain::requests::QueryHostConsensusStateRequest;
 use crate::chain::requests::QueryNextSequenceReceiveRequest;
@@ -70,6 +73,7 @@ use crate::util::pretty::PrettyEvents;
 use crate::util::queue::Queue;
 
 const MAX_RETRIES: usize = 5;
+const MAX_PROBABILISTIC_CHECKPOINT_UPDATES: usize = 4_096;
 
 /// Whether or not to resubmit packets when pending transactions
 /// fail to process within the given timeout duration.
@@ -860,6 +864,161 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
     /// or the ibc events, if the sender is [`Sync`].
     ///
     /// Propagates any encountered errors.
+    fn target_client_verified_height(
+        &self,
+        target: OperationalDataTarget,
+    ) -> Result<Height, LinkError> {
+        let (client_state, _) = match target {
+            OperationalDataTarget::Source => self
+                .src_chain()
+                .query_client_state(
+                    QueryClientStateRequest {
+                        client_id: self.src_client_id().clone(),
+                        height: QueryHeight::Latest,
+                    },
+                    IncludeProof::No,
+                )
+                .map_err(|error| LinkError::query(self.src_chain().id(), error))?,
+            OperationalDataTarget::Destination => self
+                .dst_chain()
+                .query_client_state(
+                    QueryClientStateRequest {
+                        client_id: self.dst_client_id().clone(),
+                        height: QueryHeight::Latest,
+                    },
+                    IncludeProof::No,
+                )
+                .map_err(|error| LinkError::query(self.dst_chain().id(), error))?,
+        };
+        Ok(client_state.latest_verified_height())
+    }
+
+    fn prepare_probabilistic_checkpoint_updates(
+        &self,
+        target: OperationalDataTarget,
+        update_height: Height,
+        tracking_id: TrackingId,
+    ) -> Result<(), LinkError> {
+        let (client_state, _) = match target {
+            OperationalDataTarget::Source => self
+                .src_chain()
+                .query_client_state(
+                    QueryClientStateRequest {
+                        client_id: self.src_client_id().clone(),
+                        height: QueryHeight::Latest,
+                    },
+                    IncludeProof::No,
+                )
+                .map_err(|error| LinkError::query(self.src_chain().id(), error))?,
+            OperationalDataTarget::Destination => self
+                .dst_chain()
+                .query_client_state(
+                    QueryClientStateRequest {
+                        client_id: self.dst_client_id().clone(),
+                        height: QueryHeight::Latest,
+                    },
+                    IncludeProof::No,
+                )
+                .map_err(|error| LinkError::query(self.dst_chain().id(), error))?,
+        };
+        if client_state.client_type() != ClientType::CardanoProbabilistic {
+            return Ok(());
+        }
+
+        let mut before_height = client_state.latest_verified_height();
+
+        for _ in 0..MAX_PROBABILISTIC_CHECKPOINT_UPDATES {
+            let update_messages = match target {
+                OperationalDataTarget::Source => self.build_update_client_on_src(update_height)?,
+                OperationalDataTarget::Destination => {
+                    self.build_update_client_on_dst(update_height)?
+                }
+            };
+            let checkpoint_positions = update_messages
+                .iter()
+                .enumerate()
+                .filter_map(
+                    |(index, message)| match is_probabilistic_checkpoint_update(message) {
+                        Ok(true) => Some(Ok(index)),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    },
+                )
+                .collect::<Result<Vec<_>, _>>();
+
+            let checkpoint_positions = match checkpoint_positions {
+                Ok(positions) => positions,
+                Err(decode_error) => {
+                    error!(%decode_error, "failed to inspect packet client update for checkpoint");
+                    return Err(LinkError::update_client_failed());
+                }
+            };
+            let Some(&checkpoint_index) = checkpoint_positions.first() else {
+                return Ok(());
+            };
+            if checkpoint_index != 0 {
+                error!(
+                    checkpoint_index,
+                    "probabilistic checkpoint did not precede root-bearing packet client update"
+                );
+                return Err(LinkError::update_client_failed());
+            }
+
+            let checkpoint_message = update_messages
+                .into_iter()
+                .next()
+                .expect("checkpoint position proves update list is non-empty");
+            let tracked = TrackedMsgs::new(vec![checkpoint_message], tracking_id);
+            match target {
+                OperationalDataTarget::Source => {
+                    self.src_chain()
+                        .send_messages_and_wait_commit(tracked)
+                        .map_err(LinkError::relayer)?;
+                }
+                OperationalDataTarget::Destination => {
+                    self.dst_chain()
+                        .send_messages_and_wait_commit(tracked)
+                        .map_err(LinkError::relayer)?;
+                }
+            }
+
+            let after_height = self.target_client_verified_height(target)?;
+            if after_height <= before_height {
+                error!(
+                    %before_height,
+                    %after_height,
+                    "checkpoint transaction committed without advancing packet client cursor"
+                );
+                return Err(LinkError::update_client_failed());
+            }
+            info!(
+                %before_height,
+                %after_height,
+                %update_height,
+                "probabilistic checkpoint committed before root-bearing client update"
+            );
+            before_height = after_height;
+        }
+
+        error!(
+            limit = MAX_PROBABILISTIC_CHECKPOINT_UPDATES,
+            %update_height,
+            "probabilistic checkpoint catch-up exceeded transaction limit"
+        );
+        Err(LinkError::update_client_failed())
+    }
+
+    fn prepare_probabilistic_checkpoints(&self, odata: &OperationalData) -> Result<(), LinkError> {
+        if odata.conn_delay_needed() {
+            return Ok(());
+        }
+        self.prepare_probabilistic_checkpoint_updates(
+            odata.target,
+            odata.client_update_height(self)?,
+            odata.tracking_id,
+        )
+    }
+
     fn send_from_operational_data<S: relay_sender::Submit>(
         &self,
         odata: &OperationalData,
@@ -868,6 +1027,8 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
             error!("ignoring empty operational data!");
             return Ok(S::Reply::empty());
         }
+
+        self.prepare_probabilistic_checkpoints(odata)?;
 
         let msgs = odata.assemble_msgs(self)?;
 
@@ -1054,6 +1215,11 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
     ) -> Result<Height, LinkError> {
         info!( "sending update_client to client hosted on source chain for height {} (retries left: {})", src_chain_height, retries_left );
 
+        self.prepare_probabilistic_checkpoint_updates(
+            OperationalDataTarget::Destination,
+            src_chain_height,
+            tracking_id,
+        )?;
         let dst_update = self.build_update_client_on_dst(src_chain_height)?;
         let tm = TrackedMsgs::new(dst_update, tracking_id);
         let dst_tx_events = self
@@ -1121,6 +1287,11 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
     ) -> Result<Height, LinkError> {
         info!("sending update_client to client hosted on source chain for height {} (retries left: {})", dst_chain_height, retries_left);
 
+        self.prepare_probabilistic_checkpoint_updates(
+            OperationalDataTarget::Source,
+            dst_chain_height,
+            tracking_id,
+        )?;
         let src_update = self.build_update_client_on_src(dst_chain_height)?;
         let tm = TrackedMsgs::new(src_update, tracking_id);
         let src_tx_events = self

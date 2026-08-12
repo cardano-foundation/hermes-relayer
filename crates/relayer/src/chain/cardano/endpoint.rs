@@ -3895,6 +3895,9 @@ mod tests {
             slot_length_ns: 1,
             epoch_contexts: vec![],
             pool_registration_cutoff_slot_exclusive: 0,
+            latest_checkpoint_height: Some(height(10)),
+            latest_checkpoint_block_hash: "checkpoint-10".to_string(),
+            latest_checkpoint_epoch: 0,
         })
     }
 
@@ -3927,6 +3930,7 @@ mod tests {
             host_state_tx_hash: "host_tx".to_string(),
             host_state_tx_output_index: 0,
             new_epoch_context: None,
+            is_checkpoint: false,
         }
     }
 

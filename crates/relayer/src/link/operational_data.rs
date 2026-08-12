@@ -151,6 +151,56 @@ impl OperationalData {
         }
     }
 
+    pub(crate) fn client_update_height<ChainA: ChainHandle, ChainB: ChainHandle>(
+        &self,
+        relay_path: &RelayPath<ChainA, ChainB>,
+    ) -> Result<Height, LinkError> {
+        let src_chain_is_cardano = matches!(
+            relay_path
+                .src_chain()
+                .config()
+                .map_err(LinkError::relayer)?,
+            ChainConfig::Cardano(_)
+        );
+        let dst_chain_is_cardano = matches!(
+            relay_path
+                .dst_chain()
+                .config()
+                .map_err(LinkError::relayer)?,
+            ChainConfig::Cardano(_)
+        );
+
+        if (matches!(self.target, OperationalDataTarget::Destination) && src_chain_is_cardano)
+            || (matches!(self.target, OperationalDataTarget::Source) && dst_chain_is_cardano)
+        {
+            Ok(self.proofs_height)
+        } else {
+            Ok(self.proofs_height.increment())
+        }
+    }
+
+    pub(crate) fn build_client_update_msgs<ChainA: ChainHandle, ChainB: ChainHandle>(
+        &self,
+        relay_path: &RelayPath<ChainA, ChainB>,
+    ) -> Result<Vec<Any>, LinkError> {
+        if self.conn_delay_needed() {
+            return Ok(vec![]);
+        }
+
+        let update_height = self.client_update_height(relay_path)?;
+        debug!(
+            "prepending {} client update at height {}",
+            self.target, update_height
+        );
+
+        match self.target {
+            OperationalDataTarget::Source => relay_path.build_update_client_on_src(update_height),
+            OperationalDataTarget::Destination => {
+                relay_path.build_update_client_on_dst(update_height)
+            }
+        }
+    }
+
     /// Returns all the messages in this operational
     /// data, plus prepending the client update message
     /// if necessary.
@@ -158,58 +208,9 @@ impl OperationalData {
         &self,
         relay_path: &RelayPath<ChainA, ChainB>,
     ) -> Result<TrackedMsgs, LinkError> {
-        // For zero delay we prepend the client update msgs.
-        let client_update_msgs = if !self.conn_delay_needed() {
-            // Hermes normally updates the on-chain light client to `proof_height + 1` before
-            // sending proof-bearing messages (connection/channel/packet).
-            //
-            // For Cardano↔Cosmos (Mithril) in our system, proofs are verified against the
-            // consensus state stored at the exact `proof_height` returned by the Gateway.
-            // If we update to `proof_height + 1` first, the Mithril client will not have a
-            // consensus state stored at `proof_height`, and verification fails with:
-            // "consensus state not found".
-            //
-            // Therefore, when we are updating a Cardano-tracking client (i.e. the counterparty
-            // chain in this relay path is Cardano), we update to `proof_height` directly.
-            let src_chain_is_cardano = matches!(
-                relay_path
-                    .src_chain()
-                    .config()
-                    .map_err(LinkError::relayer)?,
-                ChainConfig::Cardano(_)
-            );
-            let dst_chain_is_cardano = matches!(
-                relay_path
-                    .dst_chain()
-                    .config()
-                    .map_err(LinkError::relayer)?,
-                ChainConfig::Cardano(_)
-            );
-            let update_height = if (matches!(self.target, OperationalDataTarget::Destination)
-                && src_chain_is_cardano)
-                || (matches!(self.target, OperationalDataTarget::Source) && dst_chain_is_cardano)
-            {
-                self.proofs_height
-            } else {
-                self.proofs_height.increment()
-            };
-
-            debug!(
-                "prepending {} client update at height {}",
-                self.target, update_height
-            );
-
-            // Fetch the client update messages.
-            // Vector may be empty if the client already has the header for the requested height.
-            match self.target {
-                OperationalDataTarget::Source => {
-                    relay_path.build_update_client_on_src(update_height)?
-                }
-                OperationalDataTarget::Destination => {
-                    relay_path.build_update_client_on_dst(update_height)?
-                }
-            }
-        } else {
+        // For delayed paths the client update is scheduled separately. Preserve
+        // the existing frozen-client guard before assembling packet messages.
+        let client_update_msgs = if self.conn_delay_needed() {
             let (client_state, _) = match self.target {
                 OperationalDataTarget::Source => relay_path
                     .src_chain()
@@ -237,8 +238,9 @@ impl OperationalData {
             if client_state.is_frozen() {
                 return Ok(TrackedMsgs::new(vec![], self.tracking_id));
             }
-
             vec![]
+        } else {
+            self.build_client_update_msgs(relay_path)?
         };
 
         let msgs = client_update_msgs
