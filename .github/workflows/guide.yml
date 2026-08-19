@@ -24,7 +24,7 @@ jobs:
       - name: Install mdbook and plugins
         uses: taiki-e/install-action@v2
         with:
-          tool: mdbook,mdbook-mermaid,mdbook-template,mdbook-toc
+          tool: mdbook@0.4.52,mdbook-mermaid@0.16.2,mdbook-template@1.1.1,mdbook-toc@0.14.2
 
       - name: Build guide
         run: |
