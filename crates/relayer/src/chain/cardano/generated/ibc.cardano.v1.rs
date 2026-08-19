@@ -20,6 +20,31 @@ pub struct BuildHostStateHeartbeatResponse {
     #[prost(message, optional, tag = "4")]
     pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgPrunePacketHistory {
+    /// Cardano address whose UTxOs fund and sign the pruning transaction.
+    #[prost(string, tag = "1")]
+    pub signer: ::prost::alloc::string::String,
+    /// Local Cardano channel identifiers whose retained history is pruned.
+    #[prost(string, tag = "2")]
+    pub port_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub channel_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub sequence: u64,
+    /// ICS-23 non-membership proof for the corresponding source-chain packet
+    /// commitment, evaluated at proof_height.
+    #[prost(bytes = "vec", tag = "5")]
+    pub proof_commitment_absence: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "6")]
+    pub proof_height: ::core::option::Option<super::super::core::client::v1::Height>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgPrunePacketHistoryResponse {
+    /// Unsigned Cardano transaction CBOR encoded as UTF-8 hex.
+    #[prost(message, optional, tag = "1")]
+    pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
+}
 /// SubmitSignedTxRequest contains a signed Cardano transaction in CBOR format.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SubmitSignedTxRequest {
@@ -178,6 +203,35 @@ pub mod cardano_msg_client {
             req.extensions_mut().insert(GrpcMethod::new(
                 "ibc.cardano.v1.CardanoMsg",
                 "BuildHostStateHeartbeat",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
+        /// PrunePacketHistory builds a Cardano transaction which removes one
+        /// finalized unordered packet receipt/acknowledgement pair. Safety is
+        /// authorized by a counterparty proof that the source commitment is absent.
+        pub async fn prune_packet_history(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MsgPrunePacketHistory>,
+        ) -> std::result::Result<
+            tonic::Response<super::MsgPrunePacketHistoryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ibc.cardano.v1.CardanoMsg/PrunePacketHistory",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "ibc.cardano.v1.CardanoMsg",
+                "PrunePacketHistory",
             ));
             self.inner.unary(req, path, codec).await
         }

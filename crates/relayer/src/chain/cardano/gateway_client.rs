@@ -6,7 +6,8 @@
 use super::error::Error;
 use super::generated::ibc::cardano::v1::{
     cardano_msg_client::CardanoMsgClient, BuildHostStateHeartbeatRequest,
-    BuildHostStateHeartbeatResponse, SubmitSignedTxRequest, SubmitSignedTxResponse,
+    BuildHostStateHeartbeatResponse, MsgPrunePacketHistory, SubmitSignedTxRequest,
+    SubmitSignedTxResponse,
 };
 use super::generated::ibc::core::channel::v1::msg_client::MsgClient as GenChannelMsgClient;
 use super::generated::ibc::core::client::v1::msg_client::MsgClient as GenClientMsgClient;
@@ -47,6 +48,7 @@ use tonic::transport::Channel;
 
 const GATEWAY_HEADER_GRPC_MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
 const CARDANO_NATIVE_ASSET_MAX_QUANTITY: u64 = u64::MAX;
+const PRUNE_PACKET_HISTORY_TYPE_URL: &str = "/ibc.cardano.v1.MsgPrunePacketHistory";
 
 /// Unsigned transaction response from Gateway
 #[derive(Debug, Clone)]
@@ -773,6 +775,7 @@ impl GatewayClient {
             "/ibc.core.channel.v1.MsgTimeoutOnClose" => {
                 self.build_timeout_on_close_tx(message_data).await
             }
+            PRUNE_PACKET_HISTORY_TYPE_URL => self.build_prune_packet_history_tx(message_data).await,
 
             // IBC Transfer messages
             "/ibc.applications.transfer.v1.MsgTransfer" => {
@@ -1477,6 +1480,48 @@ impl GatewayClient {
         Ok(UnsignedTx {
             cbor_hex,
             description: format!("MsgTimeoutOnClose (sequence: {})", sequence),
+        })
+    }
+
+    async fn build_prune_packet_history_tx(
+        &self,
+        message_data: Vec<u8>,
+    ) -> Result<UnsignedTx, Error> {
+        use prost::Message;
+
+        let msg = MsgPrunePacketHistory::decode(&message_data[..]).map_err(|e| {
+            Error::Transaction(format!("Failed to decode MsgPrunePacketHistory: {}", e))
+        })?;
+        let port_id = msg.port_id.clone();
+        let channel_id = msg.channel_id.clone();
+        let sequence = msg.sequence;
+
+        let mut client = CardanoMsgClient::new(self.channel.clone());
+        let response = client
+            .prune_packet_history(tonic::Request::new(msg))
+            .await?
+            .into_inner();
+
+        let unsigned_tx_any = response.unsigned_tx.ok_or_else(|| {
+            Error::Transaction("No unsigned_tx in PrunePacketHistory response".to_string())
+        })?;
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+
+        tracing::info!(
+            "PrunePacketHistory: received unsigned CBOR (length: {}), port_id: {}, channel_id: {}, sequence: {}",
+            cbor_hex.len(),
+            port_id,
+            channel_id,
+            sequence
+        );
+
+        Ok(UnsignedTx {
+            cbor_hex,
+            description: format!(
+                "MsgPrunePacketHistory (port: {}, channel: {}, sequence: {})",
+                port_id, channel_id, sequence
+            ),
         })
     }
 

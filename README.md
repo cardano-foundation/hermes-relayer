@@ -186,6 +186,10 @@ On startup, the Cardano event source replays recent Gateway events from `event_r
 
 Cardano keys restored from mnemonics use Hermes' current Cardano-shaped SLIP-0010 Ed25519 derivation, not normal Cardano wallet Ed25519-BIP32 derivation. Operators importing a mnemonic from a Cardano wallet should verify the derived signer address before funding or relaying. Cardano key import and restore use the chain configuration's `network_id`; generic Cardano mnemonic construction without an explicit network id is rejected.
 
+### Cardano Packet-History Pruning
+
+After the source commitment for a received unordered packet has been removed, an operator can prune the corresponding receipt and acknowledgement from Cardano with `hermes tx packet-prune --dst-chain cardano-preview --src-chain injective-888 --src-port transfer --src-channel channel-7 --sequence 12`. The command defaults to the Cardano client’s latest verified source height; for a connection with a nonzero delay, pass an older, delay-matured height such as `--proof-height 888-12345`, which must still be at or above the channel’s receive high-water mark and pruning floor.
+
 ### Cardano ICS-20 Amount Range
 
 Canonical ICS-20 transfer amounts are decimal strings and Hermes models them as `U256`. Cardano ICS-20 vouchers are represented as Cardano native asset quantities through the Gateway transfer protobuf, so amounts must fit in `u64` (`0..=18446744073709551615`). Hermes validates this before asking the Gateway to build a Cardano transfer transaction. Transfers with amounts outside this range are rejected with an explicit error instead of failing later during packet creation or transaction construction.
