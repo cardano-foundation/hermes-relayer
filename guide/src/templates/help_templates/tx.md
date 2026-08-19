@@ -27,5 +27,6 @@ SUBCOMMANDS:
     ft-transfer             Send a fungible token transfer test transaction (ICS20 MsgTransfer)
     help                    Print this message or the help of the given subcommand(s)
     packet-ack              Relay acknowledgment packets
+    packet-prune            Prune one finalized packet receipt/acknowledgement pair on Cardano
     packet-recv             Relay receive or timeout packets
     upgrade-chain           Send an IBC upgrade plan
