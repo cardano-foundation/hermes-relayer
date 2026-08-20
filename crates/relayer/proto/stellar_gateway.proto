@@ -12,6 +12,7 @@ service StellarGatewayQuery {
   rpc QueryAcknowledgement(QueryAcknowledgementRequest) returns (QueryAcknowledgementResponse);
   rpc QueryNextSeqRecv(QueryNextSeqRecvRequest) returns (QueryNextSeqRecvResponse);
   rpc QueryIbcHeader(QueryIbcHeaderRequest) returns (QueryIbcHeaderResponse);
+  rpc QueryStellarClientParams(QueryStellarClientParamsRequest) returns (QueryStellarClientParamsResponse);
   rpc Events(EventsRequest) returns (EventsResponse);
 }
 
@@ -24,6 +25,7 @@ service StellarGatewayMsg {
   rpc AckPacket(MsgAckPacketRequest) returns (MsgAckPacketResponse);
   rpc TimeoutPacket(MsgTimeoutPacketRequest) returns (MsgTimeoutPacketResponse);
   rpc SubmitMisbehaviour(MsgSubmitMisbehaviourRequest) returns (MsgSubmitMisbehaviourResponse);
+  rpc CommitRoot(MsgCommitRootRequest) returns (MsgCommitRootResponse);
 }
 
 message LatestHeightRequest {}
@@ -122,12 +124,58 @@ message QueryIbcHeaderResponse {
 }
 
 message StellarHeader {
-  uint32 ledger_seq        = 1;
-  bytes  ledger_header_xdr = 2;
-  bytes  ibc_state_root    = 3;
-  bytes  scp_node_id       = 4;
-  bytes  scp_signature     = 5;
-  bytes  signed_value_xdr  = 6;
+  uint64 slot_index                 = 1;
+  bytes  ledger_header_xdr          = 2;
+  repeated bytes scp_envelopes      = 3;
+  repeated bytes quorum_sets_xdr    = 4;
+  repeated bytes next_scp_envelopes = 5;
+  bytes  next_tx_set_xdr            = 6;
+  StateRootProof state_root_proof   = 7;
+}
+
+message StateRootProof {
+  repeated bytes result_pairs  = 1;
+  uint32 result_index          = 2;
+  bytes  success_preimage_xdr  = 3;
+}
+
+message Height {
+  uint64 revision_number = 1;
+  uint64 revision_height = 2;
+}
+
+message QuorumConfig {
+  bytes  quorum_set_xdr = 1;
+  uint64 valid_from     = 2;
+}
+
+message StellarClientState {
+  string chain_id                      = 1;
+  Height latest_height                 = 2;
+  Height frozen_height                 = 3;
+  repeated QuorumConfig quorum_configs = 4;
+  repeated bytes proof_specs           = 5;
+  bytes  network_id                    = 6;
+  uint64 max_consensus_age             = 7;
+  bytes  router_contract_id            = 8;
+  bytes  root_event_topic              = 9;
+}
+
+message StellarConsensusState {
+  uint64 timestamp   = 1;
+  bytes  ledger_hash = 2;
+  bytes  root        = 3;
+}
+
+message QueryStellarClientParamsRequest {
+  uint64 height = 1;
+}
+
+message QueryStellarClientParamsResponse {
+  repeated QuorumConfig quorum_configs = 1;
+  bytes network_id                     = 2;
+  bytes router_contract_id             = 3;
+  bytes root_event_topic               = 4;
 }
 
 message EventsRequest {
@@ -238,5 +286,13 @@ message MsgSubmitMisbehaviourRequest {
 }
 
 message MsgSubmitMisbehaviourResponse {
+  bytes tx_xdr = 1;
+}
+
+message MsgCommitRootRequest {
+  string signer = 1;
+}
+
+message MsgCommitRootResponse {
   bytes tx_xdr = 1;
 }
