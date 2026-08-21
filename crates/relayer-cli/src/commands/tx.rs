@@ -71,6 +71,9 @@ pub enum TxCmd {
     /// Relay acknowledgment packets
     PacketAck(packet::TxPacketAckCmd),
 
+    /// Prune one finalized packet receipt/acknowledgement pair on Cardano
+    PacketPrune(packet::TxPacketPruneCmd),
+
     /// Send an IBC upgrade plan
     UpgradeChain(upgrade::TxIbcUpgradeChainCmd),
 }

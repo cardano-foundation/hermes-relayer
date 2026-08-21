@@ -3,7 +3,7 @@
 This command allows you to easily update the lowest log level displayed by Hermes.
 
 ```shell
-{{#include ../../../templates/help_templates/logs/log-level.md}}
+{{#include ../../../templates/help_templates/logs/set-log-level.md}}
 ```
 
 ## Set Raw Filter
@@ -11,7 +11,7 @@ This command allows you to easily update the lowest log level displayed by Herme
 This command allows you to update the tracing directive used to filter the logs. Please use this command with caution as it requires a precise syntax.
 
 ```shell
-{{#include ../../../templates/help_templates/logs/raw.md}}
+{{#include ../../../templates/help_templates/logs/set-raw-filter.md}}
 ```
 
 ## Reset

@@ -1000,7 +1000,7 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
         // height can query before the just-submitted handshake event exists.
         //
         // This is required for Cardano's accepted HostState view, and it also avoids
-        // "bad connection state" when opening Entrypoint<->Injective connections with
+        // "bad connection state" when opening Cardano<->Injective connections with
         // pre-existing clients.
         let query_height = src_latest_height;
 

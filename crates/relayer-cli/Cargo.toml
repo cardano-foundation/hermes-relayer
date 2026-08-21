@@ -20,6 +20,7 @@ name = "hermes"
 [dependencies]
 ibc-relayer-types  = { workspace = true }
 ibc-relayer        = { workspace = true }
+ibc-proto          = { workspace = true }
 ibc-telemetry      = { workspace = true }
 ibc-relayer-rest   = { workspace = true }
 ibc-chain-registry = { workspace = true }
@@ -40,6 +41,7 @@ http                             = { workspace = true }
 humantime                        = { workspace = true }
 itertools                        = { workspace = true }
 oneline-eyre                     = { workspace = true }
+prost                            = { workspace = true }
 regex                            = { workspace = true }
 serde                            = { workspace = true, features = ["serde_derive"] }
 serde_json                       = { workspace = true }
