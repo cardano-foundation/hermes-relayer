@@ -15,49 +15,83 @@ use crate::Height;
 pub const STELLAR_HEADER_TYPE_URL: &str = "/ibc.lightclients.stellar.v1.StellarHeader";
 pub const WASM_CLIENT_MESSAGE_TYPE_URL: &str = "/ibc.lightclients.wasm.v1.ClientMessage";
 
-const SMT_ROOT_BYTES: usize = 32;
+/// Byte offset of `StellarValue.closeTime` inside a `LedgerHeader`.
+///
+/// Everything before it is fixed width — `ledgerVersion` (4),
+/// `previousLedgerHash` (32), `StellarValue.txSetHash` (32) — so the close time
+/// can be read without a full XDR decode. The wire header carries no timestamp
+/// of its own; taking one from anywhere but the signed header bytes would mean
+/// trusting the relayer for it.
+const CLOSE_TIME_OFFSET: usize = 4 + 32 + 32;
 
 type RawHeader = raw::StellarHeader;
 
+/// A Stellar ledger plus the SCP evidence that it was agreed on.
+///
+/// The last four fields are what the light client verifies; `height`,
+/// `timestamp` and `trusted_height` are hermes' own bookkeeping and are not on
+/// the wire. SCP has no ledger-hash continuity chain — each header is verified
+/// independently against the client's pinned quorum set — so there is no
+/// trusted height to transmit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Header {
-    pub trusted_height: Height,
     pub height: Height,
     pub timestamp: Timestamp,
+    pub trusted_height: Height,
     pub ledger_header_xdr: Vec<u8>,
-    pub ibc_state_root: Vec<u8>,
-    pub scp_envelopes: Vec<ScpEnvelope>,
-    pub ledger_hash: Vec<u8>,
-    pub previous_ledger_hash: Vec<u8>,
+    pub scp_envelopes: Vec<Vec<u8>>,
+    pub quorum_sets_xdr: Vec<Vec<u8>>,
+    pub next_scp_envelopes: Vec<Vec<u8>>,
+    pub next_tx_set_xdr: Vec<u8>,
+    pub state_root_proof: Option<StateRootProof>,
     #[serde(default)]
     pub wrap_as_wasm: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScpEnvelope {
-    pub node_id: Vec<u8>,
-    pub statement_xdr: Vec<u8>,
-    pub signature: Vec<u8>,
+pub struct StateRootProof {
+    pub result_pairs: Vec<Vec<u8>>,
+    pub result_index: u32,
+    pub success_preimage_xdr: Vec<u8>,
 }
 
-impl From<raw::ScpEnvelope> for ScpEnvelope {
-    fn from(r: raw::ScpEnvelope) -> Self {
+impl From<raw::StateRootProof> for StateRootProof {
+    fn from(r: raw::StateRootProof) -> Self {
         Self {
-            node_id: r.node_id,
-            statement_xdr: r.statement_xdr,
-            signature: r.signature,
+            result_pairs: r.result_pairs,
+            result_index: r.result_index,
+            success_preimage_xdr: r.success_preimage_xdr,
         }
     }
 }
 
-impl From<ScpEnvelope> for raw::ScpEnvelope {
-    fn from(value: ScpEnvelope) -> Self {
+impl From<StateRootProof> for raw::StateRootProof {
+    fn from(v: StateRootProof) -> Self {
         Self {
-            node_id: value.node_id,
-            statement_xdr: value.statement_xdr,
-            signature: value.signature,
+            result_pairs: v.result_pairs,
+            result_index: v.result_index,
+            success_preimage_xdr: v.success_preimage_xdr,
         }
     }
+}
+
+/// Read `closeTime` out of a `LedgerHeader`, big-endian.
+fn close_time_secs(ledger_header_xdr: &[u8]) -> Result<u64, Error> {
+    let end = CLOSE_TIME_OFFSET + 8;
+    let bytes = ledger_header_xdr
+        .get(CLOSE_TIME_OFFSET..end)
+        .ok_or_else(|| {
+            Error::invalid_field(
+                "ledger_header_xdr",
+                format!(
+                    "too short to contain closeTime: need {end} bytes, got {}",
+                    ledger_header_xdr.len()
+                ),
+            )
+        })?;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(bytes);
+    Ok(u64::from_be_bytes(buf))
 }
 
 impl crate::core::ics02_client::header::Header for Header {
@@ -80,33 +114,8 @@ impl TryFrom<RawHeader> for Header {
     type Error = Error;
 
     fn try_from(raw: RawHeader) -> Result<Self, Self::Error> {
-        if raw.ledger_seq == 0 {
-            return Err(Error::invalid_height(raw.ledger_seq));
-        }
-
-        let trusted_height = raw
-            .trusted_height
-            .ok_or_else(|| Error::missing_field("trusted_height"))?
-            .try_into()?;
-
-        let height = Height::new(0, raw.ledger_seq).map_err(|e| {
-            Error::height_conversion(format!(
-                "failed to build height from ledger_seq={}: {e}",
-                raw.ledger_seq
-            ))
-        })?;
-
-        if raw.ibc_state_root.is_empty() {
-            return Err(Error::missing_field("ibc_state_root"));
-        }
-        if raw.ibc_state_root.len() != SMT_ROOT_BYTES {
-            return Err(Error::invalid_field(
-                "ibc_state_root",
-                format!(
-                    "expected {SMT_ROOT_BYTES} bytes, got {}",
-                    raw.ibc_state_root.len()
-                ),
-            ));
+        if raw.slot_index == 0 {
+            return Err(Error::invalid_height(raw.slot_index));
         }
         if raw.ledger_header_xdr.is_empty() {
             return Err(Error::missing_field("ledger_header_xdr"));
@@ -114,23 +123,46 @@ impl TryFrom<RawHeader> for Header {
         if raw.scp_envelopes.is_empty() {
             return Err(Error::missing_field("scp_envelopes"));
         }
+        if raw.quorum_sets_xdr.is_empty() {
+            return Err(Error::missing_field("quorum_sets_xdr"));
+        }
+        // Slot N+1 is what binds the parts of the header SCP does not sign, so
+        // a header without it cannot prove a state root and is rejected here
+        // rather than on chain.
+        if raw.next_scp_envelopes.is_empty() {
+            return Err(Error::missing_field("next_scp_envelopes"));
+        }
+        if raw.next_tx_set_xdr.is_empty() {
+            return Err(Error::missing_field("next_tx_set_xdr"));
+        }
 
-        let timestamp = if raw.timestamp == 0 {
+        let height = Height::new(0, raw.slot_index).map_err(|e| {
+            Error::height_conversion(format!(
+                "failed to build height from slot_index={}: {e}",
+                raw.slot_index
+            ))
+        })?;
+
+        let close_time = close_time_secs(&raw.ledger_header_xdr)?;
+        let timestamp = if close_time == 0 {
             Timestamp::none()
         } else {
-            Timestamp::from_nanoseconds(raw.timestamp.saturating_mul(1_000_000_000))
+            Timestamp::from_nanoseconds(close_time.saturating_mul(1_000_000_000))
                 .unwrap_or_else(|_| Timestamp::none())
         };
 
         Ok(Self {
-            trusted_height,
             height,
             timestamp,
+            // Nothing on the wire says otherwise; the endpoint overwrites this
+            // when it has the real trusted height.
+            trusted_height: height,
             ledger_header_xdr: raw.ledger_header_xdr,
-            ibc_state_root: raw.ibc_state_root,
-            scp_envelopes: raw.scp_envelopes.into_iter().map(Into::into).collect(),
-            ledger_hash: raw.ledger_hash,
-            previous_ledger_hash: raw.previous_ledger_hash,
+            scp_envelopes: raw.scp_envelopes,
+            quorum_sets_xdr: raw.quorum_sets_xdr,
+            next_scp_envelopes: raw.next_scp_envelopes,
+            next_tx_set_xdr: raw.next_tx_set_xdr,
+            state_root_proof: raw.state_root_proof.map(Into::into),
             wrap_as_wasm: false,
         })
     }
@@ -138,20 +170,14 @@ impl TryFrom<RawHeader> for Header {
 
 impl From<Header> for RawHeader {
     fn from(value: Header) -> Self {
-        let timestamp_secs = value
-            .timestamp
-            .nanoseconds()
-            .checked_div(1_000_000_000)
-            .unwrap_or(0);
         RawHeader {
-            ledger_seq: value.height.revision_height(),
+            slot_index: value.height.revision_height(),
             ledger_header_xdr: value.ledger_header_xdr,
-            ibc_state_root: value.ibc_state_root,
-            scp_envelopes: value.scp_envelopes.into_iter().map(Into::into).collect(),
-            trusted_height: Some(value.trusted_height.into()),
-            timestamp: timestamp_secs,
-            ledger_hash: value.ledger_hash,
-            previous_ledger_hash: value.previous_ledger_hash,
+            scp_envelopes: value.scp_envelopes,
+            quorum_sets_xdr: value.quorum_sets_xdr,
+            next_scp_envelopes: value.next_scp_envelopes,
+            next_tx_set_xdr: value.next_tx_set_xdr,
+            state_root_proof: value.state_root_proof.map(Into::into),
         }
     }
 }
@@ -209,47 +235,81 @@ impl From<Header> for Any {
 mod tests {
     use super::*;
 
-    fn sample_header(ts_secs: u64) -> Header {
+    /// A header whose ledger bytes are long enough to carry a closeTime at the
+    /// fixed offset, with a recognisable value.
+    fn sample_header(close_time: u64) -> Header {
+        let mut ledger_header_xdr = vec![0xCCu8; CLOSE_TIME_OFFSET];
+        ledger_header_xdr.extend_from_slice(&close_time.to_be_bytes());
+        ledger_header_xdr.extend_from_slice(&[0xDD; 32]);
+
         Header {
-            trusted_height: Height::new(0, 100).unwrap(),
             height: Height::new(0, 105).unwrap(),
-            timestamp: Timestamp::from_nanoseconds(ts_secs.saturating_mul(1_000_000_000))
+            timestamp: Timestamp::from_nanoseconds(close_time.saturating_mul(1_000_000_000))
                 .unwrap_or_else(|_| Timestamp::none()),
-            ledger_header_xdr: vec![0xCC; 16],
-            ibc_state_root: vec![0x11; 32],
-            scp_envelopes: vec![ScpEnvelope {
-                node_id: vec![0x42; 32],
-                statement_xdr: vec![1, 2, 3],
-                signature: vec![0u8; 64],
-            }],
-            ledger_hash: vec![0xaa; 32],
-            previous_ledger_hash: vec![0xbb; 32],
+            trusted_height: Height::new(0, 100).unwrap(),
+            ledger_header_xdr,
+            scp_envelopes: vec![vec![1, 2, 3]],
+            quorum_sets_xdr: vec![vec![4, 5, 6]],
+            next_scp_envelopes: vec![vec![7, 8, 9]],
+            next_tx_set_xdr: vec![0xEE; 40],
+            state_root_proof: Some(StateRootProof {
+                result_pairs: vec![vec![0xA1; 8], vec![0xA2; 8]],
+                result_index: 1,
+                success_preimage_xdr: vec![0xB0; 12],
+            }),
             wrap_as_wasm: false,
         }
     }
 
     #[test]
-    fn raw_round_trip_carries_new_fields() {
+    fn raw_round_trip_preserves_the_scp_evidence() {
         let original = sample_header(1_700_000_500);
         let raw: RawHeader = original.clone().into();
-        assert_eq!(raw.timestamp, 1_700_000_500);
-        assert_eq!(raw.ledger_hash, original.ledger_hash);
-        assert_eq!(raw.previous_ledger_hash, original.previous_ledger_hash);
+
+        assert_eq!(raw.slot_index, 105);
+        assert_eq!(raw.scp_envelopes, original.scp_envelopes);
+        assert_eq!(raw.quorum_sets_xdr, original.quorum_sets_xdr);
+        assert_eq!(raw.next_scp_envelopes, original.next_scp_envelopes);
+        assert_eq!(raw.next_tx_set_xdr, original.next_tx_set_xdr);
 
         let decoded: Header = raw.try_into().unwrap();
         assert_eq!(decoded.height, original.height);
-        assert_eq!(decoded.ledger_hash, original.ledger_hash);
-        assert_eq!(decoded.previous_ledger_hash, original.previous_ledger_hash);
+        assert_eq!(decoded.scp_envelopes, original.scp_envelopes);
+        assert_eq!(decoded.state_root_proof, original.state_root_proof);
+    }
+
+    /// The timestamp is not transmitted; it is read out of the signed ledger
+    /// header, so it cannot be set independently of the bytes the validators
+    /// signed.
+    #[test]
+    fn timestamp_is_derived_from_the_ledger_header() {
+        let original = sample_header(1_700_000_500);
+        let decoded: Header = RawHeader::from(original).try_into().unwrap();
+
+        assert_eq!(
+            decoded.timestamp.nanoseconds(),
+            1_700_000_500u64.saturating_mul(1_000_000_000)
+        );
     }
 
     #[test]
-    fn timestamp_zero_decodes_as_none() {
-        let mut original = sample_header(0);
-        original.timestamp = Timestamp::none();
-        let raw: RawHeader = original.clone().into();
-        assert_eq!(raw.timestamp, 0);
-        let decoded: Header = raw.try_into().unwrap();
-        assert_eq!(decoded.timestamp, Timestamp::none());
+    fn a_header_too_short_for_a_close_time_is_rejected() {
+        let mut original = sample_header(1_700_000_500);
+        original.ledger_header_xdr.truncate(CLOSE_TIME_OFFSET + 4);
+        let raw: RawHeader = original.into();
+
+        assert!(Header::try_from(raw).is_err());
+    }
+
+    /// Slot N+1 carries the binding for everything SCP does not sign, so a
+    /// header without it is refused before it reaches the chain.
+    #[test]
+    fn a_header_without_the_next_slot_is_rejected() {
+        let original = sample_header(1_700_000_500);
+        let mut raw: RawHeader = original.into();
+        raw.next_scp_envelopes.clear();
+
+        assert!(Header::try_from(raw).is_err());
     }
 
     #[test]
@@ -257,8 +317,9 @@ mod tests {
         let original = sample_header(1_700_000_500);
         let any: Any = original.clone().into();
         assert_eq!(any.type_url, STELLAR_HEADER_TYPE_URL);
+
         let decoded: Header = any.try_into().unwrap();
-        assert_eq!(decoded.ledger_hash, original.ledger_hash);
-        assert_eq!(decoded.previous_ledger_hash, original.previous_ledger_hash);
+        assert_eq!(decoded.height, original.height);
+        assert_eq!(decoded.next_tx_set_xdr, original.next_tx_set_xdr);
     }
 }

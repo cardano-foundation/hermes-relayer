@@ -8,8 +8,7 @@ use tracing::{debug, error_span, info, instrument, warn};
 use ibc_proto::google::protobuf::Any;
 use ibc_relayer_types::clients::ics10_stellar::v2_msgs::{
     Height as V2Height, MsgAcknowledgement, MsgRecvPacket, MsgTimeout, Packet, Payload,
-    TYPE_URL_ACKNOWLEDGEMENT, TYPE_URL_RECV_PACKET,
-    TYPE_URL_TIMEOUT,
+    TYPE_URL_ACKNOWLEDGEMENT, TYPE_URL_RECV_PACKET, TYPE_URL_TIMEOUT,
 };
 use ibc_relayer_types::core::ics24_host::identifier::ChainId;
 use ibc_relayer_types::events::{IbcEvent, ModuleEvent};
@@ -1383,21 +1382,52 @@ mod decoder_tests {
         assert!(matches!(err, BuildMsgError::Decode(_)));
     }
 
+    /// Records what was submitted and reports back the events the destination
+    /// chain would have emitted. `submit` returns events rather than a tx hash
+    /// because the relay path reads acknowledgements out of them.
     struct RecordingDestination {
         submitted: std::sync::Mutex<Vec<Vec<Any>>>,
-        tx_hash: String,
+        events: Vec<IbcEventWithHeight>,
     }
+
+    impl RecordingDestination {
+        fn new() -> Self {
+            Self {
+                submitted: std::sync::Mutex::new(Vec::new()),
+                events: Vec::new(),
+            }
+        }
+    }
+
     impl PacketRelayDestination for RecordingDestination {
-        fn submit(&self, msgs: Vec<Any>) -> Result<String, SubmitError> {
+        fn submit(&self, msgs: Vec<Any>) -> Result<Vec<IbcEventWithHeight>, SubmitError> {
             self.submitted.lock().unwrap().push(msgs);
-            Ok(self.tx_hash.clone())
+            Ok(self.events.clone())
         }
     }
 
     struct FailingDestination;
     impl PacketRelayDestination for FailingDestination {
-        fn submit(&self, _msgs: Vec<Any>) -> Result<String, SubmitError> {
+        fn submit(&self, _msgs: Vec<Any>) -> Result<Vec<IbcEventWithHeight>, SubmitError> {
             Err(SubmitError::SubmitFailed("nack from chain".to_string()))
+        }
+    }
+
+    /// Assemble the deps a relay call needs, leaving everything else unset.
+    ///
+    /// `relay_send_packet` used to take its collaborators as loose arguments;
+    /// they were collapsed into `StellarPacketDeps` so the ack and
+    /// client-update paths could reach them too.
+    fn deps_with(
+        proof_source: Option<Arc<dyn PacketProofSource>>,
+        destination: Option<Arc<dyn PacketRelayDestination>>,
+        signer: &str,
+    ) -> StellarPacketDeps {
+        StellarPacketDeps {
+            proof_source,
+            destination,
+            signer: signer.to_string(),
+            ..StellarPacketDeps::observer_only()
         }
     }
 
@@ -1408,16 +1438,11 @@ mod decoder_tests {
             proof: vec![0xAA],
             height: ICSHeight::new(0, 50).unwrap(),
         };
-        let dst = RecordingDestination {
-            submitted: std::sync::Mutex::new(Vec::new()),
-            tx_hash: "ABC123".to_string(),
-        };
+        let dst = Arc::new(RecordingDestination::new());
 
-        let status = relay_send_packet(&test_chain_id(), &event, Some(&src), Some(&dst), "signer");
-        assert!(
-            status.contains("submit=ok") && status.contains("tx=ABC123"),
-            "unexpected status: {status}"
-        );
+        let deps = deps_with(Some(Arc::new(src)), Some(dst.clone()), "signer");
+        let status = relay_send_packet(&test_chain_id(), &event, &deps);
+        assert!(status.contains("submit=ok"), "unexpected status: {status}");
 
         let recorded = dst.submitted.lock().unwrap();
         assert_eq!(recorded.len(), 1);
@@ -1436,7 +1461,8 @@ mod decoder_tests {
             proof: vec![],
             height: ICSHeight::new(0, 1).unwrap(),
         };
-        let status = relay_send_packet(&test_chain_id(), &event, Some(&src), None, "s");
+        let deps = deps_with(Some(Arc::new(src)), None, "s");
+        let status = relay_send_packet(&test_chain_id(), &event, &deps);
         assert!(
             status.contains("submit=no_destination"),
             "unexpected status: {status}"
@@ -1450,13 +1476,8 @@ mod decoder_tests {
             proof: vec![],
             height: ICSHeight::new(0, 1).unwrap(),
         };
-        let status = relay_send_packet(
-            &test_chain_id(),
-            &event,
-            Some(&src),
-            Some(&FailingDestination),
-            "s",
-        );
+        let deps = deps_with(Some(Arc::new(src)), Some(Arc::new(FailingDestination)), "s");
+        let status = relay_send_packet(&test_chain_id(), &event, &deps);
         assert!(
             status.contains("submit=failed: destination submit failed: nack from chain"),
             "unexpected status: {status}"
@@ -1466,11 +1487,9 @@ mod decoder_tests {
     #[test]
     fn relay_send_packet_skips_when_no_proof_source() {
         let event = synthetic_event(1);
-        let dst = RecordingDestination {
-            submitted: std::sync::Mutex::new(Vec::new()),
-            tx_hash: "tx".to_string(),
-        };
-        let status = relay_send_packet(&test_chain_id(), &event, None, Some(&dst), "s");
+        let dst = Arc::new(RecordingDestination::new());
+        let deps = deps_with(None, Some(dst.clone()), "s");
+        let status = relay_send_packet(&test_chain_id(), &event, &deps);
         assert_eq!(status, "no_proof_source");
         assert!(dst.submitted.lock().unwrap().is_empty());
     }
@@ -1613,10 +1632,7 @@ mod decoder_tests {
             proof: vec![0x77, 0x88],
             height: ICSHeight::new(0, 300).unwrap(),
         };
-        let src_submitter = RecordingDestination {
-            submitted: std::sync::Mutex::new(Vec::new()),
-            tx_hash: "TX-TIMEOUT".to_string(),
-        };
+        let src_submitter = RecordingDestination::new();
         let status = relay_timeout(
             &test_chain_id(),
             &event,
@@ -1626,10 +1642,7 @@ mod decoder_tests {
             1_700_000_000,
             1_700_000_500,
         );
-        assert!(
-            status.contains("submit=ok") && status.contains("tx=TX-TIMEOUT"),
-            "unexpected status: {status}"
-        );
+        assert!(status.contains("submit=ok"), "unexpected status: {status}");
         let recorded = src_submitter.submitted.lock().unwrap();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0][0].type_url, TYPE_URL_TIMEOUT);
@@ -1675,10 +1688,7 @@ mod decoder_tests {
             proof: vec![],
             height: ICSHeight::new(0, 1).unwrap(),
         };
-        let dst = RecordingDestination {
-            submitted: std::sync::Mutex::new(Vec::new()),
-            tx_hash: "tx".to_string(),
-        };
+        let dst = RecordingDestination::new();
         let status = relay_timeout(
             &test_chain_id(),
             &event,
@@ -1700,20 +1710,15 @@ mod decoder_tests {
                 proof: vec![0xAB],
                 height: ICSHeight::new(0, 50).unwrap(),
             })),
-            destination: Some(Arc::new(RecordingDestination {
-                submitted: std::sync::Mutex::new(Vec::new()),
-                tx_hash: "TX-RECV".to_string(),
-            })),
+            destination: Some(Arc::new(RecordingDestination::new())),
             absence_source: Some(Arc::new(FakeAbsenceSource {
                 proof: vec![0xCD],
                 height: ICSHeight::new(0, 60).unwrap(),
             })),
-            source_submitter: Some(Arc::new(RecordingDestination {
-                submitted: std::sync::Mutex::new(Vec::new()),
-                tx_hash: "TX-TIMEOUT".to_string(),
-            })),
+            source_submitter: Some(Arc::new(RecordingDestination::new())),
             signer: "dst-signer".to_string(),
             source_signer: "src-signer".to_string(),
+            ..StellarPacketDeps::observer_only()
         };
 
         let body_xdr = struct_val(vec![
@@ -1730,7 +1735,7 @@ mod decoder_tests {
         let decoded = decode_packet_from_event_body(&event.value_xdr).unwrap();
         let status = dispatch_send_packet(&test_chain_id(), &event, Some(&decoded), &deps);
         assert!(
-            status.contains("built_msg_recv_packet"),
+            status.contains("MsgRecvPacket"),
             "expected send-path status, got: {status}"
         );
         assert!(!status.contains("built_msg_timeout"), "got: {status}");
@@ -1752,14 +1757,8 @@ mod decoder_tests {
         event.value_xdr = body_xdr;
         let decoded = decode_packet_from_event_body(&event.value_xdr).unwrap();
 
-        let recv_dst = RecordingDestination {
-            submitted: std::sync::Mutex::new(Vec::new()),
-            tx_hash: "TX-RECV".to_string(),
-        };
-        let timeout_dst = RecordingDestination {
-            submitted: std::sync::Mutex::new(Vec::new()),
-            tx_hash: "TX-TIMEOUT".to_string(),
-        };
+        let recv_dst = RecordingDestination::new();
+        let timeout_dst = RecordingDestination::new();
         let deps = StellarPacketDeps {
             proof_source: Some(Arc::new(FakeProofSource {
                 proof: vec![0xAB],
@@ -1773,13 +1772,14 @@ mod decoder_tests {
             source_submitter: Some(Arc::new(timeout_dst)),
             signer: "dst-signer".to_string(),
             source_signer: "src-signer".to_string(),
+            ..StellarPacketDeps::observer_only()
         };
         let status = dispatch_send_packet(&test_chain_id(), &event, Some(&decoded), &deps);
         assert!(
             status.contains("built_msg_timeout"),
             "expected timeout-path status, got: {status}"
         );
-        assert!(!status.contains("built_msg_recv_packet"), "got: {status}");
+        assert!(!status.contains("MsgRecvPacket"), "got: {status}");
     }
 
     #[test]
@@ -1811,26 +1811,28 @@ mod decoder_tests {
             source_submitter: None,
             signer: "s".to_string(),
             source_signer: "s".to_string(),
+            ..StellarPacketDeps::observer_only()
         };
         let status = dispatch_send_packet(&test_chain_id(), &event, Some(&decoded), &deps);
-        assert!(status.contains("built_msg_recv_packet"), "got: {status}");
+        assert!(status.contains("MsgRecvPacket"), "got: {status}");
     }
 
     #[test]
-    fn relay_send_packet_does_not_submit_when_build_fails() {
+    fn relay_send_packet_does_not_submit_when_the_event_body_is_undecodable() {
         let mut event = synthetic_event(1);
         event.value_xdr = b"garbage".to_vec();
         let src = FakeProofSource {
             proof: vec![],
             height: ICSHeight::new(0, 1).unwrap(),
         };
-        let dst = RecordingDestination {
-            submitted: std::sync::Mutex::new(Vec::new()),
-            tx_hash: "tx".to_string(),
-        };
-        let status = relay_send_packet(&test_chain_id(), &event, Some(&src), Some(&dst), "s");
-        assert!(status.starts_with("build_failed:"), "got: {status}");
-        assert!(dst.submitted.lock().unwrap().is_empty());
+        let dst = Arc::new(RecordingDestination::new());
+        let deps = deps_with(Some(Arc::new(src)), Some(dst.clone()), "s");
+        let status = relay_send_packet(&test_chain_id(), &event, &deps);
+        assert!(status.starts_with("decode_failed:"), "got: {status}");
+        assert!(
+            dst.submitted.lock().unwrap().is_empty(),
+            "nothing may be submitted when the packet could not be read"
+        );
     }
 
     #[test]
@@ -1979,11 +1981,11 @@ mod integration_tests {
         submitted: std::sync::Mutex<Vec<Vec<Any>>>,
     }
     impl PacketRelayDestination for RecordingDestination {
-        fn submit(&self, msgs: Vec<Any>) -> Result<String, SubmitError> {
-            let mut g = self.submitted.lock().unwrap();
-            let i = g.len();
-            g.push(msgs);
-            Ok(format!("smoke-tx-{i}"))
+        fn submit(&self, msgs: Vec<Any>) -> Result<Vec<IbcEventWithHeight>, SubmitError> {
+            self.submitted.lock().unwrap().push(msgs);
+            // No events: these tests assert on what was *submitted*, not on
+            // what the destination chain reported back.
+            Ok(Vec::new())
         }
     }
 
@@ -2025,6 +2027,7 @@ mod integration_tests {
             source_submitter: None,
             signer: "signer".to_string(),
             source_signer: String::new(),
+            ..StellarPacketDeps::observer_only()
         };
 
         let handle = spawn_stellar_packet_worker(chain_id.clone(), rx, deps);
@@ -2088,6 +2091,7 @@ mod integration_tests {
             source_submitter: Some(source_submitter),
             signer: "dst-signer".to_string(),
             source_signer: "src-signer".to_string(),
+            ..StellarPacketDeps::observer_only()
         };
 
         let handle = spawn_stellar_packet_worker(chain_id.clone(), rx, deps);

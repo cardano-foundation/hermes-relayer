@@ -102,12 +102,9 @@ impl StellarEventSource {
         let mut batches = Vec::new();
 
         for seq in (self.last_height + 1)..=latest {
-            let height = Height::new(resp.revision_number, seq)
-                .map_err(|e| e.to_string())?;
-            let new_block = IbcEventWithHeight::new(
-                IbcEvent::NewBlock(NewBlock::new(height)),
-                height,
-            );
+            let height = Height::new(resp.revision_number, seq).map_err(|e| e.to_string())?;
+            let new_block =
+                IbcEventWithHeight::new(IbcEvent::NewBlock(NewBlock::new(height)), height);
             batches.push(EventBatch {
                 chain_id: self.chain_id.clone(),
                 tracking_id: TrackingId::new_uuid(),

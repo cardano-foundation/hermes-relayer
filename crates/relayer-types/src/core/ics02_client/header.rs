@@ -13,9 +13,7 @@ use crate::clients::ics08_cardano::header::{Header as MithrilHeader, MITHRIL_HEA
 use crate::clients::ics08_cardano_probabilistic::header::{
     Header as ProbabilisticHeader, PROBABILISTIC_HEADER_TYPE_URL,
 };
-use crate::clients::ics10_stellar::header::{
-    Header as StellarHeader, STELLAR_HEADER_TYPE_URL,
-};
+use crate::clients::ics10_stellar::header::{Header as StellarHeader, STELLAR_HEADER_TYPE_URL};
 use crate::core::ics02_client::client_type::ClientType;
 use crate::core::ics02_client::error::Error;
 use crate::timestamp::Timestamp;

@@ -367,7 +367,11 @@ fn spawn_stellar_packet_workers<Chain: ChainHandle>(
         };
 
         info!("[stellar→cosmos] packet relay worker started ({stellar_id} → {cosmos_id})");
-        tasks.push(spawn_stellar_packet_worker(stellar.id(), subscription, deps));
+        tasks.push(spawn_stellar_packet_worker(
+            stellar.id(),
+            subscription,
+            deps,
+        ));
     }
 
     tasks

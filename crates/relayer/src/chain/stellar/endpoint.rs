@@ -60,14 +60,26 @@ use super::gateway_client::{
     self, EventsRequest, GatewayMsgClient, GatewayQueryClient, QueryIbcHeaderRequest,
 };
 use super::signing_key_pair::StellarSigningKeyPair;
+use ibc_relayer_types::clients::ics10_stellar as stellar_types;
 
+/// One verified-on-chain Stellar ledger, as hermes carries it internally.
+///
+/// It holds the SCP *evidence* — envelopes, quorum-set preimages, the next
+/// slot's tx set — not a conclusion. Hermes does not verify any of it; the
+/// light client on the counterparty chain does. Previously this carried an
+/// `ibc_state_root` the gateway had computed off-chain, which meant trusting
+/// that service for the one value the whole bridge rests on.
 pub struct StellarLightBlock {
-    pub ledger_seq: u64,
+    pub slot_index: u64,
     pub ledger_hash: Vec<u8>,
-    pub ibc_state_root: Vec<u8>,
     pub timestamp: Timestamp,
     pub close_time_secs: u64,
-    pub scp_node_id: Vec<u8>,
+    pub ledger_header_xdr: Vec<u8>,
+    pub scp_envelopes: Vec<Vec<u8>>,
+    pub quorum_sets_xdr: Vec<Vec<u8>>,
+    pub next_scp_envelopes: Vec<Vec<u8>>,
+    pub next_tx_set_xdr: Vec<u8>,
+    pub state_root_proof: Option<stellar_raw::StateRootProof>,
 }
 
 pub struct StellarChainEndpoint {
@@ -363,13 +375,31 @@ impl ChainEndpoint for StellarChainEndpoint {
             height
         );
 
+        if wire.state_root_proof.is_none() {
+            // Legitimate for a ledger the bridge did not touch, but such a
+            // header binds no state root, so packet proofs against it will not
+            // verify.
+            tracing::debug!(
+                slot = wire.slot_index,
+                "stellar header carries no state-root proof"
+            );
+        }
+
         Ok(StellarLightBlock {
-            ledger_seq: wire.ledger_seq as u64,
+            slot_index: wire.slot_index,
             ledger_hash,
-            ibc_state_root: wire.ibc_state_root,
             timestamp,
             close_time_secs: close_time,
-            scp_node_id: wire.scp_node_id,
+            ledger_header_xdr: wire.ledger_header_xdr,
+            scp_envelopes: wire.scp_envelopes,
+            quorum_sets_xdr: wire.quorum_sets_xdr,
+            next_scp_envelopes: wire.next_scp_envelopes,
+            next_tx_set_xdr: wire.next_tx_set_xdr,
+            state_root_proof: wire.state_root_proof.map(|p| stellar_raw::StateRootProof {
+                result_pairs: p.result_pairs,
+                result_index: p.result_index,
+                success_preimage_xdr: p.success_preimage_xdr,
+            }),
         })
     }
 
@@ -411,30 +441,25 @@ impl ChainEndpoint for StellarChainEndpoint {
         let wire = gateway_client::StellarHeader::decode(witness_resp.header.as_slice())
             .map_err(|e| Error::query(format!("witness StellarHeader decode failed: {e}")))?;
 
-        let witness_envelope = stellar_raw::ScpEnvelope {
-            node_id: wire.scp_node_id,
-            statement_xdr: wire.signed_value_xdr,
-            signature: wire.scp_signature,
-        };
-        let timestamp_secs = ledger_close_time_secs(&wire.ledger_header_xdr).unwrap_or(0);
-        let previous_ledger_hash =
-            ledger_previous_hash(&wire.ledger_header_xdr).unwrap_or_default();
         let witness_raw = stellar_raw::StellarHeader {
-            ledger_seq: wire.ledger_seq as u64,
+            slot_index: wire.slot_index,
             ledger_header_xdr: wire.ledger_header_xdr,
-            ibc_state_root: wire.ibc_state_root,
-            scp_envelopes: vec![witness_envelope],
-            trusted_height: Some(stellar_raw::Height {
-                revision_number: trusted_height.revision_number(),
-                revision_height: trusted_height.revision_height(),
+            scp_envelopes: wire.scp_envelopes,
+            quorum_sets_xdr: wire.quorum_sets_xdr,
+            next_scp_envelopes: wire.next_scp_envelopes,
+            next_tx_set_xdr: wire.next_tx_set_xdr,
+            state_root_proof: wire.state_root_proof.map(|p| stellar_raw::StateRootProof {
+                result_pairs: p.result_pairs,
+                result_index: p.result_index,
+                success_preimage_xdr: p.success_preimage_xdr,
             }),
-            timestamp: timestamp_secs,
-            ledger_hash: Vec::new(),
-            previous_ledger_hash,
         };
-        let witness_header: StellarHeader = witness_raw
+        let mut witness_header: StellarHeader = witness_raw
             .try_into()
             .map_err(|e| Error::query(format!("witness StellarHeader try_into failed: {e}")))?;
+        // The wire format carries no trusted height — SCP verifies each header
+        // independently — so restore the one this update claimed.
+        witness_header.trusted_height = trusted_height;
 
         stellar_misbehaviour_evidence(update, submitted_header, witness_header, client_state)
     }
@@ -868,7 +893,7 @@ impl ChainEndpoint for StellarChainEndpoint {
         let close_time = ledger_close_time_secs(&wire.ledger_header_xdr)?;
         let ledger_hash = ledger_previous_hash(&wire.ledger_header_xdr)?;
         Ok(AnyConsensusState::Stellar(StellarConsensusState {
-            root: CommitmentRoot::from_bytes(&wire.ibc_state_root),
+            root: CommitmentRoot::from_bytes(&[]),
             timestamp: close_time,
             ledger_hash,
             wrap_as_wasm: self.is_wasm_wrapped(),
@@ -882,26 +907,67 @@ impl ChainEndpoint for StellarChainEndpoint {
     ) -> Result<Self::ClientState, Error> {
         tracing::info!(%height, "[stellar] building client state");
 
-        let network_id = network_id_from_passphrase(&self.config.network_passphrase);
-        let trusted_validators = self.scp_validators_at(height)?;
+        let params = self.stellar_client_params(height)?;
         let wasm_checksum = self.wasm_checksum_bytes()?;
 
-        tracing::info!(
-            %height,
-            trusted_validators = trusted_validators.len(),
-            wasm_wrapped = self.is_wasm_wrapped(),
-            "[stellar] client state built — SCP validators seeded",
-        );
+        // Derived locally from our own configured passphrase, not taken from
+        // the gateway. The network id decides which network's signatures the
+        // light client will accept, so it belongs to the same class of input as
+        // the quorum set: something the operator states, not something a
+        // service supplies.
+        let network_id = network_id_from_passphrase(&self.config.network_passphrase);
+        if !params.network_id.is_empty() && params.network_id != network_id {
+            return Err(Error::query(format!(
+                "gateway reports network id {} but this relayer is configured for {} — \
+                 the gateway is pointed at a different Stellar network",
+                hex_encode(&params.network_id),
+                hex_encode(&network_id),
+            )));
+        }
 
-        Ok(AnyClientState::Stellar(StellarClientState {
+        let client_state = StellarClientState {
             chain_id: self.config.id.clone(),
             latest_height: height,
             frozen_height: None,
-            trusted_validators,
+            quorum_configs: params
+                .quorum_configs
+                .into_iter()
+                .map(|c| stellar_types::QuorumConfig {
+                    quorum_set_xdr: c.quorum_set_xdr,
+                    valid_from: c.valid_from,
+                })
+                .collect(),
             proof_specs: Vec::new(),
             network_id,
+            max_consensus_age: self.trusting_period_secs(),
+            router_contract_id: params.router_contract_id,
+            root_event_topic: params.root_event_topic,
             wasm_checksum,
-        }))
+        };
+
+        // The one input that cannot be delegated. Everything downstream — every
+        // signature check, every packet proof — is only as good as this set, and
+        // it arrived over untrusted transport.
+        let pinned = self.pinned_quorum_fingerprints()?;
+        client_state
+            .verify_quorum_fingerprints(&pinned)
+            .map_err(|e| {
+                Error::query(format!(
+                    "refusing to create a Stellar client: {e}. The quorum set came from the \
+                     gateway, which is untrusted transport; add its fingerprint to \
+                     `pinned_quorum_set_hashes` only after verifying it independently \
+                     (for example with `interstellar verify --ledger <n>`)."
+                ))
+            })?;
+
+        tracing::info!(
+            %height,
+            quorum_configs = client_state.quorum_configs.len(),
+            wasm_wrapped = self.is_wasm_wrapped(),
+            "[stellar] client state built — quorum sets checked against pinned fingerprints",
+        );
+
+        Ok(AnyClientState::Stellar(client_state))
     }
 
     fn build_consensus_state(
@@ -914,8 +980,12 @@ impl ChainEndpoint for StellarChainEndpoint {
             "built stellar consensus state",
         );
 
+        // No root. The light client derives it from the state-root proof it
+        // verifies; anything hermes put here would be an unverified assertion,
+        // which is exactly the design that was removed. Proofs at the creation
+        // height therefore fail until the first update binds a real root.
         Ok(AnyConsensusState::Stellar(StellarConsensusState {
-            root: CommitmentRoot::from_bytes(&light_block.ibc_state_root),
+            root: CommitmentRoot::from_bytes(&[]),
             timestamp: light_block.close_time_secs,
             ledger_hash: light_block.ledger_hash,
             wrap_as_wasm: self.is_wasm_wrapped(),
@@ -947,32 +1017,26 @@ impl ChainEndpoint for StellarChainEndpoint {
         let wire = gateway_client::StellarHeader::decode(resp.header.as_slice())
             .map_err(|e| Error::query(format!("StellarHeader decode failed: {e}")))?;
 
-        let envelope = stellar_raw::ScpEnvelope {
-            node_id: wire.scp_node_id,
-            statement_xdr: wire.signed_value_xdr,
-            signature: wire.scp_signature,
-        };
-
-        let timestamp_secs = ledger_close_time_secs(&wire.ledger_header_xdr).unwrap_or(0);
-        let previous_ledger_hash =
-            ledger_previous_hash(&wire.ledger_header_xdr).unwrap_or_default();
         let raw = stellar_raw::StellarHeader {
-            ledger_seq: wire.ledger_seq as u64,
+            slot_index: wire.slot_index,
             ledger_header_xdr: wire.ledger_header_xdr,
-            ibc_state_root: wire.ibc_state_root,
-            scp_envelopes: vec![envelope],
-            trusted_height: Some(stellar_raw::Height {
-                revision_number: trusted_height.revision_number(),
-                revision_height: trusted_height.revision_height(),
+            scp_envelopes: wire.scp_envelopes,
+            quorum_sets_xdr: wire.quorum_sets_xdr,
+            next_scp_envelopes: wire.next_scp_envelopes,
+            next_tx_set_xdr: wire.next_tx_set_xdr,
+            state_root_proof: wire.state_root_proof.map(|p| stellar_raw::StateRootProof {
+                result_pairs: p.result_pairs,
+                result_index: p.result_index,
+                success_preimage_xdr: p.success_preimage_xdr,
             }),
-            timestamp: timestamp_secs,
-            ledger_hash: Vec::new(),
-            previous_ledger_hash,
         };
 
         let mut header: StellarHeader = raw
             .try_into()
             .map_err(|e| Error::query(format!("StellarHeader try_into failed: {e}")))?;
+        // Not on the wire — SCP verifies each header independently — so hermes
+        // records the height this update is relative to for its own bookkeeping.
+        header.trusted_height = trusted_height;
 
         header.wrap_as_wasm = self.is_wasm_wrapped();
 
@@ -1066,74 +1130,68 @@ impl StellarChainEndpoint {
         Ok(Some(bytes))
     }
 
-    fn scp_validators_at(&self, height: ICSHeight) -> Result<Vec<Vec<u8>>, Error> {
-        const MAX_SAMPLE: u64 = 24;
-        const STALL_LIMIT: usize = 4;
-        const PER_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
-
-        let top = height.revision_height();
-        let bottom = top.saturating_sub(MAX_SAMPLE - 1).max(1);
-
-        let mut validators: Vec<Vec<u8>> = Vec::new();
-        let mut stall = 0usize;
-        for h in (bottom..=top).rev() {
-            let result = self.rt.block_on(async {
+    /// Client-state parameters from the gateway: quorum configs, network id,
+    /// and the router whose root event binds Soroban state.
+    ///
+    /// This replaces a sampler that walked back over recent headers collecting
+    /// signer keys into a flat validator list. That was never a trust root —
+    /// SCP quorum sets are recursive, and a flat m-of-n check errs in *both*
+    /// directions — and it took whatever the gateway happened to serve. The
+    /// caller now pins what comes back.
+    fn stellar_client_params(
+        &self,
+        height: ICSHeight,
+    ) -> Result<gateway_client::QueryStellarClientParamsResponse, Error> {
+        self.rt
+            .block_on(async {
                 let mut guard = self.gateway_query.lock().unwrap();
-                tokio::time::timeout(
-                    PER_QUERY_TIMEOUT,
-                    guard.query_ibc_header(QueryIbcHeaderRequest { height: h }),
-                )
-                .await
-            });
+                guard
+                    .query_stellar_client_params(gateway_client::QueryStellarClientParamsRequest {
+                        height: height.revision_height(),
+                    })
+                    .await
+            })
+            .map_err(|e| {
+                Error::query(format!(
+                    "Stellar gateway query_stellar_client_params failed at {height}: {e}"
+                ))
+            })
+    }
 
-            let resp = match result {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    tracing::debug!(height = h, error = %e, "scp validator sample failed; skipping");
-                    continue;
-                }
-                Err(_) => {
-                    tracing::debug!(height = h, "scp validator sample timed out; skipping");
-                    continue;
-                }
-            };
+    /// How long a consensus state stays trustworthy, in seconds.
+    ///
+    /// Defaults to two weeks, matching the trusting period a Tendermint client
+    /// would use. An earlier version derived this from `max_block_time`, which
+    /// gave twelve seconds and expired every client almost immediately — block
+    /// cadence and trust decay are unrelated quantities.
+    fn trusting_period_secs(&self) -> u64 {
+        const DEFAULT: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+        self.config.trusting_period.unwrap_or(DEFAULT).as_secs()
+    }
 
-            let wire = match gateway_client::StellarHeader::decode(resp.header.as_slice()) {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::debug!(height = h, error = %e, "scp validator sample decode failed; skipping");
-                    continue;
-                }
-            };
-
-            if wire.scp_node_id.is_empty() {
-                continue;
-            }
-
-            if validators.contains(&wire.scp_node_id) {
-                stall += 1;
-                if stall >= STALL_LIMIT {
-                    break;
-                }
-            } else {
-                validators.push(wire.scp_node_id);
-                stall = 0;
-            }
-        }
-
-        if validators.is_empty() {
-            return Err(Error::query(
-                "could not discover any scp validators while building the stellar client state"
-                    .to_string(),
-            ));
-        }
-
-        tracing::debug!(
-            count = validators.len(),
-            "seeded stellar client trusted_validators",
-        );
-
-        Ok(validators)
+    /// The quorum-set fingerprints this relayer was configured to accept.
+    ///
+    /// Config only, deliberately: the trust root is an operator decision, and a
+    /// value compiled into the binary would be one more thing to keep current
+    /// across releases. An empty list is refused by the caller rather than
+    /// treated as "accept anything".
+    fn pinned_quorum_fingerprints(&self) -> Result<Vec<[u8; 32]>, Error> {
+        self.config
+            .pinned_quorum_set_hashes
+            .iter()
+            .map(|hex| {
+                let bytes = hex_decode(hex).map_err(|e| {
+                    Error::query(format!(
+                        "pinned_quorum_set_hashes entry {hex:?} is not valid hex: {e}"
+                    ))
+                })?;
+                <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                    Error::query(format!(
+                        "pinned_quorum_set_hashes entry {hex:?} is not 32 bytes"
+                    ))
+                })
+            })
+            .collect()
     }
 }
 
@@ -1207,9 +1265,11 @@ fn submitted_stellar_update_header(update: &UpdateClient) -> Result<Option<&Stel
 }
 
 fn stellar_headers_conflict(submitted: &StellarHeader, witness: &StellarHeader) -> bool {
+    // The ledger header is the whole of what SCP binds, so any disagreement on
+    // it is a fork. The state-root proof is derived from it and is not compared
+    // separately: two headers that agree on the ledger cannot disagree on a
+    // root the light client would accept.
     submitted.ledger_header_xdr != witness.ledger_header_xdr
-        || submitted.ibc_state_root != witness.ibc_state_root
-        || submitted.previous_ledger_hash != witness.previous_ledger_hash
 }
 
 fn stellar_misbehaviour_evidence(
@@ -1340,7 +1400,10 @@ fn packet_to_soroban_xdr(
     fn sc_struct(fields: Vec<(&str, ScVal)>) -> Result<ScVal, Error> {
         let mut entries = Vec::with_capacity(fields.len());
         for (key, val) in fields {
-            entries.push(ScMapEntry { key: sym(key)?, val });
+            entries.push(ScMapEntry {
+                key: sym(key)?,
+                val,
+            });
         }
         entries.sort_by(|a, b| a.key.cmp(&b.key));
         let vm = VecM::<ScMapEntry>::try_from(entries)
@@ -1984,4 +2047,12 @@ mod tests {
         let d = poll_backoff(base, u32::MAX);
         assert!(d <= POLL_MAX_BACKOFF);
     }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }

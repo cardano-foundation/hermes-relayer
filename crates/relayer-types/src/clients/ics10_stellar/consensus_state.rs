@@ -104,8 +104,8 @@ impl TryFrom<Any> for ConsensusState {
                 decode_state(raw_any.value.deref()).map_err(Into::into)
             }
             WASM_CONSENSUS_STATE_TYPE_URL => {
-                let wasm = RawWasmConsensusState::decode(raw_any.value.deref())
-                    .map_err(Error::decode)?;
+                let wasm =
+                    RawWasmConsensusState::decode(raw_any.value.deref()).map_err(Error::decode)?;
                 let mut inner = decode_state(&wasm.data).map_err(Into::<Ics02Error>::into)?;
                 inner.wrap_as_wasm = true;
                 Ok(inner)

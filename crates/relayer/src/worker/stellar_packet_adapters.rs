@@ -384,7 +384,9 @@ impl<H: ChainHandle> PacketProofSource for CosmosV2CommitmentSource<H> {
         }
 
         let proof = response.proof.ok_or_else(|| {
-            PacketProofError::QueryFailed("chain did not return a commitment MerkleProof".to_string())
+            PacketProofError::QueryFailed(
+                "chain did not return a commitment MerkleProof".to_string(),
+            )
         })?;
 
         Ok((encode_merkle_proof(&proof), status.height.increment()))

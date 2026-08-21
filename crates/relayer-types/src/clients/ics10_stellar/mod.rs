@@ -6,9 +6,9 @@ pub mod misbehaviour;
 pub mod raw;
 pub mod v2_msgs;
 
-pub use client_state::ClientState;
+pub use client_state::{ClientState, QuorumConfig};
 pub use consensus_state::ConsensusState;
-pub use header::{Header, ScpEnvelope};
+pub use header::{Header, StateRootProof};
 pub use misbehaviour::Misbehaviour;
 pub use v2_msgs::{
     MsgAcknowledgement, MsgRecvPacket, MsgRegisterCounterparty, MsgSubmitMisbehaviour, MsgTimeout,

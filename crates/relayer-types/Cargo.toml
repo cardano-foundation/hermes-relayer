@@ -20,6 +20,7 @@ all-features = true
 clock = []
 
 [dependencies]
+sha2 = "0.10"
 bytes                            = { workspace = true }
 derive_more                      = { workspace = true, features = ["from", "into", "display"] }
 flex-error                       = { workspace = true }

@@ -57,7 +57,10 @@ pub struct StellarSigningKeyPair {
 
 impl StellarSigningKeyPair {
     pub fn account_id(&self) -> String {
-        format!("{}", StrKeyPublic(*self.signing_key.verifying_key().as_bytes()))
+        format!(
+            "{}",
+            StrKeyPublic(*self.signing_key.verifying_key().as_bytes())
+        )
     }
 
     pub fn secret_key_strkey(&self) -> String {
@@ -83,7 +86,10 @@ impl SigningKeyPair for StellarSigningKeyPair {
     const KEY_TYPE: KeyType = KeyType::Ed25519;
     type KeyFile = StellarKeyFile;
 
-    fn from_key_file(key_file: StellarKeyFile, hd_path: &StandardHDPath) -> Result<Self, KeyringError> {
+    fn from_key_file(
+        key_file: StellarKeyFile,
+        hd_path: &StandardHDPath,
+    ) -> Result<Self, KeyringError> {
         if let Some(strkey) = key_file.secret_key {
             return Self::from_strkey(&strkey).map_err(stellar_to_keyring);
         }

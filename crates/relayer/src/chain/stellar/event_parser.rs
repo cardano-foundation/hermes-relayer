@@ -1,8 +1,4 @@
-use ibc_relayer_types::{
-    core::ics24_host::identifier::ChainId,
-    events::IbcEvent,
-    Height,
-};
+use ibc_relayer_types::{core::ics24_host::identifier::ChainId, events::IbcEvent, Height};
 
 use crate::event::IbcEventWithHeight;
 
@@ -12,8 +8,7 @@ pub fn parse_event_bytes(
     raw: &[u8],
     height: Height,
 ) -> Result<Option<IbcEventWithHeight>, StellarError> {
-    let s = std::str::from_utf8(raw)
-        .map_err(|e| StellarError::EventAttribute(e.to_string()))?;
+    let s = std::str::from_utf8(raw).map_err(|e| StellarError::EventAttribute(e.to_string()))?;
 
     let kind = event_kind(s);
 
@@ -49,8 +44,7 @@ fn event_kind(s: &str) -> &str {
 }
 
 fn attr<'a>(s: &'a str, key: &str) -> Option<&'a str> {
-    s.lines()
-        .find_map(|l| l.strip_prefix(&format!("{key}=")))
+    s.lines().find_map(|l| l.strip_prefix(&format!("{key}=")))
 }
 
 fn parse_send_packet(s: &str) -> Result<Option<IbcEvent>, StellarError> {
@@ -88,7 +82,9 @@ fn parse_ack_packet(s: &str) -> Result<Option<IbcEvent>, StellarError> {
     use ibc_relayer_types::events::IbcEvent;
 
     let packet = parse_packet(s)?;
-    Ok(Some(IbcEvent::AcknowledgePacket(AcknowledgePacket { packet })))
+    Ok(Some(IbcEvent::AcknowledgePacket(AcknowledgePacket {
+        packet,
+    })))
 }
 
 fn parse_timeout_packet(s: &str) -> Result<Option<IbcEvent>, StellarError> {
@@ -107,9 +103,11 @@ fn parse_create_client(s: &str) -> Result<Option<IbcEvent>, StellarError> {
     let client_id = attr(s, "client_id")
         .ok_or_else(|| StellarError::EventAttribute("missing client_id".to_owned()))?
         .parse()
-        .map_err(|e: ibc_relayer_types::core::ics24_host::error::ValidationError| {
-            StellarError::EventAttribute(e.to_string())
-        })?;
+        .map_err(
+            |e: ibc_relayer_types::core::ics24_host::error::ValidationError| {
+                StellarError::EventAttribute(e.to_string())
+            },
+        )?;
     let client_type = ClientType::Tendermint;
     let consensus_height = parse_height_attr(s, "consensus_height")?;
 
@@ -128,9 +126,11 @@ fn parse_update_client(s: &str) -> Result<Option<IbcEvent>, StellarError> {
     let client_id = attr(s, "client_id")
         .ok_or_else(|| StellarError::EventAttribute("missing client_id".to_owned()))?
         .parse()
-        .map_err(|e: ibc_relayer_types::core::ics24_host::error::ValidationError| {
-            StellarError::EventAttribute(e.to_string())
-        })?;
+        .map_err(
+            |e: ibc_relayer_types::core::ics24_host::error::ValidationError| {
+                StellarError::EventAttribute(e.to_string())
+            },
+        )?;
     let client_type = ClientType::Tendermint;
     let consensus_height = parse_height_attr(s, "consensus_height")?;
 
@@ -144,7 +144,9 @@ fn parse_update_client(s: &str) -> Result<Option<IbcEvent>, StellarError> {
     })))
 }
 
-fn parse_packet(s: &str) -> Result<ibc_relayer_types::core::ics04_channel::packet::Packet, StellarError> {
+fn parse_packet(
+    s: &str,
+) -> Result<ibc_relayer_types::core::ics04_channel::packet::Packet, StellarError> {
     use ibc_relayer_types::core::ics04_channel::packet::{Packet, Sequence};
     use ibc_relayer_types::core::ics24_host::identifier::{ChannelId, PortId};
     use ibc_relayer_types::timestamp::Timestamp;
@@ -157,30 +159,38 @@ fn parse_packet(s: &str) -> Result<ibc_relayer_types::core::ics04_channel::packe
     let source_port: PortId = attr(s, "packet_src_port")
         .unwrap_or("transfer")
         .parse()
-        .map_err(|e: ibc_relayer_types::core::ics24_host::error::ValidationError| {
-            StellarError::EventAttribute(e.to_string())
-        })?;
+        .map_err(
+            |e: ibc_relayer_types::core::ics24_host::error::ValidationError| {
+                StellarError::EventAttribute(e.to_string())
+            },
+        )?;
 
     let source_channel: ChannelId = attr(s, "packet_src_channel")
         .unwrap_or("channel-0")
         .parse()
-        .map_err(|e: ibc_relayer_types::core::ics24_host::error::ValidationError| {
-            StellarError::EventAttribute(e.to_string())
-        })?;
+        .map_err(
+            |e: ibc_relayer_types::core::ics24_host::error::ValidationError| {
+                StellarError::EventAttribute(e.to_string())
+            },
+        )?;
 
     let destination_port: PortId = attr(s, "packet_dst_port")
         .unwrap_or("transfer")
         .parse()
-        .map_err(|e: ibc_relayer_types::core::ics24_host::error::ValidationError| {
-            StellarError::EventAttribute(e.to_string())
-        })?;
+        .map_err(
+            |e: ibc_relayer_types::core::ics24_host::error::ValidationError| {
+                StellarError::EventAttribute(e.to_string())
+            },
+        )?;
 
     let destination_channel: ChannelId = attr(s, "packet_dst_channel")
         .unwrap_or("channel-0")
         .parse()
-        .map_err(|e: ibc_relayer_types::core::ics24_host::error::ValidationError| {
-            StellarError::EventAttribute(e.to_string())
-        })?;
+        .map_err(
+            |e: ibc_relayer_types::core::ics24_host::error::ValidationError| {
+                StellarError::EventAttribute(e.to_string())
+            },
+        )?;
 
     let data = attr(s, "packet_data")
         .map(|v| v.as_bytes().to_vec())
@@ -203,8 +213,14 @@ fn parse_packet(s: &str) -> Result<ibc_relayer_types::core::ics04_channel::packe
 fn parse_height_attr(s: &str, key: &str) -> Result<Height, StellarError> {
     let raw = attr(s, key).unwrap_or("0-0");
     let parts: Vec<&str> = raw.splitn(2, '-').collect();
-    let revision_number = parts.first().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-    let revision_height = parts.get(1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let revision_number = parts
+        .first()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let revision_height = parts
+        .get(1)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
     Height::new(revision_number, revision_height)
         .map_err(|e| StellarError::EventAttribute(e.to_string()))
 }
@@ -240,7 +256,9 @@ mod tests {
     #[test]
     fn send_packet_parsed_correctly() {
         let raw = packet_attrs(42);
-        let ev = parse_event_bytes(raw.as_bytes(), height(10)).unwrap().unwrap();
+        let ev = parse_event_bytes(raw.as_bytes(), height(10))
+            .unwrap()
+            .unwrap();
         assert_eq!(ev.height, height(10));
         assert!(matches!(ev.event, IbcEvent::SendPacket(_)));
         if let IbcEvent::SendPacket(e) = ev.event {
@@ -253,7 +271,9 @@ mod tests {
     #[test]
     fn recv_packet_parsed_correctly() {
         let raw = "type=recv_packet\npacket_sequence=7\npacket_src_port=transfer\npacket_src_channel=channel-0\npacket_dst_port=transfer\npacket_dst_channel=channel-2\n";
-        let ev = parse_event_bytes(raw.as_bytes(), height(5)).unwrap().unwrap();
+        let ev = parse_event_bytes(raw.as_bytes(), height(5))
+            .unwrap()
+            .unwrap();
         assert!(matches!(ev.event, IbcEvent::ReceivePacket(_)));
         if let IbcEvent::ReceivePacket(e) = ev.event {
             assert_eq!(u64::from(e.packet.sequence), 7);
@@ -263,7 +283,9 @@ mod tests {
     #[test]
     fn write_ack_includes_acknowledgement() {
         let raw = "type=write_acknowledgement\npacket_sequence=3\npacket_src_port=transfer\npacket_src_channel=channel-0\npacket_dst_port=transfer\npacket_dst_channel=channel-0\nacknowledgement=ack_data\n";
-        let ev = parse_event_bytes(raw.as_bytes(), height(1)).unwrap().unwrap();
+        let ev = parse_event_bytes(raw.as_bytes(), height(1))
+            .unwrap()
+            .unwrap();
         assert!(matches!(ev.event, IbcEvent::WriteAcknowledgement(_)));
         if let IbcEvent::WriteAcknowledgement(e) = ev.event {
             assert_eq!(e.ack, b"ack_data");
@@ -273,7 +295,9 @@ mod tests {
     #[test]
     fn create_client_parsed_correctly() {
         let raw = "type=create_client\nclient_id=07-tendermint-0\nconsensus_height=1-100\n";
-        let ev = parse_event_bytes(raw.as_bytes(), height(1)).unwrap().unwrap();
+        let ev = parse_event_bytes(raw.as_bytes(), height(1))
+            .unwrap()
+            .unwrap();
         assert!(matches!(ev.event, IbcEvent::CreateClient(_)));
         if let IbcEvent::CreateClient(e) = ev.event {
             assert_eq!(e.0.client_id.as_str(), "07-tendermint-0");
@@ -284,7 +308,9 @@ mod tests {
     #[test]
     fn update_client_parsed_correctly() {
         let raw = "type=update_client\nclient_id=07-tendermint-1\nconsensus_height=0-200\n";
-        let ev = parse_event_bytes(raw.as_bytes(), height(2)).unwrap().unwrap();
+        let ev = parse_event_bytes(raw.as_bytes(), height(2))
+            .unwrap()
+            .unwrap();
         assert!(matches!(ev.event, IbcEvent::UpdateClient(_)));
         if let IbcEvent::UpdateClient(e) = ev.event {
             assert_eq!(e.common.client_id.as_str(), "07-tendermint-1");
@@ -309,14 +335,18 @@ mod tests {
     #[test]
     fn ack_packet_parsed_correctly() {
         let raw = "type=acknowledge_packet\npacket_sequence=5\npacket_src_port=transfer\npacket_src_channel=channel-0\npacket_dst_port=transfer\npacket_dst_channel=channel-0\n";
-        let ev = parse_event_bytes(raw.as_bytes(), height(1)).unwrap().unwrap();
+        let ev = parse_event_bytes(raw.as_bytes(), height(1))
+            .unwrap()
+            .unwrap();
         assert!(matches!(ev.event, IbcEvent::AcknowledgePacket(_)));
     }
 
     #[test]
     fn timeout_packet_parsed_correctly() {
         let raw = "type=timeout_packet\npacket_sequence=9\npacket_src_port=transfer\npacket_src_channel=channel-0\npacket_dst_port=transfer\npacket_dst_channel=channel-0\n";
-        let ev = parse_event_bytes(raw.as_bytes(), height(1)).unwrap().unwrap();
+        let ev = parse_event_bytes(raw.as_bytes(), height(1))
+            .unwrap()
+            .unwrap();
         assert!(matches!(ev.event, IbcEvent::TimeoutPacket(_)));
     }
 }

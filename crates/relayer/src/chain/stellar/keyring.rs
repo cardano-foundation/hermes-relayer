@@ -21,7 +21,11 @@ impl StellarKeyRing {
         self.inner.get_key(key_name)
     }
 
-    pub fn add_key(&mut self, key_name: &str, key_pair: StellarSigningKeyPair) -> Result<(), Error> {
+    pub fn add_key(
+        &mut self,
+        key_name: &str,
+        key_pair: StellarSigningKeyPair,
+    ) -> Result<(), Error> {
         self.inner.add_key(key_name, key_pair)
     }
 

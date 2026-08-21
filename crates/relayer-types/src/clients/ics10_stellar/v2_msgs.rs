@@ -2,8 +2,7 @@ use ibc_proto::google::protobuf::Any;
 use prost::Message;
 use serde_derive::{Deserialize, Serialize};
 
-pub const TYPE_URL_REGISTER_COUNTERPARTY: &str =
-    "/ibc.core.client.v2.MsgRegisterCounterparty";
+pub const TYPE_URL_REGISTER_COUNTERPARTY: &str = "/ibc.core.client.v2.MsgRegisterCounterparty";
 pub const TYPE_URL_RECV_PACKET: &str = "/ibc.core.channel.v2.MsgRecvPacket";
 pub const TYPE_URL_ACKNOWLEDGEMENT: &str = "/ibc.core.channel.v2.MsgAcknowledgement";
 pub const TYPE_URL_TIMEOUT: &str = "/ibc.core.channel.v2.MsgTimeout";

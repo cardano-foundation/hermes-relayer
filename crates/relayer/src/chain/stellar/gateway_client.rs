@@ -181,6 +181,29 @@ impl GatewayQueryClient {
             .map_err(StellarError::from)
     }
 
+    /// The parameters needed to build a Stellar client state.
+    ///
+    /// The quorum sets this returns are a convenience, not an authority: the
+    /// caller pins their fingerprints before trusting them.
+    pub async fn query_stellar_client_params(
+        &mut self,
+        request: QueryStellarClientParamsRequest,
+    ) -> Result<QueryStellarClientParamsResponse, StellarError> {
+        self.ready().await?;
+        let path = http::uri::PathAndQuery::from_static(
+            "/stellar.gateway.v1.StellarGatewayQuery/QueryStellarClientParams",
+        );
+        self.inner
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
+            .await
+            .map(|r| r.into_inner())
+            .map_err(StellarError::from)
+    }
+
     pub async fn query_ibc_header(
         &mut self,
         request: QueryIbcHeaderRequest,
@@ -304,6 +327,29 @@ impl GatewayMsgClient {
         self.ready().await?;
         let path = http::uri::PathAndQuery::from_static(
             "/stellar.gateway.v1.StellarGatewayMsg/RegisterCounterparty",
+        );
+        self.inner
+            .unary(
+                tonic::Request::new(request),
+                path,
+                tonic::codec::ProstCodec::default(),
+            )
+            .await
+            .map(|r| r.into_inner())
+            .map_err(StellarError::from)
+    }
+
+    /// Prepare an unsigned `commit_root()` transaction.
+    ///
+    /// The gateway holds no key, so this only builds; the caller signs it and
+    /// sends it back through [`GatewayMsgClient::submit_signed_tx`].
+    pub async fn commit_root(
+        &mut self,
+        request: MsgCommitRootRequest,
+    ) -> Result<MsgCommitRootResponse, StellarError> {
+        self.ready().await?;
+        let path = http::uri::PathAndQuery::from_static(
+            "/stellar.gateway.v1.StellarGatewayMsg/CommitRoot",
         );
         self.inner
             .unary(
