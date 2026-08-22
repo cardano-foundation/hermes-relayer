@@ -348,3 +348,45 @@ mod retry_queue {
         assert_eq!(q.due(now + RETRY_BACKOFF).len(), 1);
     }
 }
+
+mod proof_height {
+    use ibc_relayer::worker::stellar_packet_adapters::proof_height;
+    use ibc_relayer_types::Height;
+
+    fn h(n: u64) -> Height {
+        Height::new(0, n).unwrap()
+    }
+
+    #[test]
+    fn it_proves_at_the_ledger_the_packet_was_sent_in() {
+        let chosen = proof_height(h(4_282_530), 4_282_516).unwrap();
+        assert_eq!(
+            chosen.revision_height(),
+            4_282_516,
+            "only the send ledger carries an ibc_root event, so only it has a bound state root"
+        );
+    }
+
+    #[test]
+    fn it_does_not_advance_past_the_send_ledger() {
+        let chosen = proof_height(h(4_282_517), 4_282_516).unwrap();
+        assert_ne!(
+            chosen.revision_height(),
+            4_282_517,
+            "the tendermint proof-at-h-verified-at-h+1 idiom does not hold for the stellar smt"
+        );
+    }
+
+    #[test]
+    fn it_keeps_the_revision_number_of_the_chain() {
+        let chosen = proof_height(Height::new(3, 900).unwrap(), 850).unwrap();
+        assert_eq!(chosen.revision_number(), 3);
+        assert_eq!(chosen.revision_height(), 850);
+    }
+
+    #[test]
+    fn without_a_send_ledger_it_falls_back_to_the_tip() {
+        let chosen = proof_height(h(4_282_530), 0).unwrap();
+        assert_eq!(chosen.revision_height(), 4_282_530);
+    }
+}

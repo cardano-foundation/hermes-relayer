@@ -82,6 +82,14 @@ impl<H: ChainHandle> PacketAbsenceProofSource for ChainHandleProofSource<H> {
     }
 }
 
+pub fn proof_height(tip: ICSHeight, send_ledger: u64) -> Result<ICSHeight, PacketProofError> {
+    if send_ledger == 0 {
+        return Ok(tip);
+    }
+    ICSHeight::new(tip.revision_number(), send_ledger)
+        .map_err(|e| PacketProofError::QueryFailed(format!("invalid proof height: {e}")))
+}
+
 impl<H: ChainHandle> PacketProofSource for ChainHandleProofSource<H> {
     fn packet_commitment_proof(
         &self,
@@ -90,6 +98,7 @@ impl<H: ChainHandle> PacketProofSource for ChainHandleProofSource<H> {
         min_height: u64,
     ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
         let status = wait_for_height(self.handle.as_ref(), min_height)?;
+        let height = proof_height(status.height, min_height)?;
 
         let channel_id: ChannelId = client_id
             .parse()
@@ -98,7 +107,7 @@ impl<H: ChainHandle> PacketProofSource for ChainHandleProofSource<H> {
             port_id: self.port_id.clone(),
             channel_id,
             sequence: Sequence::from(sequence),
-            height: QueryHeight::Specific(status.height),
+            height: QueryHeight::Specific(height),
         };
         let (commitment, proof) = self
             .handle
@@ -109,14 +118,14 @@ impl<H: ChainHandle> PacketProofSource for ChainHandleProofSource<H> {
             return Err(PacketProofError::CommitmentAbsent {
                 client_id: client_id.to_string(),
                 sequence,
-                height: status.height.revision_height(),
+                height: height.revision_height(),
             });
         }
         let proof = proof.ok_or_else(|| {
             PacketProofError::QueryFailed("chain did not return a MerkleProof".to_string())
         })?;
         let proof_bytes = encode_merkle_proof(&proof);
-        Ok((proof_bytes, status.height.increment()))
+        Ok((proof_bytes, height))
     }
 }
 
