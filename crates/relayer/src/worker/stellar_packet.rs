@@ -283,7 +283,13 @@ pub trait PacketProofSource: Send + Sync {
         &self,
         client_id: &str,
         sequence: u64,
+        min_height: u64,
     ) -> Result<(Vec<u8>, ICSHeight), PacketProofError>;
+}
+
+pub fn ledger_from_event_id(event_id: &str) -> Option<u64> {
+    let toid: u64 = event_id.split('-').next()?.parse().ok()?;
+    Some(toid >> 32)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -562,8 +568,11 @@ pub fn build_msg_recv_packet_from_event<S: PacketProofSource + ?Sized>(
         timeout_ts = packet.timeout_timestamp,
         "querying packet-commitment proof on source"
     );
-    let (proof_commitment, proof_height) =
-        source.packet_commitment_proof(&event.client_id, event.sequence)?;
+    let (proof_commitment, proof_height) = source.packet_commitment_proof(
+        &event.client_id,
+        event.sequence,
+        ledger_from_event_id(&event.event_id).unwrap_or(0),
+    )?;
     debug!(
         proof_height = %proof_height,
         proof_bytes = proof_commitment.len(),
@@ -737,8 +746,10 @@ fn relay_send_packet(
         }
     };
 
+    let send_ledger = ledger_from_event_id(&packet_ev.event_id).unwrap_or(0);
+
     let (proof_commitment, proof_height) =
-        match src.packet_commitment_proof(&packet_ev.client_id, packet_ev.sequence) {
+        match src.packet_commitment_proof(&packet_ev.client_id, packet_ev.sequence, send_ledger) {
             Ok(x) => x,
             Err(e) => {
                 warn!(error = %e, "recv relay: commitment proof failed");
@@ -1250,6 +1261,7 @@ mod decoder_tests {
             &self,
             _client_id: &str,
             _sequence: u64,
+            _min_height: u64,
         ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
             Ok((self.proof.clone(), self.height))
         }
@@ -1260,6 +1272,7 @@ mod decoder_tests {
             &self,
             client_id: &str,
             sequence: u64,
+            _min_height: u64,
         ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
             Err(PacketProofError::CommitmentAbsent {
                 client_id: client_id.to_string(),
@@ -1995,6 +2008,7 @@ mod integration_tests {
             &self,
             _client_id: &str,
             _sequence: u64,
+            _min_height: u64,
         ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
             Ok((vec![0xAB, 0xCD], ICSHeight::new(0, 200).unwrap()))
         }

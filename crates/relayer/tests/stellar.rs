@@ -183,3 +183,29 @@ fn key_from_mnemonic_different_accounts_differ() {
         StellarSigningKeyPair::from_mnemonic(MNEMONIC, &hd1, &AddressType::Cosmos, "").unwrap();
     assert_ne!(kp0.account(), kp1.account());
 }
+
+mod send_ledger {
+    use ibc_relayer::worker::stellar_packet::ledger_from_event_id;
+
+    #[test]
+    fn it_recovers_the_ledger_from_a_soroban_toid() {
+        assert_eq!(
+            ledger_from_event_id("0018332299103842304-0000000001"),
+            Some(4_268_321)
+        );
+    }
+
+    #[test]
+    fn it_ignores_the_operation_suffix() {
+        assert_eq!(
+            ledger_from_event_id("0018332299103842304-0000000009"),
+            ledger_from_event_id("0018332299103842304-0000000001")
+        );
+    }
+
+    #[test]
+    fn it_returns_none_for_an_unparseable_id() {
+        assert_eq!(ledger_from_event_id("not-a-toid"), None);
+        assert_eq!(ledger_from_event_id(""), None);
+    }
+}

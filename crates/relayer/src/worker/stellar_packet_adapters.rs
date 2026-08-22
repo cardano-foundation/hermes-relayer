@@ -87,11 +87,9 @@ impl<H: ChainHandle> PacketProofSource for ChainHandleProofSource<H> {
         &self,
         client_id: &str,
         sequence: u64,
+        min_height: u64,
     ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
-        let status = self
-            .handle
-            .query_application_status()
-            .map_err(|e| PacketProofError::QueryFailed(format!("query_application_status: {e}")))?;
+        let status = wait_for_height(self.handle.as_ref(), min_height)?;
 
         let channel_id: ChannelId = client_id
             .parse()
@@ -346,16 +344,45 @@ impl<H: ChainHandle> CosmosV2CommitmentSource<H> {
     }
 }
 
+const HEIGHT_WAIT_ATTEMPTS: usize = 12;
+const HEIGHT_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn wait_for_height<H: ChainHandle>(
+    handle: &H,
+    min_height: u64,
+) -> Result<crate::chain::endpoint::ChainStatus, PacketProofError> {
+    let mut last = None;
+    for attempt in 0..HEIGHT_WAIT_ATTEMPTS {
+        let status = handle
+            .query_application_status()
+            .map_err(|e| PacketProofError::QueryFailed(format!("query_application_status: {e}")))?;
+        if status.height.revision_height() >= min_height {
+            return Ok(status);
+        }
+        tracing::debug!(
+            have = status.height.revision_height(),
+            want = min_height,
+            attempt,
+            "waiting for the chain to reach the ledger the packet was sent in"
+        );
+        last = Some(status.height.revision_height());
+        std::thread::sleep(HEIGHT_WAIT_INTERVAL);
+    }
+    Err(PacketProofError::QueryFailed(format!(
+        "chain did not reach ledger {min_height} (last seen {}) after {}s",
+        last.unwrap_or(0),
+        HEIGHT_WAIT_ATTEMPTS as u64 * HEIGHT_WAIT_INTERVAL.as_secs()
+    )))
+}
+
 impl<H: ChainHandle> PacketProofSource for CosmosV2CommitmentSource<H> {
     fn packet_commitment_proof(
         &self,
         client_id: &str,
         sequence: u64,
+        min_height: u64,
     ) -> Result<(Vec<u8>, ICSHeight), PacketProofError> {
-        let status = self
-            .handle
-            .query_application_status()
-            .map_err(|e| PacketProofError::QueryFailed(format!("query_application_status: {e}")))?;
+        let status = wait_for_height(self.handle.as_ref(), min_height)?;
 
         let mut key = client_id.as_bytes().to_vec();
         key.push(0x01);

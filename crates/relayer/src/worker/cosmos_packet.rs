@@ -111,7 +111,7 @@ fn relay_recv_packet(chain_id: &ChainId, packet: &Packet, deps: &StellarPacketDe
     };
 
     let (proof_commitment, proof_height) =
-        match src.packet_commitment_proof(&packet.source_client, packet.sequence) {
+        match src.packet_commitment_proof(&packet.source_client, packet.sequence, 0) {
             Ok(x) => x,
             Err(e) => {
                 warn!(error = %e, "recv relay: commitment proof failed");
