@@ -209,3 +209,142 @@ mod send_ledger {
         assert_eq!(ledger_from_event_id(""), None);
     }
 }
+
+mod retry_queue {
+    use std::time::Instant;
+
+    use ibc_relayer::worker::stellar_packet::{
+        is_retriable, RetryQueue, StellarPacketEvent, RETRY_BACKOFF, RETRY_MAX_ATTEMPTS,
+    };
+
+    fn event(id: &str) -> StellarPacketEvent {
+        StellarPacketEvent {
+            kind: "send_packet".to_string(),
+            client_id: "07-tendermint-12".to_string(),
+            sequence: 1,
+            tx_hash: "abcd".to_string(),
+            event_id: id.to_string(),
+            value_xdr: vec![],
+            contract_id: "C".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_proof_that_is_not_ready_yet_is_retriable() {
+        assert!(is_retriable(
+            "build_failed: proof source failed: chain did not reach ledger 4281542 (last seen 4281534) after 24s"
+        ));
+        assert!(is_retriable(
+            "build_failed: no commitment for client_id=07-tendermint-12 sequence=1 at height=4281534"
+        ));
+        assert!(is_retriable("client_update_failed: rpc timeout"));
+        assert!(is_retriable(
+            "recv bytes=42 submit=failed: account sequence mismatch"
+        ));
+    }
+
+    #[test]
+    fn a_malformed_or_unconfigured_relay_is_not_retriable() {
+        assert!(!is_retriable("decode_failed: bad xdr"));
+        assert!(!is_retriable("no_proof_source"));
+        assert!(!is_retriable("recv bytes=42 submit=no_destination"));
+        assert!(!is_retriable("n/a"));
+    }
+
+    #[test]
+    fn a_successful_relay_is_never_retried() {
+        assert!(!is_retriable(
+            "recv bytes=42 submit=ok events=1 ack=no_raw_ack"
+        ));
+    }
+
+    #[test]
+    fn an_enqueued_event_is_not_due_immediately() {
+        let mut q = RetryQueue::default();
+        let now = Instant::now();
+        q.enqueue(event("e1"), now);
+
+        assert_eq!(q.len(), 1);
+        assert!(q.due(now).is_empty(), "must wait out the backoff first");
+        assert_eq!(q.due(now + RETRY_BACKOFF).len(), 1);
+    }
+
+    #[test]
+    fn the_same_event_is_never_queued_twice() {
+        let mut q = RetryQueue::default();
+        let now = Instant::now();
+        q.enqueue(event("e1"), now);
+        q.enqueue(event("e1"), now);
+
+        assert_eq!(
+            q.len(),
+            1,
+            "an event already pending must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn success_removes_the_event_from_the_queue() {
+        let mut q = RetryQueue::default();
+        let now = Instant::now();
+        q.enqueue(event("e1"), now);
+
+        assert_eq!(q.record("e1", false, now), None);
+        assert!(q.is_empty(), "a resolved packet must leave the queue");
+    }
+
+    #[test]
+    fn a_still_failing_event_is_rescheduled_not_dropped() {
+        let mut q = RetryQueue::default();
+        let now = Instant::now();
+        q.enqueue(event("e1"), now);
+
+        assert_eq!(q.record("e1", true, now), None);
+        assert_eq!(q.len(), 1);
+        assert!(
+            q.due(now).is_empty(),
+            "the retry is pushed out by the backoff"
+        );
+        assert_eq!(q.due(now + RETRY_BACKOFF).len(), 1);
+    }
+
+    #[test]
+    fn the_queue_gives_up_after_the_attempt_cap() {
+        let mut q = RetryQueue::default();
+        let now = Instant::now();
+        q.enqueue(event("e1"), now);
+
+        for _ in 0..RETRY_MAX_ATTEMPTS - 2 {
+            assert_eq!(q.record("e1", true, now), None);
+        }
+        assert_eq!(
+            q.record("e1", true, now),
+            Some(RETRY_MAX_ATTEMPTS),
+            "the final attempt reports how many were made"
+        );
+        assert!(
+            q.is_empty(),
+            "a packet past the cap must not be retried forever"
+        );
+    }
+
+    #[test]
+    fn recording_an_unknown_event_is_harmless() {
+        let mut q = RetryQueue::default();
+        assert_eq!(q.record("never-seen", true, Instant::now()), None);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn independent_events_are_tracked_separately() {
+        let mut q = RetryQueue::default();
+        let now = Instant::now();
+        q.enqueue(event("e1"), now);
+        q.enqueue(event("e2"), now);
+        assert_eq!(q.len(), 2);
+
+        q.record("e1", false, now);
+        assert_eq!(q.len(), 1, "resolving one must not evict the other");
+        assert_eq!(q.due(now + RETRY_BACKOFF).len(), 1);
+    }
+}

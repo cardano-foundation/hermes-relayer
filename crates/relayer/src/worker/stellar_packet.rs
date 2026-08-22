@@ -1,9 +1,10 @@
 use core::time::Duration;
 use std::sync::Arc;
+use std::time::Instant;
 
 use prost::Message;
 use stellar_xdr::curr::{Limits, ReadXdr, ScVal};
-use tracing::{debug, error_span, info, instrument, warn};
+use tracing::{debug, error, error_span, info, instrument, warn};
 
 use ibc_proto::google::protobuf::Any;
 use ibc_relayer_types::clients::ics10_stellar::v2_msgs::{
@@ -614,20 +615,104 @@ impl StellarPacketDeps {
     }
 }
 
+pub fn is_retriable(status: &str) -> bool {
+    if status.contains("submit=ok") {
+        return false;
+    }
+    const RETRIABLE: [&str; 4] = [
+        "build_failed:",
+        "client_update_failed:",
+        "submit=failed:",
+        "ack=client_update_failed:",
+    ];
+    RETRIABLE.iter().any(|marker| status.contains(marker))
+}
+
+const RETRY_TICK: Duration = Duration::from_secs(5);
+pub const RETRY_BACKOFF: Duration = Duration::from_secs(15);
+pub const RETRY_MAX_ATTEMPTS: u32 = 40;
+
+struct PendingRelay {
+    event: StellarPacketEvent,
+    attempts: u32,
+    next_attempt: Instant,
+}
+
+#[derive(Default)]
+pub struct RetryQueue {
+    pending: Vec<PendingRelay>,
+}
+
+impl RetryQueue {
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    pub fn enqueue(&mut self, event: StellarPacketEvent, now: Instant) {
+        if self
+            .pending
+            .iter()
+            .any(|p| p.event.event_id == event.event_id)
+        {
+            return;
+        }
+        self.pending.push(PendingRelay {
+            event,
+            attempts: 1,
+            next_attempt: now + RETRY_BACKOFF,
+        });
+    }
+
+    pub fn due(&mut self, now: Instant) -> Vec<StellarPacketEvent> {
+        let mut out = Vec::new();
+        for p in self.pending.iter_mut() {
+            if p.next_attempt <= now {
+                out.push(p.event.clone());
+            }
+        }
+        out
+    }
+
+    pub fn record(&mut self, event_id: &str, retriable: bool, now: Instant) -> Option<u32> {
+        let idx = self
+            .pending
+            .iter()
+            .position(|p| p.event.event_id == event_id)?;
+        if !retriable {
+            self.pending.remove(idx);
+            return None;
+        }
+        let p = &mut self.pending[idx];
+        p.attempts += 1;
+        p.next_attempt = now + RETRY_BACKOFF;
+        if p.attempts >= RETRY_MAX_ATTEMPTS {
+            let attempts = p.attempts;
+            self.pending.remove(idx);
+            return Some(attempts);
+        }
+        None
+    }
+}
+
 pub fn spawn_stellar_packet_worker(
     chain_id: ChainId,
     subscription: Subscription,
     deps: StellarPacketDeps,
 ) -> TaskHandle {
     let span = error_span!("worker.stellar_packet", chain.id = %chain_id);
+    let mut retries = RetryQueue::default();
 
-    spawn_background_task(
-        span,
-        Some(Duration::from_millis(100)),
-        move || match subscription.recv() {
+    spawn_background_task(span, Some(Duration::from_millis(100)), move || {
+        drain_retries(&chain_id, &deps, &mut retries);
+
+        match subscription.recv_timeout(RETRY_TICK) {
             Ok(arc_batch) => match arc_batch.as_ref() {
                 Ok(batch) => {
-                    process_batch(&chain_id, batch, &deps);
+                    process_batch(&chain_id, batch, &deps, &mut retries);
                     Ok(Next::Continue)
                 }
                 Err(err) => {
@@ -635,15 +720,55 @@ pub fn spawn_stellar_packet_worker(
                     Ok(Next::Continue)
                 }
             },
-            Err(_) => {
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(Next::Continue),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 debug!("stellar packet worker: subscription closed, exiting");
                 Ok::<Next, TaskError<RunError>>(Next::Abort)
             }
-        },
-    )
+        }
+    })
 }
 
-fn process_batch(chain_id: &ChainId, batch: &EventBatch, deps: &StellarPacketDeps) {
+fn drain_retries(chain_id: &ChainId, deps: &StellarPacketDeps, retries: &mut RetryQueue) {
+    if retries.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    for event in retries.due(now) {
+        let decoded = if event.value_xdr.is_empty() {
+            None
+        } else {
+            decode_packet_from_event_body(&event.value_xdr).ok()
+        };
+        let status = dispatch_send_packet(chain_id, &event, decoded.as_ref(), deps);
+        let retriable = is_retriable(&status);
+        if !retriable {
+            info!(
+                sequence = event.sequence,
+                client_id = %event.client_id,
+                status = %status,
+                "queued relay resolved"
+            );
+        }
+        if let Some(attempts) = retries.record(&event.event_id, retriable, Instant::now()) {
+            error!(
+                sequence = event.sequence,
+                client_id = %event.client_id,
+                event_id = %event.event_id,
+                attempts,
+                status = %status,
+                "giving up on packet after exhausting retries"
+            );
+        }
+    }
+}
+
+fn process_batch(
+    chain_id: &ChainId,
+    batch: &EventBatch,
+    deps: &StellarPacketDeps,
+    retries: &mut RetryQueue,
+) {
     let height = batch.height;
     for ev in &batch.events {
         if let IbcEvent::AppModule(m) = &ev.event {
@@ -665,7 +790,17 @@ fn process_batch(chain_id: &ChainId, batch: &EventBatch, deps: &StellarPacketDep
                     (false, None) => "decode_failed".to_string(),
                 };
                 let relay_status = if packet_ev.kind == "send_packet" {
-                    dispatch_send_packet(chain_id, &packet_ev, decoded.as_ref(), deps)
+                    let status = dispatch_send_packet(chain_id, &packet_ev, decoded.as_ref(), deps);
+                    if is_retriable(&status) {
+                        warn!(
+                            sequence = packet_ev.sequence,
+                            client_id = %packet_ev.client_id,
+                            status = %status,
+                            "relay failed — queued for retry"
+                        );
+                        retries.enqueue(packet_ev.clone(), Instant::now());
+                    }
+                    status
                 } else {
                     "n/a".to_string()
                 };

@@ -344,7 +344,7 @@ impl<H: ChainHandle> CosmosV2CommitmentSource<H> {
     }
 }
 
-const HEIGHT_WAIT_ATTEMPTS: usize = 12;
+const HEIGHT_WAIT_ATTEMPTS: usize = 4;
 const HEIGHT_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn wait_for_height<H: ChainHandle>(
