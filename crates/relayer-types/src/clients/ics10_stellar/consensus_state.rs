@@ -50,10 +50,7 @@ impl TryFrom<RawConsensusState> for ConsensusState {
     type Error = Error;
 
     fn try_from(raw: RawConsensusState) -> Result<Self, Self::Error> {
-        if raw.root.is_empty() {
-            return Err(Error::missing_field("root"));
-        }
-        if raw.root.len() != HASH_BYTES {
+        if !raw.root.is_empty() && raw.root.len() != HASH_BYTES {
             return Err(Error::invalid_field(
                 "root",
                 format!("expected {HASH_BYTES} bytes, got {}", raw.root.len()),
