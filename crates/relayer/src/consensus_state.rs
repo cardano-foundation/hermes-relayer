@@ -159,3 +159,42 @@ impl ConsensusState for AnyConsensusState {
         AnyConsensusState::timestamp(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    use super::*;
+    use ibc_relayer_types::clients::ics08_cardano_probabilistic::{
+        consensus_state::PROBABILISTIC_CONSENSUS_STATE_TYPE_URL, raw,
+    };
+
+    #[test]
+    fn probabilistic_any_round_trip_preserves_operational_certificate_marker() {
+        let raw_state = raw::ConsensusState {
+            timestamp: 1,
+            ibc_state_root: vec![3; 32],
+            accepted_block_hash: "accepted-block".to_string(),
+            accepted_epoch: 7,
+            unique_pools_count: 15,
+            unique_stake_bps: 7_000,
+            security_score_bps: 8_000,
+            operational_certificate_state_initialized: true,
+        };
+        let any = Any {
+            type_url: PROBABILISTIC_CONSENSUS_STATE_TYPE_URL.to_string(),
+            value: raw_state.encode_to_vec(),
+        };
+
+        let decoded = AnyConsensusState::try_from(any).expect("consensus state must decode");
+        let AnyConsensusState::Probabilistic(state) = &decoded else {
+            panic!("expected probabilistic consensus state");
+        };
+        assert!(state.operational_certificate_state_initialized);
+
+        let reencoded: Any = decoded.into();
+        let round_trip = raw::ConsensusState::decode(reencoded.value.as_slice())
+            .expect("round-trip consensus state must decode");
+        assert_eq!(round_trip, raw_state);
+    }
+}

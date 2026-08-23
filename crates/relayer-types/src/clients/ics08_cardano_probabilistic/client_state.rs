@@ -8,6 +8,7 @@ use ibc_proto::Protobuf;
 
 use crate::clients::ics08_cardano_probabilistic::error::Error;
 use crate::clients::ics08_cardano_probabilistic::raw;
+use crate::clients::ics08_cardano_probabilistic::validate_operational_certificate_counters;
 use crate::core::ics02_client::client_state::ClientState as Ics2ClientState;
 use crate::core::ics02_client::client_type::ClientType;
 use crate::core::ics02_client::error::Error as Ics02Error;
@@ -16,6 +17,7 @@ use crate::Height;
 
 pub const PROBABILISTIC_CLIENT_STATE_TYPE_URL: &str =
     "/ibc.lightclients.probabilistic.v1.ClientState";
+const MAX_SUPPORTED_KES_EVOLUTIONS: u64 = 64;
 
 type RawClientState = raw::ClientState;
 type RawHeight = raw::Height;
@@ -38,10 +40,13 @@ pub struct ClientState {
     pub system_start_unix_ns: u64,
     pub slot_length_ns: u64,
     pub epoch_contexts: Vec<raw::EpochContext>,
-    pub pool_registration_cutoff_slot_exclusive: u64,
     pub latest_checkpoint_height: Option<Height>,
     pub latest_checkpoint_block_hash: String,
     pub latest_checkpoint_epoch: u64,
+    pub max_kes_evolutions: u64,
+    pub latest_checkpoint_operational_certificate_counters: Vec<raw::OperationalCertificateCounter>,
+    pub operational_certificate_state_initialized: bool,
+    pub operational_certificate_counter_history_start_height: Option<Height>,
 }
 
 impl ClientState {
@@ -97,10 +102,13 @@ impl TryFrom<RawClientState> for ClientState {
             system_start_unix_ns,
             slot_length_ns,
             epoch_contexts,
-            pool_registration_cutoff_slot_exclusive,
             latest_checkpoint_height,
             latest_checkpoint_block_hash,
             latest_checkpoint_epoch,
+            max_kes_evolutions,
+            latest_checkpoint_operational_certificate_counters,
+            operational_certificate_state_initialized,
+            operational_certificate_counter_history_start_height,
         } = raw;
 
         let chain_id = ChainId::from_string(&raw_chain_id);
@@ -114,6 +122,11 @@ impl TryFrom<RawClientState> for ClientState {
         let latest_checkpoint_height = latest_checkpoint_height
             .map(TryInto::try_into)
             .transpose()?;
+
+        let operational_certificate_counter_history_start_height =
+            operational_certificate_counter_history_start_height
+                .map(TryInto::try_into)
+                .transpose()?;
 
         if let Some(checkpoint_height) = latest_checkpoint_height {
             if checkpoint_height < latest_height {
@@ -178,6 +191,44 @@ impl TryFrom<RawClientState> for ClientState {
                 "must be greater than zero".to_string(),
             ));
         }
+        let is_legacy_operational_certificate_state = !operational_certificate_state_initialized
+            && max_kes_evolutions == 0
+            && latest_checkpoint_operational_certificate_counters.is_empty()
+            && operational_certificate_counter_history_start_height.is_none();
+
+        if !is_legacy_operational_certificate_state {
+            if !operational_certificate_state_initialized {
+                return Err(Error::invalid_field(
+                    "operational_certificate_state_initialized",
+                    "must be true unless all operational-certificate fields have their legacy defaults"
+                        .to_string(),
+                ));
+            }
+            if max_kes_evolutions == 0 || max_kes_evolutions > MAX_SUPPORTED_KES_EVOLUTIONS {
+                return Err(Error::invalid_field(
+                    "max_kes_evolutions",
+                    format!("must be between 1 and {MAX_SUPPORTED_KES_EVOLUTIONS}"),
+                ));
+            }
+            validate_operational_certificate_counters(
+                &latest_checkpoint_operational_certificate_counters,
+                "latest_checkpoint_operational_certificate_counters",
+            )?;
+
+            let history_start_height = operational_certificate_counter_history_start_height
+                .ok_or_else(|| {
+                    Error::missing_field("operational_certificate_counter_history_start_height")
+                })?;
+            let latest_counter_height = latest_checkpoint_height.unwrap_or(latest_height);
+            if history_start_height > latest_counter_height {
+                return Err(Error::invalid_field(
+                    "operational_certificate_counter_history_start_height",
+                    format!(
+                        "must not be newer than the latest counter height ({latest_counter_height}), got {history_start_height}"
+                    ),
+                ));
+            }
+        }
 
         Ok(Self {
             chain_id,
@@ -196,10 +247,13 @@ impl TryFrom<RawClientState> for ClientState {
             system_start_unix_ns,
             slot_length_ns,
             epoch_contexts,
-            pool_registration_cutoff_slot_exclusive,
             latest_checkpoint_height,
             latest_checkpoint_block_hash,
             latest_checkpoint_epoch,
+            max_kes_evolutions,
+            latest_checkpoint_operational_certificate_counters,
+            operational_certificate_state_initialized,
+            operational_certificate_counter_history_start_height,
         })
     }
 }
@@ -223,10 +277,17 @@ impl From<ClientState> for RawClientState {
             system_start_unix_ns: value.system_start_unix_ns,
             slot_length_ns: value.slot_length_ns,
             epoch_contexts: value.epoch_contexts,
-            pool_registration_cutoff_slot_exclusive: value.pool_registration_cutoff_slot_exclusive,
             latest_checkpoint_height: value.latest_checkpoint_height.map(Into::into),
             latest_checkpoint_block_hash: value.latest_checkpoint_block_hash,
             latest_checkpoint_epoch: value.latest_checkpoint_epoch,
+            max_kes_evolutions: value.max_kes_evolutions,
+            latest_checkpoint_operational_certificate_counters: value
+                .latest_checkpoint_operational_certificate_counters,
+            operational_certificate_state_initialized: value
+                .operational_certificate_state_initialized,
+            operational_certificate_counter_history_start_height: value
+                .operational_certificate_counter_history_start_height
+                .map(Into::into),
         }
     }
 }
@@ -306,6 +367,13 @@ impl From<ClientState> for Any {
 mod tests {
     use super::*;
 
+    fn counter(pool_byte: u8, sequence_number: u64) -> raw::OperationalCertificateCounter {
+        raw::OperationalCertificateCounter {
+            pool_id: vec![pool_byte; 28],
+            sequence_number,
+        }
+    }
+
     fn raw_client_state() -> RawClientState {
         RawClientState {
             chain_id: "cardano-preprod".to_string(),
@@ -324,14 +392,32 @@ mod tests {
             current_epoch_end_slot_exclusive: 2,
             system_start_unix_ns: 1,
             slot_length_ns: 1,
+            max_kes_evolutions: 62,
+            operational_certificate_state_initialized: true,
+            operational_certificate_counter_history_start_height: Some(RawHeight {
+                revision_number: 0,
+                revision_height: 10,
+            }),
             ..Default::default()
         }
     }
 
+    fn legacy_raw_client_state() -> RawClientState {
+        let mut raw = raw_client_state();
+        raw.max_kes_evolutions = 0;
+        raw.latest_checkpoint_operational_certificate_counters
+            .clear();
+        raw.operational_certificate_state_initialized = false;
+        raw.operational_certificate_counter_history_start_height = None;
+        raw
+    }
+
     #[test]
     fn legacy_state_uses_latest_consensus_height_as_verified_height() {
-        let state = ClientState::try_from(raw_client_state()).unwrap();
+        let state = ClientState::try_from(legacy_raw_client_state())
+            .expect("all-default legacy state must decode");
         assert_eq!(state.latest_verified_height(), state.latest_height);
+        assert!(!state.operational_certificate_state_initialized);
     }
 
     #[test]
@@ -347,5 +433,104 @@ mod tests {
         let state = ClientState::try_from(raw).unwrap();
         assert_eq!(state.latest_height.revision_height(), 10);
         assert_eq!(state.latest_verified_height().revision_height(), 20);
+    }
+
+    #[test]
+    fn any_round_trip_preserves_operational_certificate_state() {
+        let sequence_above_u32 = u64::from(u32::MAX) + 1;
+        let mut raw = raw_client_state();
+        raw.latest_checkpoint_height = Some(RawHeight {
+            revision_number: 0,
+            revision_height: 10,
+        });
+        raw.latest_checkpoint_block_hash = "checkpoint-10".to_string();
+        raw.latest_checkpoint_epoch = 7;
+        raw.max_kes_evolutions = 62;
+        raw.latest_checkpoint_operational_certificate_counters =
+            vec![counter(1, 3), counter(2, sequence_above_u32)];
+
+        let any = Any {
+            type_url: PROBABILISTIC_CLIENT_STATE_TYPE_URL.to_string(),
+            value: raw.encode_to_vec(),
+        };
+        let decoded = ClientState::try_from(any).expect("client state must decode");
+        assert_eq!(decoded.max_kes_evolutions, 62);
+        assert!(decoded.operational_certificate_state_initialized);
+        assert_eq!(
+            decoded.operational_certificate_counter_history_start_height,
+            Some(Height::new(0, 10).unwrap())
+        );
+        assert_eq!(
+            decoded.latest_checkpoint_operational_certificate_counters,
+            vec![counter(1, 3), counter(2, sequence_above_u32)]
+        );
+
+        let reencoded: Any = decoded.into();
+        let round_trip = RawClientState::decode(reencoded.value.as_slice())
+            .expect("round-trip client state must decode");
+        assert_eq!(round_trip, raw);
+    }
+
+    #[test]
+    fn rejects_unsupported_max_kes_evolutions() {
+        for value in [0, MAX_SUPPORTED_KES_EVOLUTIONS + 1] {
+            let mut raw = raw_client_state();
+            raw.max_kes_evolutions = value;
+            assert!(ClientState::try_from(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_noncanonical_operational_certificate_counters() {
+        let cases = [
+            vec![raw::OperationalCertificateCounter {
+                pool_id: vec![1; 27],
+                sequence_number: 1,
+            }],
+            vec![counter(1, 0)],
+            vec![counter(1, 1), counter(1, 2)],
+            vec![counter(2, 1), counter(1, 2)],
+        ];
+
+        for counters in cases {
+            let mut raw = raw_client_state();
+            raw.latest_checkpoint_operational_certificate_counters = counters;
+            assert!(ClientState::try_from(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_partially_initialized_operational_certificate_state() {
+        let legacy = legacy_raw_client_state();
+
+        let mut nonzero_max = legacy.clone();
+        nonzero_max.max_kes_evolutions = 62;
+
+        let mut counters = legacy.clone();
+        counters.latest_checkpoint_operational_certificate_counters = vec![counter(1, 1)];
+
+        let mut history_start = legacy;
+        history_start.operational_certificate_counter_history_start_height = Some(RawHeight {
+            revision_number: 0,
+            revision_height: 10,
+        });
+
+        for raw in [nonzero_max, counters, history_start] {
+            assert!(ClientState::try_from(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_initialized_state_without_usable_history_start() {
+        let mut missing = raw_client_state();
+        missing.operational_certificate_counter_history_start_height = None;
+        assert!(ClientState::try_from(missing).is_err());
+
+        let mut newer_than_latest = raw_client_state();
+        newer_than_latest.operational_certificate_counter_history_start_height = Some(RawHeight {
+            revision_number: 0,
+            revision_height: 11,
+        });
+        assert!(ClientState::try_from(newer_than_latest).is_err());
     }
 }
