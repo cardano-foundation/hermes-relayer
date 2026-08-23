@@ -3917,6 +3917,7 @@ mod tests {
             epoch: 0,
             timestamp: 1,
             block_cbor: vec![],
+            header_cbor: vec![],
         }
     }
 
