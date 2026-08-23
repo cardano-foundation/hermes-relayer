@@ -139,6 +139,8 @@ pub struct ProbabilisticBlock {
     pub timestamp: u64,
     #[prost(bytes = "vec", tag = "9")]
     pub block_cbor: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "10")]
+    pub header_cbor: ::prost::alloc::vec::Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
