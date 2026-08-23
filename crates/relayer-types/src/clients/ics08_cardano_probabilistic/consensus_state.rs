@@ -26,7 +26,6 @@ pub struct ConsensusState {
     pub unique_pools_count: u64,
     pub unique_stake_bps: u64,
     pub security_score_bps: u64,
-    pub operational_certificate_state_initialized: bool,
 }
 
 impl Ics2ConsensusState for ConsensusState {
@@ -59,6 +58,7 @@ impl TryFrom<RawConsensusState> for ConsensusState {
                 format!("expected 32 bytes, got {}", raw.ibc_state_root.len()),
             ));
         }
+
         Ok(Self {
             root: CommitmentRoot::from_bytes(&raw.ibc_state_root),
             timestamp: raw.timestamp,
@@ -67,8 +67,6 @@ impl TryFrom<RawConsensusState> for ConsensusState {
             unique_pools_count: raw.unique_pools_count,
             unique_stake_bps: raw.unique_stake_bps,
             security_score_bps: raw.security_score_bps,
-            operational_certificate_state_initialized: raw
-                .operational_certificate_state_initialized,
         })
     }
 }
@@ -83,8 +81,6 @@ impl From<ConsensusState> for RawConsensusState {
             unique_pools_count: value.unique_pools_count,
             unique_stake_bps: value.unique_stake_bps,
             security_score_bps: value.security_score_bps,
-            operational_certificate_state_initialized: value
-                .operational_certificate_state_initialized,
         }
     }
 }
@@ -118,49 +114,5 @@ impl From<ConsensusState> for Any {
             type_url: PROBABILISTIC_CONSENSUS_STATE_TYPE_URL.to_string(),
             value: Protobuf::<RawConsensusState>::encode_vec(value),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn raw_consensus_state() -> RawConsensusState {
-        RawConsensusState {
-            timestamp: 1,
-            ibc_state_root: vec![3; 32],
-            accepted_block_hash: "accepted-block".to_string(),
-            accepted_epoch: 7,
-            unique_pools_count: 15,
-            unique_stake_bps: 7_000,
-            security_score_bps: 8_000,
-            operational_certificate_state_initialized: true,
-        }
-    }
-
-    #[test]
-    fn any_round_trip_preserves_operational_certificate_marker() {
-        let raw = raw_consensus_state();
-        let any = Any {
-            type_url: PROBABILISTIC_CONSENSUS_STATE_TYPE_URL.to_string(),
-            value: raw.encode_to_vec(),
-        };
-
-        let decoded = ConsensusState::try_from(any).expect("consensus state must decode");
-        assert!(decoded.operational_certificate_state_initialized);
-
-        let reencoded: Any = decoded.into();
-        let round_trip = RawConsensusState::decode(reencoded.value.as_slice())
-            .expect("round-trip consensus state must decode");
-        assert_eq!(round_trip, raw);
-    }
-
-    #[test]
-    fn legacy_consensus_state_with_default_marker_still_decodes() {
-        let mut raw = raw_consensus_state();
-        raw.operational_certificate_state_initialized = false;
-
-        let decoded = ConsensusState::try_from(raw).expect("legacy consensus state must decode");
-        assert!(!decoded.operational_certificate_state_initialized);
     }
 }

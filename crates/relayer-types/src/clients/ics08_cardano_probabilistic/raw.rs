@@ -93,9 +93,7 @@ pub struct ClientState {
     #[prost(message, repeated, tag = "23")]
     pub latest_checkpoint_operational_certificate_counters:
         ::prost::alloc::vec::Vec<OperationalCertificateCounter>,
-    #[prost(bool, tag = "24")]
-    pub operational_certificate_state_initialized: bool,
-    #[prost(message, optional, tag = "25")]
+    #[prost(message, optional, tag = "24")]
     pub operational_certificate_counter_history_start_height: ::core::option::Option<Height>,
 }
 
@@ -115,8 +113,6 @@ pub struct ConsensusState {
     pub unique_stake_bps: u64,
     #[prost(uint64, tag = "7")]
     pub security_score_bps: u64,
-    #[prost(bool, tag = "8")]
-    pub operational_certificate_state_initialized: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
@@ -169,13 +165,7 @@ pub struct ProbabilisticHeader {
 mod tests {
     use prost::Message;
 
-    use super::{ClientState, ConsensusState, OperationalCertificateCounter};
-
-    #[derive(Clone, PartialEq, Message)]
-    struct LegacyClientStateTag18 {
-        #[prost(uint64, tag = "18")]
-        pool_registration_cutoff_slot_exclusive: u64,
-    }
+    use super::{ClientState, OperationalCertificateCounter};
 
     fn counter() -> OperationalCertificateCounter {
         OperationalCertificateCounter {
@@ -189,7 +179,6 @@ mod tests {
         let encoded = ClientState {
             max_kes_evolutions: 62,
             latest_checkpoint_operational_certificate_counters: vec![counter()],
-            operational_certificate_state_initialized: true,
             operational_certificate_counter_history_start_height: Some(super::Height {
                 revision_number: 0,
                 revision_height: 10,
@@ -200,38 +189,8 @@ mod tests {
 
         let mut expected = vec![0xb0, 0x01, 62, 0xba, 0x01, 32, 0x0a, 28];
         expected.extend([0xabu8; 28]);
-        expected.extend([0x10, 7, 0xc0, 0x01, 1, 0xca, 0x01, 2, 0x10, 10]);
+        expected.extend([0x10, 7, 0xc2, 0x01, 2, 0x10, 10]);
 
         assert_eq!(encoded, expected);
-    }
-
-    #[test]
-    fn consensus_operational_certificate_marker_uses_tag_eight() {
-        let encoded = ConsensusState {
-            operational_certificate_state_initialized: true,
-            ..Default::default()
-        }
-        .encode_to_vec();
-
-        assert_eq!(encoded, vec![0x40, 1]);
-    }
-
-    #[test]
-    fn legacy_tag_eighteen_is_ignored_and_not_reused() {
-        let legacy = LegacyClientStateTag18 {
-            pool_registration_cutoff_slot_exclusive: 42,
-        }
-        .encode_to_vec();
-
-        let decoded = ClientState::decode(legacy.as_slice()).expect("legacy tag must be skippable");
-        assert_eq!(decoded.max_kes_evolutions, 0);
-        assert!(decoded
-            .latest_checkpoint_operational_certificate_counters
-            .is_empty());
-        assert!(!decoded.operational_certificate_state_initialized);
-        assert!(decoded
-            .operational_certificate_counter_history_start_height
-            .is_none());
-        assert!(decoded.encode_to_vec().is_empty());
     }
 }

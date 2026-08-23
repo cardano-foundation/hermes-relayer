@@ -2590,7 +2590,6 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     unique_pools_count: 0,
                     unique_stake_bps: 0,
                     security_score_bps: 0,
-                    operational_certificate_state_initialized: true,
                 }))
             }
             AnyHeader::Tendermint(_) => Err(Error::query(
@@ -3900,7 +3899,6 @@ mod tests {
             latest_checkpoint_epoch: 0,
             max_kes_evolutions: 62,
             latest_checkpoint_operational_certificate_counters: vec![],
-            operational_certificate_state_initialized: true,
             operational_certificate_counter_history_start_height: Some(height(10)),
         })
     }

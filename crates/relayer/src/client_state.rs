@@ -262,7 +262,6 @@ mod tests {
             slot_length_ns: 1,
             max_kes_evolutions: 62,
             latest_checkpoint_operational_certificate_counters: counters.clone(),
-            operational_certificate_state_initialized: true,
             operational_certificate_counter_history_start_height: Some(raw::Height {
                 revision_number: 0,
                 revision_height: 10,
@@ -279,7 +278,6 @@ mod tests {
             panic!("expected probabilistic client state");
         };
         assert_eq!(state.max_kes_evolutions, 62);
-        assert!(state.operational_certificate_state_initialized);
         assert_eq!(
             state.operational_certificate_counter_history_start_height,
             Some(Height::new(0, 10).unwrap())
