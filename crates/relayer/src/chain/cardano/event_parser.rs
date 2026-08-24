@@ -900,6 +900,7 @@ mod tests {
             epoch: 0,
             timestamp: 1_700_000_000,
             block_cbor: vec![0x01],
+            header_cbor: vec![],
         }
     }
 
