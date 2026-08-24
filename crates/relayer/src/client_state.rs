@@ -228,3 +228,68 @@ impl From<IdentifiedAnyClientState> for IdentifiedClientState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    use super::*;
+    use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
+
+    #[test]
+    fn probabilistic_any_round_trip_preserves_operational_certificate_state() {
+        let sequence_above_u32 = u64::from(u32::MAX) + 1;
+        let counters = vec![raw::OperationalCertificateCounter {
+            pool_id: vec![7; 28],
+            sequence_number: sequence_above_u32,
+        }];
+        let raw_state = raw::ClientState {
+            chain_id: "cardano-preprod".to_string(),
+            latest_height: Some(raw::Height {
+                revision_number: 0,
+                revision_height: 10,
+            }),
+            trusting_period: Some(ibc_proto::google::protobuf::Duration {
+                seconds: 86_400,
+                nanos: 0,
+            }),
+            host_state_nft_policy_id: vec![1; 28],
+            epoch_nonce: vec![2; 32],
+            slots_per_kes_period: 129_600,
+            current_epoch_start_slot: 1,
+            current_epoch_end_slot_exclusive: 2,
+            system_start_unix_ns: 1,
+            slot_length_ns: 1,
+            max_kes_evolutions: 62,
+            latest_checkpoint_operational_certificate_counters: counters.clone(),
+            operational_certificate_counter_history_start_height: Some(raw::Height {
+                revision_number: 0,
+                revision_height: 10,
+            }),
+            ..Default::default()
+        };
+        let any = Any {
+            type_url: PROBABILISTIC_CLIENT_STATE_TYPE_URL.to_string(),
+            value: raw_state.encode_to_vec(),
+        };
+
+        let decoded = AnyClientState::try_from(any).expect("client state must decode");
+        let AnyClientState::Probabilistic(state) = &decoded else {
+            panic!("expected probabilistic client state");
+        };
+        assert_eq!(state.max_kes_evolutions, 62);
+        assert_eq!(
+            state.operational_certificate_counter_history_start_height,
+            Some(Height::new(0, 10).unwrap())
+        );
+        assert_eq!(
+            state.latest_checkpoint_operational_certificate_counters,
+            counters
+        );
+
+        let reencoded: Any = decoded.into();
+        let round_trip = raw::ClientState::decode(reencoded.value.as_slice())
+            .expect("round-trip client state must decode");
+        assert_eq!(round_trip, raw_state);
+    }
+}
