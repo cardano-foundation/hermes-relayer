@@ -20,6 +20,10 @@ pub struct StakeDistributionEntry {
     pub vrf_key_hash: ::prost::alloc::vec::Vec<u8>,
     #[prost(uint64, tag = "4")]
     pub first_registration_slot: u64,
+    #[prost(uint64, tag = "5")]
+    pub relative_stake_numerator: u64,
+    #[prost(uint64, tag = "6")]
+    pub relative_stake_denominator: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
@@ -95,6 +99,16 @@ pub struct ClientState {
         ::prost::alloc::vec::Vec<OperationalCertificateCounter>,
     #[prost(message, optional, tag = "24")]
     pub operational_certificate_counter_history_start_height: ::core::option::Option<Height>,
+    #[prost(uint64, tag = "25")]
+    pub active_slot_coefficient_numerator: u64,
+    #[prost(uint64, tag = "26")]
+    pub active_slot_coefficient_denominator: u64,
+    #[prost(message, optional, tag = "27")]
+    pub max_clock_drift: ::core::option::Option<ibc_proto::google::protobuf::Duration>,
+    #[prost(uint64, tag = "28")]
+    pub latest_checkpoint_slot: u64,
+    #[prost(uint64, tag = "29")]
+    pub latest_checkpoint_timestamp: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
@@ -167,7 +181,7 @@ pub struct ProbabilisticHeader {
 mod tests {
     use prost::Message;
 
-    use super::{ClientState, OperationalCertificateCounter};
+    use super::{ClientState, OperationalCertificateCounter, StakeDistributionEntry};
 
     fn counter() -> OperationalCertificateCounter {
         OperationalCertificateCounter {
@@ -194,5 +208,41 @@ mod tests {
         expected.extend([0x10, 7, 0xc2, 0x01, 2, 0x10, 10]);
 
         assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn stake_distribution_relative_stake_uses_canonical_wire_tags() {
+        let encoded = StakeDistributionEntry {
+            relative_stake_numerator: 1,
+            relative_stake_denominator: 20,
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        assert_eq!(encoded, vec![0x28, 1, 0x30, 20]);
+    }
+
+    #[test]
+    fn client_temporal_and_praos_fields_use_canonical_wire_tags() {
+        let encoded = ClientState {
+            active_slot_coefficient_numerator: 1,
+            active_slot_coefficient_denominator: 20,
+            max_clock_drift: Some(ibc_proto::google::protobuf::Duration {
+                seconds: 10,
+                nanos: 0,
+            }),
+            latest_checkpoint_slot: 11,
+            latest_checkpoint_timestamp: 12,
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        assert_eq!(
+            encoded,
+            vec![
+                0xc8, 0x01, 1, 0xd0, 0x01, 20, 0xda, 0x01, 2, 0x08, 10, 0xe0, 0x01, 11, 0xe8, 0x01,
+                12,
+            ]
+        );
     }
 }

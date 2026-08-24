@@ -26,6 +26,7 @@ use ibc_relayer_types::Height;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
 pub enum AnyClientState {
     Tendermint(TmClientState),
     /// Cardano-tracking client state (`08-cardano-mithril`), encoded as `ibc.lightclients.mithril.v1.ClientState`.
@@ -88,7 +89,7 @@ impl AnyClientState {
         match self {
             AnyClientState::Tendermint(state) => state.max_clock_drift,
             AnyClientState::Mithril(_) => Duration::from_secs(300), // 5 minutes default
-            AnyClientState::Probabilistic(_) => Duration::from_secs(300),
+            AnyClientState::Probabilistic(state) => state.max_clock_drift,
         }
     }
 
@@ -237,12 +238,20 @@ mod tests {
     use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
 
     #[test]
-    fn probabilistic_any_round_trip_preserves_operational_certificate_state() {
+    fn probabilistic_any_round_trip_preserves_current_client_state() {
         let sequence_above_u32 = u64::from(u32::MAX) + 1;
         let counters = vec![raw::OperationalCertificateCounter {
             pool_id: vec![7; 28],
             sequence_number: sequence_above_u32,
         }];
+        let stake_entry = raw::StakeDistributionEntry {
+            pool_id: "pool-a".to_string(),
+            stake: 40,
+            vrf_key_hash: vec![8; 32],
+            first_registration_slot: 1,
+            relative_stake_numerator: 2,
+            relative_stake_denominator: 5,
+        };
         let raw_state = raw::ClientState {
             chain_id: "cardano-preprod".to_string(),
             latest_height: Some(raw::Height {
@@ -254,13 +263,35 @@ mod tests {
                 nanos: 0,
             }),
             host_state_nft_policy_id: vec![1; 28],
+            epoch_stake_distribution: vec![stake_entry.clone()],
             epoch_nonce: vec![2; 32],
             slots_per_kes_period: 129_600,
             current_epoch_start_slot: 1,
             current_epoch_end_slot_exclusive: 2,
             system_start_unix_ns: 1,
             slot_length_ns: 1,
+            epoch_contexts: vec![raw::EpochContext {
+                epoch: 7,
+                stake_distribution: vec![stake_entry],
+                epoch_nonce: vec![3; 32],
+                slots_per_kes_period: 129_600,
+                epoch_start_slot: 1,
+                epoch_end_slot_exclusive: 100,
+            }],
             max_kes_evolutions: 62,
+            active_slot_coefficient_numerator: 1,
+            active_slot_coefficient_denominator: 20,
+            max_clock_drift: Some(ibc_proto::google::protobuf::Duration {
+                seconds: 10,
+                nanos: 0,
+            }),
+            latest_checkpoint_height: Some(raw::Height {
+                revision_number: 0,
+                revision_height: 10,
+            }),
+            latest_checkpoint_block_hash: "checkpoint-10".to_string(),
+            latest_checkpoint_slot: 10,
+            latest_checkpoint_timestamp: 11,
             latest_checkpoint_operational_certificate_counters: counters.clone(),
             operational_certificate_counter_history_start_height: Some(raw::Height {
                 revision_number: 0,
@@ -278,6 +309,20 @@ mod tests {
             panic!("expected probabilistic client state");
         };
         assert_eq!(state.max_kes_evolutions, 62);
+        assert_eq!(state.max_clock_drift, Duration::from_secs(10));
+        assert_eq!(decoded.max_clock_drift(), Duration::from_secs(10));
+        assert_eq!(state.active_slot_coefficient_numerator, 1);
+        assert_eq!(state.active_slot_coefficient_denominator, 20);
+        assert_eq!(state.latest_checkpoint_slot, 10);
+        assert_eq!(state.latest_checkpoint_timestamp, 11);
+        assert_eq!(
+            state.epoch_stake_distribution[0].relative_stake_numerator,
+            2
+        );
+        assert_eq!(
+            state.epoch_contexts[0].stake_distribution[0].relative_stake_denominator,
+            5
+        );
         assert_eq!(
             state.operational_certificate_counter_history_start_height,
             Some(Height::new(0, 10).unwrap())
