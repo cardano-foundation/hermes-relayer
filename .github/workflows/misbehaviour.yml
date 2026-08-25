@@ -11,7 +11,7 @@ on:
       - scripts/**
       - crates/**
   push:
-    branches: master
+    branches: [master, main]
     paths:
       - .github/workflows/misbehaviour.yaml
       - Cargo.toml

@@ -10,7 +10,7 @@ on:
       - crates/**
       - tools/**
   push:
-    branches: master
+    branches: [master, main]
     paths:
       - .github/workflows/rust.yml
       - Cargo.toml

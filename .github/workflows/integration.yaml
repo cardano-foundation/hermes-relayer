@@ -12,7 +12,7 @@ on:
       - crates/**
       - tools/**
   push:
-    branches: master
+    branches: [master, main]
     paths:
       - .github/workflows/integration.yaml
       - Cargo.toml

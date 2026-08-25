@@ -2,7 +2,7 @@ name: Codespell
 on:
   pull_request:
   push:
-    branches: master
+    branches: [master, main]
 
 # Cancel previous runs of this workflow when a new commit is added to the PR, branch or tag
 concurrency:
