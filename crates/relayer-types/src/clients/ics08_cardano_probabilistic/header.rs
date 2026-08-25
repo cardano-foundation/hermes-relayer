@@ -192,6 +192,28 @@ mod tests {
             .expect("re-encoded domain header should decode")
     }
 
+    #[test]
+    fn new_epoch_context_round_trip_preserves_relative_stake() {
+        let mut raw = header(block(11, vec![1], vec![]), vec![], vec![]);
+        raw.new_epoch_context = Some(raw::EpochContext {
+            epoch: 8,
+            stake_distribution: vec![raw::StakeDistributionEntry {
+                pool_id: "pool-a".to_string(),
+                stake: 40,
+                vrf_key_hash: vec![2; 32],
+                first_registration_slot: 10,
+                relative_stake_numerator: 2,
+                relative_stake_denominator: 5,
+            }],
+            epoch_nonce: vec![3; 32],
+            slots_per_kes_period: 129_600,
+            epoch_start_slot: 100,
+            epoch_end_slot_exclusive: 200,
+        });
+
+        assert_eq!(raw_domain_round_trip(raw.clone()), raw);
+    }
+
     fn sized_block(revision_height: u64, compact: bool) -> raw::ProbabilisticBlock {
         raw::ProbabilisticBlock {
             height: Some(raw::Height {

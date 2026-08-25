@@ -46,6 +46,11 @@ pub struct ClientState {
     pub max_kes_evolutions: u64,
     pub latest_checkpoint_operational_certificate_counters: Vec<raw::OperationalCertificateCounter>,
     pub operational_certificate_counter_history_start_height: Option<Height>,
+    pub active_slot_coefficient_numerator: u64,
+    pub active_slot_coefficient_denominator: u64,
+    pub max_clock_drift: Duration,
+    pub latest_checkpoint_slot: u64,
+    pub latest_checkpoint_timestamp: u64,
 }
 
 impl ClientState {
@@ -107,6 +112,11 @@ impl TryFrom<RawClientState> for ClientState {
             max_kes_evolutions,
             latest_checkpoint_operational_certificate_counters,
             operational_certificate_counter_history_start_height,
+            active_slot_coefficient_numerator,
+            active_slot_coefficient_denominator,
+            max_clock_drift,
+            latest_checkpoint_slot,
+            latest_checkpoint_timestamp,
         } = raw;
 
         let chain_id = ChainId::from_string(&raw_chain_id);
@@ -138,16 +148,26 @@ impl TryFrom<RawClientState> for ClientState {
             if latest_checkpoint_block_hash.trim().is_empty() {
                 return Err(Error::missing_field("latest_checkpoint_block_hash"));
             }
-        } else if !latest_checkpoint_block_hash.is_empty() || latest_checkpoint_epoch != 0 {
+        } else if !latest_checkpoint_block_hash.is_empty()
+            || latest_checkpoint_epoch != 0
+            || latest_checkpoint_slot != 0
+            || latest_checkpoint_timestamp != 0
+        {
             return Err(Error::invalid_field(
                 "latest_checkpoint_height",
-                "checkpoint hash and epoch require a checkpoint height".to_string(),
+                "checkpoint hash, epoch, slot, and timestamp require a checkpoint height"
+                    .to_string(),
             ));
         }
 
-        let trusting_period = trusting_period
-            .and_then(|d| duration_from_proto(d).ok())
-            .ok_or_else(|| Error::missing_field("trusting_period"))?;
+        let trusting_period = required_duration(trusting_period, "trusting_period")?;
+        let max_clock_drift = required_duration(max_clock_drift, "max_clock_drift")?;
+        if max_clock_drift.is_zero() {
+            return Err(Error::invalid_field(
+                "max_clock_drift",
+                "must be greater than zero".to_string(),
+            ));
+        }
 
         if host_state_nft_policy_id.is_empty() {
             return Err(Error::missing_field("host_state_nft_policy_id"));
@@ -195,6 +215,53 @@ impl TryFrom<RawClientState> for ClientState {
                 format!("must be between 1 and {MAX_SUPPORTED_KES_EVOLUTIONS}"),
             ));
         }
+        if active_slot_coefficient_numerator == 0 {
+            return Err(Error::invalid_field(
+                "active_slot_coefficient_numerator",
+                "must be greater than zero".to_string(),
+            ));
+        }
+        if active_slot_coefficient_denominator == 0 {
+            return Err(Error::invalid_field(
+                "active_slot_coefficient_denominator",
+                "must be greater than zero".to_string(),
+            ));
+        }
+        if active_slot_coefficient_numerator > active_slot_coefficient_denominator {
+            return Err(Error::invalid_field(
+                "active_slot_coefficient_numerator",
+                "active slot coefficient must not exceed one".to_string(),
+            ));
+        }
+        if latest_checkpoint_height.is_some() {
+            if latest_checkpoint_timestamp == 0 {
+                if latest_checkpoint_slot != 0 || latest_checkpoint_height != Some(latest_height) {
+                    return Err(Error::invalid_field(
+                        "latest_checkpoint_timestamp",
+                        "missing timestamp is only valid for a legacy root-bearing checkpoint at latest_height"
+                            .to_string(),
+                    ));
+                }
+            } else {
+                let expected_timestamp = latest_checkpoint_slot
+                    .checked_mul(slot_length_ns)
+                    .and_then(|slot_offset| system_start_unix_ns.checked_add(slot_offset))
+                    .ok_or_else(|| {
+                        Error::invalid_field(
+                            "latest_checkpoint_slot",
+                            "slot-derived timestamp overflows uint64".to_string(),
+                        )
+                    })?;
+                if latest_checkpoint_timestamp != expected_timestamp {
+                    return Err(Error::invalid_field(
+                        "latest_checkpoint_timestamp",
+                        format!(
+                            "does not match slot {latest_checkpoint_slot} timestamp {expected_timestamp}"
+                        ),
+                    ));
+                }
+            }
+        }
         validate_operational_certificate_counters(
             &latest_checkpoint_operational_certificate_counters,
             "latest_checkpoint_operational_certificate_counters",
@@ -237,6 +304,11 @@ impl TryFrom<RawClientState> for ClientState {
             max_kes_evolutions,
             latest_checkpoint_operational_certificate_counters,
             operational_certificate_counter_history_start_height,
+            active_slot_coefficient_numerator,
+            active_slot_coefficient_denominator,
+            max_clock_drift,
+            latest_checkpoint_slot,
+            latest_checkpoint_timestamp,
         })
     }
 }
@@ -269,6 +341,11 @@ impl From<ClientState> for RawClientState {
             operational_certificate_counter_history_start_height: value
                 .operational_certificate_counter_history_start_height
                 .map(Into::into),
+            active_slot_coefficient_numerator: value.active_slot_coefficient_numerator,
+            active_slot_coefficient_denominator: value.active_slot_coefficient_denominator,
+            max_clock_drift: Some(duration_to_proto(value.max_clock_drift)),
+            latest_checkpoint_slot: value.latest_checkpoint_slot,
+            latest_checkpoint_timestamp: value.latest_checkpoint_timestamp,
         }
     }
 }
@@ -301,8 +378,22 @@ fn duration_from_proto(d: ibc_proto::google::protobuf::Duration) -> Result<Durat
 
     let nanos = u32::try_from(d.nanos)
         .map_err(|_| Error::timestamp_conversion("negative duration nanos".to_string()))?;
+    if nanos >= 1_000_000_000 {
+        return Err(Error::timestamp_conversion(
+            "duration nanos must be less than 1000000000".to_string(),
+        ));
+    }
 
     Ok(Duration::new(secs, nanos))
+}
+
+fn required_duration(
+    duration: Option<ibc_proto::google::protobuf::Duration>,
+    field: &'static str,
+) -> Result<Duration, Error> {
+    duration
+        .ok_or_else(|| Error::missing_field(field))
+        .and_then(duration_from_proto)
 }
 
 fn duration_to_proto(d: Duration) -> ibc_proto::google::protobuf::Duration {
@@ -355,6 +446,17 @@ mod tests {
         }
     }
 
+    fn stake_entry(pool_id: &str, stake: u64) -> raw::StakeDistributionEntry {
+        raw::StakeDistributionEntry {
+            pool_id: pool_id.to_string(),
+            stake,
+            vrf_key_hash: vec![3; 32],
+            first_registration_slot: 1,
+            relative_stake_numerator: stake,
+            relative_stake_denominator: 100,
+        }
+    }
+
     fn raw_client_state() -> RawClientState {
         RawClientState {
             chain_id: "cardano-preprod".to_string(),
@@ -374,6 +476,12 @@ mod tests {
             system_start_unix_ns: 1,
             slot_length_ns: 1,
             max_kes_evolutions: 62,
+            active_slot_coefficient_numerator: 1,
+            active_slot_coefficient_denominator: 20,
+            max_clock_drift: Some(ibc_proto::google::protobuf::Duration {
+                seconds: 10,
+                nanos: 0,
+            }),
             operational_certificate_counter_history_start_height: Some(RawHeight {
                 revision_number: 0,
                 revision_height: 10,
@@ -397,6 +505,8 @@ mod tests {
         });
         raw.latest_checkpoint_block_hash = "checkpoint-20".to_string();
         raw.latest_checkpoint_epoch = 8;
+        raw.latest_checkpoint_slot = 20;
+        raw.latest_checkpoint_timestamp = 21;
 
         let state = ClientState::try_from(raw).unwrap();
         assert_eq!(state.latest_height.revision_height(), 10);
@@ -404,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn any_round_trip_preserves_operational_certificate_state() {
+    fn any_round_trip_preserves_current_probabilistic_state() {
         let sequence_above_u32 = u64::from(u32::MAX) + 1;
         let mut raw = raw_client_state();
         raw.latest_checkpoint_height = Some(RawHeight {
@@ -413,7 +523,18 @@ mod tests {
         });
         raw.latest_checkpoint_block_hash = "checkpoint-10".to_string();
         raw.latest_checkpoint_epoch = 7;
+        raw.latest_checkpoint_slot = 10;
+        raw.latest_checkpoint_timestamp = 11;
         raw.max_kes_evolutions = 62;
+        raw.epoch_stake_distribution = vec![stake_entry("pool-a", 40)];
+        raw.epoch_contexts = vec![raw::EpochContext {
+            epoch: 7,
+            stake_distribution: vec![stake_entry("pool-b", 60)],
+            epoch_nonce: vec![4; 32],
+            slots_per_kes_period: 129_600,
+            epoch_start_slot: 1,
+            epoch_end_slot_exclusive: 100,
+        }];
         raw.latest_checkpoint_operational_certificate_counters =
             vec![counter(1, 3), counter(2, sequence_above_u32)];
 
@@ -423,6 +544,19 @@ mod tests {
         };
         let decoded = ClientState::try_from(any).expect("client state must decode");
         assert_eq!(decoded.max_kes_evolutions, 62);
+        assert_eq!(decoded.active_slot_coefficient_numerator, 1);
+        assert_eq!(decoded.active_slot_coefficient_denominator, 20);
+        assert_eq!(decoded.max_clock_drift, Duration::from_secs(10));
+        assert_eq!(decoded.latest_checkpoint_slot, 10);
+        assert_eq!(decoded.latest_checkpoint_timestamp, 11);
+        assert_eq!(
+            decoded.epoch_stake_distribution[0].relative_stake_numerator,
+            40
+        );
+        assert_eq!(
+            decoded.epoch_contexts[0].stake_distribution[0].relative_stake_denominator,
+            100
+        );
         assert_eq!(
             decoded.operational_certificate_counter_history_start_height,
             Some(Height::new(0, 10).unwrap())
@@ -445,6 +579,65 @@ mod tests {
             raw.max_kes_evolutions = value;
             assert!(ClientState::try_from(raw).is_err());
         }
+    }
+
+    #[test]
+    fn rejects_invalid_active_slot_coefficient() {
+        for (numerator, denominator) in [(0, 20), (1, 0), (21, 20)] {
+            let mut raw = raw_client_state();
+            raw.active_slot_coefficient_numerator = numerator;
+            raw.active_slot_coefficient_denominator = denominator;
+            assert!(ClientState::try_from(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_max_clock_drift() {
+        for max_clock_drift in [
+            None,
+            Some(ibc_proto::google::protobuf::Duration {
+                seconds: 0,
+                nanos: 0,
+            }),
+            Some(ibc_proto::google::protobuf::Duration {
+                seconds: -1,
+                nanos: 0,
+            }),
+            Some(ibc_proto::google::protobuf::Duration {
+                seconds: 0,
+                nanos: 1_000_000_000,
+            }),
+        ] {
+            let mut raw = raw_client_state();
+            raw.max_clock_drift = max_clock_drift;
+            assert!(ClientState::try_from(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_inconsistent_checkpoint_temporal_cursor() {
+        let mut missing_timestamp = raw_client_state();
+        missing_timestamp.latest_checkpoint_height = Some(RawHeight {
+            revision_number: 0,
+            revision_height: 20,
+        });
+        missing_timestamp.latest_checkpoint_block_hash = "checkpoint-20".to_string();
+        assert!(ClientState::try_from(missing_timestamp).is_err());
+
+        let mut mismatched_timestamp = raw_client_state();
+        mismatched_timestamp.latest_checkpoint_height = Some(RawHeight {
+            revision_number: 0,
+            revision_height: 10,
+        });
+        mismatched_timestamp.latest_checkpoint_block_hash = "checkpoint-10".to_string();
+        mismatched_timestamp.latest_checkpoint_slot = 10;
+        mismatched_timestamp.latest_checkpoint_timestamp = 12;
+        assert!(ClientState::try_from(mismatched_timestamp).is_err());
+
+        let mut cursor_without_height = raw_client_state();
+        cursor_without_height.latest_checkpoint_slot = 10;
+        cursor_without_height.latest_checkpoint_timestamp = 11;
+        assert!(ClientState::try_from(cursor_without_height).is_err());
     }
 
     #[test]

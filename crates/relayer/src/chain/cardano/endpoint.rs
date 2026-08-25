@@ -3900,6 +3900,11 @@ mod tests {
             max_kes_evolutions: 62,
             latest_checkpoint_operational_certificate_counters: vec![],
             operational_certificate_counter_history_start_height: Some(height(10)),
+            active_slot_coefficient_numerator: 1,
+            active_slot_coefficient_denominator: 20,
+            max_clock_drift: Duration::from_secs(10),
+            latest_checkpoint_slot: 10,
+            latest_checkpoint_timestamp: 11,
         })
     }
 
