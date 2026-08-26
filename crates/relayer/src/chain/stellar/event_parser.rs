@@ -15,8 +15,8 @@ pub fn parse_event_bytes(
     let ibc_event = match kind {
         "send_packet" => parse_send_packet(s)?,
         "recv_packet" => parse_recv_packet(s)?,
-        "write_acknowledgement" => parse_write_ack(s)?,
-        "acknowledge_packet" => parse_ack_packet(s)?,
+        "write_ack" | "write_acknowledgement" => parse_write_ack(s)?,
+        "ack_packet" | "acknowledge_packet" => parse_ack_packet(s)?,
         "timeout_packet" => parse_timeout_packet(s)?,
         "create_client" => parse_create_client(s)?,
         "update_client" => parse_update_client(s)?,
@@ -278,6 +278,32 @@ mod tests {
         if let IbcEvent::ReceivePacket(e) = ev.event {
             assert_eq!(u64::from(e.packet.sequence), 7);
         }
+    }
+
+    #[test]
+    fn parses_the_write_ack_name_the_router_emits() {
+        let raw = "type=write_ack\npacket_sequence=7\nacknowledgement={\"result\":\"AQ==\"}\n";
+        let parsed = parse_event_bytes(raw.as_bytes(), Height::new(0, 1).unwrap())
+            .expect("parse")
+            .expect("an event");
+
+        match parsed.event {
+            IbcEvent::WriteAcknowledgement(wa) => {
+                assert_eq!(u64::from(wa.packet.sequence), 7);
+                assert_eq!(wa.ack, br#"{"result":"AQ=="}"#.to_vec());
+            }
+            other => panic!("expected a write acknowledgement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_the_ack_packet_name_the_router_emits() {
+        let raw = "type=ack_packet\npacket_sequence=5\n";
+        let parsed = parse_event_bytes(raw.as_bytes(), Height::new(0, 1).unwrap())
+            .expect("parse")
+            .expect("an event");
+
+        assert!(matches!(parsed.event, IbcEvent::AcknowledgePacket(_)));
     }
 
     #[test]
