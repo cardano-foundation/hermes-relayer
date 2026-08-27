@@ -1,7 +1,7 @@
 //! Wire types for the Stellar light client.
 //!
 //! These mirror the prost structs in
-//! `interstellar/contracts/cosmwasm/light-client/src/types.rs` **field number
+//! `ipsa/contracts/cosmwasm/light-client/src/types.rs` **field number
 //! for field number**. The contract decodes these bytes directly, so a
 //! divergence is not a build error — protobuf will read one LEN field as
 //! another and hand the contract garbage.

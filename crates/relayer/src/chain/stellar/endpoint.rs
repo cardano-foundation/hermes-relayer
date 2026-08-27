@@ -956,7 +956,7 @@ impl ChainEndpoint for StellarChainEndpoint {
                     "refusing to create a Stellar client: {e}. The quorum set came from the \
                      gateway, which is untrusted transport; add its fingerprint to \
                      `pinned_quorum_set_hashes` only after verifying it independently \
-                     (for example with `interstellar verify --ledger <n>`)."
+                     (for example with `scp-verify --ledger <n>`)."
                 ))
             })?;
 
