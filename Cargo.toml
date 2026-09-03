@@ -48,6 +48,7 @@ namada_sdk              = "0.149.1"
 # Other dependencies
 abscissa_core            = "=0.6.0"
 anyhow                   = "1.0"
+atomic-write-file        = "0.2.3"
 async-stream             = "0.3.6"
 async-trait              = "0.1.83"
 axum                     = "0.6.18"
@@ -122,6 +123,7 @@ tracing                  = { version = "0.1.36", default-features = false }
 tracing-subscriber       = "0.3.14"
 uint                     = "0.9"
 uuid                     = "1.10.5"
+zeroize                  = { version = "1.8", features = ["serde"] }
 
 [profile.release]
 overflow-checks = true

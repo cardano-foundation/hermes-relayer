@@ -5,29 +5,61 @@ use crate::config::AddressType;
 use crate::keyring::{errors::Error as KeyringError, KeyType, SigningKeyPair};
 use hdpath::StandardHDPath;
 use serde::{Deserialize, Serialize};
-use std::any::Any;
+use std::{any::Any, borrow::Cow, fmt};
+use zeroize::Zeroizing;
+
+const REDACTED_KEY_MATERIAL: &str = "<redacted>";
 
 /// Keyfile format for Cardano keys
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct CardanoKeyFile {
     pub name: String,
     pub r#type: String,
     pub address: String,
     pub pubkey: String,
-    pub mnemonic: String,
+    pub mnemonic: Zeroizing<String>,
     #[serde(default)]
     pub network_id: Option<u8>,
 }
 
+impl fmt::Debug for CardanoKeyFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CardanoKeyFile")
+            .field("name", &self.name)
+            .field("type", &self.r#type)
+            .field("address", &self.address)
+            .field("pubkey", &self.pubkey)
+            .field("mnemonic", &REDACTED_KEY_MATERIAL)
+            .field("network_id", &self.network_id)
+            .finish()
+    }
+}
+
 /// Cardano signing key pair wrapper for Hermes
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct CardanoSigningKeyPair {
     #[serde(skip)]
     keyring: Option<CardanoKeyring>,
     // Store serializable data
-    mnemonic: String,
+    mnemonic: Zeroizing<String>,
     account: u32,
     network_id: u8,
+}
+
+impl fmt::Debug for CardanoSigningKeyPair {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CardanoSigningKeyPair")
+            .field(
+                "keyring",
+                &self.keyring.as_ref().map(|_| REDACTED_KEY_MATERIAL),
+            )
+            .field("mnemonic", &REDACTED_KEY_MATERIAL)
+            .field("account", &self.account)
+            .field("network_id", &self.network_id)
+            .finish()
+    }
 }
 
 impl CardanoSigningKeyPair {
@@ -42,15 +74,23 @@ impl CardanoSigningKeyPair {
         account: u32,
         network_id: u8,
     ) -> Result<Self, KeyringError> {
+        Self::new_with_secret(Zeroizing::new(mnemonic_or_key), account, network_id)
+    }
+
+    fn new_with_secret(
+        mnemonic_or_key: Zeroizing<String>,
+        account: u32,
+        network_id: u8,
+    ) -> Result<Self, KeyringError> {
         // Check if this is a bech32 private key instead of a mnemonic
         let keyring = if mnemonic_or_key.starts_with("ed25519_sk") {
-            CardanoKeyring::from_bech32_key(&mnemonic_or_key).map_err(|_| {
+            CardanoKeyring::from_bech32_key(mnemonic_or_key.as_str()).map_err(|_| {
                 KeyringError::invalid_mnemonic(anyhow::anyhow!(
                     "Failed to load Cardano key from bech32"
                 ))
             })?
         } else {
-            CardanoKeyring::from_mnemonic(&mnemonic_or_key, account).map_err(|_| {
+            CardanoKeyring::from_mnemonic(mnemonic_or_key.as_str(), account).map_err(|_| {
                 KeyringError::invalid_mnemonic(anyhow::anyhow!(
                     "Failed to derive Cardano key from mnemonic"
                 ))
@@ -71,7 +111,7 @@ impl CardanoSigningKeyPair {
         network_id: u8,
     ) -> Result<Self, KeyringError> {
         let account = hd_path.account();
-        Self::new(key_file.mnemonic, account, network_id)
+        Self::new_with_secret(key_file.mnemonic, account, network_id)
     }
 
     pub fn from_seed_file_with_network_id(
@@ -96,49 +136,31 @@ impl CardanoSigningKeyPair {
         self.network_id
     }
 
-    /// Ensure the keyring is initialized (for after deserialization)
-    fn ensure_keyring(&mut self) -> Result<(), KeyringError> {
-        if self.keyring.is_none() {
-            let keyring = if self.mnemonic.starts_with("ed25519_sk") {
-                CardanoKeyring::from_bech32_key(&self.mnemonic).map_err(|_| {
-                    KeyringError::invalid_mnemonic(anyhow::anyhow!(
-                        "Failed to reinitialize keyring from bech32"
-                    ))
-                })?
-            } else {
-                CardanoKeyring::from_mnemonic(&self.mnemonic, self.account).map_err(|_| {
-                    KeyringError::invalid_mnemonic(anyhow::anyhow!(
-                        "Failed to reinitialize keyring from mnemonic"
-                    ))
-                })?
-            };
-            self.keyring = Some(keyring);
+    fn derive_keyring(&self) -> Result<CardanoKeyring, KeyringError> {
+        if self.mnemonic.starts_with("ed25519_sk") {
+            CardanoKeyring::from_bech32_key(self.mnemonic.as_str()).map_err(|_| {
+                KeyringError::invalid_mnemonic(anyhow::anyhow!(
+                    "Failed to reinitialize keyring from bech32"
+                ))
+            })
+        } else {
+            CardanoKeyring::from_mnemonic(self.mnemonic.as_str(), self.account).map_err(|_| {
+                KeyringError::invalid_mnemonic(anyhow::anyhow!(
+                    "Failed to reinitialize keyring from mnemonic"
+                ))
+            })
         }
-        Ok(())
     }
 
-    /// Get a reference to the keyring, initializing if needed
-    fn keyring(&mut self) -> Result<&CardanoKeyring, KeyringError> {
-        self.ensure_keyring()?;
-        self.keyring
-            .as_ref()
-            .ok_or_else(KeyringError::key_not_found)
-    }
-
-    /// Get a mutable reference to the keyring, initializing if needed
-    fn keyring_mut(&mut self) -> Result<&mut CardanoKeyring, KeyringError> {
-        self.ensure_keyring()?;
-        self.keyring
-            .as_mut()
-            .ok_or_else(KeyringError::key_not_found)
-    }
-
-    /// Get a clone of the CardanoKeyring (public method for external signing)
-    /// This clones self internally to handle lazy initialization
-    pub fn get_cardano_keyring(&self) -> Result<CardanoKeyring, KeyringError> {
-        let mut mutable_self = self.clone();
-        mutable_self.ensure_keyring()?;
-        mutable_self.keyring.ok_or_else(KeyringError::key_not_found)
+    /// Borrow the cached Cardano keyring, or derive a temporary one after deserialization.
+    ///
+    /// Returning a borrowed keyring for normally constructed values avoids cloning the
+    /// mnemonic and signing key for every signature.
+    pub fn get_cardano_keyring(&self) -> Result<Cow<'_, CardanoKeyring>, KeyringError> {
+        match self.keyring.as_ref() {
+            Some(keyring) => Ok(Cow::Borrowed(keyring)),
+            None => self.derive_keyring().map(Cow::Owned),
+        }
     }
 }
 
@@ -182,18 +204,14 @@ impl SigningKeyPair for CardanoSigningKeyPair {
     }
 
     fn account(&self) -> String {
-        // Return cached address or generate it
-        // Clone self to make it mutable for ensure_keyring
-        let mut mutable_self = self.clone();
-        match mutable_self.keyring() {
+        match self.get_cardano_keyring() {
             Ok(keyring) => keyring.address(self.network_id),
             Err(_) => format!("cardano_address_error_account_{}", self.account),
         }
     }
 
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, KeyringError> {
-        let mut mutable_self = self.clone();
-        let keyring = mutable_self.keyring_mut()?;
+        let keyring = self.get_cardano_keyring()?;
         let signature = keyring.sign(message);
         Ok(signature.to_bytes().to_vec())
     }
@@ -287,7 +305,7 @@ mod tests {
             r#type: "local".to_string(),
             address: String::new(),
             pubkey: String::new(),
-            mnemonic: TEST_MNEMONIC.to_string(),
+            mnemonic: Zeroizing::new(TEST_MNEMONIC.to_string()),
             network_id: Some(1),
         };
 
@@ -305,7 +323,7 @@ mod tests {
             r#type: "local".to_string(),
             address: String::new(),
             pubkey: String::new(),
-            mnemonic: TEST_MNEMONIC.to_string(),
+            mnemonic: Zeroizing::new(TEST_MNEMONIC.to_string()),
             network_id: None,
         };
 
@@ -325,7 +343,7 @@ mod tests {
             r#type: "local".to_string(),
             address,
             pubkey: String::new(),
-            mnemonic: TEST_MNEMONIC.to_string(),
+            mnemonic: Zeroizing::new(TEST_MNEMONIC.to_string()),
             network_id: None,
         };
 
@@ -358,5 +376,42 @@ mod tests {
         let message = b"test";
         let signature = deserialized.sign(message).unwrap();
         assert_eq!(signature.len(), 64);
+    }
+
+    #[test]
+    fn test_debug_output_redacts_key_material() {
+        let key_pair = CardanoSigningKeyPair::new(TEST_MNEMONIC.to_string(), 0, 0).unwrap();
+        let key_file = CardanoKeyFile {
+            name: "test".to_string(),
+            r#type: "local".to_string(),
+            address: String::new(),
+            pubkey: String::new(),
+            mnemonic: Zeroizing::new(TEST_MNEMONIC.to_string()),
+            network_id: Some(0),
+        };
+
+        let key_pair_debug = format!("{key_pair:?}");
+        let key_file_debug = format!("{key_file:?}");
+
+        assert!(!key_pair_debug.contains(TEST_MNEMONIC));
+        assert!(!key_file_debug.contains(TEST_MNEMONIC));
+        assert!(key_pair_debug.contains(REDACTED_KEY_MATERIAL));
+        assert!(key_file_debug.contains(REDACTED_KEY_MATERIAL));
+    }
+
+    #[test]
+    fn test_cached_keyring_is_borrowed_without_cloning_secret_material() {
+        let key_pair = CardanoSigningKeyPair::new(TEST_MNEMONIC.to_string(), 0, 0).unwrap();
+        assert!(matches!(
+            key_pair.get_cardano_keyring().unwrap(),
+            Cow::Borrowed(_)
+        ));
+
+        let serialized = serde_json::to_string(&key_pair).unwrap();
+        let deserialized: CardanoSigningKeyPair = serde_json::from_str(&serialized).unwrap();
+        assert!(matches!(
+            deserialized.get_cardano_keyring().unwrap(),
+            Cow::Owned(_)
+        ));
     }
 }

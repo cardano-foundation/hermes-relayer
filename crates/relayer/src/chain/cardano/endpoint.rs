@@ -3,8 +3,11 @@
 //! This module implements the ChainEndpoint trait required by Hermes for custom chain support.
 
 use super::config::CardanoConfig;
-use super::gateway_client::GatewayClient;
+use super::gateway_client::{GatewayClient, TxSubmitResponse};
 use super::signing_key_pair::CardanoSigningKeyPair;
+use super::signing_policy::{SigningIntent, SigningPolicyLimits, TransactionSigningPolicy};
+use super::transaction_evaluator::OgmiosTransactionEvaluator;
+use super::utxo_resolver::KupoInputResolver;
 
 use ibc_relayer_types::clients::ics08_cardano::consensus_state::ConsensusState as MithrilConsensusState;
 use ibc_relayer_types::clients::ics08_cardano::misbehaviour::Misbehaviour as MithrilMisbehaviour;
@@ -36,7 +39,7 @@ use crate::consensus_state::AnyConsensusState;
 use crate::denom::DenomTrace;
 use crate::error::Error;
 use crate::event::IbcEventWithHeight;
-use crate::keyring::{KeyRing, SigningKeyPair};
+use crate::keyring::KeyRing;
 use crate::misbehaviour::{AnyMisbehaviour, MisbehaviourEvidence};
 use ibc_proto::ibc::core::channel::v1::{
     QueryNextSequenceReceiveResponse, QueryPacketAcknowledgementResponse,
@@ -84,7 +87,11 @@ pub struct CardanoChainEndpoint {
     rt: Arc<TokioRuntime>,
     gateway_client: GatewayClient,
     witness_gateway_client: Option<GatewayClient>,
+    signing_policy: TransactionSigningPolicy,
+    input_resolver: KupoInputResolver,
+    transaction_evaluator: OgmiosTransactionEvaluator,
     keyring: KeyRing<CardanoSigningKeyPair>,
+    signer_address: String,
     event_source_cmd: Option<crate::event::source::TxEventSourceCmd>,
     pending_new_client_consensus_states: Mutex<HashMap<u64, AnyConsensusState>>,
 }
@@ -123,14 +130,76 @@ fn assert_gateway_proof_height(
     Ok(())
 }
 
+fn assert_submitted_tx_hash(expected: &str, actual: &str) -> Result<(), Error> {
+    if !expected.eq_ignore_ascii_case(actual) {
+        return Err(Error::send_tx(format!(
+            "transaction hash mismatch: Hermes signed {expected}, service reported {actual}"
+        )));
+    }
+    Ok(())
+}
+
 impl CardanoChainEndpoint {
+    async fn resolve_signing_intent_denom(&self, intent: &mut SigningIntent) -> Result<(), Error> {
+        let Some(hash) = intent.unresolved_ibc_denom_hash().map(str::to_owned) else {
+            return Ok(());
+        };
+
+        let resolved = self
+            .gateway_client
+            .query_denom(&hash)
+            .await
+            .map_err(|error| {
+                Error::send_tx(format!(
+                    "Failed to resolve ICS-20 denomination ibc/{hash}: {error}"
+                ))
+            })?;
+        intent
+            .resolve_ibc_denom(&resolved.full_denom())
+            .map_err(|error| {
+                Error::send_tx(format!(
+                    "Failed to verify ICS-20 denomination ibc/{hash}: {error}"
+                ))
+            })
+    }
+
     /// Sign a transaction using the keyring (private helper method)
-    fn sign_transaction_helper(&self, unsigned_cbor_hex: &str) -> Result<String, Error> {
+    async fn sign_transaction_helper(
+        &self,
+        unsigned_cbor_hex: &str,
+        intent: &SigningIntent,
+    ) -> Result<super::signer::SignedTransaction, Error> {
         use super::signer;
 
         // Convert hex to bytes
         let unsigned_tx_bytes = hex::decode(unsigned_cbor_hex)
             .map_err(|e| Error::send_tx(format!("Failed to decode unsigned tx hex: {}", e)))?;
+
+        // Resolve values and independently evaluate the exact candidate before
+        // loading private key material. Neither trust decision depends on the
+        // Gateway that built the transaction.
+        let (resolved_inputs, _) = tokio::try_join!(
+            async {
+                self.input_resolver
+                    .resolve_unsigned_transaction(&unsigned_tx_bytes)
+                    .await
+                    .map_err(|error| {
+                        Error::send_tx(format!(
+                            "Failed trusted UTxO resolution before signing: {error}"
+                        ))
+                    })
+            },
+            async {
+                self.transaction_evaluator
+                    .evaluate_unsigned_transaction(&unsigned_tx_bytes)
+                    .await
+                    .map_err(|error| {
+                        Error::send_tx(format!(
+                            "Failed trusted phase-2 evaluation before signing: {error}"
+                        ))
+                    })
+            }
+        )?;
 
         // Get signing key from keyring
         let key = self
@@ -138,23 +207,60 @@ impl CardanoChainEndpoint {
             .get_key(&self.config.key_name)
             .map_err(Error::key_base)?;
 
-        // Get the CardanoSigningKeyPair and extract the CardanoKeyring
-        let signing_key_pair = key
-            .as_any()
-            .downcast_ref::<CardanoSigningKeyPair>()
-            .ok_or_else(|| {
-                Error::send_tx("Failed to downcast to CardanoSigningKeyPair".to_string())
-            })?;
-        let cardano_keyring = signing_key_pair
+        let cardano_keyring = key
             .get_cardano_keyring()
             .map_err(|e| Error::send_tx(format!("Failed to get CardanoKeyring: {}", e)))?;
 
         // Sign the transaction
-        let signed_tx_bytes = signer::sign_transaction(&unsigned_tx_bytes, &cardano_keyring)
-            .map_err(|e| Error::send_tx(format!("Failed to sign transaction: {}", e)))?;
+        let signed_tx = signer::sign_transaction(
+            &unsigned_tx_bytes,
+            &cardano_keyring,
+            &self.signer_address,
+            &self.signing_policy,
+            intent,
+            &resolved_inputs,
+        )
+        .map_err(|e| Error::send_tx(format!("Failed to sign transaction: {}", e)))?;
 
-        // Convert back to hex
-        Ok(hex::encode(signed_tx_bytes))
+        Ok(signed_tx)
+    }
+
+    /// Submit the exact signed envelope through trusted Ogmios, then give the
+    /// Gateway only its body hash so it can verify inclusion and finalize the
+    /// matching pending IBC state update.
+    async fn submit_and_observe_signed_transaction(
+        &self,
+        signed_tx: &super::signer::SignedTransaction,
+    ) -> Result<TxSubmitResponse, Error> {
+        let submitted_hash = self
+            .transaction_evaluator
+            .submit_signed_transaction(&signed_tx.cbor)
+            .await
+            .map_err(|error| {
+                Error::send_tx(format!(
+                    "Failed to submit exact signed transaction through trusted Ogmios: {error}"
+                ))
+            })?;
+        assert_submitted_tx_hash(&signed_tx.tx_hash, &submitted_hash)?;
+
+        let response = self
+            .gateway_client
+            .observe_tx(&signed_tx.tx_hash)
+            .await
+            .map_err(|error| {
+                Error::send_tx(format!(
+                    "Trusted Ogmios accepted transaction {}, but the Gateway could not verify and finalize it: {error}",
+                    signed_tx.tx_hash
+                ))
+            })?;
+        assert_submitted_tx_hash(&signed_tx.tx_hash, &response.tx_hash)?;
+        if response.height.is_none() {
+            return Err(Error::send_tx(format!(
+                "Gateway finalized transaction {} without a confirmed inclusion height",
+                signed_tx.tx_hash
+            )));
+        }
+        Ok(response)
     }
 
     /// Initialize the event source for monitoring Cardano chain events
@@ -292,8 +398,8 @@ impl CardanoChainEndpoint {
     /// Cardano transaction inclusion height.
     ///
     /// Why this exists:
-    /// - The Gateway returns a transaction `height` in `submit_signed_tx` based on `db-sync`'s
-    ///   `block_no` for the block that included the transaction.
+    /// - After trusted Ogmios submission, the Gateway reports the transaction
+    ///   inclusion height from `db-sync`'s `block_no`.
     /// - Separately, for Cardano↔Cosmos IBC, the Cosmos-side light client only accepts heights
     ///   that satisfy the active Gateway light-client mode. In Mithril mode this is a certified
     ///   transaction snapshot block number; in probabilistic mode it is a heuristically accepted
@@ -440,9 +546,54 @@ impl ChainEndpoint for CardanoChainEndpoint {
             cardano_config.gateway_url
         );
 
+        let bridge_manifest_path =
+            cardano_config
+                .bridge_manifest_path
+                .as_ref()
+                .ok_or_else(|| {
+                    tracing::error!(
+                "Cardano bridge_manifest_path is required to authorize Gateway-built transactions"
+            );
+                    Error::config(ConfigError::wrong_type())
+                })?;
+        let signing_policy = TransactionSigningPolicy::load(
+            bridge_manifest_path,
+            cardano_config.network_id,
+            SigningPolicyLimits {
+                max_fee_lovelace: cardano_config.max_tx_fee_lovelace,
+                max_total_collateral_lovelace: cardano_config.max_total_collateral_lovelace,
+                max_tx_size_bytes: cardano_config.max_tx_size_bytes,
+                max_external_output_lovelace: cardano_config.max_external_output_lovelace,
+                max_total_protocol_output_lovelace: cardano_config
+                    .max_total_protocol_output_lovelace,
+                max_wallet_lovelace_top_up: cardano_config.max_wallet_lovelace_top_up,
+                max_validity_interval_slots: cardano_config.max_validity_interval_slots,
+            },
+        )
+        .map_err(|error| {
+            tracing::error!("Failed to initialize Cardano transaction signing policy: {error}");
+            Error::config(ConfigError::wrong_type())
+        })?;
+
+        let input_resolver = KupoInputResolver::from_config(&cardano_config).map_err(|error| {
+            tracing::error!("Failed to initialize trusted Cardano UTxO resolver: {error}");
+            Error::config(ConfigError::wrong_type())
+        })?;
+        let transaction_evaluator = OgmiosTransactionEvaluator::from_config(&cardano_config)
+            .map_err(|error| {
+                tracing::error!(
+                    "Failed to initialize trusted Cardano transaction evaluator: {error}"
+                );
+                Error::config(ConfigError::wrong_type())
+            })?;
+
         // Initialize Gateway client (async operation, so use rt.block_on)
         let gateway_client = rt
-            .block_on(GatewayClient::new(cardano_config.gateway_url.clone()))
+            .block_on(GatewayClient::new_with_security(
+                cardano_config.gateway_url.clone(),
+                cardano_config.gateway_tls_ca_file.clone(),
+                cardano_config.gateway_auth_token_file.clone(),
+            ))
             .map_err(|e| {
                 tracing::error!("Failed to initialize Gateway client: {}", e);
                 Error::config(ConfigError::wrong_type())
@@ -457,14 +608,22 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     witness_url
                 );
                 Some(
-                    rt.block_on(GatewayClient::new(witness_url.clone()))
-                        .map_err(|e| {
-                            tracing::error!(
-                                "Failed to initialize Cardano misbehaviour witness Gateway: {}",
-                                e
-                            );
-                            Error::config(ConfigError::wrong_type())
-                        })?,
+                    rt.block_on(GatewayClient::new_with_security(
+                        witness_url.clone(),
+                        cardano_config
+                            .misbehaviour_witness_gateway_tls_ca_file
+                            .clone(),
+                        cardano_config
+                            .misbehaviour_witness_gateway_auth_token_file
+                            .clone(),
+                    ))
+                    .map_err(|e| {
+                        tracing::error!(
+                            "Failed to initialize Cardano misbehaviour witness Gateway: {}",
+                            e
+                        );
+                        Error::config(ConfigError::wrong_type())
+                    })?,
                 )
             } else {
                 tracing::warn!(
@@ -476,13 +635,23 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
         // Initialize keyring
         // Note: Cardano uses "addr" as account prefix (similar to how Cosmos uses prefixes)
-        let keyring = KeyRing::new(
+        let keyring: KeyRing<CardanoSigningKeyPair> = KeyRing::new(
             cardano_config.key_store_type,
             "addr", // Cardano address prefix
             &cardano_config.id,
             &cardano_config.key_store_folder,
         )
         .map_err(Error::key_base)?;
+
+        // Cache only the public address. This avoids cloning or re-deriving secret
+        // key material once to authorize the request and again to sign its result.
+        let signer_address = {
+            let key = keyring
+                .get_key(&cardano_config.key_name)
+                .map_err(Error::key_base)?;
+            let cardano_keyring = key.get_cardano_keyring().map_err(Error::key_base)?;
+            cardano_keyring.address(cardano_config.network_id)
+        };
 
         tracing::info!("Keyring initialized successfully");
 
@@ -491,7 +660,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
             rt,
             gateway_client,
             witness_gateway_client,
+            signing_policy,
+            input_resolver,
+            transaction_evaluator,
             keyring,
+            signer_address,
             event_source_cmd: None, // Initialized lazily on first subscribe() call
             pending_new_client_consensus_states: Mutex::new(HashMap::new()),
         };
@@ -573,15 +746,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
     }
 
     fn get_signer(&self) -> Result<Signer, Error> {
-        let key = self
-            .keyring
-            .get_key(&self.config.key_name)
-            .map_err(Error::key_base)?;
-
-        let cardano_keyring = key.get_cardano_keyring().map_err(Error::key_base)?;
-        let address = cardano_keyring.address(self.config.network_id);
-
-        Signer::from_str(&address).map_err(|e| {
+        Signer::from_str(&self.signer_address).map_err(|e| {
             Error::key_base(crate::keyring::errors::Error::invalid_mnemonic(
                 anyhow::anyhow!("Invalid signer address: {e}"),
             ))
@@ -621,6 +786,19 @@ impl ChainEndpoint for CardanoChainEndpoint {
             for msg in tracked_msgs.msgs.iter() {
                 tracing::debug!("Processing message type: {:?}", msg.type_url);
 
+                let expected_signer = self.get_signer()?.to_string();
+                let mut signing_intent = SigningIntent::ibc(
+                    &msg.type_url,
+                    &msg.value,
+                    &expected_signer,
+                    self.config.network_id,
+                )
+                .map_err(|error| {
+                    Error::send_tx(format!("Failed to authorize signing intent: {error}"))
+                })?;
+                self.resolve_signing_intent_denom(&mut signing_intent)
+                    .await?;
+
                 // Step 1: Build unsigned transaction via Gateway
                 let unsigned_tx = self
                     .gateway_client
@@ -631,16 +809,18 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 tracing::debug!("Built unsigned tx: {}", unsigned_tx.description);
 
                 // Step 2: Sign transaction with keyring
-                let signed_cbor_hex = self.sign_transaction_helper(&unsigned_tx.cbor_hex)?;
+                let signed_tx = self
+                    .sign_transaction_helper(&unsigned_tx.cbor_hex, &signing_intent)
+                    .await?;
 
-                tracing::debug!("Signed transaction, CBOR length: {}", signed_cbor_hex.len());
+                tracing::debug!("Signed transaction, CBOR length: {}", signed_tx.cbor.len());
 
-                // Step 3: Submit signed transaction via Gateway
+                // Step 3: Submit the immutable signed envelope through trusted
+                // Ogmios. The Gateway receives only its body hash to verify
+                // inclusion and finalize the matching pending state update.
                 let tx_response = self
-                    .gateway_client
-                    .submit_signed_tx(&signed_cbor_hex)
-                    .await
-                    .map_err(|e| Error::send_tx(format!("Failed to submit transaction: {}", e)))?;
+                    .submit_and_observe_signed_transaction(&signed_tx)
+                    .await?;
 
                 let tx_hash = tx_response.tx_hash.clone();
                 let event_count = tx_response.events.len();
@@ -782,19 +962,32 @@ impl ChainEndpoint for CardanoChainEndpoint {
             for msg in tracked_msgs.msgs.iter() {
                 tracing::debug!("Processing message type: {:?}", msg.type_url);
 
+                let expected_signer = self.get_signer()?.to_string();
+                let mut signing_intent = SigningIntent::ibc(
+                    &msg.type_url,
+                    &msg.value,
+                    &expected_signer,
+                    self.config.network_id,
+                )
+                .map_err(|error| {
+                    Error::send_tx(format!("Failed to authorize signing intent: {error}"))
+                })?;
+                self.resolve_signing_intent_denom(&mut signing_intent)
+                    .await?;
+
                 let unsigned_tx = self
                     .gateway_client
                     .build_ibc_tx(&msg.type_url, msg.value.clone())
                     .await
                     .map_err(|e| Error::send_tx(format!("Failed to build transaction: {e}")))?;
 
-                let signed_cbor_hex = self.sign_transaction_helper(&unsigned_tx.cbor_hex)?;
+                let signed_tx = self
+                    .sign_transaction_helper(&unsigned_tx.cbor_hex, &signing_intent)
+                    .await?;
 
                 let tx_response = self
-                    .gateway_client
-                    .submit_signed_tx(&signed_cbor_hex)
-                    .await
-                    .map_err(|e| Error::send_tx(format!("Failed to submit transaction: {e}")))?;
+                    .submit_and_observe_signed_transaction(&signed_tx)
+                    .await?;
 
                 let included_height = tx_response.height.ok_or_else(|| {
                     Error::send_tx(format!(
@@ -841,6 +1034,12 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn submit_host_state_heartbeat(&mut self) -> Result<HostStateHeartbeatOutcome, Error> {
         let signer = self.get_signer()?.to_string();
+        let signing_intent = SigningIntent::heartbeat(&signer, &signer, self.config.network_id)
+            .map_err(|error| {
+                Error::send_tx(format!(
+                    "Failed to authorize heartbeat signing intent: {error}"
+                ))
+            })?;
 
         self.rt.block_on(async {
             let build = self
@@ -864,14 +1063,12 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     build.current_epoch
                 ))
             })?;
-            let signed_cbor_hex = self.sign_transaction_helper(&unsigned_tx.cbor_hex)?;
+            let signed_tx = self
+                .sign_transaction_helper(&unsigned_tx.cbor_hex, &signing_intent)
+                .await?;
             let response = self
-                .gateway_client
-                .submit_signed_tx(&signed_cbor_hex)
-                .await
-                .map_err(|e| {
-                    Error::send_tx(format!("Failed to submit HostState heartbeat: {e}"))
-                })?;
+                .submit_and_observe_signed_transaction(&signed_tx)
+                .await?;
 
             Ok(HostStateHeartbeatOutcome::Submitted {
                 tx_hash: response.tx_hash,
@@ -1026,10 +1223,20 @@ impl ChainEndpoint for CardanoChainEndpoint {
         )))
     }
 
-    fn query_denom_trace(&self, _hash: String) -> Result<DenomTrace, Error> {
-        // Not applicable to Cardano (native assets)
-        tracing::warn!("query_denom_trace: not applicable for Cardano");
-        Err(Error::config(ConfigError::wrong_type()))
+    fn query_denom_trace(&self, hash: String) -> Result<DenomTrace, Error> {
+        let resolved = self
+            .rt
+            .block_on(self.gateway_client.query_denom(&hash))
+            .map_err(|error| {
+                Error::query(format!(
+                    "Gateway failed to resolve ICS-20 denomination {hash}: {error}"
+                ))
+            })?;
+
+        Ok(DenomTrace {
+            path: resolved.path,
+            base_denom: resolved.base_denom,
+        })
     }
 
     fn query_commitment_prefix(&self) -> Result<CommitmentPrefix, Error> {

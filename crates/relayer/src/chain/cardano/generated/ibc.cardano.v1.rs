@@ -69,6 +69,27 @@ pub struct SubmitSignedTxResponse {
     #[prost(message, repeated, tag = "3")]
     pub events: ::prost::alloc::vec::Vec<Event>,
 }
+/// ObserveTxRequest identifies a transaction that Hermes already submitted
+/// through its trusted Cardano node connection.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ObserveTxRequest {
+    /// Blake2b-256 hash of the Cardano transaction body, encoded as 64 hex digits.
+    #[prost(string, tag = "1")]
+    pub tx_hash: ::prost::alloc::string::String,
+}
+/// ObserveTxResponse contains the confirmed inclusion height and IBC events.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ObserveTxResponse {
+    /// Canonical Blake2b-256 transaction body hash.
+    #[prost(string, tag = "1")]
+    pub tx_hash: ::prost::alloc::string::String,
+    /// Confirmed block height in IBC revision-number/revision-height form.
+    #[prost(string, tag = "2")]
+    pub height: ::prost::alloc::string::String,
+    /// Raw transaction events for IBC event parsing.
+    #[prost(message, repeated, tag = "3")]
+    pub events: ::prost::alloc::vec::Vec<Event>,
+}
 /// Event represents a transaction event with type and attributes.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Event {
@@ -258,6 +279,30 @@ pub mod cardano_msg_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("ibc.cardano.v1.CardanoMsg", "SubmitSignedTx"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// ObserveTx waits for a transaction submitted directly by Hermes to be
+        /// indexed, then finalizes the Gateway's pending IBC state update. The
+        /// signed transaction is deliberately never sent to the Gateway.
+        pub async fn observe_tx(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ObserveTxRequest>,
+        ) -> std::result::Result<tonic::Response<super::ObserveTxResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ibc.cardano.v1.CardanoMsg/ObserveTx",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("ibc.cardano.v1.CardanoMsg", "ObserveTx"));
             self.inner.unary(req, path, codec).await
         }
     }

@@ -6,8 +6,8 @@
 use super::error::Error;
 use super::generated::ibc::cardano::v1::{
     cardano_msg_client::CardanoMsgClient, BuildHostStateHeartbeatRequest,
-    BuildHostStateHeartbeatResponse, MsgPrunePacketHistory, SubmitSignedTxRequest,
-    SubmitSignedTxResponse,
+    BuildHostStateHeartbeatResponse, MsgPrunePacketHistory, ObserveTxRequest, ObserveTxResponse,
+    SubmitSignedTxRequest, SubmitSignedTxResponse,
 };
 use super::generated::ibc::core::channel::v1::msg_client::MsgClient as GenChannelMsgClient;
 use super::generated::ibc::core::client::v1::msg_client::MsgClient as GenClientMsgClient;
@@ -43,8 +43,14 @@ use ibc_relayer_types::clients::{
 };
 use ibc_relayer_types::core::ics02_client::header::AnyHeader;
 use ibc_relayer_types::Height;
+use sha2::{Digest, Sha256};
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use tonic::metadata::AsciiMetadataValue;
-use tonic::transport::Channel;
+use tonic::service::interceptor::InterceptedService;
+use tonic::service::Interceptor;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Uri};
+use tonic::{Request, Status};
 
 const GATEWAY_HEADER_GRPC_MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
 const CARDANO_NATIVE_ASSET_MAX_QUANTITY: u64 = u64::MAX;
@@ -71,6 +77,55 @@ pub struct HostStateHeartbeatBuild {
     pub current_epoch: u64,
     pub host_state_epoch: u64,
     pub unsigned_tx: Option<UnsignedTx>,
+}
+
+/// A denomination trace returned by the ibc-go v10 `Query/Denom` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDenom {
+    pub path: String,
+    pub base_denom: String,
+}
+
+impl ResolvedDenom {
+    pub fn full_denom(&self) -> String {
+        if self.path.is_empty() {
+            self.base_denom.clone()
+        } else {
+            format!("{}/{}", self.path, self.base_denom)
+        }
+    }
+}
+
+// ibc-proto 0.51 still exposes the pre-v10 Query/DenomTrace messages. These
+// small prost types are the wire-compatible ibc-go v10 Query/Denom messages
+// served by the Cardano Gateway. Keeping them private avoids exposing a second
+// protobuf API while Hermes remains on ibc-proto 0.51.
+#[derive(Clone, PartialEq, prost::Message)]
+struct QueryDenomRequest {
+    #[prost(string, tag = "1")]
+    hash: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct QueryDenomResponse {
+    #[prost(message, optional, tag = "1")]
+    denom: Option<GatewayDenom>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GatewayDenom {
+    #[prost(string, tag = "1")]
+    base: String,
+    #[prost(message, repeated, tag = "3")]
+    trace: Vec<GatewayDenomHop>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct GatewayDenomHop {
+    #[prost(string, tag = "1")]
+    port_id: String,
+    #[prost(string, tag = "2")]
+    channel_id: String,
 }
 
 /// Simplified IBC event structure for Gateway responses
@@ -101,18 +156,72 @@ fn describe_update_client_message(type_url: Option<&str>) -> String {
 #[derive(Clone)]
 pub struct GatewayClient {
     endpoint: String,
-    channel: Channel,
+    channel: InterceptedService<Channel, GatewayAuthInterceptor>,
+}
+
+#[derive(Clone)]
+struct GatewayAuthInterceptor {
+    authorization: Option<AsciiMetadataValue>,
+}
+
+impl Interceptor for GatewayAuthInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        if let Some(authorization) = &self.authorization {
+            request
+                .metadata_mut()
+                .insert("authorization", authorization.clone());
+        }
+
+        Ok(request)
+    }
 }
 
 impl GatewayClient {
     /// Create a new Gateway client and establish a gRPC connection
     pub async fn new(endpoint: String) -> Result<Self, Error> {
+        Self::new_with_security(endpoint, None, None).await
+    }
+
+    /// Create a Gateway client with optional private-CA trust and bearer authentication.
+    pub async fn new_with_security(
+        endpoint: String,
+        tls_ca_file: Option<PathBuf>,
+        auth_token_file: Option<PathBuf>,
+    ) -> Result<Self, Error> {
         tracing::info!("Connecting to Cardano Gateway at {}", endpoint);
 
-        let channel = Channel::from_shared(endpoint.clone())
-            .map_err(|e| Error::GatewayClient(e.to_string()))?
-            .connect()
-            .await?;
+        let channel_endpoint = Channel::from_shared(endpoint.clone())
+            .map_err(|e| Error::GatewayClient(format!("invalid Gateway endpoint: {e}")))?;
+        let use_tls = validate_gateway_endpoint(channel_endpoint.uri())?;
+
+        let channel_endpoint = if use_tls {
+            let mut tls_config = ClientTlsConfig::new().with_native_roots();
+            if let Some(ca_file) = tls_ca_file.as_deref() {
+                let ca_pem = read_gateway_file(ca_file, "TLS CA certificate")?;
+                tls_config = tls_config.ca_certificate(Certificate::from_pem(ca_pem));
+            }
+            channel_endpoint.tls_config(tls_config).map_err(|e| {
+                Error::GatewayClient(format!("invalid Gateway TLS configuration: {e}"))
+            })?
+        } else {
+            if tls_ca_file.is_some() {
+                return Err(Error::GatewayClient(
+                    "gateway_tls_ca_file requires an https:// Gateway endpoint".to_string(),
+                ));
+            }
+            tracing::warn!(
+                "Using plaintext gRPC for loopback Cardano Gateway endpoint {}; do not expose this connection to an untrusted network",
+                endpoint
+            );
+            channel_endpoint
+        };
+
+        let authorization = auth_token_file
+            .as_deref()
+            .map(read_gateway_auth_token)
+            .transpose()?;
+        let channel = channel_endpoint.connect().await?;
+        let channel = InterceptedService::new(channel, GatewayAuthInterceptor { authorization });
 
         Ok(Self { endpoint, channel })
     }
@@ -505,6 +614,41 @@ impl GatewayClient {
         let response = client.client_states(request).await?.into_inner();
 
         Ok(prost::Message::encode_to_vec(&response))
+    }
+
+    /// Resolve an ICS-20 hash through the standard ibc-go v10 `Query/Denom`
+    /// endpoint and cryptographically bind the response to the requested hash.
+    ///
+    /// The Gateway is not trusted to choose the full denomination used by the
+    /// signing policy. A response is accepted only when its canonical full denom
+    /// hashes to the exact SHA-256 value requested by Hermes.
+    pub async fn query_denom(&self, hash: &str) -> Result<ResolvedDenom, Error> {
+        let expected_hash = parse_ibc_denom_hash(hash)?;
+        let mut client = tonic::client::Grpc::new(self.channel.clone());
+        client.ready().await.map_err(|_| {
+            Error::GatewayClient("Gateway denomination query service was not ready".to_string())
+        })?;
+
+        let codec = tonic::codec::ProstCodec::default();
+        let path =
+            http::uri::PathAndQuery::from_static("/ibc.applications.transfer.v1.Query/Denom");
+        let mut request = tonic::Request::new(QueryDenomRequest {
+            hash: hex::encode_upper(expected_hash),
+        });
+        request.extensions_mut().insert(tonic::GrpcMethod::new(
+            "ibc.applications.transfer.v1.Query",
+            "Denom",
+        ));
+
+        let response: tonic::Response<QueryDenomResponse> =
+            client.unary(request, path, codec).await?;
+        let denom = response.into_inner().denom.ok_or_else(|| {
+            Error::GatewayClient(format!(
+                "Gateway returned an empty denomination for hash {hash}"
+            ))
+        })?;
+
+        resolve_gateway_denom(denom, expected_hash)
     }
 
     /// Query connections associated with a client
@@ -1567,6 +1711,9 @@ impl GatewayClient {
     }
 
     /// Submit a signed transaction to the Cardano blockchain via Gateway
+    #[deprecated(
+        note = "Hermes must submit exact signed bytes through trusted Ogmios, then call observe_tx"
+    )]
     pub async fn submit_signed_tx(&self, signed_tx_cbor: &str) -> Result<TxSubmitResponse, Error> {
         tracing::info!(
             "Submitting signed transaction (CBOR length: {})",
@@ -1591,6 +1738,38 @@ impl GatewayClient {
             .map(|e| IbcEvent {
                 event_type: e.r#type,
                 attributes: e.attributes.into_iter().map(|a| (a.key, a.value)).collect(),
+            })
+            .collect();
+
+        Ok(TxSubmitResponse {
+            tx_hash: response.tx_hash,
+            height,
+            events,
+        })
+    }
+
+    /// Wait for a transaction submitted through Hermes's trusted node path and
+    /// finalize the matching pending Gateway state update by body hash only.
+    pub async fn observe_tx(&self, tx_hash: &str) -> Result<TxSubmitResponse, Error> {
+        let mut client = CardanoMsgClient::new(self.channel.clone());
+        let response: ObserveTxResponse = client
+            .observe_tx(tonic::Request::new(ObserveTxRequest {
+                tx_hash: tx_hash.to_string(),
+            }))
+            .await?
+            .into_inner();
+
+        let height = parse_submit_signed_tx_height(&response.height)?;
+        let events = response
+            .events
+            .into_iter()
+            .map(|event| IbcEvent {
+                event_type: event.r#type,
+                attributes: event
+                    .attributes
+                    .into_iter()
+                    .map(|attribute| (attribute.key, attribute.value))
+                    .collect(),
             })
             .collect();
 
@@ -1667,6 +1846,145 @@ impl GatewayClient {
     }
 }
 
+fn parse_ibc_denom_hash(value: &str) -> Result<[u8; 32], Error> {
+    let hash = value.strip_prefix("ibc/").unwrap_or(value);
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::GatewayClient(format!(
+            "invalid ICS-20 denomination hash '{value}': expected 64 hexadecimal characters, optionally prefixed by 'ibc/'"
+        )));
+    }
+
+    let bytes = hex::decode(hash).map_err(|_| {
+        Error::GatewayClient(format!(
+            "invalid ICS-20 denomination hash '{value}': expected hexadecimal characters"
+        ))
+    })?;
+    bytes.try_into().map_err(|_| {
+        Error::GatewayClient(format!(
+            "invalid ICS-20 denomination hash '{value}': expected 32 bytes"
+        ))
+    })
+}
+
+fn resolve_gateway_denom(
+    denom: GatewayDenom,
+    expected_hash: [u8; 32],
+) -> Result<ResolvedDenom, Error> {
+    if denom.base.is_empty() {
+        return Err(Error::GatewayClient(
+            "Gateway returned a denomination with an empty base".to_string(),
+        ));
+    }
+
+    let mut path_segments = Vec::with_capacity(denom.trace.len() * 2);
+    for hop in denom.trace {
+        if hop.port_id.is_empty()
+            || hop.channel_id.is_empty()
+            || hop.port_id.contains('/')
+            || hop.channel_id.contains('/')
+        {
+            return Err(Error::GatewayClient(
+                "Gateway returned an invalid denomination trace hop".to_string(),
+            ));
+        }
+        path_segments.push(hop.port_id);
+        path_segments.push(hop.channel_id);
+    }
+
+    let resolved = ResolvedDenom {
+        path: path_segments.join("/"),
+        base_denom: denom.base,
+    };
+    let full_denom = resolved.full_denom();
+    let actual_hash: [u8; 32] = Sha256::digest(full_denom.as_bytes()).into();
+    if actual_hash != expected_hash {
+        return Err(Error::GatewayClient(format!(
+            "Gateway denomination response does not match requested ICS-20 hash {}",
+            hex::encode_upper(expected_hash)
+        )));
+    }
+
+    Ok(resolved)
+}
+
+fn read_gateway_file(path: &Path, description: &str) -> Result<Vec<u8>, Error> {
+    std::fs::read(path).map_err(|error| {
+        Error::GatewayClient(format!(
+            "failed to read Gateway {description} file {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn read_gateway_auth_token(path: &Path) -> Result<AsciiMetadataValue, Error> {
+    let bytes = read_gateway_file(path, "authentication token")?;
+    let token = std::str::from_utf8(&bytes).map_err(|error| {
+        Error::GatewayClient(format!(
+            "Gateway authentication token file {} is not valid UTF-8: {error}",
+            path.display()
+        ))
+    })?;
+    authorization_metadata(token)
+}
+
+fn authorization_metadata(token: &str) -> Result<AsciiMetadataValue, Error> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(Error::GatewayClient(
+            "Gateway authentication token must not be empty".to_string(),
+        ));
+    }
+
+    let mut authorization = format!("Bearer {token}")
+        .parse::<AsciiMetadataValue>()
+        .map_err(|_| {
+            Error::GatewayClient(
+                "Gateway authentication token contains characters that are invalid in gRPC metadata"
+                    .to_string(),
+            )
+        })?;
+    authorization.set_sensitive(true);
+    Ok(authorization)
+}
+
+fn validate_gateway_endpoint(uri: &Uri) -> Result<bool, Error> {
+    match uri.scheme_str() {
+        Some("https") => Ok(true),
+        Some("http") => {
+            let host = uri.host().ok_or_else(|| {
+                Error::GatewayClient("Gateway endpoint must include a host".to_string())
+            })?;
+
+            if is_loopback_host(host) {
+                Ok(false)
+            } else {
+                Err(Error::GatewayClient(format!(
+                    "refusing plaintext gRPC connection to non-loopback Gateway host '{host}'; use an https:// endpoint"
+                )))
+            }
+        }
+        Some(scheme) => Err(Error::GatewayClient(format!(
+            "unsupported Gateway endpoint scheme '{scheme}'; use https://, or http:// for loopback only"
+        ))),
+        None => Err(Error::GatewayClient(
+            "Gateway endpoint must include an https:// scheme, or http:// for loopback only"
+                .to_string(),
+        )),
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    matches!(host.parse::<IpAddr>(), Ok(address) if address.is_loopback())
+}
+
 fn parse_submit_signed_tx_height(raw_height: &str) -> Result<Option<Height>, Error> {
     if raw_height.is_empty() {
         return Ok(None);
@@ -1732,6 +2050,171 @@ fn parse_cardano_native_asset_quantity(amount: &str, denom: &str) -> Result<u64,
 mod tests {
     use super::*;
     use ibc_proto::cosmos::base::v1beta1::Coin as ProtoCoin;
+
+    fn gateway_uri(value: &str) -> Uri {
+        value.parse().expect("valid test URI")
+    }
+
+    fn denom_hash(full_denom: &str) -> [u8; 32] {
+        Sha256::digest(full_denom.as_bytes()).into()
+    }
+
+    #[test]
+    fn gateway_denom_is_bound_to_requested_sha256_hash() {
+        let full_denom = "transfer/channel-7/uatom";
+        let resolved = resolve_gateway_denom(
+            GatewayDenom {
+                base: "uatom".to_string(),
+                trace: vec![GatewayDenomHop {
+                    port_id: "transfer".to_string(),
+                    channel_id: "channel-7".to_string(),
+                }],
+            },
+            denom_hash(full_denom),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.path, "transfer/channel-7");
+        assert_eq!(resolved.base_denom, "uatom");
+        assert_eq!(resolved.full_denom(), full_denom);
+    }
+
+    #[test]
+    fn gateway_denom_rejects_a_response_for_another_hash() {
+        let error = resolve_gateway_denom(
+            GatewayDenom {
+                base: "uosmo".to_string(),
+                trace: vec![GatewayDenomHop {
+                    port_id: "transfer".to_string(),
+                    channel_id: "channel-7".to_string(),
+                }],
+            },
+            denom_hash("transfer/channel-7/uatom"),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not match requested ICS-20 hash"));
+    }
+
+    #[test]
+    fn gateway_denom_hash_accepts_raw_and_prefixed_hex_only() {
+        let hash = "AB".repeat(32);
+        assert_eq!(
+            parse_ibc_denom_hash(&hash).unwrap(),
+            parse_ibc_denom_hash(&format!("ibc/{hash}")).unwrap()
+        );
+
+        let non_hex = "gg".repeat(32);
+        for malformed in ["ibc/1234", "xyz", non_hex.as_str()] {
+            assert!(parse_ibc_denom_hash(malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn plaintext_gateway_is_limited_to_loopback_hosts() {
+        for endpoint in [
+            "http://localhost:5001",
+            "http://LOCALHOST.:5001",
+            "http://127.0.0.1:5001",
+            "http://127.42.0.9:5001",
+            "http://[::1]:5001",
+        ] {
+            assert!(
+                !validate_gateway_endpoint(&gateway_uri(endpoint)).unwrap(),
+                "{endpoint} should be accepted as loopback plaintext"
+            );
+        }
+    }
+
+    #[test]
+    fn plaintext_gateway_rejects_non_loopback_hosts() {
+        for endpoint in [
+            "http://gateway:5001",
+            "http://0.0.0.0:5001",
+            "http://192.168.1.2:5001",
+            "http://10.0.0.2:5001",
+            "http://localhost.example:5001",
+        ] {
+            let error = validate_gateway_endpoint(&gateway_uri(endpoint)).unwrap_err();
+            assert!(
+                error.to_string().contains("refusing plaintext"),
+                "unexpected error for {endpoint}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_client_rejects_remote_plaintext_before_connecting() {
+        let error = GatewayClient::new("http://gateway.example:5001".to_string())
+            .await
+            .err()
+            .expect("remote plaintext must fail");
+
+        assert!(error.to_string().contains("refusing plaintext"));
+    }
+
+    #[tokio::test]
+    async fn gateway_client_rejects_tls_ca_for_plaintext() {
+        let error = GatewayClient::new_with_security(
+            "http://localhost:5001".to_string(),
+            Some(PathBuf::from("/does/not/need/to/exist.pem")),
+            None,
+        )
+        .await
+        .err()
+        .expect("TLS CA with plaintext must fail");
+
+        assert!(error
+            .to_string()
+            .contains("gateway_tls_ca_file requires an https://"));
+    }
+
+    #[test]
+    fn secure_gateway_requires_https_scheme() {
+        assert!(validate_gateway_endpoint(&gateway_uri("https://gateway.example:5001")).unwrap());
+
+        for endpoint in ["ftp://gateway.example:5001", "gateway.example:5001"] {
+            let error = validate_gateway_endpoint(&gateway_uri(endpoint)).unwrap_err();
+            assert!(
+                error.to_string().contains("Gateway endpoint"),
+                "unexpected error for {endpoint}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_auth_interceptor_adds_sensitive_bearer_metadata() {
+        let authorization = authorization_metadata("  test-secret\n").unwrap();
+        assert_eq!(authorization, "Bearer test-secret");
+        assert!(authorization.is_sensitive());
+
+        let mut interceptor = GatewayAuthInterceptor {
+            authorization: Some(authorization),
+        };
+        let request = interceptor.call(Request::new(())).unwrap();
+        let actual = request
+            .metadata()
+            .get("authorization")
+            .expect("authorization metadata");
+        assert_eq!(actual, "Bearer test-secret");
+        assert!(actual.is_sensitive());
+    }
+
+    #[test]
+    fn gateway_auth_interceptor_is_optional_and_rejects_invalid_tokens() {
+        let mut interceptor = GatewayAuthInterceptor {
+            authorization: None,
+        };
+        let request = interceptor.call(Request::new(())).unwrap();
+        assert!(request.metadata().get("authorization").is_none());
+
+        assert!(authorization_metadata(" \n\t").is_err());
+        let error = authorization_metadata("token\nwith-newline").unwrap_err();
+        assert!(error.to_string().contains("invalid in gRPC metadata"));
+        assert!(!error.to_string().contains("token\nwith-newline"));
+    }
 
     fn transfer_coin(amount: &str) -> ProtoCoin {
         ProtoCoin {
