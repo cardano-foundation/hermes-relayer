@@ -34,6 +34,7 @@ ibc-telemetry     = { workspace = true }
 ibc-relayer-types = { workspace = true, features = ["clock"] }
 
 anyhow                           = { workspace = true }
+atomic-write-file                = { workspace = true }
 async-stream                     = { workspace = true }
 bech32                           = { workspace = true }
 bitcoin                          = { workspace = true, features = ["serde"] }
@@ -44,7 +45,7 @@ crossbeam-channel                = { workspace = true }
 digest                           = { workspace = true }
 dirs-next                        = { workspace = true }
 ed25519                          = { workspace = true }
-ed25519-dalek                    = { workspace = true, features = ["serde"] }
+ed25519-dalek                    = { workspace = true, features = ["serde", "zeroize"] }
 ed25519-dalek-bip32              = { workspace = true }
 flex-error                       = { workspace = true }
 futures                          = { workspace = true }
@@ -84,7 +85,7 @@ tendermint-proto                 = { workspace = true }
 tendermint-rpc                   = { workspace = true, features = ["http-client", "websocket-client"] }
 thiserror                        = { workspace = true }
 tiny-bip39                       = { workspace = true }
-tiny-keccak                      = { workspace = true, features = ["keccak"] }
+tiny-keccak                      = { workspace = true, features = ["keccak", "sha3"] }
 tokio                            = { workspace = true, features = ["rt-multi-thread", "time", "sync"] }
 tokio-stream                     = { workspace = true }
 toml                             = { workspace = true }
@@ -92,6 +93,7 @@ tonic                            = { workspace = true, features = ["tls", "tls-r
 tracing                          = { workspace = true }
 tracing-subscriber               = { workspace = true, features = ["fmt", "env-filter", "json"] }
 uuid                             = { workspace = true, features = ["v4"] }
+zeroize                          = { workspace = true }
 
 # Cardano-specific dependencies
 slip10                           = "0.4"

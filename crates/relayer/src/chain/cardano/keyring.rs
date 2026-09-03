@@ -5,13 +5,23 @@ use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use slip10::BIP32Path;
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Cardano keyring for signing transactions
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CardanoKeyring {
     signing_key: SigningKey,
     verifying_key: VerifyingKey,
+}
+
+impl fmt::Debug for CardanoKeyring {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CardanoKeyring")
+            .field("verifying_key", &self.verifying_key)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CardanoKeyring {
@@ -20,10 +30,11 @@ impl CardanoKeyring {
         use bech32::FromBase32;
 
         // Decode bech32 key
-        let (hrp, data, _variant) = bech32::decode(bech32_key)
+        let (hrp, mut data, _variant) = bech32::decode(bech32_key)
             .map_err(|e| Error::Keyring(format!("Invalid bech32 key: {:?}", e)))?;
 
         if hrp != "ed25519_sk" {
+            data.fill(bech32::u5::default());
             return Err(Error::Keyring(format!(
                 "Expected ed25519_sk prefix, got: {}",
                 hrp
@@ -31,8 +42,10 @@ impl CardanoKeyring {
         }
 
         // Convert from base32 (u5) to bytes
-        let bytes = Vec::<u8>::from_base32(&data)
-            .map_err(|e| Error::Keyring(format!("Failed to decode base32: {:?}", e)))?;
+        let decoded_bytes = Vec::<u8>::from_base32(&data)
+            .map_err(|e| Error::Keyring(format!("Failed to decode base32: {:?}", e)));
+        data.fill(bech32::u5::default());
+        let bytes = Zeroizing::new(decoded_bytes?);
 
         // Data should be 32 bytes for Ed25519 private key
         if bytes.len() != 32 {
@@ -42,7 +55,7 @@ impl CardanoKeyring {
             )));
         }
 
-        let mut key_bytes = [0u8; 32];
+        let mut key_bytes = Zeroizing::new([0u8; 32]);
         key_bytes.copy_from_slice(&bytes);
 
         let signing_key = SigningKey::from_bytes(&key_bytes);
@@ -71,11 +84,14 @@ impl CardanoKeyring {
             .map_err(|e| Error::Keyring(format!("Invalid derivation path: {:?}", e)))?;
 
         // Derive key using SLIP-0010 Ed25519
-        let derived_key = slip10::derive_key_from_path(seed_bytes, slip10::Curve::Ed25519, &path)
-            .map_err(|e| Error::Keyring(format!("Key derivation failed: {:?}", e)))?;
+        let mut derived_key =
+            slip10::derive_key_from_path(seed_bytes, slip10::Curve::Ed25519, &path)
+                .map_err(|e| Error::Keyring(format!("Key derivation failed: {:?}", e)))?;
 
         // Create Ed25519 signing key
         let signing_key = SigningKey::from_bytes(&derived_key.key);
+        derived_key.key.zeroize();
+        derived_key.chain_code.zeroize();
         let verifying_key = signing_key.verifying_key();
 
         Ok(Self {

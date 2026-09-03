@@ -15,6 +15,9 @@ pub mod generated;
 pub mod keyring;
 pub mod signer;
 pub mod signing_key_pair;
+pub mod signing_policy;
+pub mod transaction_evaluator;
+pub mod utxo_resolver;
 
 // Re-export key types for convenience
 pub use config::CardanoConfig;
@@ -23,6 +26,10 @@ pub use error::Error as CardanoError;
 pub use gateway_client::GatewayClient;
 pub use keyring::CardanoKeyring;
 pub use signing_key_pair::CardanoSigningKeyPair;
+pub use transaction_evaluator::{EvaluatedRedeemer, OgmiosTransactionEvaluator, RedeemerPurpose};
+pub use utxo_resolver::{
+    KupoInputResolver, ResolvedAsset, ResolvedInput, ResolvedTransactionInputs, TransactionOutRef,
+};
 
 // Type alias matching Cosmos/Penumbra pattern
 pub type CardanoChain = CardanoChainEndpoint;
