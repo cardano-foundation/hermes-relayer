@@ -3181,6 +3181,7 @@ fn parse_identifier_sequence(
         || expected_prefix.is_some_and(|expected| prefix != expected)
         || sequence.is_empty()
         || sequence.len() > 8
+        || (sequence.len() > 1 && sequence.starts_with('0'))
         || !sequence.bytes().all(|byte| byte.is_ascii_digit())
     {
         return Err(Error::Signer(format!(
@@ -3280,6 +3281,7 @@ fn decode_fixed_hex(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::cardano::utxo_resolver::ResolvedAsset;
     use pallas_codec::minicbor;
 
     fn limits() -> SigningPolicyLimits {
@@ -3303,7 +3305,7 @@ mod tests {
                         "script_hash": "{}",
                         "ref_utxo": {{"tx_hash": "{}", "output_index": 0}}
                     }},
-                    "spend_client": {{"address": "70{}"}},
+                    "spend_client": {{"address": "70{}", "script_hash": "{}", "ref_utxo": {{"tx_hash": "{}", "output_index": 0}}}},
                     "spend_connection": {{"address": "70{}"}},
                     "spend_channel": {{"address": "70{}"}},
                     "recover_client": {{"script_hash": "{}", "ref_utxo": {{"tx_hash": "{}", "output_index": 0}}}},
@@ -3329,6 +3331,8 @@ mod tests {
             "21".repeat(28),
             "31".repeat(32),
             "12".repeat(28),
+            "22".repeat(28),
+            "32".repeat(32),
             "13".repeat(28),
             "14".repeat(28),
             "20".repeat(28),
@@ -3438,6 +3442,21 @@ mod tests {
     }
 
     #[test]
+    fn identifier_sequences_must_use_canonical_decimal() {
+        assert_eq!(
+            parse_identifier_sequence("07-tendermint-0", Some("07-tendermint")).unwrap(),
+            0
+        );
+        assert_eq!(
+            parse_identifier_sequence("07-tendermint-7", Some("07-tendermint")).unwrap(),
+            7
+        );
+        for identifier in ["07-tendermint-00", "07-tendermint-0007"] {
+            assert!(parse_identifier_sequence(identifier, Some("07-tendermint")).is_err());
+        }
+    }
+
+    #[test]
     fn recovery_spend_redeemer_binds_the_substitute_token() {
         let policy = vec![0x25; 28];
         let name = b"substitute".to_vec();
@@ -3461,6 +3480,326 @@ mod tests {
             substitute_name: b"another-client".to_vec(),
         }
         .matches(&redeemer));
+    }
+
+    const RECOVERY_HOST_INPUT_ID: [u8; 32] = [0x41; 32];
+    const RECOVERY_SUBJECT_INPUT_ID: [u8; 32] = [0x42; 32];
+    const RECOVERY_SIGNER_INPUT_ID: [u8; 32] = [0x43; 32];
+    const RECOVERY_SUBSTITUTE_REFERENCE_ID: [u8; 32] = [0x44; 32];
+
+    fn recovery_signer() -> String {
+        format!("60{}", "99".repeat(28))
+    }
+
+    fn recovery_intent() -> SigningIntent {
+        let signer = recovery_signer();
+        let message = MsgRecoverClient {
+            subject_client_id: "07-tendermint-7".to_string(),
+            substitute_client_id: "07-tendermint-12".to_string(),
+            signer: signer.clone(),
+        }
+        .encode_to_vec();
+        SigningIntent::ibc("/ibc.core.client.v1.MsgRecoverClient", &message, &signer, 0).unwrap()
+    }
+
+    fn encode_transaction_input(
+        encoder: &mut minicbor::Encoder<&mut Vec<u8>>,
+        transaction_id: &[u8],
+        output_index: u64,
+    ) {
+        encoder
+            .array(2)
+            .unwrap()
+            .bytes(transaction_id)
+            .unwrap()
+            .u64(output_index)
+            .unwrap();
+    }
+
+    fn encode_single_asset_output(
+        encoder: &mut minicbor::Encoder<&mut Vec<u8>>,
+        address: &[u8],
+        policy: &[u8],
+        name: &[u8],
+    ) {
+        encoder
+            .array(3)
+            .unwrap()
+            .bytes(address)
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .u64(2_000_000)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .bytes(policy)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .bytes(name)
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .null()
+            .unwrap();
+    }
+
+    fn encode_auth_token(
+        encoder: &mut minicbor::Encoder<&mut Vec<u8>>,
+        policy: &[u8],
+        name: &[u8],
+    ) {
+        encoder
+            .tag(minicbor::data::Tag::Unassigned(121))
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .bytes(policy)
+            .unwrap()
+            .bytes(name)
+            .unwrap();
+    }
+
+    fn recovery_transaction(
+        policy: &TransactionSigningPolicy,
+        spend_substitute_sequence: u64,
+    ) -> Vec<u8> {
+        let signer_address = hex::decode(recovery_signer()).unwrap();
+        let subject_name = policy.state_token_name(StateOutputKind::Client, 7);
+        let substitute_name = policy.state_token_name(StateOutputKind::Client, 12);
+        let spend_substitute_name =
+            policy.state_token_name(StateOutputKind::Client, spend_substitute_sequence);
+        let recovery_script = required_script(&policy.scripts, "recoverclient").unwrap();
+        let mut reference_inputs = vec![
+            policy.host_state_reference.clone(),
+            required_script(&policy.scripts, "spendclient")
+                .unwrap()
+                .reference
+                .clone(),
+            recovery_script.reference.clone(),
+            (RECOVERY_SUBSTITUTE_REFERENCE_ID.to_vec(), 0),
+        ];
+        reference_inputs.sort_unstable();
+
+        let mut encoded = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut encoded);
+        encoder
+            .array(4)
+            .unwrap()
+            .map(7)
+            .unwrap()
+            .u8(0)
+            .unwrap()
+            .array(3)
+            .unwrap();
+        encode_transaction_input(&mut encoder, &RECOVERY_HOST_INPUT_ID, 0);
+        encode_transaction_input(&mut encoder, &RECOVERY_SUBJECT_INPUT_ID, 0);
+        encode_transaction_input(&mut encoder, &RECOVERY_SIGNER_INPUT_ID, 0);
+
+        encoder.u8(1).unwrap().array(3).unwrap();
+        encode_single_asset_output(
+            &mut encoder,
+            &policy.host_state_address,
+            &policy.host_state_nft_policy,
+            &policy.host_state_nft_name,
+        );
+        encode_single_asset_output(
+            &mut encoder,
+            &policy.client_state.address,
+            &policy.client_state.policy,
+            &subject_name,
+        );
+        encoder
+            .array(3)
+            .unwrap()
+            .bytes(&signer_address)
+            .unwrap()
+            .u64(2_500_000)
+            .unwrap()
+            .null()
+            .unwrap()
+            .u8(2)
+            .unwrap()
+            .u64(500_000)
+            .unwrap()
+            .u8(3)
+            .unwrap()
+            .u64(1_000)
+            .unwrap()
+            .u8(5)
+            .unwrap()
+            .map(1)
+            .unwrap();
+        encoder
+            .bytes(&[&[0xf0][..], recovery_script.hash.as_slice()].concat())
+            .unwrap()
+            .u64(0)
+            .unwrap()
+            .u8(14)
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .bytes(&[0x99; 28])
+            .unwrap()
+            .u8(18)
+            .unwrap()
+            .array(reference_inputs.len() as u64)
+            .unwrap();
+        for (transaction_id, output_index) in reference_inputs {
+            encode_transaction_input(&mut encoder, &transaction_id, output_index);
+        }
+
+        encoder.map(1).unwrap().u8(5).unwrap().array(3).unwrap();
+
+        // HostState UpdateClient, Spend[0].
+        encoder
+            .array(4)
+            .unwrap()
+            .u8(0)
+            .unwrap()
+            .u32(0)
+            .unwrap()
+            .tag(minicbor::data::Tag::Unassigned(125))
+            .unwrap()
+            .array(3)
+            .unwrap()
+            .array(0)
+            .unwrap()
+            .array(0)
+            .unwrap()
+            .array(0)
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .u64(1)
+            .unwrap();
+
+        // SpendClient RecoverClient, Spend[1].
+        encoder
+            .array(4)
+            .unwrap()
+            .u8(0)
+            .unwrap()
+            .u32(1)
+            .unwrap()
+            .tag(minicbor::data::Tag::Unassigned(122))
+            .unwrap()
+            .array(1)
+            .unwrap();
+        encode_auth_token(
+            &mut encoder,
+            &policy.client_state.policy,
+            &spend_substitute_name,
+        );
+        encoder.array(2).unwrap().u64(1).unwrap().u64(1).unwrap();
+
+        // RecoverClient withdrawal, Reward[0].
+        encoder
+            .array(4)
+            .unwrap()
+            .u8(3)
+            .unwrap()
+            .u32(0)
+            .unwrap()
+            .tag(minicbor::data::Tag::Unassigned(121))
+            .unwrap()
+            .array(2)
+            .unwrap();
+        encode_auth_token(&mut encoder, &policy.client_state.policy, &subject_name);
+        encode_auth_token(&mut encoder, &policy.client_state.policy, &substitute_name);
+        encoder
+            .array(2)
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .bool(true)
+            .unwrap()
+            .null()
+            .unwrap();
+        encoded
+    }
+
+    fn recovery_resolved_inputs(policy: &TransactionSigningPolicy) -> ResolvedTransactionInputs {
+        let mut resolved = ResolvedTransactionInputs::default();
+        resolved.regular.insert(
+            TransactionOutRef {
+                transaction_id: RECOVERY_HOST_INPUT_ID,
+                output_index: 0,
+            },
+            ResolvedInput {
+                address: policy.host_state_address.clone(),
+                lovelace: 2_000_000,
+                assets: vec![ResolvedAsset {
+                    policy_id: policy.host_state_nft_policy.clone().try_into().unwrap(),
+                    asset_name: policy.host_state_nft_name.clone(),
+                    quantity: 1,
+                }],
+            },
+        );
+        resolved.regular.insert(
+            TransactionOutRef {
+                transaction_id: RECOVERY_SUBJECT_INPUT_ID,
+                output_index: 0,
+            },
+            ResolvedInput {
+                address: policy.client_state.address.clone(),
+                lovelace: 2_000_000,
+                assets: vec![ResolvedAsset {
+                    policy_id: policy.client_state.policy.clone().try_into().unwrap(),
+                    asset_name: policy.state_token_name(StateOutputKind::Client, 7),
+                    quantity: 1,
+                }],
+            },
+        );
+        resolved.regular.insert(
+            TransactionOutRef {
+                transaction_id: RECOVERY_SIGNER_INPUT_ID,
+                output_index: 0,
+            },
+            ResolvedInput {
+                address: hex::decode(recovery_signer()).unwrap(),
+                lovelace: 3_000_000,
+                assets: Vec::new(),
+            },
+        );
+        resolved
+    }
+
+    fn validate_recovery_transaction(
+        policy: &TransactionSigningPolicy,
+        spend_substitute_sequence: u64,
+    ) -> Result<(), Error> {
+        let encoded = recovery_transaction(policy, spend_substitute_sequence);
+        let mut decoder = minicbor::Decoder::new(&encoded);
+        let transaction: MintedTx<'_> = decoder.decode().unwrap();
+        assert_eq!(decoder.position(), encoded.len());
+        policy.validate(
+            &transaction,
+            encoded.len(),
+            &recovery_signer(),
+            &recovery_intent(),
+            &recovery_resolved_inputs(policy),
+        )
+    }
+
+    #[test]
+    fn complete_recovery_transaction_matches_signing_policy() {
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        validate_recovery_transaction(&policy, 12).unwrap();
+    }
+
+    #[test]
+    fn complete_recovery_rejects_wrong_substitute_token() {
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let error = validate_recovery_transaction(&policy, 13).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("state input does not match the original IBC message"));
     }
 
     fn transaction_with_withdrawal(reward_account: &[u8], amount: u64) -> Vec<u8> {
