@@ -30,7 +30,7 @@ use super::generated::ibc::core::{
         MsgChannelOpenConfirm, MsgChannelOpenInit, MsgChannelOpenTry, MsgRecvPacket, MsgTimeout,
         MsgTimeoutOnClose,
     },
-    client::v1::{MsgCreateClient, MsgUpdateClient},
+    client::v1::{MsgCreateClient, MsgRecoverClient, MsgUpdateClient},
     connection::v1::{
         MsgConnectionOpenAck, MsgConnectionOpenConfirm, MsgConnectionOpenInit, MsgConnectionOpenTry,
     },
@@ -113,6 +113,7 @@ pub struct SigningIntent {
     external_output: Option<ExternalOutputIntent>,
     transfer: Option<TransferIntent>,
     state_sequence: Option<u64>,
+    recovery_substitute_sequence: Option<u64>,
     packet: Option<PacketIntent>,
     acknowledgement: Option<Vec<u8>>,
     prune_sequence: Option<u64>,
@@ -224,6 +225,10 @@ struct OperationRequirements<'a> {
 
 enum ChannelRedeemerIntent<'a> {
     Constructor(u64),
+    ClientRecovery {
+        substitute_policy: Vec<u8>,
+        substitute_name: Vec<u8>,
+    },
     Packet {
         alternative: u64,
         packet: &'a PacketIntent,
@@ -237,6 +242,13 @@ impl ChannelRedeemerIntent<'_> {
     fn matches(&self, data: &PlutusData) -> bool {
         match self {
             Self::Constructor(alternative) => constructor_fields(data, *alternative).is_some(),
+            Self::ClientRecovery {
+                substitute_policy,
+                substitute_name,
+            } => constructor_fields(data, 1)
+                .filter(|fields| fields.len() == 1)
+                .and_then(|fields| fields.first())
+                .is_some_and(|token| auth_token_matches(token, substitute_policy, substitute_name)),
             Self::Packet {
                 alternative,
                 packet,
@@ -441,6 +453,12 @@ impl TransactionSigningPolicy {
                 "/ibc.core.client.v1.MsgUpdateClient" => {
                     (vec!["spendclient"], vec![], StateOutputKind::Client, false)
                 }
+                "/ibc.core.client.v1.MsgRecoverClient" => (
+                    vec!["spendclient", "recoverclient"],
+                    vec![],
+                    StateOutputKind::Client,
+                    false,
+                ),
                 "/ibc.core.connection.v1.MsgConnectionOpenInit" => (
                     vec!["mintconnectionstt"],
                     vec!["mintconnectionstt"],
@@ -619,9 +637,7 @@ impl TransactionSigningPolicy {
         if body.certificates.is_some() {
             return Err(reject("certificates are not authorized".to_string()));
         }
-        if body.withdrawals.is_some() {
-            return Err(reject("withdrawals are not authorized".to_string()));
-        }
+        self.validate_withdrawals(body, intent, &reject)?;
         if body.auxiliary_data_hash.is_some() {
             return Err(reject("auxiliary data hash is not authorized".to_string()));
         }
@@ -762,6 +778,50 @@ impl TransactionSigningPolicy {
         )?;
         self.validate_wallet_delta(body, &signer_address, intent, resolved_inputs, &reject)?;
 
+        Ok(())
+    }
+
+    fn validate_withdrawals<F>(
+        &self,
+        body: &pallas_primitives::conway::MintedTransactionBody<'_>,
+        intent: &SigningIntent,
+        reject: &F,
+    ) -> Result<(), Error>
+    where
+        F: Fn(String) -> Error,
+    {
+        if intent.operation != "/ibc.core.client.v1.MsgRecoverClient" {
+            if body.withdrawals.is_some() {
+                return Err(reject("withdrawals are not authorized".to_string()));
+            }
+            return Ok(());
+        }
+
+        let withdrawals = body.withdrawals.as_ref().ok_or_else(|| {
+            reject("client recovery requires its validator withdrawal".to_string())
+        })?;
+        if withdrawals.len() != 1 {
+            return Err(reject(
+                "client recovery requires exactly one validator withdrawal".to_string(),
+            ));
+        }
+
+        let recovery_script = required_script(&self.scripts, "recoverclient").map_err(reject)?;
+        let expected_reward_account = [
+            &[0xf0 | self.network_id][..],
+            recovery_script.hash.as_slice(),
+        ]
+        .concat();
+        let (reward_account, amount) = withdrawals
+            .iter()
+            .next()
+            .expect("non-empty withdrawal map has one entry");
+        if reward_account.as_slice() != expected_reward_account || *amount != 0 {
+            return Err(reject(
+                "client recovery withdrawal does not execute the pinned recovery validator with zero value"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -1307,7 +1367,7 @@ impl TransactionSigningPolicy {
         let host_alternative = match intent.operation.as_str() {
             "HostStateHeartbeat" => 10,
             "/ibc.core.client.v1.MsgCreateClient" => 0,
-            "/ibc.core.client.v1.MsgUpdateClient" => 4,
+            "/ibc.core.client.v1.MsgUpdateClient" | "/ibc.core.client.v1.MsgRecoverClient" => 4,
             "/ibc.core.connection.v1.MsgConnectionOpenInit"
             | "/ibc.core.connection.v1.MsgConnectionOpenTry" => 1,
             "/ibc.core.connection.v1.MsgConnectionOpenAck"
@@ -1348,6 +1408,19 @@ impl TransactionSigningPolicy {
         let expected = match intent.operation.as_str() {
             "/ibc.core.client.v1.MsgUpdateClient" => {
                 Some((&self.client_state, ChannelRedeemerIntent::Constructor(0)))
+            }
+            "/ibc.core.client.v1.MsgRecoverClient" => {
+                let substitute_sequence = intent.recovery_substitute_sequence.ok_or_else(|| {
+                    reject("recovery substitute client sequence is missing".to_string())
+                })?;
+                Some((
+                    &self.client_state,
+                    ChannelRedeemerIntent::ClientRecovery {
+                        substitute_policy: self.client_state.policy.clone(),
+                        substitute_name: self
+                            .state_token_name(StateOutputKind::Client, substitute_sequence),
+                    },
+                ))
             }
             "/ibc.core.connection.v1.MsgConnectionOpenAck" => Some((
                 &self.connection_state,
@@ -1447,6 +1520,57 @@ impl TransactionSigningPolicy {
         if !expected.matches(actual) {
             return Err(reject(
                 "redeemer attached to the message-selected protocol state input does not match the original IBC message"
+                    .to_string(),
+            ));
+        }
+        if intent.operation == "/ibc.core.client.v1.MsgRecoverClient" {
+            let substitute_sequence = intent.recovery_substitute_sequence.ok_or_else(|| {
+                reject("recovery substitute client sequence is missing".to_string())
+            })?;
+            let substitute_name =
+                self.state_token_name(StateOutputKind::Client, substitute_sequence);
+            self.validate_recovery_withdrawal_redeemer(
+                redeemers,
+                &token_name,
+                &substitute_name,
+                reject,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_recovery_withdrawal_redeemer<F>(
+        &self,
+        redeemers: &pallas_primitives::conway::Redeemers,
+        subject_name: &[u8],
+        substitute_name: &[u8],
+        reject: &F,
+    ) -> Result<(), Error>
+    where
+        F: Fn(String) -> Error,
+    {
+        let mut rewards = redeemers
+            .iter()
+            .filter(|(key, _)| key.tag == pallas_primitives::conway::RedeemerTag::Reward);
+        let (key, value) = rewards
+            .next()
+            .ok_or_else(|| reject("client recovery has no withdrawal redeemer".to_string()))?;
+        if rewards.next().is_some() || key.index != 0 {
+            return Err(reject(
+                "client recovery must have exactly one withdrawal redeemer at index zero"
+                    .to_string(),
+            ));
+        }
+        let fields = constructor_fields(&value.data, 0)
+            .filter(|fields| fields.len() == 2)
+            .ok_or_else(|| {
+                reject("client recovery withdrawal redeemer is malformed".to_string())
+            })?;
+        if !auth_token_matches(&fields[0], &self.client_state.policy, subject_name)
+            || !auth_token_matches(&fields[1], &self.client_state.policy, substitute_name)
+        {
+            return Err(reject(
+                "client recovery withdrawal redeemer does not match the requested clients"
                     .to_string(),
             ));
         }
@@ -2072,6 +2196,15 @@ fn plutus_u64(data: &PlutusData) -> Option<u64> {
     u64::try_from(i128::from(*value)).ok()
 }
 
+fn auth_token_matches(data: &PlutusData, policy: &[u8], name: &[u8]) -> bool {
+    constructor_fields(data, 0)
+        .filter(|fields| fields.len() == 2)
+        .is_some_and(|fields| {
+            fields.first().and_then(plutus_bytes) == Some(policy)
+                && fields.get(1).and_then(plutus_bytes) == Some(name)
+        })
+}
+
 fn plutus_height(data: &PlutusData) -> Option<(u64, u64)> {
     let fields = constructor_fields(data, 0)?;
     Some((plutus_u64(fields.first()?)?, plutus_u64(fields.get(1)?)?))
@@ -2177,6 +2310,7 @@ impl SigningIntent {
             external_output: None,
             transfer: None,
             state_sequence: None,
+            recovery_substitute_sequence: None,
             packet: None,
             acknowledgement: None,
             prune_sequence: None,
@@ -2193,6 +2327,7 @@ impl SigningIntent {
         let mut transfer = None;
         let mut module_port = None;
         let mut state_sequence = None;
+        let mut recovery_substitute_sequence = None;
         let mut packet_intent = None;
         let mut acknowledgement = None;
         let mut prune_sequence = None;
@@ -2206,6 +2341,21 @@ impl SigningIntent {
             "/ibc.core.client.v1.MsgUpdateClient" => {
                 let msg = MsgUpdateClient::decode(message).map_err(decode_error)?;
                 state_sequence = Some(parse_identifier_sequence(&msg.client_id, None)?);
+                msg.signer
+            }
+            "/ibc.core.client.v1.MsgRecoverClient" => {
+                let msg = MsgRecoverClient::decode(message).map_err(decode_error)?;
+                let subject_sequence =
+                    parse_identifier_sequence(&msg.subject_client_id, Some("07-tendermint"))?;
+                let substitute_sequence =
+                    parse_identifier_sequence(&msg.substitute_client_id, Some("07-tendermint"))?;
+                if subject_sequence == substitute_sequence {
+                    return Err(Error::Signer(
+                        "recovery subject and substitute clients must be different".to_string(),
+                    ));
+                }
+                state_sequence = Some(subject_sequence);
+                recovery_substitute_sequence = Some(substitute_sequence);
                 msg.signer
             }
             "/ibc.core.connection.v1.MsgConnectionOpenInit" => {
@@ -2449,6 +2599,7 @@ impl SigningIntent {
             external_output,
             transfer,
             state_sequence,
+            recovery_substitute_sequence,
             packet: packet_intent,
             acknowledgement,
             prune_sequence,
@@ -3155,6 +3306,7 @@ mod tests {
                     "spend_client": {{"address": "70{}"}},
                     "spend_connection": {{"address": "70{}"}},
                     "spend_channel": {{"address": "70{}"}},
+                    "recover_client": {{"script_hash": "{}", "ref_utxo": {{"tx_hash": "{}", "output_index": 0}}}},
                     "mint_client_stt": {{"script_hash": "{}", "ref_utxo": {{"tx_hash": "{}", "output_index": 0}}}},
                     "mint_connection_stt": {{"script_hash": "{}", "ref_utxo": {{"tx_hash": "{}", "output_index": 0}}}},
                     "mint_channel_stt": {{"script_hash": "{}", "ref_utxo": {{"tx_hash": "{}", "output_index": 0}}}},
@@ -3179,6 +3331,8 @@ mod tests {
             "12".repeat(28),
             "13".repeat(28),
             "14".repeat(28),
+            "20".repeat(28),
+            "30".repeat(32),
             "25".repeat(28),
             "35".repeat(32),
             "26".repeat(28),
@@ -3232,6 +3386,199 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("message signer does not match"));
+    }
+
+    #[test]
+    fn recovery_intent_binds_both_tendermint_clients() {
+        let signer = format!("60{}", "99".repeat(28));
+        let message = MsgRecoverClient {
+            subject_client_id: "07-tendermint-7".to_string(),
+            substitute_client_id: "07-tendermint-12".to_string(),
+            signer: signer.clone(),
+        }
+        .encode_to_vec();
+        let intent =
+            SigningIntent::ibc("/ibc.core.client.v1.MsgRecoverClient", &message, &signer, 0)
+                .unwrap();
+
+        assert_eq!(intent.state_sequence, Some(7));
+        assert_eq!(intent.recovery_substitute_sequence, Some(12));
+
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let requirements = policy.operation_requirements(&intent).unwrap();
+        assert_eq!(requirements.state_output, StateOutputKind::Client);
+        assert_eq!(
+            requirements.required_scripts,
+            vec!["spendclient", "recoverclient"]
+        );
+        assert!(requirements.required_mint_scripts.is_empty());
+    }
+
+    #[test]
+    fn recovery_intent_rejects_the_same_or_non_tendermint_client() {
+        let signer = format!("60{}", "99".repeat(28));
+        for (subject, substitute) in [
+            ("07-tendermint-7", "07-tendermint-7"),
+            ("08-cardano-7", "07-tendermint-12"),
+        ] {
+            let message = MsgRecoverClient {
+                subject_client_id: subject.to_string(),
+                substitute_client_id: substitute.to_string(),
+                signer: signer.clone(),
+            }
+            .encode_to_vec();
+            assert!(SigningIntent::ibc(
+                "/ibc.core.client.v1.MsgRecoverClient",
+                &message,
+                &signer,
+                0,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn recovery_spend_redeemer_binds_the_substitute_token() {
+        let policy = vec![0x25; 28];
+        let name = b"substitute".to_vec();
+        let mut encoded = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut encoded);
+        encoder.tag(minicbor::data::Tag::Unassigned(122)).unwrap();
+        encoder.array(1).unwrap();
+        encoder.tag(minicbor::data::Tag::Unassigned(121)).unwrap();
+        encoder.array(2).unwrap();
+        encoder.bytes(&policy).unwrap();
+        encoder.bytes(&name).unwrap();
+        let redeemer: PlutusData = minicbor::decode(&encoded).unwrap();
+
+        assert!(ChannelRedeemerIntent::ClientRecovery {
+            substitute_policy: policy.clone(),
+            substitute_name: name.clone(),
+        }
+        .matches(&redeemer));
+        assert!(!ChannelRedeemerIntent::ClientRecovery {
+            substitute_policy: policy,
+            substitute_name: b"another-client".to_vec(),
+        }
+        .matches(&redeemer));
+    }
+
+    fn transaction_with_withdrawal(reward_account: &[u8], amount: u64) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut encoded);
+        encoder.array(4).unwrap();
+        encoder.map(4).unwrap();
+        encoder.u8(0).unwrap();
+        encoder.array(0).unwrap();
+        encoder.u8(1).unwrap();
+        encoder.array(0).unwrap();
+        encoder.u8(2).unwrap();
+        encoder.u64(1).unwrap();
+        encoder.u8(5).unwrap();
+        encoder.map(1).unwrap();
+        encoder.bytes(reward_account).unwrap();
+        encoder.u64(amount).unwrap();
+        encoder.map(0).unwrap();
+        encoder.bool(true).unwrap();
+        encoder.null().unwrap();
+        encoded
+    }
+
+    #[test]
+    fn only_the_pinned_zero_value_recovery_withdrawal_is_authorized() {
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let recovery_script = required_script(&policy.scripts, "recoverclient").unwrap();
+        let reward_account = [&[0xf0][..], recovery_script.hash.as_slice()].concat();
+        let encoded = transaction_with_withdrawal(&reward_account, 0);
+        let tx: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+        let recovery_intent = bare_intent("/ibc.core.client.v1.MsgRecoverClient", None);
+        let reject = |reason| Error::Signer(reason);
+
+        policy
+            .validate_withdrawals(&tx.transaction_body, &recovery_intent, &reject)
+            .unwrap();
+
+        let encoded = transaction_with_withdrawal(&reward_account, 1);
+        let tx: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+        assert!(policy
+            .validate_withdrawals(&tx.transaction_body, &recovery_intent, &reject)
+            .is_err());
+
+        let encoded = transaction_with_withdrawal(&reward_account, 0);
+        let tx: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+        assert!(policy
+            .validate_withdrawals(
+                &tx.transaction_body,
+                &bare_intent("/ibc.core.client.v1.MsgUpdateClient", None),
+                &reject,
+            )
+            .is_err());
+    }
+
+    fn recovery_withdrawal_redeemer_data(
+        policy: &[u8],
+        subject_name: &[u8],
+        substitute_name: &[u8],
+    ) -> PlutusData {
+        let mut encoded = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut encoded);
+        encoder.tag(minicbor::data::Tag::Unassigned(121)).unwrap();
+        encoder.array(2).unwrap();
+        for name in [subject_name, substitute_name] {
+            encoder.tag(minicbor::data::Tag::Unassigned(121)).unwrap();
+            encoder.array(2).unwrap();
+            encoder.bytes(policy).unwrap();
+            encoder.bytes(name).unwrap();
+        }
+        minicbor::decode(&encoded).unwrap()
+    }
+
+    #[test]
+    fn recovery_withdrawal_redeemer_binds_subject_and_substitute_tokens() {
+        use pallas_codec::utils::NonEmptyKeyValuePairs;
+        use pallas_primitives::conway::{
+            ExUnits, RedeemerTag, Redeemers, RedeemersKey, RedeemersValue,
+        };
+
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let subject_name = policy.state_token_name(StateOutputKind::Client, 7);
+        let substitute_name = policy.state_token_name(StateOutputKind::Client, 12);
+        let data = recovery_withdrawal_redeemer_data(
+            &policy.client_state.policy,
+            &subject_name,
+            &substitute_name,
+        );
+        let pairs: NonEmptyKeyValuePairs<_, _> = vec![(
+            RedeemersKey {
+                tag: RedeemerTag::Reward,
+                index: 0,
+            },
+            RedeemersValue {
+                data,
+                ex_units: ExUnits { mem: 1, steps: 1 },
+            },
+        )]
+        .try_into()
+        .unwrap();
+        let redeemers = Redeemers::from(pairs);
+        let reject = |reason| Error::Signer(reason);
+
+        policy
+            .validate_recovery_withdrawal_redeemer(
+                &redeemers,
+                &subject_name,
+                &substitute_name,
+                &reject,
+            )
+            .unwrap();
+        assert!(policy
+            .validate_recovery_withdrawal_redeemer(
+                &redeemers,
+                &substitute_name,
+                &subject_name,
+                &reject,
+            )
+            .is_err());
     }
 
     fn transfer_message(denom: String, signer: String) -> Vec<u8> {
@@ -3347,6 +3694,7 @@ mod tests {
             external_output: None,
             transfer: None,
             state_sequence: None,
+            recovery_substitute_sequence: None,
             packet: None,
             acknowledgement: None,
             prune_sequence: None,
