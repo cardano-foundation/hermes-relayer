@@ -7,7 +7,7 @@ use super::error::Error;
 use super::generated::ibc::cardano::v1::{
     cardano_msg_client::CardanoMsgClient, BuildHostStateHeartbeatRequest,
     BuildHostStateHeartbeatResponse, MsgPrunePacketHistory, ObserveTxRequest, ObserveTxResponse,
-    SubmitSignedTxRequest, SubmitSignedTxResponse,
+    SubmitSignedTxRequest, SubmitSignedTxResponse, TendermintUpdateTxChain,
 };
 use super::generated::ibc::core::channel::v1::msg_client::MsgClient as GenChannelMsgClient;
 use super::generated::ibc::core::client::v1::msg_client::MsgClient as GenClientMsgClient;
@@ -43,6 +43,7 @@ use ibc_relayer_types::clients::{
 };
 use ibc_relayer_types::core::ics02_client::header::AnyHeader;
 use ibc_relayer_types::Height;
+use prost::Message;
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -55,6 +56,25 @@ use tonic::{Request, Status};
 const GATEWAY_HEADER_GRPC_MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
 const CARDANO_NATIVE_ASSET_MAX_QUANTITY: u64 = u64::MAX;
 const PRUNE_PACKET_HISTORY_TYPE_URL: &str = "/ibc.cardano.v1.MsgPrunePacketHistory";
+const LEGACY_TENDERMINT_UPDATE_STEP_TYPE_URL: &str = "/ibc.cardano.v1.TendermintUpdateStep";
+pub const TENDERMINT_UPDATE_TX_CHAIN_TYPE_URL: &str = "/ibc.cardano.v1.TendermintUpdateTxChain";
+pub const TENDERMINT_UPDATE_TX_CHAIN_VERSION: u32 = 1;
+pub const MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH: usize = 100;
+
+/// An unsigned IBC transaction and its role in a possibly staged update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltIbcTxKind {
+    Singleton,
+    TendermintUpdateChain,
+    LegacyTendermintUpdateStep,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuiltIbcTx {
+    pub transactions: Vec<UnsignedTx>,
+    pub kind: BuiltIbcTxKind,
+    pub rebuild_after_submission: bool,
+}
 
 /// Unsigned transaction response from Gateway
 #[derive(Debug, Clone)]
@@ -150,6 +170,104 @@ fn describe_update_client_message(type_url: Option<&str>) -> String {
         Some(other) => format!("MsgUpdateClient<{}>", other),
         None => "MsgUpdateClient<missing-client-message>".to_string(),
     }
+}
+
+fn validate_unsigned_tx_cbor(cbor_hex: &str, index: usize) -> Result<(), Error> {
+    if cbor_hex.is_empty() || cbor_hex.len() % 2 != 0 || hex::decode(cbor_hex).is_err() {
+        return Err(Error::Transaction(format!(
+            "Gateway returned invalid unsigned transaction CBOR hex at chain index {index}"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_update_client_transactions(
+    client_message_type_url: Option<&str>,
+    unsigned_tx: prost_types::Any,
+    description: &str,
+) -> Result<BuiltIbcTx, Error> {
+    if unsigned_tx.type_url == LEGACY_TENDERMINT_UPDATE_STEP_TYPE_URL {
+        if client_message_type_url != Some(TENDERMINT_HEADER_TYPE_URL) {
+            return Err(Error::Transaction(format!(
+                "Gateway returned the legacy Tendermint update marker for {}, but staged execution is only supported for MsgUpdateClient<TendermintHeader>",
+                describe_update_client_message(client_message_type_url)
+            )));
+        }
+        let cbor_hex = String::from_utf8(unsigned_tx.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {e}")))?;
+        validate_unsigned_tx_cbor(&cbor_hex, 0)?;
+        return Ok(BuiltIbcTx {
+            transactions: vec![UnsignedTx {
+                cbor_hex,
+                description: description.to_string(),
+            }],
+            kind: BuiltIbcTxKind::LegacyTendermintUpdateStep,
+            rebuild_after_submission: false,
+        });
+    }
+
+    if unsigned_tx.type_url != TENDERMINT_UPDATE_TX_CHAIN_TYPE_URL {
+        let cbor_hex = String::from_utf8(unsigned_tx.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {e}")))?;
+        validate_unsigned_tx_cbor(&cbor_hex, 0)?;
+        return Ok(BuiltIbcTx {
+            transactions: vec![UnsignedTx {
+                cbor_hex,
+                description: description.to_string(),
+            }],
+            kind: BuiltIbcTxKind::Singleton,
+            rebuild_after_submission: false,
+        });
+    }
+
+    if client_message_type_url != Some(TENDERMINT_HEADER_TYPE_URL) {
+        return Err(Error::Transaction(format!(
+            "Gateway returned {} for {}, but transaction chaining is only supported for MsgUpdateClient<TendermintHeader>",
+            TENDERMINT_UPDATE_TX_CHAIN_TYPE_URL,
+            describe_update_client_message(client_message_type_url)
+        )));
+    }
+
+    let chain = TendermintUpdateTxChain::decode(unsigned_tx.value.as_slice()).map_err(|e| {
+        Error::Transaction(format!(
+            "Failed to decode Tendermint update transaction chain: {e}"
+        ))
+    })?;
+    if chain.version != TENDERMINT_UPDATE_TX_CHAIN_VERSION {
+        return Err(Error::Transaction(format!(
+            "Unsupported Tendermint update transaction chain version {}; expected {}",
+            chain.version, TENDERMINT_UPDATE_TX_CHAIN_VERSION
+        )));
+    }
+    if chain.unsigned_tx_cbor.is_empty()
+        || chain.unsigned_tx_cbor.len() > MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH
+    {
+        return Err(Error::Transaction(format!(
+            "Tendermint update transaction chain length must be between 1 and {} (got {})",
+            MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH,
+            chain.unsigned_tx_cbor.len()
+        )));
+    }
+
+    let total = chain.unsigned_tx_cbor.len();
+    let transactions = chain
+        .unsigned_tx_cbor
+        .into_iter()
+        .enumerate()
+        .map(|(index, cbor_hex)| {
+            validate_unsigned_tx_cbor(&cbor_hex, index)?;
+            Ok(UnsignedTx {
+                cbor_hex,
+                description: format!("{description} (chain transaction {}/{total})", index + 1),
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+
+    Ok(BuiltIbcTx {
+        transactions,
+        kind: BuiltIbcTxKind::TendermintUpdateChain,
+        rebuild_after_submission: chain.rebuild_after_submission,
+    })
 }
 
 /// Client for communicating with Cardano Gateway
@@ -860,20 +978,20 @@ impl GatewayClient {
         &self,
         type_url: &str,
         message_data: Vec<u8>,
-    ) -> Result<UnsignedTx, Error> {
+    ) -> Result<BuiltIbcTx, Error> {
         tracing::info!(
             "Building unsigned transaction for message type: {}",
             type_url
         );
 
         // Route based on type_url
-        match type_url {
+        let transaction = match type_url {
             // IBC Client messages
             "/ibc.core.client.v1.MsgCreateClient" => {
                 self.build_create_client_tx(message_data).await
             }
             "/ibc.core.client.v1.MsgUpdateClient" => {
-                self.build_update_client_tx(message_data).await
+                return self.build_update_client_tx(message_data).await;
             }
 
             // IBC Connection messages
@@ -934,7 +1052,13 @@ impl GatewayClient {
                     type_url
                 )))
             }
-        }
+        }?;
+
+        Ok(BuiltIbcTx {
+            transactions: vec![transaction],
+            kind: BuiltIbcTxKind::Singleton,
+            rebuild_after_submission: false,
+        })
     }
 
     //
@@ -975,7 +1099,7 @@ impl GatewayClient {
         })
     }
 
-    async fn build_update_client_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+    async fn build_update_client_tx(&self, message_data: Vec<u8>) -> Result<BuiltIbcTx, Error> {
         use super::generated::ibc::core::client::v1::MsgUpdateClient;
         use prost::Message;
 
@@ -983,11 +1107,12 @@ impl GatewayClient {
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgUpdateClient: {}", e)))?;
 
         let client_id = msg.client_id.clone();
-        let message_description = describe_update_client_message(
-            msg.client_message
-                .as_ref()
-                .map(|client_message| client_message.type_url.as_str()),
-        );
+        let client_message_type_url = msg
+            .client_message
+            .as_ref()
+            .map(|client_message| client_message.type_url.clone());
+        let message_description =
+            describe_update_client_message(client_message_type_url.as_deref());
 
         let mut client = GenClientMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
@@ -998,20 +1123,18 @@ impl GatewayClient {
             Error::Transaction("No unsigned_tx in UpdateClient response".to_string())
         })?;
 
-        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
-            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
-
         tracing::info!(
-            "{}: received unsigned CBOR (length: {}), client_id: {}",
+            "{}: received unsigned transaction payload (length: {}), client_id: {}",
             message_description,
-            cbor_hex.len(),
+            unsigned_tx_any.value.len(),
             client_id
         );
 
-        Ok(UnsignedTx {
-            cbor_hex,
-            description: format!("{message_description} (client_id: {client_id})"),
-        })
+        decode_update_client_transactions(
+            client_message_type_url.as_deref(),
+            unsigned_tx_any,
+            &format!("{message_description} (client_id: {client_id})"),
+        )
     }
 
     async fn build_connection_open_init_tx(
@@ -2281,6 +2404,138 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    fn update_client_any(type_url: &str, value: Vec<u8>) -> prost_types::Any {
+        prost_types::Any {
+            type_url: type_url.to_string(),
+            value,
+        }
+    }
+
+    fn chain_any(
+        version: u32,
+        transactions: Vec<String>,
+        rebuild_after_submission: bool,
+    ) -> prost_types::Any {
+        update_client_any(
+            TENDERMINT_UPDATE_TX_CHAIN_TYPE_URL,
+            TendermintUpdateTxChain {
+                version,
+                unsigned_tx_cbor: transactions,
+                rebuild_after_submission,
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    #[test]
+    fn tendermint_header_chain_decodes_in_dependency_order() {
+        let built = decode_update_client_transactions(
+            Some(TENDERMINT_HEADER_TYPE_URL),
+            chain_any(1, vec!["a100".to_string(), "b200".to_string()], false),
+            "update",
+        )
+        .unwrap();
+
+        assert_eq!(built.kind, BuiltIbcTxKind::TendermintUpdateChain);
+        assert_eq!(built.transactions.len(), 2);
+        assert_eq!(built.transactions[0].cbor_hex, "a100");
+        assert_eq!(built.transactions[1].cbor_hex, "b200");
+        assert!(built.transactions[1].description.contains("2/2"));
+        assert!(!built.rebuild_after_submission);
+    }
+
+    #[test]
+    fn phase_boundary_chain_requests_rebuild_after_confirmed_submission() {
+        let built = decode_update_client_transactions(
+            Some(TENDERMINT_HEADER_TYPE_URL),
+            chain_any(1, vec!["a100".to_string()], true),
+            "phase boundary",
+        )
+        .unwrap();
+
+        assert_eq!(built.kind, BuiltIbcTxKind::TendermintUpdateChain);
+        assert!(built.rebuild_after_submission);
+    }
+
+    #[test]
+    fn tendermint_header_chain_accepts_exactly_one_hundred_transactions() {
+        let built = decode_update_client_transactions(
+            Some(TENDERMINT_HEADER_TYPE_URL),
+            chain_any(
+                1,
+                vec!["a100".to_string(); MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH],
+                false,
+            ),
+            "update",
+        )
+        .unwrap();
+
+        assert_eq!(built.transactions.len(), 100);
+    }
+
+    #[test]
+    fn tendermint_header_chain_rejects_bad_version_or_length() {
+        for any in [
+            chain_any(2, vec!["a100".to_string()], false),
+            chain_any(1, vec![], false),
+            chain_any(
+                1,
+                vec!["a100".to_string(); MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH + 1],
+                false,
+            ),
+        ] {
+            assert!(decode_update_client_transactions(
+                Some(TENDERMINT_HEADER_TYPE_URL),
+                any,
+                "update"
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn chain_is_rejected_for_tendermint_misbehaviour() {
+        let err = decode_update_client_transactions(
+            Some(TENDERMINT_MISBEHAVIOR_TYPE_URL),
+            chain_any(1, vec!["a100".to_string()], false),
+            "misbehaviour",
+        )
+        .unwrap_err();
+
+        match err {
+            Error::Transaction(msg) => {
+                assert!(msg.contains("only supported for MsgUpdateClient<TendermintHeader>"));
+                assert!(msg.contains(TENDERMINT_UPDATE_TX_CHAIN_TYPE_URL));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordinary_update_client_response_remains_a_singleton() {
+        let built = decode_update_client_transactions(
+            Some(TENDERMINT_MISBEHAVIOR_TYPE_URL),
+            update_client_any("", b"a100".to_vec()),
+            "misbehaviour",
+        )
+        .unwrap();
+
+        assert_eq!(built.kind, BuiltIbcTxKind::Singleton);
+        assert_eq!(built.transactions.len(), 1);
+    }
+
+    #[test]
+    fn legacy_tendermint_step_remains_supported() {
+        let built = decode_update_client_transactions(
+            Some(TENDERMINT_HEADER_TYPE_URL),
+            update_client_any(LEGACY_TENDERMINT_UPDATE_STEP_TYPE_URL, b"a100".to_vec()),
+            "update",
+        )
+        .unwrap();
+
+        assert_eq!(built.kind, BuiltIbcTxKind::LegacyTendermintUpdateStep);
     }
 
     #[test]
