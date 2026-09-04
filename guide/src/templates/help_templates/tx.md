@@ -29,4 +29,6 @@ SUBCOMMANDS:
     packet-ack              Relay acknowledgment packets
     packet-prune            Prune one finalized packet receipt/acknowledgement pair on Cardano
     packet-recv             Relay receive or timeout packets
+    recover-client          Recover a frozen or expired Cardano IBC client using an active
+                                substitute
     upgrade-chain           Send an IBC upgrade plan
