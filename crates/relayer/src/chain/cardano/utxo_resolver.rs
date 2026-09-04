@@ -88,8 +88,11 @@ pub(crate) struct OgmiosAdditionalUtxo {
     index: u64,
     address: String,
     value: JsonValue,
+    #[serde(skip_serializing_if = "Option::is_none")]
     datum_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     datum: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     script: Option<JsonValue>,
 }
 
@@ -515,9 +518,7 @@ fn trusted_overlay_output(
                 Some(PseudoDatumOption::Hash(hash)) => (Some(hex::encode(hash.as_ref())), None),
                 Some(PseudoDatumOption::Data(data)) => {
                     let raw = data.0.raw_cbor();
-                    let mut hasher = Blake2b::<U32>::new();
-                    hasher.update(raw);
-                    (Some(hex::encode(hasher.finalize())), Some(hex::encode(raw)))
+                    (None, Some(hex::encode(raw)))
                 }
             };
             (
@@ -1154,6 +1155,8 @@ mod tests {
         assert_eq!(json["index"], 0);
         assert_eq!(json["value"]["ada"]["lovelace"], 5_000_000);
         assert_eq!(json["datum"], "182a");
+        assert!(json.get("datumHash").is_none());
+        assert!(json.get("script").is_none());
         assert!(json["address"].as_str().unwrap().starts_with("addr_test1"));
 
         let dependent_tx = decode_transaction(&dependent, "test").unwrap();

@@ -466,7 +466,7 @@ impl CardanoChainEndpoint {
                 .unwrap_or(&direct_signing_intent);
 
             let mut overlay = TrustedUtxoOverlay::new();
-            let mut final_signed_transaction = None;
+            let mut signed_transactions = Vec::with_capacity(total);
             for (index, transaction) in built.transactions.iter().enumerate() {
                 tracing::debug!("Built unsigned tx: {}", transaction.description);
                 let unsigned_tx_bytes = hex::decode(&transaction.cbor_hex).map_err(|error| {
@@ -488,23 +488,24 @@ impl CardanoChainEndpoint {
                             total
                         ))
                     })?;
-                self.submit_signed_transaction(&signed_tx, index > 0)
-                    .await?;
+                signed_transactions.push(signed_tx);
+            }
 
+            for (index, signed_tx) in signed_transactions.iter().enumerate() {
+                self.submit_signed_transaction(signed_tx, index > 0).await?;
                 tracing::info!(
                     "Trusted node accepted transaction {}/{} ({})",
                     index + 1,
                     total,
                     signed_tx.tx_hash
                 );
-                final_signed_transaction = Some(signed_tx);
             }
 
-            let final_signed_transaction = final_signed_transaction.ok_or_else(|| {
+            let final_signed_transaction = signed_transactions.last().ok_or_else(|| {
                 Error::send_tx("Gateway transaction set had no final transaction".to_string())
             })?;
             let final_response = self
-                .observe_signed_transaction(&final_signed_transaction)
+                .observe_signed_transaction(final_signed_transaction)
                 .await?;
             let included_height = final_response.height.ok_or_else(|| {
                 Error::send_tx(format!(
