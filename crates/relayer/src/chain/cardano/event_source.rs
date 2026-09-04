@@ -8,11 +8,12 @@ use std::{
 };
 
 use crossbeam_channel as channel;
+use futures::future::BoxFuture;
 use tokio::{
     runtime::Runtime as TokioRuntime,
     time::{sleep, Duration, Instant},
 };
-use tracing::{debug, error, error_span, trace};
+use tracing::{debug, error, error_span, trace, warn};
 
 use ibc_relayer_types::{
     core::{
@@ -28,11 +29,39 @@ use crate::{
     telemetry,
 };
 
-use super::{event_parser, gateway_client::GatewayClient};
+use super::{
+    event_parser, gateway_client::GatewayClient, generated::ibc::cardano::v1::QueryEventsResponse,
+};
 
 use crate::event::source::{EventBatch, EventSourceCmd, TxEventSourceCmd};
 
 pub type Result<T> = core::result::Result<T, Error>;
+
+trait EventSourceGateway: Send + Sync {
+    fn query_latest_height(
+        &self,
+    ) -> BoxFuture<'_, core::result::Result<Height, super::error::Error>>;
+
+    fn query_events(
+        &self,
+        since_height: Height,
+    ) -> BoxFuture<'_, core::result::Result<QueryEventsResponse, super::error::Error>>;
+}
+
+impl EventSourceGateway for GatewayClient {
+    fn query_latest_height(
+        &self,
+    ) -> BoxFuture<'_, core::result::Result<Height, super::error::Error>> {
+        Box::pin(GatewayClient::query_latest_height(self))
+    }
+
+    fn query_events(
+        &self,
+        since_height: Height,
+    ) -> BoxFuture<'_, core::result::Result<QueryEventsResponse, super::error::Error>> {
+        Box::pin(GatewayClient::query_events(self, since_height))
+    }
+}
 
 #[derive(Debug, Copy, Clone)]
 enum Next {
@@ -46,7 +75,7 @@ pub struct CardanoEventSource {
     chain_id: ChainId,
 
     /// Gateway client for querying events
-    gateway_client: GatewayClient,
+    gateway_client: Arc<dyn EventSourceGateway>,
 
     /// Poll interval
     poll_interval: Duration,
@@ -98,6 +127,22 @@ impl CardanoEventSource {
     pub fn new(
         chain_id: ChainId,
         gateway_client: GatewayClient,
+        poll_interval: Duration,
+        event_replay_window: u64,
+        rt: Arc<TokioRuntime>,
+    ) -> Result<(Self, TxEventSourceCmd)> {
+        Self::new_with_gateway(
+            chain_id,
+            Arc::new(gateway_client),
+            poll_interval,
+            event_replay_window,
+            rt,
+        )
+    }
+
+    fn new_with_gateway(
+        chain_id: ChainId,
+        gateway_client: Arc<dyn EventSourceGateway>,
         poll_interval: Duration,
         event_replay_window: u64,
         rt: Arc<TokioRuntime>,
@@ -384,24 +429,30 @@ fn process_block_events(
         }
 
         if !keyed_gateway_events.is_empty() {
-            let event_keys = keyed_gateway_events
-                .iter()
-                .map(|(key, _)| key.clone())
-                .collect::<Vec<_>>();
-            let gateway_events = keyed_gateway_events
-                .into_iter()
-                .map(|(_, event)| event)
-                .collect();
-            let ibc_events = event_parser::parse_events(gateway_events, height).map_err(|e| {
-                Error::collect_events_failed(format!("Failed to parse events: {}", e))
-            })?;
+            for (key, gateway_event) in keyed_gateway_events {
+                match event_parser::parse_events(vec![gateway_event], height) {
+                    Ok(ibc_events) => {
+                        events_with_height.extend(
+                            ibc_events
+                                .into_iter()
+                                .map(|event| IbcEventWithHeight::new(event, height)),
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            chain = %chain_id,
+                            height = %height,
+                            event_type = %key.event_type,
+                            %error,
+                            "skipping malformed Cardano Gateway event"
+                        );
+                    }
+                }
 
-            seen_event_keys.extend(event_keys);
-            events_with_height.extend(
-                ibc_events
-                    .into_iter()
-                    .map(|event| IbcEventWithHeight::new(event, height)),
-            );
+                // A malformed event cannot become parseable on the next overlapping poll.
+                // Remember it so one bad Gateway response is not retried indefinitely.
+                seen_event_keys.insert(key);
+            }
         }
     }
 
@@ -424,21 +475,55 @@ fn process_block_events(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{
+        collections::{BTreeSet, VecDeque},
+        sync::{Arc, Mutex},
+    };
 
+    use futures::future::BoxFuture;
     use ibc_relayer_types::{
         core::{ics02_client::height::Height, ics24_host::identifier::ChainId},
         events::IbcEvent,
     };
+    use tokio::{runtime::Runtime as TokioRuntime, time::Duration};
 
-    use crate::chain::cardano::generated::ibc::{
-        cardano::v1::BlockEvents,
-        core::types::v1::{
-            Event as CoreEvent, EventAttribute as CoreEventAttribute, ResponseDeliverTx,
+    use crate::chain::cardano::{
+        error::Error as CardanoError,
+        generated::ibc::{
+            cardano::v1::{BlockEvents, QueryEventsResponse},
+            core::types::v1::{
+                Event as CoreEvent, EventAttribute as CoreEventAttribute, ResponseDeliverTx,
+            },
         },
     };
 
-    use super::{process_block_events, startup_replay_height};
+    use super::{
+        process_block_events, startup_replay_height, CardanoEventSource, EventSourceGateway, Next,
+    };
+
+    struct ScriptedGateway {
+        responses: Mutex<VecDeque<QueryEventsResponse>>,
+        requested_heights: Arc<Mutex<Vec<Height>>>,
+    }
+
+    impl EventSourceGateway for ScriptedGateway {
+        fn query_latest_height(&self) -> BoxFuture<'_, core::result::Result<Height, CardanoError>> {
+            Box::pin(async { Ok(Height::new(0, 1).unwrap()) })
+        }
+
+        fn query_events(
+            &self,
+            since_height: Height,
+        ) -> BoxFuture<'_, core::result::Result<QueryEventsResponse, CardanoError>> {
+            Box::pin(async move {
+                self.requested_heights.lock().unwrap().push(since_height);
+
+                self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+                    CardanoError::GatewayClient("scripted response missing".to_string())
+                })
+            })
+        }
+    }
 
     #[test]
     fn startup_replay_height_subtracts_window() {
@@ -525,6 +610,58 @@ mod tests {
         assert!(matches!(batch.events[0].event, IbcEvent::NewBlock(_)));
     }
 
+    #[test]
+    fn event_source_advances_past_malformed_gateway_event() {
+        let requested_heights = Arc::new(Mutex::new(Vec::new()));
+        let gateway = Arc::new(ScriptedGateway {
+            responses: Mutex::new(VecDeque::from([
+                QueryEventsResponse {
+                    current_height: 43,
+                    scanned_to_height: 43,
+                    events: vec![block_with_malformed_and_valid_send_packets()],
+                },
+                QueryEventsResponse {
+                    current_height: 44,
+                    scanned_to_height: 44,
+                    events: vec![],
+                },
+            ])),
+            requested_heights: Arc::clone(&requested_heights),
+        });
+        let rt = Arc::new(TokioRuntime::new().unwrap());
+        let (mut source, _tx_cmd) = CardanoEventSource::new_with_gateway(
+            chain_id(),
+            gateway,
+            Duration::ZERO,
+            0,
+            Arc::clone(&rt),
+        )
+        .unwrap();
+        source.last_fetched_height = Height::new(0, 41).unwrap();
+        let event_rx = source.event_bus.subscribe();
+
+        rt.block_on(async {
+            assert!(matches!(source.step().await.unwrap(), Next::Continue));
+            assert_eq!(source.last_fetched_height, Height::new(0, 43).unwrap());
+
+            let block_42 = event_rx.try_recv().unwrap();
+            let block_42 = block_42.as_ref().as_ref().unwrap();
+            assert_eq!(block_42.height, Height::new(0, 42).unwrap());
+            assert!(block_42
+                .events
+                .iter()
+                .any(|event| matches!(event.event, IbcEvent::SendPacket(_))));
+
+            assert!(matches!(source.step().await.unwrap(), Next::Continue));
+            assert_eq!(source.last_fetched_height, Height::new(0, 44).unwrap());
+        });
+
+        assert_eq!(
+            *requested_heights.lock().unwrap(),
+            vec![Height::new(0, 41).unwrap(), Height::new(0, 43).unwrap()]
+        );
+    }
+
     fn chain_id() -> ChainId {
         "cardano-preprod".parse().unwrap()
     }
@@ -534,20 +671,34 @@ mod tests {
             height: 42,
             events: vec![ResponseDeliverTx {
                 code: 0,
-                events: vec![CoreEvent {
-                    r#type: "send_packet".to_string(),
-                    event_attribute: attrs(&[
-                        ("packet_sequence", "7"),
-                        ("packet_src_port", "transfer"),
-                        ("packet_src_channel", "channel-2"),
-                        ("packet_dst_port", "transfer"),
-                        ("packet_dst_channel", "channel-0"),
-                        ("packet_data", "deadbeef"),
-                        ("packet_timeout_height", "0-0"),
-                        ("packet_timeout_timestamp", "1000"),
-                    ]),
-                }],
+                events: vec![send_packet_event("7")],
             }],
+        }
+    }
+
+    fn block_with_malformed_and_valid_send_packets() -> BlockEvents {
+        BlockEvents {
+            height: 42,
+            events: vec![ResponseDeliverTx {
+                code: 0,
+                events: vec![send_packet_event("not-a-number"), send_packet_event("7")],
+            }],
+        }
+    }
+
+    fn send_packet_event(sequence: &str) -> CoreEvent {
+        CoreEvent {
+            r#type: "send_packet".to_string(),
+            event_attribute: attrs(&[
+                ("packet_sequence", sequence),
+                ("packet_src_port", "transfer"),
+                ("packet_src_channel", "channel-2"),
+                ("packet_dst_port", "transfer"),
+                ("packet_dst_channel", "channel-0"),
+                ("packet_data", "deadbeef"),
+                ("packet_timeout_height", "0-0"),
+                ("packet_timeout_timestamp", "1000"),
+            ]),
         }
     }
 
