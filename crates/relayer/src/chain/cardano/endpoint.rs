@@ -9,7 +9,7 @@ use super::gateway_client::{
 use super::signing_key_pair::CardanoSigningKeyPair;
 use super::signing_policy::{SigningIntent, SigningPolicyLimits, TransactionSigningPolicy};
 use super::transaction_evaluator::OgmiosTransactionEvaluator;
-use super::utxo_resolver::KupoInputResolver;
+use super::utxo_resolver::{KupoInputResolver, TrustedUtxoOverlay};
 
 use ibc_relayer_types::clients::ics08_cardano::consensus_state::ConsensusState as MithrilConsensusState;
 use ibc_relayer_types::clients::ics08_cardano::misbehaviour::Misbehaviour as MithrilMisbehaviour;
@@ -273,6 +273,7 @@ impl CardanoChainEndpoint {
         &self,
         unsigned_cbor_hex: &str,
         intent: &SigningIntent,
+        overlay: &TrustedUtxoOverlay,
     ) -> Result<super::signer::SignedTransaction, Error> {
         use super::signer;
 
@@ -286,7 +287,7 @@ impl CardanoChainEndpoint {
         let (resolved_inputs, _) = tokio::try_join!(
             async {
                 self.input_resolver
-                    .resolve_unsigned_transaction(&unsigned_tx_bytes)
+                    .resolve_unsigned_transaction_with_overlay(&unsigned_tx_bytes, overlay)
                     .await
                     .map_err(|error| {
                         Error::send_tx(format!(
@@ -296,7 +297,7 @@ impl CardanoChainEndpoint {
             },
             async {
                 self.transaction_evaluator
-                    .evaluate_unsigned_transaction(&unsigned_tx_bytes)
+                    .evaluate_unsigned_transaction_with_overlay(&unsigned_tx_bytes, overlay)
                     .await
                     .map_err(|error| {
                         Error::send_tx(format!(
@@ -337,17 +338,14 @@ impl CardanoChainEndpoint {
         &self,
         signed_tx: &super::signer::SignedTransaction,
     ) -> Result<TxSubmitResponse, Error> {
-        let submitted_hash = self
-            .transaction_evaluator
-            .submit_signed_transaction(&signed_tx.cbor)
-            .await
-            .map_err(|error| {
-                Error::send_tx(format!(
-                    "Failed to submit exact signed transaction through trusted Ogmios: {error}"
-                ))
-            })?;
-        assert_submitted_tx_hash(&signed_tx.tx_hash, &submitted_hash)?;
+        self.submit_signed_transaction(signed_tx, false).await?;
+        self.observe_signed_transaction(signed_tx).await
+    }
 
+    async fn observe_signed_transaction(
+        &self,
+        signed_tx: &super::signer::SignedTransaction,
+    ) -> Result<TxSubmitResponse, Error> {
         let response = self
             .gateway_client
             .observe_tx(&signed_tx.tx_hash)
@@ -368,24 +366,42 @@ impl CardanoChainEndpoint {
         Ok(response)
     }
 
+    async fn submit_signed_transaction(
+        &self,
+        signed_tx: &super::signer::SignedTransaction,
+        has_prior_dependency: bool,
+    ) -> Result<(), Error> {
+        let submitted_hash = self
+            .transaction_evaluator
+            .submit_signed_transaction_with_prior_dependency(&signed_tx.cbor, has_prior_dependency)
+            .await
+            .map_err(|error| {
+                Error::send_tx(format!(
+                    "Failed to submit exact signed transaction through trusted Ogmios: {error}"
+                ))
+            })?;
+        assert_submitted_tx_hash(&signed_tx.tx_hash, &submitted_hash)?;
+        Ok(())
+    }
+
     /// Submit one logical IBC message. A staged Tendermint update may return
     /// multiple bounded transaction phases. Every candidate is validated and
-    /// submitted through trusted local services, while the Gateway receives
-    /// only the body hash needed to observe and finalize it.
+    /// submitted through trusted local services. The Gateway receives only the
+    /// final body hash needed to observe and finalize the phase.
     async fn submit_ibc_message_until_final(
         &self,
         message_type_url: &str,
         message_value: &[u8],
     ) -> Result<TxSubmitResponse, Error> {
         let expected_signer = self.get_signer()?.to_string();
-        let mut signing_intent = SigningIntent::ibc(
+        let mut direct_signing_intent = SigningIntent::ibc(
             message_type_url,
             message_value,
             &expected_signer,
             self.config.network_id,
         )
         .map_err(|error| Error::send_tx(format!("Failed to authorize signing intent: {error}")))?;
-        self.resolve_signing_intent_denom(&mut signing_intent)
+        self.resolve_signing_intent_denom(&mut direct_signing_intent)
             .await?;
 
         let mut completed_steps = 0usize;
@@ -428,46 +444,80 @@ impl CardanoChainEndpoint {
                 staged_update_started = true;
             }
 
-            let mut final_response = None;
+            let staged_signing_intent = if built.kind == BuiltIbcTxKind::Singleton {
+                None
+            } else {
+                Some(
+                    SigningIntent::staged_tendermint_update(
+                        message_type_url,
+                        message_value,
+                        &expected_signer,
+                        self.config.network_id,
+                    )
+                    .map_err(|error| {
+                        Error::send_tx(format!(
+                            "Failed to authorize staged Tendermint signing intent: {error}"
+                        ))
+                    })?,
+                )
+            };
+            let phase_signing_intent = staged_signing_intent
+                .as_ref()
+                .unwrap_or(&direct_signing_intent);
+
+            let mut overlay = TrustedUtxoOverlay::new();
+            let mut final_signed_transaction = None;
             for (index, transaction) in built.transactions.iter().enumerate() {
                 tracing::debug!("Built unsigned tx: {}", transaction.description);
-                let signed_tx = self
-                    .sign_transaction_helper(&transaction.cbor_hex, &signing_intent)
-                    .await?;
-                let is_final = index + 1 == total;
-                let tx_response = self
-                    .submit_and_observe_signed_transaction(&signed_tx)
-                    .await?;
-
-                if !is_final {
-                    ensure_intermediate_has_no_events(&tx_response)?;
-                    tracing::info!(
-                        "Confirmed Tendermint update chain transaction {}/{} ({})",
-                        index + 1,
-                        total,
-                        tx_response.tx_hash
-                    );
-                    continue;
-                }
-
-                let included_height = tx_response.height.ok_or_else(|| {
+                let unsigned_tx_bytes = hex::decode(&transaction.cbor_hex).map_err(|error| {
                     Error::send_tx(format!(
-                        "No height in final transaction response for {}",
-                        tx_response.tx_hash
+                        "Failed to decode transaction {}/{}: {error}",
+                        index + 1,
+                        total
                     ))
                 })?;
+                let signed_tx = self
+                    .sign_transaction_helper(&transaction.cbor_hex, phase_signing_intent, &overlay)
+                    .await?;
+                overlay
+                    .extend_from_validated_transaction(&unsigned_tx_bytes, &signed_tx.tx_hash)
+                    .map_err(|error| {
+                        Error::send_tx(format!(
+                            "Failed to extend trusted UTxO overlay after transaction {}/{}: {error}",
+                            index + 1,
+                            total
+                        ))
+                    })?;
+                self.submit_signed_transaction(&signed_tx, index > 0)
+                    .await?;
+
                 tracing::info!(
-                    "Submitted final transaction {} at height {} after {} intermediates",
-                    tx_response.tx_hash,
-                    included_height,
-                    total - 1
+                    "Trusted node accepted transaction {}/{} ({})",
+                    index + 1,
+                    total,
+                    signed_tx.tx_hash
                 );
-                final_response = Some(tx_response);
+                final_signed_transaction = Some(signed_tx);
             }
 
-            let final_response = final_response.ok_or_else(|| {
+            let final_signed_transaction = final_signed_transaction.ok_or_else(|| {
                 Error::send_tx("Gateway transaction set had no final transaction".to_string())
             })?;
+            let final_response = self
+                .observe_signed_transaction(&final_signed_transaction)
+                .await?;
+            let included_height = final_response.height.ok_or_else(|| {
+                Error::send_tx(format!(
+                    "No height in final transaction response for {}",
+                    final_response.tx_hash
+                ))
+            })?;
+            tracing::info!(
+                "Observed final transaction {} at height {} after {} intermediates",
+                final_response.tx_hash,
+                included_height,
+                total - 1
+            );
 
             if let Some(step_number) = legacy_step_number {
                 ensure_intermediate_has_no_events(&final_response)?;
@@ -1254,8 +1304,9 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     build.current_epoch
                 ))
             })?;
+            let overlay = TrustedUtxoOverlay::new();
             let signed_tx = self
-                .sign_transaction_helper(&unsigned_tx.cbor_hex, &signing_intent)
+                .sign_transaction_helper(&unsigned_tx.cbor_hex, &signing_intent, &overlay)
                 .await?;
             let response = self
                 .submit_and_observe_signed_transaction(&signed_tx)
@@ -4172,31 +4223,7 @@ mod tests {
     }
 
     #[test]
-    fn chained_update_submits_only_intermediates_and_extends_only_final_timeout() {
-        assert_eq!(
-            submission_options(BuiltIbcTxKind::TendermintUpdateChain, 0, 88, false).unwrap(),
-            (true, 0, true, false)
-        );
-        assert_eq!(
-            submission_options(BuiltIbcTxKind::TendermintUpdateChain, 86, 88, false).unwrap(),
-            (true, 0, true, true)
-        );
-        assert_eq!(
-            submission_options(BuiltIbcTxKind::TendermintUpdateChain, 87, 88, false).unwrap(),
-            (false, 30 * 60, false, true)
-        );
-    }
-
-    #[test]
-    fn ordinary_singleton_keeps_default_confirmation_timeout() {
-        assert_eq!(
-            submission_options(BuiltIbcTxKind::Singleton, 0, 1, false).unwrap(),
-            (false, 0, false, false)
-        );
-    }
-
-    #[test]
-    fn intermediate_submit_only_response_accepts_absent_height() {
+    fn tree_neutral_response_accepts_no_events() {
         let response = TxSubmitResponse {
             tx_hash: "abc123".to_string(),
             height: None,
@@ -4214,10 +4241,6 @@ mod tests {
             events: vec![],
         };
 
-        assert_eq!(
-            submission_options(BuiltIbcTxKind::TendermintUpdateChain, 2, 3, true).unwrap(),
-            (false, 30 * 60, true, true)
-        );
         assert!(should_rebuild_after_submission(
             BuiltIbcTxKind::TendermintUpdateChain,
             true,
@@ -4274,12 +4297,7 @@ mod tests {
             height: Some(height(43)),
             events: vec![],
         };
-        let error = ensure_completed_tendermint_chain_has_update_event(
-            BuiltIbcTxKind::TendermintUpdateChain,
-            false,
-            &empty,
-        )
-        .unwrap_err();
+        let error = ensure_completed_tendermint_chain_has_update_event(true, &empty).unwrap_err();
         assert!(error
             .to_string()
             .contains("returned no update_client event"));
@@ -4292,12 +4310,7 @@ mod tests {
                 attributes: vec![],
             }],
         };
-        ensure_completed_tendermint_chain_has_update_event(
-            BuiltIbcTxKind::TendermintUpdateChain,
-            false,
-            &update,
-        )
-        .unwrap();
+        ensure_completed_tendermint_chain_has_update_event(true, &update).unwrap();
     }
 
     #[test]
@@ -4308,18 +4321,7 @@ mod tests {
             events: vec![],
         };
 
-        ensure_completed_tendermint_chain_has_update_event(
-            BuiltIbcTxKind::TendermintUpdateChain,
-            true,
-            &empty,
-        )
-        .unwrap();
-        ensure_completed_tendermint_chain_has_update_event(
-            BuiltIbcTxKind::Singleton,
-            false,
-            &empty,
-        )
-        .unwrap();
+        ensure_completed_tendermint_chain_has_update_event(false, &empty).unwrap();
     }
 
     fn host_state_tx_body_cbor(root: [u8; 32]) -> Vec<u8> {
