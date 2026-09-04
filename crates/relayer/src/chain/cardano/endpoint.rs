@@ -3,11 +3,18 @@
 //! This module implements the ChainEndpoint trait required by Hermes for custom chain support.
 
 use super::config::CardanoConfig;
-use super::gateway_client::{GatewayClient, TxSubmitResponse};
+use super::gateway_client::{
+    BuiltIbcTxKind, GatewayClient, TxSubmitResponse, MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH,
+};
 use super::signing_key_pair::CardanoSigningKeyPair;
-use super::signing_policy::{SigningIntent, SigningPolicyLimits, TransactionSigningPolicy};
+use super::signing_policy::{
+    SigningIntent, SigningPolicyLimits, TendermintSessionAction, TransactionSigningPolicy,
+    ValidatedTendermintSessionAction,
+};
 use super::transaction_evaluator::OgmiosTransactionEvaluator;
-use super::utxo_resolver::KupoInputResolver;
+use super::utxo_resolver::{
+    transaction_consumes_output_from, KupoInputResolver, TrustedUtxoOverlay,
+};
 
 use ibc_relayer_types::clients::ics08_cardano::consensus_state::ConsensusState as MithrilConsensusState;
 use ibc_relayer_types::clients::ics08_cardano::misbehaviour::Misbehaviour as MithrilMisbehaviour;
@@ -68,6 +75,15 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tendermint_rpc::endpoint::broadcast::tx_sync::Response as TxResponse;
 use tokio::runtime::Runtime as TokioRuntime;
+
+const MAX_TENDERMINT_UPDATE_STEPS: usize = 100;
+const MAX_TENDERMINT_UPDATE_REBUILD_PHASES: usize = 3;
+const MAX_TENDERMINT_UPDATE_TOTAL_TRANSACTIONS: usize = 300;
+
+struct PolicyValidatedSignedTransaction {
+    transaction: super::signer::SignedTransaction,
+    staged_action: Option<ValidatedTendermintSessionAction>,
+}
 
 /// Cardano light block (placeholder)
 #[derive(Debug, Clone)]
@@ -139,6 +155,188 @@ fn assert_submitted_tx_hash(expected: &str, actual: &str) -> Result<(), Error> {
     Ok(())
 }
 
+fn next_tendermint_update_step(
+    kind: BuiltIbcTxKind,
+    completed_steps: usize,
+) -> Result<Option<usize>, Error> {
+    if kind != BuiltIbcTxKind::LegacyTendermintUpdateStep {
+        return Ok(None);
+    }
+
+    if completed_steps >= MAX_TENDERMINT_UPDATE_STEPS {
+        return Err(Error::send_tx(format!(
+            "Tendermint client update exceeded the strict limit of {MAX_TENDERMINT_UPDATE_STEPS} intermediate transactions; the Gateway did not return a final unmarked transaction"
+        )));
+    }
+
+    Ok(Some(completed_steps + 1))
+}
+
+fn ensure_intermediate_has_no_events(response: &TxSubmitResponse) -> Result<(), Error> {
+    if !response.events.is_empty() {
+        return Err(Error::send_tx(format!(
+            "Tree-neutral Tendermint transaction {} produced {} IBC events; staged session transactions must not produce IBC events",
+            response.tx_hash,
+            response.events.len()
+        )));
+    }
+    // A submit-only response intentionally has no inclusion height. Do not
+    // synthesize one or require confirmation for intermediate chain links.
+    Ok(())
+}
+
+fn ensure_tendermint_phase_budget(
+    kind: BuiltIbcTxKind,
+    rebuild_after_submission: bool,
+    completed_rebuild_phases: usize,
+    completed_transactions: usize,
+    phase_transactions: usize,
+) -> Result<(), Error> {
+    if kind == BuiltIbcTxKind::TendermintUpdateChain
+        && phase_transactions > MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH
+    {
+        return Err(Error::send_tx(format!(
+            "Tendermint update phase exceeds the strict limit of {} transactions",
+            MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH
+        )));
+    }
+    if kind == BuiltIbcTxKind::TendermintUpdateChain
+        && phase_transactions
+            > MAX_TENDERMINT_UPDATE_TOTAL_TRANSACTIONS.saturating_sub(completed_transactions)
+    {
+        return Err(Error::send_tx(format!(
+            "Tendermint update phases exceed the strict total limit of {MAX_TENDERMINT_UPDATE_TOTAL_TRANSACTIONS} transactions"
+        )));
+    }
+    if kind == BuiltIbcTxKind::TendermintUpdateChain
+        && rebuild_after_submission
+        && completed_rebuild_phases >= MAX_TENDERMINT_UPDATE_REBUILD_PHASES
+    {
+        return Err(Error::send_tx(format!(
+            "Tendermint update exceeded the strict limit of {MAX_TENDERMINT_UPDATE_REBUILD_PHASES} confirmed rebuild phases"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_tendermint_phase_actions(
+    kind: BuiltIbcTxKind,
+    rebuild_after_submission: bool,
+    actions: &[ValidatedTendermintSessionAction],
+) -> Result<(), Error> {
+    match kind {
+        BuiltIbcTxKind::Singleton => {
+            if !actions.is_empty() {
+                return Err(Error::send_tx(
+                    "singleton transaction unexpectedly used staged Tendermint authorization"
+                        .to_string(),
+                ));
+            }
+        }
+        BuiltIbcTxKind::LegacyTendermintUpdateStep => {
+            if actions.len() != 1 || actions[0].action == TendermintSessionAction::Finalize {
+                return Err(Error::send_tx(
+                    "legacy Tendermint update marker must contain one tree-neutral staged transaction"
+                        .to_string(),
+                ));
+            }
+        }
+        BuiltIbcTxKind::TendermintUpdateChain if !rebuild_after_submission => {
+            if actions.len() != 1 || actions[0].action != TendermintSessionAction::Finalize {
+                return Err(Error::send_tx(
+                    "final Tendermint update phase must contain exactly one finalization transaction"
+                        .to_string(),
+                ));
+            }
+        }
+        BuiltIbcTxKind::TendermintUpdateChain => {
+            let mut initialized = false;
+            let mut advancing = false;
+            let mut active_token_name: Option<&[u8]> = None;
+            for action in actions {
+                match action.action {
+                    TendermintSessionAction::Cancel if !initialized && !advancing => {}
+                    TendermintSessionAction::Initialize if !initialized && !advancing => {
+                        initialized = true;
+                        active_token_name = Some(&action.token_name);
+                    }
+                    TendermintSessionAction::Advance => {
+                        if active_token_name
+                            .is_some_and(|expected| expected != action.token_name.as_slice())
+                        {
+                            return Err(Error::send_tx(
+                                "Tendermint verification links use different session NFTs"
+                                    .to_string(),
+                            ));
+                        }
+                        active_token_name = Some(&action.token_name);
+                        advancing = true;
+                    }
+                    TendermintSessionAction::Cancel => {
+                        return Err(Error::send_tx(
+                            "Tendermint session cancellation must precede initialization and verification"
+                                .to_string(),
+                        ));
+                    }
+                    TendermintSessionAction::Initialize => {
+                        return Err(Error::send_tx(
+                            "Tendermint update phase contains more than one initialization or initializes after verification"
+                                .to_string(),
+                        ));
+                    }
+                    TendermintSessionAction::Finalize => {
+                        return Err(Error::send_tx(
+                            "tree-neutral Tendermint update phase contains a finalization transaction"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            if actions.is_empty() {
+                return Err(Error::send_tx(
+                    "tree-neutral Tendermint update phase contains no transactions".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn should_rebuild_after_submission(
+    kind: BuiltIbcTxKind,
+    rebuild_after_submission: bool,
+    final_response: &TxSubmitResponse,
+) -> Result<bool, Error> {
+    if !rebuild_after_submission {
+        return Ok(false);
+    }
+    if kind != BuiltIbcTxKind::TendermintUpdateChain {
+        return Err(Error::send_tx(
+            "Gateway requested rebuild after a non-chain transaction".to_string(),
+        ));
+    }
+    ensure_intermediate_has_no_events(final_response)?;
+    Ok(true)
+}
+
+fn ensure_completed_tendermint_chain_has_update_event(
+    staged_update_started: bool,
+    final_response: &TxSubmitResponse,
+) -> Result<(), Error> {
+    if staged_update_started
+        && !final_response
+            .events
+            .iter()
+            .any(|event| event.event_type == "update_client")
+    {
+        return Err(Error::send_tx(format!(
+            "Final Tendermint update transaction {} returned no update_client event",
+            final_response.tx_hash
+        )));
+    }
+
+    Ok(())
+}
 impl CardanoChainEndpoint {
     async fn resolve_signing_intent_denom(&self, intent: &mut SigningIntent) -> Result<(), Error> {
         let Some(hash) = intent.unresolved_ibc_denom_hash().map(str::to_owned) else {
@@ -168,7 +366,8 @@ impl CardanoChainEndpoint {
         &self,
         unsigned_cbor_hex: &str,
         intent: &SigningIntent,
-    ) -> Result<super::signer::SignedTransaction, Error> {
+        overlay: &TrustedUtxoOverlay,
+    ) -> Result<PolicyValidatedSignedTransaction, Error> {
         use super::signer;
 
         // Convert hex to bytes
@@ -181,7 +380,7 @@ impl CardanoChainEndpoint {
         let (resolved_inputs, _) = tokio::try_join!(
             async {
                 self.input_resolver
-                    .resolve_unsigned_transaction(&unsigned_tx_bytes)
+                    .resolve_unsigned_transaction_with_overlay(&unsigned_tx_bytes, overlay)
                     .await
                     .map_err(|error| {
                         Error::send_tx(format!(
@@ -191,7 +390,7 @@ impl CardanoChainEndpoint {
             },
             async {
                 self.transaction_evaluator
-                    .evaluate_unsigned_transaction(&unsigned_tx_bytes)
+                    .evaluate_unsigned_transaction_with_overlay(&unsigned_tx_bytes, overlay)
                     .await
                     .map_err(|error| {
                         Error::send_tx(format!(
@@ -200,6 +399,20 @@ impl CardanoChainEndpoint {
                     })
             }
         )?;
+
+        let staged_action = if intent.is_staged_tendermint() {
+            Some(
+                self.signing_policy
+                    .staged_tendermint_action(&unsigned_tx_bytes, &resolved_inputs)
+                    .map_err(|error| {
+                        Error::send_tx(format!(
+                            "Failed to classify staged Tendermint transaction: {error}"
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
 
         // Get signing key from keyring
         let key = self
@@ -222,7 +435,10 @@ impl CardanoChainEndpoint {
         )
         .map_err(|e| Error::send_tx(format!("Failed to sign transaction: {}", e)))?;
 
-        Ok(signed_tx)
+        Ok(PolicyValidatedSignedTransaction {
+            transaction: signed_tx,
+            staged_action,
+        })
     }
 
     /// Submit the exact signed envelope through trusted Ogmios, then give the
@@ -232,17 +448,14 @@ impl CardanoChainEndpoint {
         &self,
         signed_tx: &super::signer::SignedTransaction,
     ) -> Result<TxSubmitResponse, Error> {
-        let submitted_hash = self
-            .transaction_evaluator
-            .submit_signed_transaction(&signed_tx.cbor)
-            .await
-            .map_err(|error| {
-                Error::send_tx(format!(
-                    "Failed to submit exact signed transaction through trusted Ogmios: {error}"
-                ))
-            })?;
-        assert_submitted_tx_hash(&signed_tx.tx_hash, &submitted_hash)?;
+        self.submit_signed_transaction(signed_tx, false).await?;
+        self.observe_signed_transaction(signed_tx).await
+    }
 
+    async fn observe_signed_transaction(
+        &self,
+        signed_tx: &super::signer::SignedTransaction,
+    ) -> Result<TxSubmitResponse, Error> {
         let response = self
             .gateway_client
             .observe_tx(&signed_tx.tx_hash)
@@ -261,6 +474,229 @@ impl CardanoChainEndpoint {
             )));
         }
         Ok(response)
+    }
+
+    async fn submit_signed_transaction(
+        &self,
+        signed_tx: &super::signer::SignedTransaction,
+        has_prior_dependency: bool,
+    ) -> Result<(), Error> {
+        let submitted_hash = self
+            .transaction_evaluator
+            .submit_signed_transaction_with_prior_dependency(&signed_tx.cbor, has_prior_dependency)
+            .await
+            .map_err(|error| {
+                Error::send_tx(format!(
+                    "Failed to submit exact signed transaction through trusted Ogmios: {error}"
+                ))
+            })?;
+        assert_submitted_tx_hash(&signed_tx.tx_hash, &submitted_hash)?;
+        Ok(())
+    }
+
+    /// Submit one logical IBC message. A staged Tendermint update may return
+    /// multiple bounded transaction phases. Every candidate is validated and
+    /// submitted through trusted local services. The Gateway receives only the
+    /// final body hash needed to observe and finalize the phase.
+    async fn submit_ibc_message_until_final(
+        &self,
+        message_type_url: &str,
+        message_value: &[u8],
+    ) -> Result<TxSubmitResponse, Error> {
+        let expected_signer = self.get_signer()?.to_string();
+        let mut direct_signing_intent = SigningIntent::ibc(
+            message_type_url,
+            message_value,
+            &expected_signer,
+            self.config.network_id,
+        )
+        .map_err(|error| Error::send_tx(format!("Failed to authorize signing intent: {error}")))?;
+        self.resolve_signing_intent_denom(&mut direct_signing_intent)
+            .await?;
+
+        let mut completed_steps = 0usize;
+        let mut completed_chain_transactions = 0usize;
+        let mut completed_rebuild_phases = 0usize;
+        let mut staged_update_started = false;
+
+        loop {
+            let built = self
+                .gateway_client
+                .build_ibc_tx(message_type_url, message_value.to_vec())
+                .await
+                .map_err(|e| {
+                    if completed_steps == 0 {
+                        Error::send_tx(format!("Failed to build transaction: {e}"))
+                    } else {
+                        Error::send_tx(format!(
+                            "Failed to build transaction after {completed_steps} completed Tendermint update steps: {e}"
+                        ))
+                    }
+                })?;
+
+            ensure_tendermint_phase_budget(
+                built.kind,
+                built.rebuild_after_submission,
+                completed_rebuild_phases,
+                completed_chain_transactions,
+                built.transactions.len(),
+            )?;
+
+            let legacy_step_number = next_tendermint_update_step(built.kind, completed_steps)?;
+            let total = built.transactions.len();
+            if total == 0 {
+                return Err(Error::send_tx(
+                    "Gateway returned an empty transaction set".to_string(),
+                ));
+            }
+
+            if built.kind != BuiltIbcTxKind::Singleton {
+                staged_update_started = true;
+            }
+
+            let staged_signing_intent = if built.kind == BuiltIbcTxKind::Singleton {
+                None
+            } else {
+                Some(
+                    SigningIntent::staged_tendermint_update(
+                        message_type_url,
+                        message_value,
+                        &expected_signer,
+                        self.config.network_id,
+                    )
+                    .map_err(|error| {
+                        Error::send_tx(format!(
+                            "Failed to authorize staged Tendermint signing intent: {error}"
+                        ))
+                    })?,
+                )
+            };
+            let phase_signing_intent = staged_signing_intent
+                .as_ref()
+                .unwrap_or(&direct_signing_intent);
+
+            let mut overlay = TrustedUtxoOverlay::new();
+            let mut signed_transactions: Vec<super::signer::SignedTransaction> =
+                Vec::with_capacity(total);
+            let mut staged_actions = Vec::with_capacity(total);
+            for (index, transaction) in built.transactions.iter().enumerate() {
+                tracing::debug!("Built unsigned tx: {}", transaction.description);
+                let unsigned_tx_bytes = hex::decode(&transaction.cbor_hex).map_err(|error| {
+                    Error::send_tx(format!(
+                        "Failed to decode transaction {}/{}: {error}",
+                        index + 1,
+                        total
+                    ))
+                })?;
+                if let Some(previous) = signed_transactions.last() {
+                    if !transaction_consumes_output_from(&unsigned_tx_bytes, &previous.tx_hash)
+                        .map_err(|error| {
+                            Error::send_tx(format!(
+                                "Failed to verify dependency for transaction {}/{}: {error}",
+                                index + 1,
+                                total
+                            ))
+                        })?
+                    {
+                        return Err(Error::send_tx(format!(
+                            "Transaction {}/{} does not consume an output of the immediately preceding transaction",
+                            index + 1,
+                            total
+                        )));
+                    }
+                }
+                let validated = self
+                    .sign_transaction_helper(&transaction.cbor_hex, phase_signing_intent, &overlay)
+                    .await?;
+                overlay
+                    .extend_from_validated_transaction(
+                        &unsigned_tx_bytes,
+                        &validated.transaction.tx_hash,
+                    )
+                    .map_err(|error| {
+                        Error::send_tx(format!(
+                            "Failed to extend trusted UTxO overlay after transaction {}/{}: {error}",
+                            index + 1,
+                            total
+                        ))
+                    })?;
+                if let Some(action) = validated.staged_action {
+                    staged_actions.push(action);
+                }
+                signed_transactions.push(validated.transaction);
+            }
+
+            ensure_tendermint_phase_actions(
+                built.kind,
+                built.rebuild_after_submission,
+                &staged_actions,
+            )?;
+
+            for (index, signed_tx) in signed_transactions.iter().enumerate() {
+                self.submit_signed_transaction(signed_tx, index > 0).await?;
+                tracing::info!(
+                    "Trusted node accepted transaction {}/{} ({})",
+                    index + 1,
+                    total,
+                    signed_tx.tx_hash
+                );
+            }
+
+            let final_signed_transaction = signed_transactions.last().ok_or_else(|| {
+                Error::send_tx("Gateway transaction set had no final transaction".to_string())
+            })?;
+            let final_response = self
+                .observe_signed_transaction(final_signed_transaction)
+                .await?;
+            let included_height = final_response.height.ok_or_else(|| {
+                Error::send_tx(format!(
+                    "No height in final transaction response for {}",
+                    final_response.tx_hash
+                ))
+            })?;
+            tracing::info!(
+                "Observed final transaction {} at height {} after {} intermediates",
+                final_response.tx_hash,
+                included_height,
+                total - 1
+            );
+
+            if let Some(step_number) = legacy_step_number {
+                ensure_intermediate_has_no_events(&final_response)?;
+                completed_steps = step_number;
+                tracing::info!(
+                    "Confirmed legacy Tendermint update step {}/{} as transaction {}; rebuilding the original message",
+                    completed_steps,
+                    MAX_TENDERMINT_UPDATE_STEPS,
+                    final_response.tx_hash
+                );
+                continue;
+            }
+
+            if built.kind == BuiltIbcTxKind::TendermintUpdateChain {
+                completed_chain_transactions += total;
+            }
+            if should_rebuild_after_submission(
+                built.kind,
+                built.rebuild_after_submission,
+                &final_response,
+            )? {
+                completed_rebuild_phases += 1;
+                tracing::info!(
+                    "Confirmed tree-neutral Tendermint phase boundary ({} total submitted transactions across {} phases); rebuilding the original MsgUpdateClient",
+                    completed_chain_transactions,
+                    completed_rebuild_phases
+                );
+                continue;
+            }
+
+            ensure_completed_tendermint_chain_has_update_event(
+                staged_update_started,
+                &final_response,
+            )?;
+
+            return Ok(final_response);
+        }
     }
 
     /// Initialize the event source for monitoring Cardano chain events
@@ -786,40 +1222,10 @@ impl ChainEndpoint for CardanoChainEndpoint {
             for msg in tracked_msgs.msgs.iter() {
                 tracing::debug!("Processing message type: {:?}", msg.type_url);
 
-                let expected_signer = self.get_signer()?.to_string();
-                let mut signing_intent = SigningIntent::ibc(
-                    &msg.type_url,
-                    &msg.value,
-                    &expected_signer,
-                    self.config.network_id,
-                )
-                .map_err(|error| {
-                    Error::send_tx(format!("Failed to authorize signing intent: {error}"))
-                })?;
-                self.resolve_signing_intent_denom(&mut signing_intent)
-                    .await?;
-
-                // Step 1: Build unsigned transaction via Gateway
-                let unsigned_tx = self
-                    .gateway_client
-                    .build_ibc_tx(&msg.type_url, msg.value.clone())
-                    .await
-                    .map_err(|e| Error::send_tx(format!("Failed to build transaction: {}", e)))?;
-
-                tracing::debug!("Built unsigned tx: {}", unsigned_tx.description);
-
-                // Step 2: Sign transaction with keyring
-                let signed_tx = self
-                    .sign_transaction_helper(&unsigned_tx.cbor_hex, &signing_intent)
-                    .await?;
-
-                tracing::debug!("Signed transaction, CBOR length: {}", signed_tx.cbor.len());
-
-                // Step 3: Submit the immutable signed envelope through trusted
-                // Ogmios. The Gateway receives only its body hash to verify
-                // inclusion and finalize the matching pending state update.
+                // Build, sign, and submit. Tendermint header updates repeat this
+                // operation while the Gateway returns an intermediate marker.
                 let tx_response = self
-                    .submit_and_observe_signed_transaction(&signed_tx)
+                    .submit_ibc_message_until_final(&msg.type_url, &msg.value)
                     .await?;
 
                 let tx_hash = tx_response.tx_hash.clone();
@@ -962,31 +1368,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
             for msg in tracked_msgs.msgs.iter() {
                 tracing::debug!("Processing message type: {:?}", msg.type_url);
 
-                let expected_signer = self.get_signer()?.to_string();
-                let mut signing_intent = SigningIntent::ibc(
-                    &msg.type_url,
-                    &msg.value,
-                    &expected_signer,
-                    self.config.network_id,
-                )
-                .map_err(|error| {
-                    Error::send_tx(format!("Failed to authorize signing intent: {error}"))
-                })?;
-                self.resolve_signing_intent_denom(&mut signing_intent)
-                    .await?;
-
-                let unsigned_tx = self
-                    .gateway_client
-                    .build_ibc_tx(&msg.type_url, msg.value.clone())
-                    .await
-                    .map_err(|e| Error::send_tx(format!("Failed to build transaction: {e}")))?;
-
-                let signed_tx = self
-                    .sign_transaction_helper(&unsigned_tx.cbor_hex, &signing_intent)
-                    .await?;
-
                 let tx_response = self
-                    .submit_and_observe_signed_transaction(&signed_tx)
+                    .submit_ibc_message_until_final(&msg.type_url, &msg.value)
                     .await?;
 
                 let included_height = tx_response.height.ok_or_else(|| {
@@ -1063,11 +1446,12 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     build.current_epoch
                 ))
             })?;
+            let overlay = TrustedUtxoOverlay::new();
             let signed_tx = self
-                .sign_transaction_helper(&unsigned_tx.cbor_hex, &signing_intent)
+                .sign_transaction_helper(&unsigned_tx.cbor_hex, &signing_intent, &overlay)
                 .await?;
             let response = self
-                .submit_and_observe_signed_transaction(&signed_tx)
+                .submit_and_observe_signed_transaction(&signed_tx.transaction)
                 .await?;
 
             Ok(HostStateHeartbeatOutcome::Submitted {
@@ -3918,6 +4302,7 @@ fn cardano_latest_height_unhealthy_error(
 mod tests {
     use super::*;
     use crate::chain::cardano::error::Error as CardanoError;
+    use crate::chain::cardano::gateway_client::IbcEvent;
     use crate::client_state::AnyClientState;
     use ibc_proto::ibc::core::client::v1::Height as RawHeight;
     use ibc_proto::Protobuf;
@@ -3944,6 +4329,254 @@ mod tests {
 
     fn client_id() -> ClientId {
         "08-cardano-mithril-0".parse().expect("valid client id")
+    }
+
+    fn staged_action(
+        action: TendermintSessionAction,
+        token_name: u8,
+    ) -> ValidatedTendermintSessionAction {
+        ValidatedTendermintSessionAction {
+            action,
+            token_name: vec![token_name; 32],
+        }
+    }
+
+    #[test]
+    fn tendermint_update_accepts_exactly_one_hundred_intermediate_transactions() {
+        let mut completed_steps = 0;
+
+        for expected_step in 1..=MAX_TENDERMINT_UPDATE_STEPS {
+            completed_steps = next_tendermint_update_step(
+                BuiltIbcTxKind::LegacyTendermintUpdateStep,
+                completed_steps,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(completed_steps, expected_step);
+        }
+
+        assert_eq!(
+            next_tendermint_update_step(BuiltIbcTxKind::Singleton, completed_steps).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn tendermint_update_rejects_a_hundred_and_first_intermediate_transaction() {
+        let err = next_tendermint_update_step(
+            BuiltIbcTxKind::LegacyTendermintUpdateStep,
+            MAX_TENDERMINT_UPDATE_STEPS,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("strict limit of 100 intermediate transactions"));
+        assert!(message.contains("final unmarked transaction"));
+    }
+
+    #[test]
+    fn tree_neutral_response_accepts_no_events() {
+        let response = TxSubmitResponse {
+            tx_hash: "abc123".to_string(),
+            height: None,
+            events: vec![],
+        };
+
+        ensure_intermediate_has_no_events(&response).unwrap();
+    }
+
+    #[test]
+    fn tree_neutral_phase_boundary_confirms_then_requests_rebuild() {
+        let response = TxSubmitResponse {
+            tx_hash: "phase-boundary-final".to_string(),
+            height: Some(height(42)),
+            events: vec![],
+        };
+
+        assert!(should_rebuild_after_submission(
+            BuiltIbcTxKind::TendermintUpdateChain,
+            true,
+            &response,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn cleanup_and_continuation_have_separate_phase_transaction_budgets() {
+        ensure_tendermint_phase_budget(BuiltIbcTxKind::TendermintUpdateChain, true, 0, 0, 100)
+            .unwrap();
+        ensure_tendermint_phase_budget(BuiltIbcTxKind::TendermintUpdateChain, true, 1, 100, 88)
+            .unwrap();
+        ensure_tendermint_phase_budget(BuiltIbcTxKind::TendermintUpdateChain, false, 2, 188, 1)
+            .unwrap();
+
+        let oversized =
+            ensure_tendermint_phase_budget(BuiltIbcTxKind::TendermintUpdateChain, true, 0, 0, 101)
+                .unwrap_err();
+        assert!(oversized
+            .to_string()
+            .contains("phase exceeds the strict limit of 100"));
+
+        let looping = ensure_tendermint_phase_budget(
+            BuiltIbcTxKind::TendermintUpdateChain,
+            true,
+            MAX_TENDERMINT_UPDATE_REBUILD_PHASES,
+            3,
+            1,
+        )
+        .unwrap_err();
+        assert!(looping
+            .to_string()
+            .contains("strict limit of 3 confirmed rebuild phases"));
+
+        let total = ensure_tendermint_phase_budget(
+            BuiltIbcTxKind::TendermintUpdateChain,
+            false,
+            2,
+            250,
+            51,
+        )
+        .unwrap_err();
+        assert!(total
+            .to_string()
+            .contains("strict total limit of 300 transactions"));
+    }
+
+    #[test]
+    fn staged_tendermint_phase_accepts_the_v1_tree_neutral_grammar() {
+        for actions in [
+            vec![
+                staged_action(TendermintSessionAction::Cancel, 1),
+                staged_action(TendermintSessionAction::Cancel, 2),
+                staged_action(TendermintSessionAction::Initialize, 3),
+                staged_action(TendermintSessionAction::Advance, 3),
+                staged_action(TendermintSessionAction::Advance, 3),
+            ],
+            vec![
+                staged_action(TendermintSessionAction::Cancel, 1),
+                staged_action(TendermintSessionAction::Advance, 2),
+            ],
+            vec![staged_action(TendermintSessionAction::Initialize, 1)],
+            vec![staged_action(TendermintSessionAction::Advance, 1)],
+            vec![staged_action(TendermintSessionAction::Cancel, 1)],
+        ] {
+            ensure_tendermint_phase_actions(BuiltIbcTxKind::TendermintUpdateChain, true, &actions)
+                .unwrap();
+        }
+
+        ensure_tendermint_phase_actions(
+            BuiltIbcTxKind::TendermintUpdateChain,
+            false,
+            &[staged_action(TendermintSessionAction::Finalize, 1)],
+        )
+        .unwrap();
+        ensure_tendermint_phase_actions(BuiltIbcTxKind::Singleton, false, &[]).unwrap();
+    }
+
+    #[test]
+    fn staged_tendermint_phase_rejects_gateway_action_mismatches() {
+        for actions in [
+            vec![staged_action(TendermintSessionAction::Finalize, 1)],
+            vec![
+                staged_action(TendermintSessionAction::Advance, 1),
+                staged_action(TendermintSessionAction::Cancel, 1),
+            ],
+            vec![
+                staged_action(TendermintSessionAction::Initialize, 1),
+                staged_action(TendermintSessionAction::Initialize, 1),
+            ],
+            vec![
+                staged_action(TendermintSessionAction::Advance, 1),
+                staged_action(TendermintSessionAction::Initialize, 1),
+            ],
+        ] {
+            assert!(ensure_tendermint_phase_actions(
+                BuiltIbcTxKind::TendermintUpdateChain,
+                true,
+                &actions,
+            )
+            .is_err());
+        }
+
+        assert!(ensure_tendermint_phase_actions(
+            BuiltIbcTxKind::TendermintUpdateChain,
+            false,
+            &[
+                staged_action(TendermintSessionAction::Advance, 1),
+                staged_action(TendermintSessionAction::Finalize, 1),
+            ],
+        )
+        .is_err());
+        assert!(ensure_tendermint_phase_actions(
+            BuiltIbcTxKind::LegacyTendermintUpdateStep,
+            false,
+            &[staged_action(TendermintSessionAction::Finalize, 1)],
+        )
+        .is_err());
+        assert!(ensure_tendermint_phase_actions(
+            BuiltIbcTxKind::Singleton,
+            false,
+            &[staged_action(TendermintSessionAction::Advance, 1)],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn staged_tendermint_phase_rejects_verification_across_session_nfts() {
+        for actions in [
+            vec![
+                staged_action(TendermintSessionAction::Initialize, 1),
+                staged_action(TendermintSessionAction::Advance, 2),
+            ],
+            vec![
+                staged_action(TendermintSessionAction::Advance, 1),
+                staged_action(TendermintSessionAction::Advance, 2),
+            ],
+        ] {
+            let error = ensure_tendermint_phase_actions(
+                BuiltIbcTxKind::TendermintUpdateChain,
+                true,
+                &actions,
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("verification links use different session NFTs"));
+        }
+    }
+
+    #[test]
+    fn completed_tendermint_chain_requires_an_update_client_event() {
+        let empty = TxSubmitResponse {
+            tx_hash: "final-without-event".to_string(),
+            height: Some(height(43)),
+            events: vec![],
+        };
+        let error = ensure_completed_tendermint_chain_has_update_event(true, &empty).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("returned no update_client event"));
+
+        let update = TxSubmitResponse {
+            tx_hash: "final-with-event".to_string(),
+            height: Some(height(44)),
+            events: vec![IbcEvent {
+                event_type: "update_client".to_string(),
+                attributes: vec![],
+            }],
+        };
+        ensure_completed_tendermint_chain_has_update_event(true, &update).unwrap();
+    }
+
+    #[test]
+    fn rebuild_boundary_chain_and_singleton_do_not_require_an_update_client_event() {
+        let empty = TxSubmitResponse {
+            tx_hash: "tree-neutral-final".to_string(),
+            height: Some(height(45)),
+            events: vec![],
+        };
+
+        ensure_completed_tendermint_chain_has_update_event(false, &empty).unwrap();
     }
 
     fn host_state_tx_body_cbor(root: [u8; 32]) -> Vec<u8> {

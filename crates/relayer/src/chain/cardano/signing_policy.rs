@@ -11,7 +11,7 @@ use std::path::Path;
 use bech32::FromBase32;
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
-use pallas_codec::utils::Nullable;
+use pallas_codec::{minicbor, utils::Nullable};
 use pallas_primitives::alonzo::{BigInt, PlutusData, Value as LegacyValue};
 use pallas_primitives::conway::{
     MintedTransactionOutput, MintedTx, NetworkId, PseudoTransactionOutput, Value,
@@ -36,6 +36,7 @@ use super::generated::ibc::core::{
     },
 };
 use super::utxo_resolver::{ResolvedInput, ResolvedTransactionInputs, TransactionOutRef};
+use ibc_relayer_types::clients::ics07_tendermint::header::TENDERMINT_HEADER_TYPE_URL;
 
 const LOVELACE: &str = "lovelace";
 const LOVELACE_HEX: &str = "6c6f76656c616365";
@@ -45,6 +46,8 @@ const MAX_INPUTS: usize = 128;
 const MAX_OUTPUTS: usize = 128;
 const MAX_REFERENCE_INPUTS: usize = 128;
 const MAX_COLLATERAL_INPUTS: usize = 3;
+const MAX_TENDERMINT_SESSION_BATCH_SIZE: usize = 6;
+const TENDERMINT_SESSION_TOKEN_NAME_BYTES: usize = 32;
 
 /// Limits that bound the wallet value a transaction may put at risk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +106,7 @@ pub struct TransactionSigningPolicy {
     trace_registry_policy: Vec<u8>,
     voucher_metadata_address: Vec<u8>,
     voucher_policy: Vec<u8>,
+    tendermint_session: Option<StateOutputRoot>,
 }
 
 /// Authorization derived exclusively from the request Hermes intended to send.
@@ -116,6 +120,7 @@ pub struct SigningIntent {
     packet: Option<PacketIntent>,
     acknowledgement: Option<Vec<u8>>,
     prune_sequence: Option<u64>,
+    staged_tendermint: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -205,6 +210,7 @@ struct OutputValue {
     coin: u64,
     assets: Vec<(Vec<u8>, Vec<u8>, u64)>,
     has_script_ref: bool,
+    has_inline_datum: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,6 +226,22 @@ struct OperationRequirements<'a> {
     required_mint_scripts: Vec<&'static str>,
     state_output: StateOutputKind,
     module: Option<&'a ModuleRoot>,
+    requires_host_state: bool,
+    tendermint_session: Option<ValidatedTendermintSessionAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TendermintSessionAction {
+    Initialize,
+    Advance,
+    Cancel,
+    Finalize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ValidatedTendermintSessionAction {
+    pub(crate) action: TendermintSessionAction,
+    pub(crate) token_name: Vec<u8>,
 }
 
 enum ChannelRedeemerIntent<'a> {
@@ -392,6 +414,37 @@ impl TransactionSigningPolicy {
             &["voucher_metadata", "voucherMetadata"],
             network_id,
         )?;
+        let session_spend = object_field(
+            validators,
+            &[
+                "spend_tendermint_update_session",
+                "spendTendermintUpdateSession",
+            ],
+        );
+        let session_mint = object_field(
+            validators,
+            &[
+                "mint_tendermint_update_session",
+                "mintTendermintUpdateSession",
+            ],
+        );
+        let tendermint_session = match (session_spend, session_mint) {
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(
+                    "manifest must configure both staged Tendermint session validators".to_string(),
+                )
+            }
+            (Some(spend), Some(_)) => Some(StateOutputRoot {
+                address: decode_address(
+                    required_string(spend, &["address"], "staged Tendermint session address")?,
+                    network_id,
+                )?,
+                policy: required_script(&scripts, "minttendermintupdatesession")?
+                    .hash
+                    .clone(),
+            }),
+        };
 
         let mut protocol_addresses = HashSet::from([
             host_state_address.clone(),
@@ -402,6 +455,14 @@ impl TransactionSigningPolicy {
             voucher_metadata_address.clone(),
         ]);
         protocol_addresses.extend(modules.values().map(|module| module.address.clone()));
+        if let Some(session) = &tendermint_session {
+            if protocol_addresses.contains(&session.address) {
+                return Err(
+                    "staged Tendermint session address overlaps another protocol role".to_string(),
+                );
+            }
+            protocol_addresses.insert(session.address.clone());
+        }
 
         Ok(Self {
             network_id,
@@ -422,6 +483,7 @@ impl TransactionSigningPolicy {
             trace_registry_policy,
             voucher_metadata_address,
             voucher_policy,
+            tendermint_session,
         })
     }
 
@@ -555,6 +617,107 @@ impl TransactionSigningPolicy {
             required_mint_scripts,
             state_output,
             module,
+            requires_host_state: true,
+            tendermint_session: None,
+        })
+    }
+
+    fn staged_tendermint_requirements<'a>(
+        &'a self,
+        body: &pallas_primitives::conway::MintedTransactionBody<'_>,
+        intent: &SigningIntent,
+        resolved_inputs: &ResolvedTransactionInputs,
+    ) -> Result<OperationRequirements<'a>, String> {
+        if intent.operation != "/ibc.core.client.v1.MsgUpdateClient" {
+            return Err("staged Tendermint intent is not an MsgUpdateClient".to_string());
+        }
+        let session = self.tendermint_session.as_ref().ok_or_else(|| {
+            "pinned manifest has no staged Tendermint session validators".to_string()
+        })?;
+        let requirement = classify_tendermint_session_transaction(
+            body,
+            resolved_inputs,
+            session,
+            &self.host_state_address,
+            &self.client_state.address,
+        )?;
+        let (required_scripts, required_mint_scripts, state_output, requires_host_state) =
+            match requirement.action {
+                TendermintSessionAction::Initialize => (
+                    vec!["minttendermintupdatesession"],
+                    vec!["minttendermintupdatesession"],
+                    StateOutputKind::None,
+                    false,
+                ),
+                TendermintSessionAction::Advance => (
+                    vec!["spendtendermintupdatesession"],
+                    vec![],
+                    StateOutputKind::None,
+                    false,
+                ),
+                TendermintSessionAction::Cancel => (
+                    vec![
+                        "spendtendermintupdatesession",
+                        "minttendermintupdatesession",
+                    ],
+                    vec!["minttendermintupdatesession"],
+                    StateOutputKind::None,
+                    false,
+                ),
+                TendermintSessionAction::Finalize => (
+                    vec![
+                        "spendclient",
+                        "spendtendermintupdatesession",
+                        "minttendermintupdatesession",
+                    ],
+                    vec!["minttendermintupdatesession"],
+                    StateOutputKind::Client,
+                    true,
+                ),
+            };
+        Ok(OperationRequirements {
+            required_scripts,
+            required_mint_scripts,
+            state_output,
+            module: None,
+            requires_host_state,
+            tendermint_session: Some(requirement),
+        })
+    }
+
+    /// Classify the staged action from the same exact transaction body and
+    /// trusted inputs used by the signing policy. Callers use this result to
+    /// enforce the transaction-chain protocol around individually valid links.
+    pub(crate) fn staged_tendermint_action(
+        &self,
+        transaction_cbor: &[u8],
+        resolved_inputs: &ResolvedTransactionInputs,
+    ) -> Result<ValidatedTendermintSessionAction, Error> {
+        let mut decoder = minicbor::Decoder::new(transaction_cbor);
+        let tx: MintedTx<'_> = decoder.decode().map_err(|error| {
+            Error::CborDecode(format!(
+                "failed to decode staged Tendermint transaction: {error:?}"
+            ))
+        })?;
+        if decoder.position() != transaction_cbor.len() {
+            return Err(Error::CborDecode(
+                "failed to decode staged Tendermint transaction: trailing CBOR data".to_string(),
+            ));
+        }
+        let session = self.tendermint_session.as_ref().ok_or_else(|| {
+            Error::Signer("pinned manifest has no staged Tendermint session validators".to_string())
+        })?;
+        classify_tendermint_session_transaction(
+            &tx.transaction_body,
+            resolved_inputs,
+            session,
+            &self.host_state_address,
+            &self.client_state.address,
+        )
+        .map_err(|reason| {
+            Error::Signer(format!(
+                "refusing to classify staged Tendermint transaction: {reason}"
+            ))
         })
     }
 
@@ -573,7 +736,12 @@ impl TransactionSigningPolicy {
                 intent.operation
             ))
         };
-        let requirements = self.operation_requirements(intent).map_err(reject)?;
+        let requirements = if intent.staged_tendermint {
+            self.staged_tendermint_requirements(&tx.transaction_body, intent, resolved_inputs)
+                .map_err(reject)?
+        } else {
+            self.operation_requirements(intent).map_err(reject)?
+        };
         if intent.unresolved_ibc_denom_hash().is_some() {
             return Err(reject(
                 "hashed ICS-20 denomination was not resolved and verified".to_string(),
@@ -672,7 +840,7 @@ impl TransactionSigningPolicy {
                 "transaction contains duplicate reference inputs".to_string(),
             ));
         }
-        if !reference_set.contains(&self.host_state_reference) {
+        if requirements.requires_host_state && !reference_set.contains(&self.host_state_reference) {
             return Err(reject(
                 "pinned HostState reference script is missing".to_string(),
             ));
@@ -745,7 +913,9 @@ impl TransactionSigningPolicy {
         self.validate_message_binding(
             body,
             witnesses.redeemer.as_deref(),
+            &signer_address,
             intent,
+            &requirements,
             resolved_inputs,
             &reject,
         )?;
@@ -813,10 +983,15 @@ impl TransactionSigningPolicy {
             .state_sequence
             .zip(expected_state)
             .map(|(sequence, _)| self.state_token_name(requirements.state_output, sequence));
+        let expected_session = requirements
+            .tendermint_session
+            .as_ref()
+            .zip(self.tendermint_session.as_ref());
 
         let mut signer_input_count = 0usize;
         let mut host_state_nft_quantity = 0u64;
         let mut expected_state_quantity = 0u64;
+        let mut expected_session_quantity = 0u64;
         for input in resolved_inputs.regular.values() {
             validate_address_network(&input.address, self.network_id).map_err(reject)?;
             if input.address == signer_address {
@@ -824,8 +999,10 @@ impl TransactionSigningPolicy {
                 continue;
             }
 
-            let allowed_protocol_input = input.address == self.host_state_address
+            let allowed_protocol_input = (requirements.requires_host_state
+                && input.address == self.host_state_address)
                 || expected_state.is_some_and(|state| input.address == state.address)
+                || expected_session.is_some_and(|(_, session)| input.address == session.address)
                 || requirements
                     .module
                     .is_some_and(|module| input.address == module.address)
@@ -885,6 +1062,21 @@ impl TransactionSigningPolicy {
                             })?;
                     }
                 }
+                if let Some((requirement, session)) = expected_session {
+                    if input.address == session.address
+                        && asset.policy_id.as_slice() == session.policy
+                        && asset.asset_name == requirement.token_name
+                    {
+                        expected_session_quantity = expected_session_quantity
+                            .checked_add(asset.quantity)
+                            .ok_or_else(|| {
+                                reject(
+                                    "staged Tendermint session NFT input quantity overflows u64"
+                                        .to_string(),
+                                )
+                            })?;
+                    }
+                }
             }
 
             if input.address == self.host_state_address
@@ -910,6 +1102,19 @@ impl TransactionSigningPolicy {
                     ));
                 }
             }
+            if let Some((requirement, session)) = expected_session {
+                if input.address == session.address
+                    && (input.assets.len() != 1
+                        || input.assets[0].policy_id.as_slice() != session.policy
+                        || input.assets[0].asset_name != requirement.token_name
+                        || input.assets[0].quantity != 1)
+                {
+                    return Err(reject(
+                        "staged Tendermint session input does not contain exactly its pinned NFT"
+                            .to_string(),
+                    ));
+                }
+            }
         }
 
         if signer_input_count == 0 {
@@ -917,14 +1122,26 @@ impl TransactionSigningPolicy {
                 "transaction does not consume an input owned by the configured signer".to_string(),
             ));
         }
-        if host_state_nft_quantity != 1 {
+        let expected_host_state_quantity = u64::from(requirements.requires_host_state);
+        if host_state_nft_quantity != expected_host_state_quantity {
             return Err(reject(format!(
-                "expected exactly one HostState NFT in regular inputs, found {host_state_nft_quantity}"
+                "expected {expected_host_state_quantity} HostState NFTs in regular inputs, found {host_state_nft_quantity}"
             )));
         }
         if expected_state_name.is_some() && expected_state_quantity != 1 {
             return Err(reject(format!(
                 "expected exactly one message-selected protocol state token in regular inputs, found {expected_state_quantity}"
+            )));
+        }
+        let expected_session_input_quantity = u64::from(
+            requirements
+                .tendermint_session
+                .as_ref()
+                .is_some_and(|session| session.action != TendermintSessionAction::Initialize),
+        );
+        if expected_session_quantity != expected_session_input_quantity {
+            return Err(reject(format!(
+                "expected {expected_session_input_quantity} staged Tendermint session NFTs in regular inputs, found {expected_session_quantity}"
             )));
         }
 
@@ -1044,6 +1261,24 @@ impl TransactionSigningPolicy {
     {
         let mut voucher_assets = Vec::new();
         let mut actual_policies = HashSet::new();
+        let expected_session_mint =
+            requirements
+                .tendermint_session
+                .as_ref()
+                .and_then(|requirement| {
+                    let quantity = match requirement.action {
+                        TendermintSessionAction::Initialize => 1,
+                        TendermintSessionAction::Cancel | TendermintSessionAction::Finalize => -1,
+                        TendermintSessionAction::Advance => return None,
+                    };
+                    self.tendermint_session.as_ref().map(|session| {
+                        (
+                            session.policy.as_slice(),
+                            requirement.token_name.as_slice(),
+                            quantity,
+                        )
+                    })
+                });
 
         if let Some(mint) = body.mint.as_ref() {
             for (policy, assets) in mint.iter() {
@@ -1067,6 +1302,15 @@ impl TransactionSigningPolicy {
                     }
                     if policy.as_ref() == self.voucher_policy.as_slice() {
                         voucher_assets.push((name.as_slice().to_vec(), quantity));
+                    } else if expected_session_mint.is_some_and(
+                        |(expected_policy, expected_name, expected_quantity)| {
+                            policy.as_ref() == expected_policy
+                                && name.as_slice() == expected_name
+                                && quantity == expected_quantity
+                        },
+                    ) {
+                        // Exact session NFT creation/burn is authorized by the
+                        // staged transaction classification above.
                     } else if quantity != 1 {
                         return Err(reject(format!(
                             "bridge authorization token under policy {policy} must mint exactly one unit"
@@ -1286,11 +1530,184 @@ impl TransactionSigningPolicy {
         .concat()
     }
 
+    fn validate_tendermint_session_redeemers<F>(
+        &self,
+        body: &pallas_primitives::conway::MintedTransactionBody<'_>,
+        redeemers: &pallas_primitives::conway::Redeemers,
+        signer_address: &[u8],
+        intent: &SigningIntent,
+        requirement: &ValidatedTendermintSessionAction,
+        resolved_inputs: &ResolvedTransactionInputs,
+        reject: &F,
+    ) -> Result<(), Error>
+    where
+        F: Fn(String) -> Error,
+    {
+        let session = self
+            .tendermint_session
+            .as_ref()
+            .expect("session requirement needs a configured session root");
+        let expected_client_name = intent
+            .state_sequence
+            .map(|sequence| self.state_token_name(StateOutputKind::Client, sequence))
+            .ok_or_else(|| reject("staged update has no selected client identifier".to_string()))?;
+
+        match requirement.action {
+            TendermintSessionAction::Initialize => {
+                let mint_redeemer =
+                    mint_redeemer_for_policy(body, redeemers, &session.policy).map_err(reject)?;
+                let fields = constructor_fields(mint_redeemer, 0).ok_or_else(|| {
+                    reject("session initialization does not use MintSession".to_string())
+                })?;
+                if fields.len() != 3 {
+                    return Err(reject(
+                        "MintSession redeemer must contain seed, owner, and update plan"
+                            .to_string(),
+                    ));
+                }
+                let seed = plutus_output_reference(&fields[0]).ok_or_else(|| {
+                    reject("MintSession redeemer contains an invalid seed reference".to_string())
+                })?;
+                let seed_input = resolved_inputs.regular.get(&seed).ok_or_else(|| {
+                    reject("MintSession seed is not a regular transaction input".to_string())
+                })?;
+                if seed_input.address != signer_address {
+                    return Err(reject(
+                        "MintSession seed is not owned by the configured relayer".to_string(),
+                    ));
+                }
+                if plutus_bytes(&fields[1]) != signer_address.get(1..) {
+                    return Err(reject(
+                        "MintSession owner is not the configured relayer key".to_string(),
+                    ));
+                }
+                let plan_fields = constructor_fields(&fields[2], 0).ok_or_else(|| {
+                    reject("MintSession update plan has an invalid encoding".to_string())
+                })?;
+                let client_token = plan_fields.first().and_then(plutus_auth_token);
+                if client_token
+                    != Some((
+                        self.client_state.policy.as_slice(),
+                        expected_client_name.as_slice(),
+                    ))
+                {
+                    return Err(reject(
+                        "MintSession update plan targets a different client".to_string(),
+                    ));
+                }
+            }
+            TendermintSessionAction::Advance => {
+                let session_redeemer =
+                    self.session_spend_redeemer(body, redeemers, resolved_inputs, session, reject)?;
+                let batch = constructor_fields(session_redeemer, 0)
+                    .or_else(|| constructor_fields(session_redeemer, 1))
+                    .and_then(|fields| fields.first())
+                    .and_then(|field| match field {
+                        PlutusData::Array(items) => Some(items.len()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        reject(
+                            "session advance must use VerifyTrusted or VerifyTarget with one batch"
+                                .to_string(),
+                        )
+                    })?;
+                if !(1..=MAX_TENDERMINT_SESSION_BATCH_SIZE).contains(&batch) {
+                    return Err(reject(format!(
+                        "staged Tendermint verifier batch must contain between 1 and {MAX_TENDERMINT_SESSION_BATCH_SIZE} entries"
+                    )));
+                }
+            }
+            TendermintSessionAction::Cancel | TendermintSessionAction::Finalize => {
+                let session_redeemer =
+                    self.session_spend_redeemer(body, redeemers, resolved_inputs, session, reject)?;
+                let expected_alternative = if requirement.action == TendermintSessionAction::Cancel
+                {
+                    3
+                } else {
+                    2
+                };
+                if constructor_fields(session_redeemer, expected_alternative)
+                    .is_none_or(|fields| !fields.is_empty())
+                {
+                    return Err(reject(format!(
+                        "session {:?} transaction has the wrong session spend redeemer",
+                        requirement.action
+                    )));
+                }
+                let mint_redeemer =
+                    mint_redeemer_for_policy(body, redeemers, &session.policy).map_err(reject)?;
+                let burned_name = constructor_fields(mint_redeemer, 1)
+                    .filter(|fields| fields.len() == 1)
+                    .and_then(|fields| plutus_bytes(&fields[0]));
+                if burned_name != Some(requirement.token_name.as_slice()) {
+                    return Err(reject(
+                        "BurnSession redeemer does not select the consumed session NFT".to_string(),
+                    ));
+                }
+
+                if requirement.action == TendermintSessionAction::Finalize {
+                    let client_input = selected_state_input(
+                        resolved_inputs,
+                        &self.client_state,
+                        &expected_client_name,
+                    )
+                    .ok_or_else(|| {
+                        reject("staged finalization omits the selected client input".to_string())
+                    })?;
+                    let client_redeemer =
+                        spend_redeemer_for_input(body, redeemers, client_input).map_err(reject)?;
+                    let selected_session = constructor_fields(client_redeemer, 0)
+                        .filter(|fields| fields.len() == 1)
+                        .and_then(|fields| plutus_auth_token(&fields[0]));
+                    if selected_session
+                        != Some((session.policy.as_slice(), requirement.token_name.as_slice()))
+                    {
+                        return Err(reject(
+                            "staged client finalization redeemer selects a different session NFT"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn session_spend_redeemer<'a, F>(
+        &self,
+        body: &pallas_primitives::conway::MintedTransactionBody<'_>,
+        redeemers: &'a pallas_primitives::conway::Redeemers,
+        resolved_inputs: &ResolvedTransactionInputs,
+        session: &StateOutputRoot,
+        reject: &F,
+    ) -> Result<&'a PlutusData, Error>
+    where
+        F: Fn(String) -> Error,
+    {
+        let mut inputs = resolved_inputs
+            .regular
+            .iter()
+            .filter(|(_, input)| input.address == session.address)
+            .map(|(out_ref, _)| out_ref);
+        let input = inputs
+            .next()
+            .ok_or_else(|| reject("staged Tendermint session input is missing".to_string()))?;
+        if inputs.next().is_some() {
+            return Err(reject(
+                "transaction consumes multiple staged Tendermint sessions".to_string(),
+            ));
+        }
+        spend_redeemer_for_input(body, redeemers, input).map_err(reject)
+    }
+
     fn validate_message_binding<F>(
         &self,
         body: &pallas_primitives::conway::MintedTransactionBody<'_>,
         redeemers: Option<&pallas_primitives::conway::Redeemers>,
+        signer_address: &[u8],
         intent: &SigningIntent,
+        requirements: &OperationRequirements<'_>,
         resolved_inputs: &ResolvedTransactionInputs,
         reject: &F,
     ) -> Result<(), Error>
@@ -1303,6 +1720,21 @@ impl TransactionSigningPolicy {
                     .to_string(),
             )
         })?;
+
+        if let Some(session) = requirements.tendermint_session.as_ref() {
+            self.validate_tendermint_session_redeemers(
+                body,
+                redeemers,
+                signer_address,
+                intent,
+                session,
+                resolved_inputs,
+                reject,
+            )?;
+            if session.action != TendermintSessionAction::Finalize {
+                return Ok(());
+            }
+        }
 
         let host_alternative = match intent.operation.as_str() {
             "HostStateHeartbeat" => 10,
@@ -1578,6 +2010,7 @@ impl TransactionSigningPolicy {
         let mut module_escrow_output_count = 0usize;
         let mut trace_registry_output_count = 0usize;
         let mut voucher_metadata_output_count = 0usize;
+        let mut tendermint_session_output_count = 0usize;
         let mut protocol_lovelace = 0u64;
 
         let expected_state = match requirements.state_output {
@@ -1590,6 +2023,10 @@ impl TransactionSigningPolicy {
             .state_sequence
             .zip(expected_state)
             .map(|(sequence, _)| self.state_token_name(requirements.state_output, sequence));
+        let expected_session = requirements
+            .tendermint_session
+            .as_ref()
+            .zip(self.tendermint_session.as_ref());
         let expected_asset = intent.transfer.as_ref().map(expected_asset);
         let reference_voucher_name = match expected_asset.as_ref() {
             Some(ExpectedAsset::Voucher {
@@ -1653,6 +2090,12 @@ impl TransactionSigningPolicy {
             }
 
             if output.address == self.host_state_address {
+                if !requirements.requires_host_state {
+                    return Err(reject(
+                        "tree-neutral staged Tendermint transaction creates a HostState output"
+                            .to_string(),
+                    ));
+                }
                 if !is_exact_state_output(
                     output,
                     &self.host_state_nft_policy,
@@ -1660,6 +2103,42 @@ impl TransactionSigningPolicy {
                 ) {
                     return Err(reject(
                         "HostState output contains unauthorized assets or lacks its NFT"
+                            .to_string(),
+                    ));
+                }
+                protocol_lovelace = checked_protocol_coin(protocol_lovelace, output.coin, reject)?;
+                continue;
+            }
+
+            if self
+                .tendermint_session
+                .as_ref()
+                .is_some_and(|session| output.address == session.address)
+            {
+                let (requirement, session) = expected_session.ok_or_else(|| {
+                    reject(
+                        "transaction creates a staged Tendermint session output without a staged intent"
+                            .to_string(),
+                    )
+                })?;
+                if !matches!(
+                    requirement.action,
+                    TendermintSessionAction::Initialize | TendermintSessionAction::Advance
+                ) || !is_exact_state_output(
+                    output,
+                    &session.policy,
+                    Some(&requirement.token_name),
+                ) || !output.has_inline_datum
+                {
+                    return Err(reject(
+                        "staged Tendermint session output must preserve exactly one session NFT and an inline datum"
+                            .to_string(),
+                    ));
+                }
+                tendermint_session_output_count += 1;
+                if tendermint_session_output_count > 1 {
+                    return Err(reject(
+                        "transaction creates multiple staged Tendermint session outputs"
                             .to_string(),
                     ));
                 }
@@ -1825,9 +2304,10 @@ impl TransactionSigningPolicy {
             }
         }
 
-        if host_state_nft_quantity != 1 {
+        let expected_host_state_quantity = u64::from(requirements.requires_host_state);
+        if host_state_nft_quantity != expected_host_state_quantity {
             return Err(reject(format!(
-                "expected exactly one HostState NFT in outputs, found {host_state_nft_quantity}"
+                "expected {expected_host_state_quantity} HostState NFTs in outputs, found {host_state_nft_quantity}"
             )));
         }
         if expected_state.is_some() && state_output_count != 1 {
@@ -1835,6 +2315,22 @@ impl TransactionSigningPolicy {
                 "transaction omits the protocol state output required by this IBC operation"
                     .to_string(),
             ));
+        }
+        let expected_session_outputs = usize::from(
+            requirements
+                .tendermint_session
+                .as_ref()
+                .is_some_and(|session| {
+                    matches!(
+                        session.action,
+                        TendermintSessionAction::Initialize | TendermintSessionAction::Advance
+                    )
+                }),
+        );
+        if tendermint_session_output_count != expected_session_outputs {
+            return Err(reject(format!(
+                "expected {expected_session_outputs} staged Tendermint session outputs, found {tendermint_session_output_count}"
+            )));
         }
         if requirements.module.is_some() && module_output_count == 0 {
             return Err(reject(
@@ -2039,6 +2535,113 @@ impl TransactionSigningPolicy {
     }
 }
 
+fn classify_tendermint_session_transaction(
+    body: &pallas_primitives::conway::MintedTransactionBody<'_>,
+    resolved_inputs: &ResolvedTransactionInputs,
+    session: &StateOutputRoot,
+    host_state_address: &[u8],
+    client_address: &[u8],
+) -> Result<ValidatedTendermintSessionAction, String> {
+    let mut input_names = Vec::new();
+    for input in resolved_inputs.regular.values() {
+        if input.address != session.address {
+            continue;
+        }
+        if input.assets.len() != 1
+            || input.assets[0].policy_id.as_slice() != session.policy
+            || input.assets[0].quantity != 1
+        {
+            return Err(
+                "staged Tendermint session input does not contain exactly one pinned session NFT"
+                    .to_string(),
+            );
+        }
+        input_names.push(input.assets[0].asset_name.clone());
+    }
+
+    let mut output_names = Vec::new();
+    for output in body.outputs.iter().map(unpack_output) {
+        if output.address != session.address {
+            continue;
+        }
+        if output.assets.len() != 1
+            || output.assets[0].0 != session.policy
+            || output.assets[0].2 != 1
+        {
+            return Err(
+                "staged Tendermint session output does not contain exactly one pinned session NFT"
+                    .to_string(),
+            );
+        }
+        output_names.push(output.assets[0].1.clone());
+    }
+
+    let mut mint_entries = Vec::new();
+    if let Some(mint) = body.mint.as_ref() {
+        for (policy, assets) in mint.iter() {
+            if policy.as_ref() != session.policy {
+                continue;
+            }
+            mint_entries.extend(
+                assets
+                    .iter()
+                    .map(|(name, quantity)| (name.as_slice().to_vec(), i64::from(quantity))),
+            );
+        }
+    }
+
+    if input_names.len() > 1 || output_names.len() > 1 || mint_entries.len() > 1 {
+        return Err("staged Tendermint transaction contains multiple session NFTs".to_string());
+    }
+    for name in input_names
+        .iter()
+        .chain(output_names.iter())
+        .chain(mint_entries.iter().map(|(name, _)| name))
+    {
+        if name.len() != TENDERMINT_SESSION_TOKEN_NAME_BYTES {
+            return Err(format!(
+                "staged Tendermint session token name must contain {TENDERMINT_SESSION_TOKEN_NAME_BYTES} bytes"
+            ));
+        }
+    }
+
+    let has_finalization_input = resolved_inputs
+        .regular
+        .values()
+        .any(|input| input.address == host_state_address || input.address == client_address);
+
+    let (action, token_name) = match (
+        input_names.as_slice(),
+        output_names.as_slice(),
+        mint_entries.as_slice(),
+    ) {
+        ([], [output], [(minted, 1)]) if output == minted => {
+            (TendermintSessionAction::Initialize, output.clone())
+        }
+        ([input], [output], []) if input == output => {
+            (TendermintSessionAction::Advance, input.clone())
+        }
+        ([input], [], [(burned, -1)]) if input == burned => {
+            (
+                if has_finalization_input {
+                    TendermintSessionAction::Finalize
+                } else {
+                    TendermintSessionAction::Cancel
+                },
+                input.clone(),
+            )
+        }
+        _ => {
+            return Err(
+                "transaction is not an exact staged Tendermint init, advance, cancel, or finalize shape"
+                    .to_string(),
+            )
+        }
+    };
+
+    Ok(ValidatedTendermintSessionAction { action, token_name })
+}
+
 fn constructor_fields(data: &PlutusData, alternative: u64) -> Option<&[PlutusData]> {
     let PlutusData::Constr(constructor) = data else {
         return None;
@@ -2169,6 +2772,10 @@ fn is_cardano_token_unit(denom: &str) -> bool {
 }
 
 impl SigningIntent {
+    pub(crate) fn is_staged_tendermint(&self) -> bool {
+        self.staged_tendermint
+    }
+
     pub fn heartbeat(signer: &str, expected_signer: &str, network_id: u8) -> Result<Self, Error> {
         validate_request_signer(signer, expected_signer, network_id, "HostStateHeartbeat")?;
         Ok(Self {
@@ -2180,7 +2787,39 @@ impl SigningIntent {
             packet: None,
             acknowledgement: None,
             prune_sequence: None,
+            staged_tendermint: false,
         })
+    }
+
+    /// Build the signing intent shared by every transaction in one staged
+    /// Tendermint update. The nested client message is checked here so this
+    /// policy cannot accidentally authorize staged transactions for another
+    /// light-client implementation.
+    pub fn staged_tendermint_update(
+        type_url: &str,
+        message: &[u8],
+        expected_signer: &str,
+        network_id: u8,
+    ) -> Result<Self, Error> {
+        if type_url != "/ibc.core.client.v1.MsgUpdateClient" {
+            return Err(Error::Signer(
+                "staged Tendermint signing requires MsgUpdateClient".to_string(),
+            ));
+        }
+        let update = MsgUpdateClient::decode(message).map_err(decode_error)?;
+        let header = update.client_message.as_ref().ok_or_else(|| {
+            Error::Signer("staged Tendermint update has no client message".to_string())
+        })?;
+        if header.type_url != TENDERMINT_HEADER_TYPE_URL {
+            return Err(Error::Signer(format!(
+                "staged Tendermint update has unsupported client message type {}",
+                header.type_url
+            )));
+        }
+
+        let mut intent = Self::ibc(type_url, message, expected_signer, network_id)?;
+        intent.staged_tendermint = true;
+        Ok(intent)
     }
 
     pub fn ibc(
@@ -2452,6 +3091,7 @@ impl SigningIntent {
             packet: packet_intent,
             acknowledgement,
             prune_sequence,
+            staged_tendermint: false,
         })
     }
 
@@ -2747,6 +3387,84 @@ fn spend_redeemer_for_input<'a>(
     Ok(data)
 }
 
+fn mint_redeemer_for_policy<'a>(
+    body: &pallas_primitives::conway::MintedTransactionBody<'_>,
+    redeemers: &'a pallas_primitives::conway::Redeemers,
+    policy: &[u8],
+) -> Result<&'a PlutusData, String> {
+    let mut policies: Vec<Vec<u8>> = body
+        .mint
+        .as_ref()
+        .into_iter()
+        .flat_map(|mint| mint.iter().map(|(policy, _)| policy.as_ref().to_vec()))
+        .collect();
+    policies.sort_unstable();
+    let index = policies
+        .iter()
+        .position(|candidate| candidate.as_slice() == policy)
+        .ok_or_else(|| "session minting policy is absent from the transaction body".to_string())?;
+    let index = u32::try_from(index)
+        .map_err(|_| "minting policy index exceeds the Cardano redeemer range".to_string())?;
+
+    let mut matching = redeemers.iter().filter(|(key, _)| {
+        key.tag == pallas_primitives::conway::RedeemerTag::Mint && key.index == index
+    });
+    let data = matching
+        .next()
+        .map(|(_, value)| &value.data)
+        .ok_or_else(|| format!("transaction has no Mint[{index}] redeemer for session policy"))?;
+    if matching.next().is_some() {
+        return Err(format!(
+            "transaction has duplicate Mint[{index}] redeemers for session policy"
+        ));
+    }
+    Ok(data)
+}
+
+fn plutus_output_reference(data: &PlutusData) -> Option<TransactionOutRef> {
+    let fields = constructor_fields(data, 0)?;
+    if fields.len() != 2 {
+        return None;
+    }
+    let transaction_id_fields = constructor_fields(&fields[0], 0)?;
+    if transaction_id_fields.len() != 1 {
+        return None;
+    }
+    let transaction_id: [u8; 32] = plutus_bytes(&transaction_id_fields[0])?.try_into().ok()?;
+    Some(TransactionOutRef {
+        transaction_id,
+        output_index: plutus_u64(&fields[1])?,
+    })
+}
+
+fn plutus_auth_token(data: &PlutusData) -> Option<(&[u8], &[u8])> {
+    let fields = constructor_fields(data, 0)?;
+    if fields.len() != 2 {
+        return None;
+    }
+    Some((plutus_bytes(&fields[0])?, plutus_bytes(&fields[1])?))
+}
+
+fn selected_state_input<'a>(
+    resolved_inputs: &'a ResolvedTransactionInputs,
+    state: &StateOutputRoot,
+    token_name: &[u8],
+) -> Option<&'a TransactionOutRef> {
+    let mut matches = resolved_inputs
+        .regular
+        .iter()
+        .filter_map(|(out_ref, input)| {
+            (input.address == state.address
+                && input.assets.len() == 1
+                && input.assets[0].policy_id.as_slice() == state.policy
+                && input.assets[0].asset_name == token_name
+                && input.assets[0].quantity == 1)
+                .then_some(out_ref)
+        });
+    let selected = matches.next()?;
+    matches.next().is_none().then_some(selected)
+}
+
 fn add_resolved_assets<F>(
     totals: &mut AssetTotals,
     input: &ResolvedInput,
@@ -2793,12 +3511,17 @@ fn unpack_output(output: &MintedTransactionOutput<'_>) -> OutputValue {
             coin: legacy_coin(&output.amount),
             assets: legacy_assets(&output.amount),
             has_script_ref: false,
+            has_inline_datum: false,
         },
         PseudoTransactionOutput::PostAlonzo(output) => OutputValue {
             address: output.address.as_slice().to_vec(),
             coin: conway_coin(&output.value),
             assets: conway_assets(&output.value),
             has_script_ref: output.script_ref.is_some(),
+            has_inline_datum: matches!(
+                output.datum_option.as_ref(),
+                Some(pallas_primitives::babbage::PseudoDatumOption::Data(_))
+            ),
         },
     }
 }
@@ -3217,6 +3940,77 @@ mod tests {
     }
 
     #[test]
+    fn staged_manifest_requires_paired_session_validators() {
+        let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
+        let validators = value["validators"].as_object_mut().unwrap();
+        validators.insert(
+            "spend_tendermint_update_session".to_string(),
+            serde_json::json!({
+                "address": format!("70{}", "18".repeat(28)),
+                "script_hash": "40".repeat(28),
+                "ref_utxo": { "tx_hash": "50".repeat(32), "output_index": 0 }
+            }),
+        );
+        let error = TransactionSigningPolicy::from_json(
+            &serde_json::to_string(&value).unwrap(),
+            0,
+            limits(),
+        )
+        .unwrap_err();
+        assert!(error.contains("both staged Tendermint session validators"));
+
+        value["validators"]["mint_tendermint_update_session"] = serde_json::json!({
+            "script_hash": "41".repeat(28),
+            "ref_utxo": { "tx_hash": "51".repeat(32), "output_index": 0 }
+        });
+        let policy = TransactionSigningPolicy::from_json(
+            &serde_json::to_string(&value).unwrap(),
+            0,
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(policy.protocol_addresses.len(), 8);
+        assert_eq!(policy.tendermint_session.unwrap().policy, vec![0x41; 28]);
+    }
+
+    #[test]
+    fn staged_intent_is_limited_to_tendermint_update_headers() {
+        let signer = format!("60{}", "99".repeat(28));
+        let update = |type_url: &str| {
+            MsgUpdateClient {
+                client_id: "07-tendermint-12".to_string(),
+                client_message: Some(prost_types::Any {
+                    type_url: type_url.to_string(),
+                    value: Vec::new(),
+                }),
+                signer: signer.clone(),
+            }
+            .encode_to_vec()
+        };
+
+        let intent = SigningIntent::staged_tendermint_update(
+            "/ibc.core.client.v1.MsgUpdateClient",
+            &update(TENDERMINT_HEADER_TYPE_URL),
+            &signer,
+            0,
+        )
+        .unwrap();
+        assert!(intent.staged_tendermint);
+        assert_eq!(intent.state_sequence, Some(12));
+
+        let error = SigningIntent::staged_tendermint_update(
+            "/ibc.core.client.v1.MsgUpdateClient",
+            &update("/ibc.lightclients.solomachine.v3.Header"),
+            &signer,
+            0,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported client message type"));
+    }
+
+    #[test]
     fn message_signer_must_match_local_key() {
         let message = MsgCreateClient {
             client_state: None,
@@ -3350,6 +4144,7 @@ mod tests {
             packet: None,
             acknowledgement: None,
             prune_sequence: None,
+            staged_tendermint: false,
         }
     }
 

@@ -20,18 +20,23 @@ use serde_json::Value as JsonValue;
 
 use super::config::CardanoConfig;
 use super::error::Error;
+use super::utxo_resolver::{OgmiosAdditionalUtxo, TrustedUtxoOverlay};
 
 const OGMIOS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_OGMIOS_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const OGMIOS_API_KEY_HEADER: HeaderName = HeaderName::from_static("dmtr-api-key");
 const OGMIOS_VALIDITY_INTERVAL_ERROR_CODE: i64 = 3118;
+const OGMIOS_UNKNOWN_INPUT_ERROR_CODE: i64 = 3117;
 const OGMIOS_SUBMISSION_MAX_RETRIES: usize = 5;
+const OGMIOS_DEPENDENCY_MAX_RETRIES: usize = 40;
 const CARDANO_SLOT_LENGTH: Duration = Duration::from_secs(1);
 const OGMIOS_SUBMISSION_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy)]
 struct SubmissionRetryPolicy {
-    max_retries: usize,
+    max_validity_retries: usize,
+    max_dependency_retries: usize,
+    allow_dependency_retry: bool,
     slot_length: Duration,
     backoff: Duration,
 }
@@ -39,7 +44,9 @@ struct SubmissionRetryPolicy {
 impl Default for SubmissionRetryPolicy {
     fn default() -> Self {
         Self {
-            max_retries: OGMIOS_SUBMISSION_MAX_RETRIES,
+            max_validity_retries: OGMIOS_SUBMISSION_MAX_RETRIES,
+            max_dependency_retries: OGMIOS_DEPENDENCY_MAX_RETRIES,
+            allow_dependency_retry: false,
             slot_length: CARDANO_SLOT_LENGTH,
             backoff: OGMIOS_SUBMISSION_RETRY_BACKOFF,
         }
@@ -143,6 +150,20 @@ impl OgmiosTransactionEvaluator {
         &self,
         unsigned_tx_cbor: &[u8],
     ) -> Result<Vec<EvaluatedRedeemer>, Error> {
+        self.evaluate_unsigned_transaction_with_overlay(
+            unsigned_tx_cbor,
+            &TrustedUtxoOverlay::default(),
+        )
+        .await
+    }
+
+    /// Evaluate a transaction with outputs derived from already-validated
+    /// parent bodies supplied through Ogmios's `additionalUtxo` parameter.
+    pub async fn evaluate_unsigned_transaction_with_overlay(
+        &self,
+        unsigned_tx_cbor: &[u8],
+        overlay: &TrustedUtxoOverlay,
+    ) -> Result<Vec<EvaluatedRedeemer>, Error> {
         let declared = transaction_redeemer_budgets(unsigned_tx_cbor)?;
         if declared.is_empty() {
             return Err(Error::Transaction(
@@ -157,7 +178,7 @@ impl OgmiosTransactionEvaluator {
                 transaction: SerializedTransaction {
                     cbor: hex::encode(unsigned_tx_cbor),
                 },
-                additional_utxo: Vec::new(),
+                additional_utxo: overlay.additional_utxo_for_transaction(unsigned_tx_cbor)?,
             },
             id: 1,
         };
@@ -322,6 +343,22 @@ impl OgmiosTransactionEvaluator {
         .await
     }
 
+    /// Submit an exact signed transaction, permitting a bounded retry for an
+    /// unknown input only when the caller has already validated and submitted
+    /// the transaction's in-phase parent.
+    pub async fn submit_signed_transaction_with_prior_dependency(
+        &self,
+        signed_tx_cbor: &[u8],
+        has_prior_dependency: bool,
+    ) -> Result<String, Error> {
+        let retry_policy = SubmissionRetryPolicy {
+            allow_dependency_retry: has_prior_dependency,
+            ..SubmissionRetryPolicy::default()
+        };
+        self.submit_signed_transaction_with_retry_policy(signed_tx_cbor, retry_policy)
+            .await
+    }
+
     async fn submit_signed_transaction_with_retry_policy(
         &self,
         signed_tx_cbor: &[u8],
@@ -338,7 +375,9 @@ impl OgmiosTransactionEvaluator {
             id: 2,
         };
 
-        for attempt in 0..=retry_policy.max_retries {
+        let mut validity_retries = 0usize;
+        let mut dependency_retries = 0usize;
+        loop {
             let mut request_builder = self
                 .client
                 .post(self.endpoint.clone())
@@ -400,6 +439,23 @@ impl OgmiosTransactionEvaluator {
                 ));
             }
             if let Some(error) = response.error {
+                if retry_policy.allow_dependency_retry && is_unknown_input_rejection(&error) {
+                    if dependency_retries >= retry_policy.max_dependency_retries {
+                        return Err(Error::Transaction(format!(
+                            "trusted Ogmios still rejected the dependent transaction with an unknown input after {} retries{}",
+                            retry_policy.max_dependency_retries,
+                            format_json_rpc_error(&error)
+                        )));
+                    }
+                    dependency_retries += 1;
+                    tracing::warn!(
+                        retry = dependency_retries,
+                        max_retries = retry_policy.max_dependency_retries,
+                        "Trusted Ogmios has not accepted the parent output yet; retrying the exact dependent transaction bytes"
+                    );
+                    tokio::time::sleep(retry_policy.backoff).await;
+                    continue;
+                }
                 if let Some(rejection) = parse_validity_interval_rejection(&error)? {
                     if let Some(invalid_after) = rejection.invalid_after {
                         if rejection.current_slot > invalid_after {
@@ -412,22 +468,23 @@ impl OgmiosTransactionEvaluator {
 
                     if let Some(invalid_before) = rejection.invalid_before {
                         if rejection.current_slot < invalid_before {
-                            if attempt >= retry_policy.max_retries {
+                            if validity_retries >= retry_policy.max_validity_retries {
                                 return Err(Error::Transaction(format!(
                                     "trusted Ogmios still rejected transaction submission as too early after {} retries (current slot {}, invalid-before {})",
-                                    retry_policy.max_retries,
+                                    retry_policy.max_validity_retries,
                                     rejection.current_slot,
                                     invalid_before
                                 )));
                             }
 
                             let delay = submission_retry_delay(rejection, retry_policy)?;
+                            validity_retries += 1;
                             tracing::warn!(
                                 current_slot = rejection.current_slot,
                                 invalid_before,
                                 wait_ms = delay.as_millis(),
-                                retry = attempt + 1,
-                                max_retries = retry_policy.max_retries,
+                                retry = validity_retries,
+                                max_retries = retry_policy.max_validity_retries,
                                 "Trusted Ogmios rejected transaction submission as too early; retrying the exact signed bytes"
                             );
                             tokio::time::sleep(delay).await;
@@ -462,10 +519,6 @@ impl OgmiosTransactionEvaluator {
             }
             return Ok(transaction_id);
         }
-
-        Err(Error::Transaction(
-            "trusted Ogmios submission retry loop exited unexpectedly".to_string(),
-        ))
     }
 }
 
@@ -568,7 +621,7 @@ struct SubmitTransactionParams {
 struct EvaluateTransactionParams {
     transaction: SerializedTransaction,
     #[serde(rename = "additionalUtxo")]
-    additional_utxo: Vec<JsonValue>,
+    additional_utxo: Vec<OgmiosAdditionalUtxo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -622,6 +675,10 @@ struct OgmiosValidator {
 struct OgmiosBudget {
     memory: u64,
     cpu: u64,
+}
+
+fn is_unknown_input_rejection(error: &JsonValue) -> bool {
+    error.get("code").and_then(JsonValue::as_i64) == Some(OGMIOS_UNKNOWN_INPUT_ERROR_CODE)
 }
 
 fn parse_validity_interval_rejection(
@@ -1011,7 +1068,9 @@ mod tests {
 
     fn immediate_retry_policy(max_retries: usize) -> SubmissionRetryPolicy {
         SubmissionRetryPolicy {
-            max_retries,
+            max_validity_retries: max_retries,
+            max_dependency_retries: max_retries,
+            allow_dependency_retry: false,
             slot_length: Duration::ZERO,
             backoff: Duration::ZERO,
         }
@@ -1134,6 +1193,51 @@ mod tests {
         server.join().unwrap();
 
         assert!(error.to_string().contains("too early after 1 retries"));
+    }
+
+    #[tokio::test]
+    async fn unknown_input_retry_is_bounded_and_requires_a_prior_dependency() {
+        let transaction = vec![0x84, 0x01, 0x02, 0x03];
+        let rejection = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {
+                "code": OGMIOS_UNKNOWN_INPUT_ERROR_CODE,
+                "message": "Unknown output reference"
+            }
+        })
+        .to_string();
+        let expected_id = "ef".repeat(32);
+        let success = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": { "transaction": { "id": expected_id } }
+        })
+        .to_string();
+
+        let (endpoint, server) =
+            mock_submit_ogmios_responses(transaction.clone(), vec![rejection.clone()]);
+        let evaluator =
+            OgmiosTransactionEvaluator::new_with_security(&endpoint, None, None).unwrap();
+        let error = evaluator
+            .submit_signed_transaction_with_retry_policy(&transaction, immediate_retry_policy(1))
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(error.to_string().contains("code 3117"));
+
+        let (endpoint, server) =
+            mock_submit_ogmios_responses(transaction.clone(), vec![rejection, success]);
+        let evaluator =
+            OgmiosTransactionEvaluator::new_with_security(&endpoint, None, None).unwrap();
+        let mut policy = immediate_retry_policy(1);
+        policy.allow_dependency_retry = true;
+        let transaction_id = evaluator
+            .submit_signed_transaction_with_retry_policy(&transaction, policy)
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(transaction_id, expected_id);
     }
 
     #[tokio::test]

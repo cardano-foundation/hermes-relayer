@@ -10,13 +10,19 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use bech32::FromBase32;
+use bech32::{FromBase32, ToBase32, Variant};
+use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest};
 use pallas_codec::minicbor;
-use pallas_primitives::conway::MintedTx;
+use pallas_primitives::babbage::PseudoDatumOption;
+use pallas_primitives::conway::{
+    MintedTransactionOutput, MintedTx, PseudoScript, PseudoTransactionOutput, Value,
+};
 use reqwest::header::{HeaderName, HeaderValue, ACCEPT};
 use reqwest::redirect::Policy;
 use reqwest::{Certificate, Client, Url};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::config::CardanoConfig;
 use super::error::Error;
@@ -25,6 +31,9 @@ const KUPO_ACCEPT: &str = "application/json;asset-quantity=string";
 const KUPO_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_KUPO_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const KUPO_API_KEY_HEADER: HeaderName = HeaderName::from_static("dmtr-api-key");
+/// A staged phase contains at most 100 transactions and the signing policy
+/// accepts at most 128 outputs per transaction.
+const MAX_TRUSTED_OVERLAY_OUTPUTS: usize = 100 * 128;
 
 /// A Cardano transaction output reference.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -62,6 +71,147 @@ pub struct ResolvedInput {
     pub address: Vec<u8>,
     pub lovelace: u64,
     pub assets: Vec<ResolvedAsset>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct OgmiosTransactionId {
+    id: String,
+}
+
+/// One complete transaction output in the JSON form accepted by Ogmios's
+/// `additionalUtxo` parameter. This is deliberately kept together with the
+/// policy-facing projection below so both views come from the same exact body.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OgmiosAdditionalUtxo {
+    transaction: OgmiosTransactionId,
+    index: u64,
+    address: String,
+    value: JsonValue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    datum_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    datum: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    script: Option<JsonValue>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TrustedOverlayOutput {
+    resolved: ResolvedInput,
+    ogmios: OgmiosAdditionalUtxo,
+}
+
+/// Outputs derived from transaction bodies that Hermes has already validated.
+///
+/// Kupo cannot resolve outputs of an unconfirmed parent transaction. A staged
+/// Tendermint phase therefore carries this bounded local overlay while its
+/// dependent transactions are evaluated, signed, and submitted in order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrustedUtxoOverlay {
+    outputs: BTreeMap<TransactionOutRef, TrustedOverlayOutput>,
+}
+
+impl TrustedUtxoOverlay {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add every output from an exact, already-validated transaction body and
+    /// retire any overlay outputs it consumes. The supplied hash must be the
+    /// canonical Blake2b-256 hash of the preserved transaction-body CBOR.
+    pub fn extend_from_validated_transaction(
+        &mut self,
+        transaction_cbor: &[u8],
+        expected_tx_hash: &str,
+    ) -> Result<(), Error> {
+        let tx = decode_transaction(transaction_cbor, "trusted UTxO overlay")?;
+        let actual_hash = transaction_body_hash(&tx);
+        if expected_tx_hash.len() != 64
+            || !expected_tx_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || !actual_hash.eq_ignore_ascii_case(expected_tx_hash)
+        {
+            return Err(Error::Transaction(format!(
+                "validated transaction body hash mismatch: expected {expected_tx_hash}, computed {actual_hash}"
+            )));
+        }
+
+        let body = &*tx.transaction_body;
+        for input in body.inputs.iter() {
+            self.outputs
+                .remove(&TransactionOutRef::from_transaction_input(input));
+        }
+
+        let output_count = body.outputs.len();
+        let next_size = self
+            .outputs
+            .len()
+            .checked_add(output_count)
+            .ok_or_else(|| Error::Transaction("trusted UTxO overlay size overflow".to_string()))?;
+        if next_size > MAX_TRUSTED_OVERLAY_OUTPUTS {
+            return Err(Error::Transaction(format!(
+                "trusted UTxO overlay exceeds the strict limit of {MAX_TRUSTED_OVERLAY_OUTPUTS} outputs"
+            )));
+        }
+
+        let tx_id = decode_fixed_hex::<32>(&actual_hash, "validated transaction body hash")?;
+        for (index, output) in body.outputs.iter().enumerate() {
+            let output_index = u64::try_from(index).map_err(|_| {
+                Error::Transaction("transaction output index exceeds the u64 range".to_string())
+            })?;
+            let out_ref = TransactionOutRef {
+                transaction_id: tx_id,
+                output_index,
+            };
+            let output = trusted_overlay_output(&actual_hash, output_index, output)?;
+            if self.outputs.insert(out_ref.clone(), output).is_some() {
+                return Err(Error::Transaction(format!(
+                    "trusted UTxO overlay already contains output {}",
+                    format_out_ref(&out_ref)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn additional_utxo_for_transaction(
+        &self,
+        transaction_cbor: &[u8],
+    ) -> Result<Vec<OgmiosAdditionalUtxo>, Error> {
+        let requested = parse_input_references(transaction_cbor)?;
+        Ok(requested
+            .regular
+            .iter()
+            .chain(requested.collateral.iter())
+            .filter_map(|out_ref| {
+                self.outputs
+                    .get(out_ref)
+                    .map(|output| output.ogmios.clone())
+            })
+            .collect())
+    }
+
+    fn resolved(&self, out_ref: &TransactionOutRef) -> Option<&ResolvedInput> {
+        self.outputs.get(out_ref).map(|output| &output.resolved)
+    }
+}
+
+/// Return whether the transaction consumes a regular output produced by the
+/// given transaction body hash. This establishes the dependency required
+/// before the submitter enables unknown-parent retries for a chained link.
+pub(crate) fn transaction_consumes_output_from(
+    transaction_cbor: &[u8],
+    parent_transaction_id: &str,
+) -> Result<bool, Error> {
+    let parent_transaction_id =
+        decode_fixed_hex::<32>(parent_transaction_id, "parent transaction body hash")?;
+    let requested = parse_input_references(transaction_cbor)?;
+    Ok(requested
+        .regular
+        .iter()
+        .any(|out_ref| out_ref.transaction_id == parent_transaction_id))
 }
 
 /// Independently resolved regular and collateral inputs, keyed by output reference.
@@ -162,19 +312,44 @@ impl KupoInputResolver {
         &self,
         unsigned_tx_cbor: &[u8],
     ) -> Result<ResolvedTransactionInputs, Error> {
+        self.resolve_unsigned_transaction_with_overlay(
+            unsigned_tx_cbor,
+            &TrustedUtxoOverlay::default(),
+        )
+        .await
+    }
+
+    /// Resolve inputs from the trusted local overlay first and query Kupo only
+    /// for outputs that must already exist in confirmed ledger state.
+    pub async fn resolve_unsigned_transaction_with_overlay(
+        &self,
+        unsigned_tx_cbor: &[u8],
+        overlay: &TrustedUtxoOverlay,
+    ) -> Result<ResolvedTransactionInputs, Error> {
         let requested = parse_input_references(unsigned_tx_cbor)?;
         let mut all_refs = requested.regular.clone();
         all_refs.extend(requested.collateral.iter().cloned());
 
         let mut refs_by_transaction = BTreeMap::<[u8; 32], BTreeSet<u64>>::new();
         for out_ref in &all_refs {
+            if overlay.resolved(out_ref).is_some() {
+                continue;
+            }
             refs_by_transaction
                 .entry(out_ref.transaction_id)
                 .or_default()
                 .insert(out_ref.output_index);
         }
 
-        let mut resolved = BTreeMap::new();
+        let mut resolved = all_refs
+            .iter()
+            .filter_map(|out_ref| {
+                overlay
+                    .resolved(out_ref)
+                    .cloned()
+                    .map(|output| (out_ref.clone(), output))
+            })
+            .collect::<BTreeMap<_, _>>();
         for (transaction_id, output_indexes) in refs_by_transaction {
             self.resolve_transaction_outputs(transaction_id, &output_indexes, &mut resolved)
                 .await?;
@@ -312,6 +487,217 @@ impl KupoInputResolver {
     }
 }
 
+fn decode_transaction<'a>(
+    transaction_cbor: &'a [u8],
+    context: &str,
+) -> Result<MintedTx<'a>, Error> {
+    let mut decoder = minicbor::Decoder::new(transaction_cbor);
+    let tx: MintedTx<'_> = decoder.decode().map_err(|error| {
+        Error::CborDecode(format!(
+            "failed to decode transaction for {context}: {error:?}"
+        ))
+    })?;
+    if decoder.position() != transaction_cbor.len() {
+        return Err(Error::CborDecode(format!(
+            "failed to decode transaction for {context}: trailing CBOR data"
+        )));
+    }
+    Ok(tx)
+}
+
+fn transaction_body_hash(tx: &MintedTx<'_>) -> String {
+    let mut hasher = Blake2b::<U32>::new();
+    hasher.update(tx.transaction_body.raw_cbor());
+    hex::encode(hasher.finalize())
+}
+
+fn trusted_overlay_output(
+    transaction_id: &str,
+    output_index: u64,
+    output: &MintedTransactionOutput<'_>,
+) -> Result<TrustedOverlayOutput, Error> {
+    let (address, lovelace, assets, datum_hash, datum, script) = match output {
+        PseudoTransactionOutput::Legacy(output) => (
+            output.address.as_slice().to_vec(),
+            value_coin_legacy(&output.amount),
+            value_assets_legacy(&output.amount)?,
+            output
+                .datum_hash
+                .as_ref()
+                .map(|hash| hex::encode(hash.as_ref())),
+            None,
+            None,
+        ),
+        PseudoTransactionOutput::PostAlonzo(output) => {
+            let (datum_hash, datum) = match output.datum_option.as_ref() {
+                None => (None, None),
+                Some(PseudoDatumOption::Hash(hash)) => (Some(hex::encode(hash.as_ref())), None),
+                Some(PseudoDatumOption::Data(data)) => {
+                    let raw = data.0.raw_cbor();
+                    (None, Some(hex::encode(raw)))
+                }
+            };
+            (
+                output.address.as_slice().to_vec(),
+                value_coin(&output.value),
+                value_assets(&output.value)?,
+                datum_hash,
+                datum,
+                output.script_ref.as_ref().map(ogmios_script).transpose()?,
+            )
+        }
+    };
+    let address_bech32 = encode_shelley_address(&address)?;
+    let value = ogmios_value(lovelace, &assets);
+
+    Ok(TrustedOverlayOutput {
+        resolved: ResolvedInput {
+            address,
+            lovelace,
+            assets,
+        },
+        ogmios: OgmiosAdditionalUtxo {
+            transaction: OgmiosTransactionId {
+                id: transaction_id.to_string(),
+            },
+            index: output_index,
+            address: address_bech32,
+            value,
+            datum_hash,
+            datum,
+            script,
+        },
+    })
+}
+
+fn value_coin_legacy(value: &pallas_primitives::alonzo::Value) -> u64 {
+    match value {
+        pallas_primitives::alonzo::Value::Coin(coin)
+        | pallas_primitives::alonzo::Value::Multiasset(coin, _) => *coin,
+    }
+}
+
+fn value_assets_legacy(
+    value: &pallas_primitives::alonzo::Value,
+) -> Result<Vec<ResolvedAsset>, Error> {
+    let pallas_primitives::alonzo::Value::Multiasset(_, policies) = value else {
+        return Ok(Vec::new());
+    };
+    policies
+        .iter()
+        .flat_map(|(policy, assets)| {
+            assets
+                .iter()
+                .map(move |(name, quantity)| (policy, name, *quantity))
+        })
+        .map(|(policy, name, quantity)| resolved_asset(policy.as_ref(), name.as_slice(), quantity))
+        .collect()
+}
+
+fn value_coin(value: &Value) -> u64 {
+    match value {
+        Value::Coin(coin) | Value::Multiasset(coin, _) => *coin,
+    }
+}
+
+fn value_assets(value: &Value) -> Result<Vec<ResolvedAsset>, Error> {
+    let Value::Multiasset(_, policies) = value else {
+        return Ok(Vec::new());
+    };
+    policies
+        .iter()
+        .flat_map(|(policy, assets)| {
+            assets
+                .iter()
+                .map(move |(name, quantity)| (policy, name, u64::from(quantity)))
+        })
+        .map(|(policy, name, quantity)| resolved_asset(policy.as_ref(), name.as_slice(), quantity))
+        .collect()
+}
+
+fn resolved_asset(policy: &[u8], name: &[u8], quantity: u64) -> Result<ResolvedAsset, Error> {
+    let policy_id: [u8; 28] = policy.try_into().map_err(|_| {
+        Error::Transaction(format!(
+            "transaction output contains a native-asset policy of {} bytes instead of 28",
+            policy.len()
+        ))
+    })?;
+    if name.len() > 32 {
+        return Err(Error::Transaction(format!(
+            "transaction output contains a native-asset name of {} bytes instead of at most 32",
+            name.len()
+        )));
+    }
+    if quantity == 0 {
+        return Err(Error::Transaction(
+            "transaction output contains a zero-quantity native asset".to_string(),
+        ));
+    }
+    Ok(ResolvedAsset {
+        policy_id,
+        asset_name: name.to_vec(),
+        quantity,
+    })
+}
+
+fn encode_shelley_address(address: &[u8]) -> Result<String, Error> {
+    let network = address.first().map(|byte| byte & 0x0f).ok_or_else(|| {
+        Error::Transaction("transaction output contains an empty address".to_string())
+    })?;
+    let hrp = if network == 1 { "addr" } else { "addr_test" };
+    bech32::encode(hrp, address.to_base32(), Variant::Bech32).map_err(|error| {
+        Error::Transaction(format!(
+            "failed to encode transaction output address for Ogmios: {error}"
+        ))
+    })
+}
+
+fn ogmios_value(lovelace: u64, assets: &[ResolvedAsset]) -> JsonValue {
+    let mut value = JsonMap::new();
+    value.insert(
+        "ada".to_string(),
+        serde_json::json!({ "lovelace": lovelace }),
+    );
+    for asset in assets {
+        let policy = hex::encode(asset.policy_id);
+        let name = hex::encode(&asset.asset_name);
+        let policy_assets = value
+            .entry(policy)
+            .or_insert_with(|| JsonValue::Object(JsonMap::new()))
+            .as_object_mut()
+            .expect("overlay policy value is initialized as an object");
+        policy_assets.insert(name, JsonValue::from(asset.quantity));
+    }
+    JsonValue::Object(value)
+}
+
+fn ogmios_script(
+    script: &pallas_codec::utils::CborWrap<pallas_primitives::conway::MintedScriptRef<'_>>,
+) -> Result<JsonValue, Error> {
+    let (language, bytes) = match &script.0 {
+        PseudoScript::NativeScript(_) => {
+            return Err(Error::Transaction(
+                "trusted UTxO overlay does not support native reference-script outputs".to_string(),
+            ))
+        }
+        PseudoScript::PlutusV1Script(script) => ("plutus:v1", script.as_ref()),
+        PseudoScript::PlutusV2Script(script) => ("plutus:v2", script.as_ref()),
+        PseudoScript::PlutusV3Script(script) => ("plutus:v3", script.as_ref()),
+    };
+    let mut encoded = Vec::new();
+    minicbor::Encoder::new(&mut encoded)
+        .bytes(bytes)
+        .map_err(|error| {
+            Error::CborDecode(format!(
+                "failed to encode overlay reference script for Ogmios: {error:?}"
+            ))
+        })?;
+    Ok(serde_json::json!({
+        "language": language,
+        "cbor": hex::encode(encoded),
+    }))
+}
+
 #[derive(Debug)]
 struct RequestedInputReferences {
     regular: BTreeSet<TransactionOutRef>,
@@ -319,17 +705,7 @@ struct RequestedInputReferences {
 }
 
 fn parse_input_references(unsigned_tx_cbor: &[u8]) -> Result<RequestedInputReferences, Error> {
-    let mut decoder = minicbor::Decoder::new(unsigned_tx_cbor);
-    let tx: MintedTx<'_> = decoder.decode().map_err(|error| {
-        Error::CborDecode(format!(
-            "failed to decode transaction for input resolution: {error:?}"
-        ))
-    })?;
-    if decoder.position() != unsigned_tx_cbor.len() {
-        return Err(Error::CborDecode(
-            "failed to decode transaction for input resolution: trailing CBOR data".to_string(),
-        ));
-    }
+    let tx = decode_transaction(unsigned_tx_cbor, "input resolution")?;
 
     let body = &*tx.transaction_body;
     let regular = collect_out_refs(body.inputs.iter(), "regular")?;
@@ -621,6 +997,56 @@ mod tests {
         output
     }
 
+    fn parent_tx_fixture() -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut output);
+        encoder.array(4).unwrap();
+        encoder.map(3).unwrap();
+        encoder.u8(0).unwrap();
+        encoder.array(1).unwrap();
+        encoder.array(2).unwrap();
+        encoder.bytes(&[0x11; 32]).unwrap();
+        encoder.u64(0).unwrap();
+        encoder.u8(1).unwrap();
+        encoder.array(1).unwrap();
+        encoder.map(3).unwrap();
+        encoder.u8(0).unwrap();
+        encoder.bytes(&[0x70; 29]).unwrap();
+        encoder.u8(1).unwrap();
+        encoder.u64(5_000_000).unwrap();
+        encoder.u8(2).unwrap();
+        encoder.array(2).unwrap();
+        encoder.u8(1).unwrap();
+        encoder.tag(minicbor::data::Tag::Cbor).unwrap();
+        encoder.bytes(&[0x18, 0x2a]).unwrap();
+        encoder.u8(2).unwrap();
+        encoder.u64(200_000).unwrap();
+        encoder.map(0).unwrap();
+        encoder.bool(true).unwrap();
+        encoder.null().unwrap();
+        output
+    }
+
+    fn dependent_tx_fixture(parent_id: [u8; 32]) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut output);
+        encoder.array(4).unwrap();
+        encoder.map(3).unwrap();
+        encoder.u8(0).unwrap();
+        encoder.array(1).unwrap();
+        encoder.array(2).unwrap();
+        encoder.bytes(&parent_id).unwrap();
+        encoder.u64(0).unwrap();
+        encoder.u8(1).unwrap();
+        encoder.array(0).unwrap();
+        encoder.u8(2).unwrap();
+        encoder.u64(200_000).unwrap();
+        encoder.map(0).unwrap();
+        encoder.bool(true).unwrap();
+        encoder.null().unwrap();
+        output
+    }
+
     fn mock_kupo(
         response_body: String,
         expected_api_key: Option<&str>,
@@ -714,6 +1140,62 @@ mod tests {
         assert_eq!(regular.assets[0].policy_id, [0xbb; 28]);
         assert_eq!(regular.assets[0].asset_name, vec![0x01]);
         assert_eq!(regular.assets[0].quantity, 2);
+    }
+
+    #[tokio::test]
+    async fn validated_parent_outputs_resolve_and_serialize_without_kupo() {
+        let parent = parent_tx_fixture();
+        let parent_tx = decode_transaction(&parent, "test").unwrap();
+        let parent_hash = transaction_body_hash(&parent_tx);
+        let parent_id = decode_fixed_hex::<32>(&parent_hash, "test hash").unwrap();
+        let dependent = dependent_tx_fixture(parent_id);
+        assert!(transaction_consumes_output_from(&dependent, &parent_hash).unwrap());
+        assert!(!transaction_consumes_output_from(&dependent, &"42".repeat(32)).unwrap());
+        assert!(transaction_consumes_output_from(&dependent, "not-a-hash").is_err());
+        let mut overlay = TrustedUtxoOverlay::new();
+        overlay
+            .extend_from_validated_transaction(&parent, &parent_hash)
+            .unwrap();
+
+        let resolver =
+            KupoInputResolver::new_with_security("http://127.0.0.1:1", None, None).unwrap();
+        let resolved = resolver
+            .resolve_unsigned_transaction_with_overlay(&dependent, &overlay)
+            .await
+            .unwrap();
+        let resolved_parent = resolved.regular.values().next().unwrap();
+        assert_eq!(resolved_parent.address, vec![0x70; 29]);
+        assert_eq!(resolved_parent.lovelace, 5_000_000);
+
+        let additional = overlay.additional_utxo_for_transaction(&dependent).unwrap();
+        assert_eq!(additional.len(), 1);
+        let json = serde_json::to_value(&additional[0]).unwrap();
+        assert_eq!(json["transaction"]["id"], parent_hash);
+        assert_eq!(json["index"], 0);
+        assert_eq!(json["value"]["ada"]["lovelace"], 5_000_000);
+        assert_eq!(json["datum"], "182a");
+        assert!(json.get("datumHash").is_none());
+        assert!(json.get("script").is_none());
+        assert!(json["address"].as_str().unwrap().starts_with("addr_test1"));
+
+        let dependent_tx = decode_transaction(&dependent, "test").unwrap();
+        let dependent_hash = transaction_body_hash(&dependent_tx);
+        overlay
+            .extend_from_validated_transaction(&dependent, &dependent_hash)
+            .unwrap();
+        assert!(overlay
+            .additional_utxo_for_transaction(&dependent)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn overlay_rejects_a_mismatched_transaction_hash() {
+        let mut overlay = TrustedUtxoOverlay::new();
+        let error = overlay
+            .extend_from_validated_transaction(&parent_tx_fixture(), &"ff".repeat(32))
+            .unwrap_err();
+        assert!(error.to_string().contains("body hash mismatch"));
     }
 
     #[tokio::test]
