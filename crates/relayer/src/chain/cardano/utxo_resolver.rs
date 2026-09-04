@@ -198,6 +198,22 @@ impl TrustedUtxoOverlay {
     }
 }
 
+/// Return whether the transaction consumes a regular output produced by the
+/// given transaction body hash. This establishes the dependency required
+/// before the submitter enables unknown-parent retries for a chained link.
+pub(crate) fn transaction_consumes_output_from(
+    transaction_cbor: &[u8],
+    parent_transaction_id: &str,
+) -> Result<bool, Error> {
+    let parent_transaction_id =
+        decode_fixed_hex::<32>(parent_transaction_id, "parent transaction body hash")?;
+    let requested = parse_input_references(transaction_cbor)?;
+    Ok(requested
+        .regular
+        .iter()
+        .any(|out_ref| out_ref.transaction_id == parent_transaction_id))
+}
+
 /// Independently resolved regular and collateral inputs, keyed by output reference.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResolvedTransactionInputs {
@@ -1133,6 +1149,9 @@ mod tests {
         let parent_hash = transaction_body_hash(&parent_tx);
         let parent_id = decode_fixed_hex::<32>(&parent_hash, "test hash").unwrap();
         let dependent = dependent_tx_fixture(parent_id);
+        assert!(transaction_consumes_output_from(&dependent, &parent_hash).unwrap());
+        assert!(!transaction_consumes_output_from(&dependent, &"42".repeat(32)).unwrap());
+        assert!(transaction_consumes_output_from(&dependent, "not-a-hash").is_err());
         let mut overlay = TrustedUtxoOverlay::new();
         overlay
             .extend_from_validated_transaction(&parent, &parent_hash)

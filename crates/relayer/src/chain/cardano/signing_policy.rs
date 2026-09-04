@@ -11,7 +11,7 @@ use std::path::Path;
 use bech32::FromBase32;
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
-use pallas_codec::utils::Nullable;
+use pallas_codec::{minicbor, utils::Nullable};
 use pallas_primitives::alonzo::{BigInt, PlutusData, Value as LegacyValue};
 use pallas_primitives::conway::{
     MintedTransactionOutput, MintedTx, NetworkId, PseudoTransactionOutput, Value,
@@ -227,11 +227,11 @@ struct OperationRequirements<'a> {
     state_output: StateOutputKind,
     module: Option<&'a ModuleRoot>,
     requires_host_state: bool,
-    tendermint_session: Option<TendermintSessionRequirement>,
+    tendermint_session: Option<ValidatedTendermintSessionAction>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TendermintSessionAction {
+pub(crate) enum TendermintSessionAction {
     Initialize,
     Advance,
     Cancel,
@@ -239,9 +239,9 @@ enum TendermintSessionAction {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct TendermintSessionRequirement {
-    action: TendermintSessionAction,
-    token_name: Vec<u8>,
+pub(crate) struct ValidatedTendermintSessionAction {
+    pub(crate) action: TendermintSessionAction,
+    pub(crate) token_name: Vec<u8>,
 }
 
 enum ChannelRedeemerIntent<'a> {
@@ -682,6 +682,42 @@ impl TransactionSigningPolicy {
             module: None,
             requires_host_state,
             tendermint_session: Some(requirement),
+        })
+    }
+
+    /// Classify the staged action from the same exact transaction body and
+    /// trusted inputs used by the signing policy. Callers use this result to
+    /// enforce the transaction-chain protocol around individually valid links.
+    pub(crate) fn staged_tendermint_action(
+        &self,
+        transaction_cbor: &[u8],
+        resolved_inputs: &ResolvedTransactionInputs,
+    ) -> Result<ValidatedTendermintSessionAction, Error> {
+        let mut decoder = minicbor::Decoder::new(transaction_cbor);
+        let tx: MintedTx<'_> = decoder.decode().map_err(|error| {
+            Error::CborDecode(format!(
+                "failed to decode staged Tendermint transaction: {error:?}"
+            ))
+        })?;
+        if decoder.position() != transaction_cbor.len() {
+            return Err(Error::CborDecode(
+                "failed to decode staged Tendermint transaction: trailing CBOR data".to_string(),
+            ));
+        }
+        let session = self.tendermint_session.as_ref().ok_or_else(|| {
+            Error::Signer("pinned manifest has no staged Tendermint session validators".to_string())
+        })?;
+        classify_tendermint_session_transaction(
+            &tx.transaction_body,
+            resolved_inputs,
+            session,
+            &self.host_state_address,
+            &self.client_state.address,
+        )
+        .map_err(|reason| {
+            Error::Signer(format!(
+                "refusing to classify staged Tendermint transaction: {reason}"
+            ))
         })
     }
 
@@ -1500,7 +1536,7 @@ impl TransactionSigningPolicy {
         redeemers: &pallas_primitives::conway::Redeemers,
         signer_address: &[u8],
         intent: &SigningIntent,
-        requirement: &TendermintSessionRequirement,
+        requirement: &ValidatedTendermintSessionAction,
         resolved_inputs: &ResolvedTransactionInputs,
         reject: &F,
     ) -> Result<(), Error>
@@ -2505,7 +2541,7 @@ fn classify_tendermint_session_transaction(
     session: &StateOutputRoot,
     host_state_address: &[u8],
     client_address: &[u8],
-) -> Result<TendermintSessionRequirement, String> {
+) -> Result<ValidatedTendermintSessionAction, String> {
     let mut input_names = Vec::new();
     for input in resolved_inputs.regular.values() {
         if input.address != session.address {
@@ -2603,7 +2639,7 @@ fn classify_tendermint_session_transaction(
         }
     };
 
-    Ok(TendermintSessionRequirement { action, token_name })
+    Ok(ValidatedTendermintSessionAction { action, token_name })
 }
 
 fn constructor_fields(data: &PlutusData, alternative: u64) -> Option<&[PlutusData]> {
@@ -2736,6 +2772,10 @@ fn is_cardano_token_unit(denom: &str) -> bool {
 }
 
 impl SigningIntent {
+    pub(crate) fn is_staged_tendermint(&self) -> bool {
+        self.staged_tendermint
+    }
+
     pub fn heartbeat(signer: &str, expected_signer: &str, network_id: u8) -> Result<Self, Error> {
         validate_request_signer(signer, expected_signer, network_id, "HostStateHeartbeat")?;
         Ok(Self {
