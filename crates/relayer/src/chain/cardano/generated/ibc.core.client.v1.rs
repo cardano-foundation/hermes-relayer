@@ -804,6 +804,25 @@ pub struct MsgSubmitMisbehaviour {
 /// type.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct MsgSubmitMisbehaviourResponse {}
+/// MsgRecoverClient defines the message used to recover a frozen or expired client.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgRecoverClient {
+    /// client identifier for the frozen or expired client
+    #[prost(string, tag = "1")]
+    pub subject_client_id: ::prost::alloc::string::String,
+    /// client identifier for the active client used as the recovery checkpoint
+    #[prost(string, tag = "2")]
+    pub substitute_client_id: ::prost::alloc::string::String,
+    /// signer address
+    #[prost(string, tag = "3")]
+    pub signer: ::prost::alloc::string::String,
+}
+/// MsgRecoverClientResponse defines the Msg/RecoverClient response type.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgRecoverClientResponse {
+    #[prost(message, optional, tag = "1")]
+    pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
+}
 /// Generated client implementations.
 pub mod msg_client {
     #![allow(
@@ -994,6 +1013,31 @@ pub mod msg_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("ibc.core.client.v1.Msg", "SubmitMisbehaviour"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// RecoverClient defines a rpc handler method for MsgRecoverClient.
+        pub async fn recover_client(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MsgRecoverClient>,
+        ) -> std::result::Result<
+            tonic::Response<super::MsgRecoverClientResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ibc.core.client.v1.Msg/RecoverClient",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("ibc.core.client.v1.Msg", "RecoverClient"));
             self.inner.unary(req, path, codec).await
         }
     }

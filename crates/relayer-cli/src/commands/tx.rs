@@ -74,6 +74,9 @@ pub enum TxCmd {
     /// Prune one finalized packet receipt/acknowledgement pair on Cardano
     PacketPrune(packet::TxPacketPruneCmd),
 
+    /// Recover a frozen or expired Cardano IBC client using an active substitute
+    RecoverClient(client::TxRecoverClientCmd),
+
     /// Send an IBC upgrade plan
     UpgradeChain(upgrade::TxIbcUpgradeChainCmd),
 }
@@ -84,5 +87,28 @@ impl Override<Config> for TxCmd {
             Self::FtTransfer(cmd) => cmd.override_config(config),
             _ => Ok(config),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TxCmd;
+    use abscissa_core::clap::Parser;
+
+    #[test]
+    fn recover_client_subcommand_is_registered() {
+        assert!(matches!(
+            TxCmd::parse_from([
+                "test",
+                "recover-client",
+                "--host-chain",
+                "cardano-local",
+                "--subject-client",
+                "07-tendermint-0",
+                "--substitute-client",
+                "07-tendermint-1",
+            ]),
+            TxCmd::RecoverClient(_)
+        ));
     }
 }
