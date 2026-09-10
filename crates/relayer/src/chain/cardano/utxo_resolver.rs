@@ -183,8 +183,7 @@ impl TrustedUtxoOverlay {
         let requested = parse_input_references(transaction_cbor)?;
         Ok(requested
             .regular
-            .iter()
-            .chain(requested.collateral.iter())
+            .union(&requested.collateral)
             .filter_map(|out_ref| {
                 self.outputs
                     .get(out_ref)
@@ -307,7 +306,8 @@ impl KupoInputResolver {
     ///
     /// The lookup fails unless Kupo returns exactly one unspent output for every
     /// requested reference. Duplicate records, missing records, malformed values,
-    /// duplicate transaction inputs, and regular/collateral overlap are rejected.
+    /// and duplicate inputs within either role are rejected. A shared regular and
+    /// collateral input is resolved once, then copied into both role maps.
     pub async fn resolve_unsigned_transaction(
         &self,
         unsigned_tx_cbor: &[u8],
@@ -713,13 +713,6 @@ fn parse_input_references(unsigned_tx_cbor: &[u8]) -> Result<RequestedInputRefer
         Some(inputs) => collect_out_refs(inputs.iter(), "collateral")?,
         None => BTreeSet::new(),
     };
-
-    if let Some(overlap) = regular.intersection(&collateral).next() {
-        return Err(Error::Transaction(format!(
-            "regular and collateral inputs overlap at {}",
-            format_out_ref(overlap)
-        )));
-    }
 
     Ok(RequestedInputReferences {
         regular,
@@ -1140,6 +1133,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_regular_and_collateral_input_is_resolved_once() {
+        let body = serde_json::to_string(&vec![kupo_output(0)]).unwrap();
+        // This server accepts exactly one HTTP request. A second lookup would
+        // fail rather than returning another potentially inconsistent record.
+        let (endpoint, server) = mock_kupo(body, None);
+        let resolver = KupoInputResolver::new_with_security(&endpoint, None, None).unwrap();
+        let resolved = resolver
+            .resolve_unsigned_transaction(&unsigned_tx_fixture(true))
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(resolved.regular.len(), 1);
+        assert_eq!(resolved.collateral.len(), 1);
+        assert_eq!(resolved.regular, resolved.collateral);
+        let output = resolved.regular.values().next().unwrap();
+        assert_eq!(output.lovelace, 9_007_199_254_740_993);
+        assert_eq!(output.assets[0].quantity, 2);
+    }
+
+    #[tokio::test]
+    async fn shared_overlay_input_resolves_once_for_staged_evaluation() {
+        let parent = parent_tx_fixture();
+        let parent_hash = transaction_body_hash(&decode_transaction(&parent, "test").unwrap());
+        let parent_id = decode_fixed_hex::<32>(&parent_hash, "test hash").unwrap();
+        let mut tx: pallas_primitives::conway::Tx =
+            minicbor::decode(&dependent_tx_fixture(parent_id)).unwrap();
+        tx.transaction_body.collateral = Some(
+            vec![tx.transaction_body.inputs.first().unwrap().clone()]
+                .try_into()
+                .unwrap(),
+        );
+        let dependent = minicbor::to_vec(tx).unwrap();
+        let mut overlay = TrustedUtxoOverlay::new();
+        overlay
+            .extend_from_validated_transaction(&parent, &parent_hash)
+            .unwrap();
+        let resolver =
+            KupoInputResolver::new_with_security("http://127.0.0.1:1", None, None).unwrap();
+        let resolved = resolver
+            .resolve_unsigned_transaction_with_overlay(&dependent, &overlay)
+            .await
+            .unwrap();
+        assert_eq!(resolved.regular.len(), 1);
+        assert_eq!(resolved.regular, resolved.collateral);
+        let additional = overlay.additional_utxo_for_transaction(&dependent).unwrap();
+        assert_eq!(additional.len(), 1);
+        assert_eq!(additional[0].transaction.id, parent_hash);
+        assert_eq!(additional[0].index, 0);
+        // Successful inclusion consumes the shared regular input; it must not
+        // remain available as collateral to a later staged transaction.
+        let dependent_hash =
+            transaction_body_hash(&decode_transaction(&dependent, "test").unwrap());
+        overlay
+            .extend_from_validated_transaction(&dependent, &dependent_hash)
+            .unwrap();
+        assert!(overlay
+            .additional_utxo_for_transaction(&dependent)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn validated_parent_outputs_resolve_and_serialize_without_kupo() {
         let parent = parent_tx_fixture();
         let parent_tx = decode_transaction(&parent, "test").unwrap();
@@ -1322,11 +1377,28 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_or_overlapping_transaction_inputs_are_rejected() {
-        let error = parse_input_references(&unsigned_tx_fixture(true)).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("regular and collateral inputs overlap"));
+    fn shared_input_is_allowed_but_duplicates_within_either_set_are_rejected() {
+        let encoded = unsigned_tx_fixture(true);
+        let requested = parse_input_references(&encoded).unwrap();
+        assert_eq!(requested.regular, requested.collateral);
+        for regular in [true, false] {
+            let mut tx: pallas_primitives::conway::Tx = minicbor::decode(&encoded).unwrap();
+            let input = tx.transaction_body.inputs.first().unwrap().clone();
+            if regular {
+                tx.transaction_body.inputs = vec![input.clone(), input].into();
+            } else {
+                tx.transaction_body.collateral =
+                    Some(vec![input.clone(), input].try_into().unwrap());
+            }
+            let error = parse_input_references(&minicbor::to_vec(tx).unwrap())
+                .unwrap_err()
+                .to_string();
+            let kind = if regular { "regular" } else { "collateral" };
+            assert!(
+                error.contains(&format!("duplicate {kind} input")),
+                "{error}"
+            );
+        }
     }
 
     #[test]
