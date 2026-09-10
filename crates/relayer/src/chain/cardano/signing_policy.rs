@@ -809,7 +809,7 @@ impl TransactionSigningPolicy {
             &reject,
         )?;
 
-        self.validate_collateral(body, &signer_address, &input_set, resolved_inputs, &reject)?;
+        self.validate_collateral(body, &signer_address, resolved_inputs, &reject)?;
         self.validate_mint(body, intent, &requirements, &reference_set, &reject)?;
         self.validate_outputs(
             body,
@@ -907,6 +907,22 @@ impl TransactionSigningPolicy {
             return Err(reject(
                 "trusted UTxO resolution does not exactly cover the collateral inputs".to_string(),
             ));
+        }
+
+        // CIP-40 permits a wallet output to fund success and collateral failure.
+        // The trusted resolver reads it once; reject inconsistent records from
+        // any other caller before checking those mutually exclusive balances.
+        for (out_ref, collateral) in &resolved_inputs.collateral {
+            if resolved_inputs
+                .regular
+                .get(out_ref)
+                .is_some_and(|regular| regular != collateral)
+            {
+                return Err(reject(
+                    "trusted UTxO resolution disagrees for a shared regular/collateral input"
+                        .to_string(),
+                ));
+            }
         }
 
         let expected_state = match requirements.state_output {
@@ -1041,7 +1057,6 @@ impl TransactionSigningPolicy {
         &self,
         body: &pallas_primitives::conway::MintedTransactionBody<'_>,
         signer_address: &[u8],
-        inputs: &HashSet<(String, u64)>,
         resolved_inputs: &ResolvedTransactionInputs,
         reject: &F,
     ) -> Result<(), Error>
@@ -1095,10 +1110,8 @@ impl TransactionSigningPolicy {
                 let mut collateral_assets = BTreeMap::new();
                 for input in collateral.iter() {
                     let out_ref = (input.transaction_id.to_string(), input.index);
-                    if inputs.contains(&out_ref) || !seen.insert(out_ref) {
-                        return Err(reject(
-                            "collateral inputs overlap or contain duplicates".to_string(),
-                        ));
+                    if !seen.insert(out_ref) {
+                        return Err(reject("collateral inputs contain duplicates".to_string()));
                     }
                     let resolved = resolved_inputs.collateral_input(input).ok_or_else(|| {
                         reject("trusted UTxO resolution is missing a collateral input".to_string())
@@ -3995,6 +4008,15 @@ mod tests {
         tx: &pallas_primitives::conway::Tx,
         recovery: bool,
     ) -> Result<(), Error> {
+        validate_client_fixture_with_inputs(policy, tx, recovery, &recovery_resolved_inputs(policy))
+    }
+
+    fn validate_client_fixture_with_inputs(
+        policy: &TransactionSigningPolicy,
+        tx: &pallas_primitives::conway::Tx,
+        recovery: bool,
+        resolved: &ResolvedTransactionInputs,
+    ) -> Result<(), Error> {
         let encoded = minicbor::to_vec(tx).unwrap();
         let transaction: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
         policy.validate(
@@ -4006,8 +4028,238 @@ mod tests {
             } else {
                 update_intent()
             },
-            &recovery_resolved_inputs(policy),
+            resolved,
         )
+    }
+
+    fn set_test_wallet_value(
+        output: &mut pallas_primitives::conway::TransactionOutput,
+        lovelace: u64,
+        asset_quantity: Option<u64>,
+    ) {
+        let PseudoTransactionOutput::Legacy(output) = output else {
+            panic!("expected legacy fixture output")
+        };
+        output.amount = match asset_quantity {
+            None => LegacyValue::Coin(lovelace),
+            Some(quantity) => LegacyValue::Multiasset(
+                lovelace,
+                vec![([0xbb; 28].into(), vec![(vec![1].into(), quantity)].into())].into(),
+            ),
+        };
+    }
+
+    fn shared_collateral_fixture(
+        policy: &TransactionSigningPolicy,
+        recovery: bool,
+    ) -> (pallas_primitives::conway::Tx, ResolvedTransactionInputs) {
+        let mut tx = proof_backed_transaction(policy, recovery);
+        let mut resolved = recovery_resolved_inputs(policy);
+        let reference = TransactionOutRef {
+            transaction_id: RECOVERY_SIGNER_INPUT_ID,
+            output_index: 0,
+        };
+        let wallet_input = resolved.regular.get_mut(&reference).unwrap();
+        wallet_input.assets.push(ResolvedAsset {
+            policy_id: [0xbb; 28],
+            asset_name: vec![1],
+            quantity: 7,
+        });
+        resolved.collateral.insert(reference, wallet_input.clone());
+        tx.transaction_body.collateral = Some(
+            vec![pallas_primitives::conway::TransactionInput {
+                transaction_id: RECOVERY_SIGNER_INPUT_ID.into(),
+                index: 0,
+            }]
+            .try_into()
+            .unwrap(),
+        );
+        tx.transaction_body.total_collateral = Some(1_000_000);
+        // Success: 3 ADA -> 2.5 ADA + 0.5 ADA fee. Failure: 3 ADA ->
+        // 2 ADA collateral return + 1 ADA collateral. Tokens survive either path.
+        set_test_wallet_value(&mut tx.transaction_body.outputs[2], 2_500_000, Some(7));
+        let mut collateral_return = tx.transaction_body.outputs[2].clone();
+        set_test_wallet_value(&mut collateral_return, 2_000_000, Some(7));
+        tx.transaction_body.collateral_return = Some(collateral_return);
+        (tx, resolved)
+    }
+
+    #[test]
+    fn shared_wallet_input_keeps_success_and_failure_balances_separate() {
+        let policy = proof_backed_policy();
+        for recovery in [false, true] {
+            let (tx, resolved) = shared_collateral_fixture(&policy, recovery);
+            validate_client_fixture_with_inputs(&policy, &tx, recovery, &resolved).unwrap();
+            let mut bad_success = tx.clone();
+            set_test_wallet_value(
+                &mut bad_success.transaction_body.outputs[2],
+                2_500_000,
+                Some(6),
+            );
+            assert!(validate_client_fixture_with_inputs(
+                &policy,
+                &bad_success,
+                recovery,
+                &resolved
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unauthorized signer asset"));
+            let mut bad_failure = tx.clone();
+            set_test_wallet_value(
+                bad_failure
+                    .transaction_body
+                    .collateral_return
+                    .as_mut()
+                    .unwrap(),
+                2_000_000,
+                Some(6),
+            );
+            assert!(validate_client_fixture_with_inputs(
+                &policy,
+                &bad_failure,
+                recovery,
+                &resolved
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("preserve all collateral native assets"));
+
+            // A good failure return cannot compensate for excessive success loss.
+            let mut tight_policy = policy.clone();
+            tight_policy.limits.max_wallet_lovelace_top_up = 1;
+            let mut bad_success_value = tx;
+            set_test_wallet_value(
+                &mut bad_success_value.transaction_body.outputs[2],
+                2_000_000,
+                Some(7),
+            );
+            assert!(validate_client_fixture_with_inputs(
+                &tight_policy,
+                &bad_success_value,
+                recovery,
+                &resolved
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("configured top-up allowance"));
+        }
+    }
+
+    #[test]
+    fn shared_wallet_input_rejects_conflicting_trusted_resolution() {
+        let policy = proof_backed_policy();
+        let (tx, resolved) = shared_collateral_fixture(&policy, false);
+        for mutation in 0..3 {
+            let mut inconsistent = resolved.clone();
+            let collateral = inconsistent.collateral.values_mut().next().unwrap();
+            match mutation {
+                0 => collateral.address[1] ^= 1,
+                1 => collateral.lovelace += 1,
+                _ => collateral.assets[0].quantity += 1,
+            }
+            assert!(
+                validate_client_fixture_with_inputs(&policy, &tx, false, &inconsistent)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("disagrees for a shared regular/collateral input")
+            );
+        }
+    }
+
+    #[test]
+    fn shared_collateral_keeps_duplicate_loss_return_and_ownership_checks() {
+        let policy = proof_backed_policy();
+        for recovery in [false, true] {
+            let (tx, resolved) = shared_collateral_fixture(&policy, recovery);
+            for mutation in 0..7 {
+                let mut bad = tx.clone();
+                let expected_error = match mutation {
+                    0 => {
+                        let input = bad
+                            .transaction_body
+                            .collateral
+                            .as_ref()
+                            .unwrap()
+                            .first()
+                            .unwrap()
+                            .clone();
+                        bad.transaction_body.collateral =
+                            Some(vec![input.clone(), input].try_into().unwrap());
+                        "collateral inputs contain duplicates"
+                    }
+                    1 => {
+                        bad.transaction_body.total_collateral = None;
+                        "explicit total collateral"
+                    }
+                    2 => {
+                        bad.transaction_body.total_collateral = Some(0);
+                        "greater than zero"
+                    }
+                    3 => {
+                        bad.transaction_body.total_collateral =
+                            Some(policy.limits.max_total_collateral_lovelace + 1);
+                        "exceeds"
+                    }
+                    4 => {
+                        bad.transaction_body.collateral_return = None;
+                        "explicit collateral return"
+                    }
+                    5 => {
+                        let PseudoTransactionOutput::Legacy(output) =
+                            bad.transaction_body.collateral_return.as_mut().unwrap()
+                        else {
+                            unreachable!()
+                        };
+                        output.address = vec![0x60; 29].into();
+                        "does not pay the configured relayer"
+                    }
+                    _ => {
+                        set_test_wallet_value(
+                            bad.transaction_body.collateral_return.as_mut().unwrap(),
+                            2_000_001,
+                            Some(7),
+                        );
+                        "collateral return is"
+                    }
+                };
+                let error = validate_client_fixture_with_inputs(&policy, &bad, recovery, &resolved)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(expected_error),
+                    "mutation {mutation}: {error}"
+                );
+            }
+            let mut foreign = tx;
+            let mut foreign_resolved = resolved;
+            foreign.transaction_body.collateral = Some(
+                vec![pallas_primitives::conway::TransactionInput {
+                    transaction_id: RECOVERY_HOST_INPUT_ID.into(),
+                    index: 0,
+                }]
+                .try_into()
+                .unwrap(),
+            );
+            foreign_resolved.collateral.clear();
+            let reference = TransactionOutRef {
+                transaction_id: RECOVERY_HOST_INPUT_ID,
+                output_index: 0,
+            };
+            foreign_resolved.collateral.insert(
+                reference.clone(),
+                foreign_resolved.regular[&reference].clone(),
+            );
+            assert!(validate_client_fixture_with_inputs(
+                &policy,
+                &foreign,
+                recovery,
+                &foreign_resolved
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("collateral input is not owned by the configured relayer"));
+        }
     }
 
     #[test]
@@ -4168,6 +4420,14 @@ mod tests {
                     assert!(inputs.insert(reference, value).is_none());
                 }
             }
+            assert!(
+                resolved
+                    .regular
+                    .keys()
+                    .any(|reference| resolved.collateral.contains_key(reference)),
+                "{} must exercise shared regular/collateral inputs",
+                case["name"],
+            );
             let encoded = hex::decode(case["unsigned_tx_cbor"].as_str().unwrap()).unwrap();
             let mut decoder = minicbor::Decoder::new(&encoded);
             let transaction: MintedTx<'_> = decoder.decode().unwrap();
