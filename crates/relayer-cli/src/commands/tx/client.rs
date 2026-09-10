@@ -7,6 +7,9 @@ use std::thread;
 use abscissa_core::clap::Parser;
 use abscissa_core::{Command, Runnable};
 
+use ibc_proto::google::protobuf::Any;
+use ibc_proto::ibc::core::client::v1::MsgRecoverClient;
+use ibc_relayer::chain::tracking::TrackedMsgs;
 use ibc_relayer::config::Config;
 use ibc_relayer::event::IbcEventWithHeight;
 use ibc_relayer::foreign_client::{CreateOptions, ForeignClient};
@@ -20,6 +23,7 @@ use ibc_relayer::{
 use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ClientId};
 use ibc_relayer_types::events::IbcEvent;
 use ibc_relayer_types::Height;
+use prost::Message;
 use tendermint::block::Height as BlockHeight;
 use tendermint_light_client_verifier::types::TrustThreshold;
 use tendermint_rpc::Url;
@@ -256,6 +260,107 @@ impl Runnable for TxUpdateClientCmd {
             Ok(events) => Output::success(events).exit(),
             Err(e) => Output::error(e).exit(),
         }
+    }
+}
+
+const RECOVER_CLIENT_TYPE_URL: &str = "/ibc.core.client.v1.MsgRecoverClient";
+
+#[derive(Clone, Command, Debug, Parser, PartialEq, Eq)]
+pub struct TxRecoverClientCmd {
+    #[clap(
+        long = "host-chain",
+        required = true,
+        value_name = "HOST_CHAIN_ID",
+        help_heading = "REQUIRED",
+        help = "Identifier of the chain that hosts both clients"
+    )]
+    host_chain_id: ChainId,
+
+    #[clap(
+        long = "subject-client",
+        required = true,
+        value_name = "SUBJECT_CLIENT_ID",
+        help_heading = "REQUIRED",
+        help = "Identifier of the frozen or expired client to recover"
+    )]
+    subject_client_id: ClientId,
+
+    #[clap(
+        long = "substitute-client",
+        required = true,
+        value_name = "SUBSTITUTE_CLIENT_ID",
+        help_heading = "REQUIRED",
+        help = "Identifier of the active client used as the recovery checkpoint"
+    )]
+    substitute_client_id: ClientId,
+
+    #[clap(
+        long = "key-name",
+        value_name = "KEY_NAME",
+        help = "Use the given recovery authority key name (default: `key_name` config)"
+    )]
+    key_name: Option<String>,
+}
+
+impl TxRecoverClientCmd {
+    fn execute(
+        &self,
+    ) -> Result<Vec<tendermint_rpc::endpoint::broadcast::tx_sync::Response>, Error> {
+        if self.subject_client_id == self.substitute_client_id {
+            return Err(Error::cli_arg(
+                "subject and substitute clients must be different".to_string(),
+            ));
+        }
+
+        let mut config = (*app_config()).clone();
+        let host_chain_config = config.find_chain_mut(&self.host_chain_id).ok_or_else(|| {
+            Error::cli_arg(format!(
+                "missing configuration for host chain '{}'",
+                self.host_chain_id
+            ))
+        })?;
+
+        if let Some(key_name) = &self.key_name {
+            host_chain_config.set_key_name(key_name.clone());
+        }
+
+        let host_chain = spawn_chain_runtime(&config, &self.host_chain_id)?;
+        let signer = host_chain.get_signer().map_err(Error::relayer)?;
+        let message = recover_client_any(
+            &self.subject_client_id,
+            &self.substitute_client_id,
+            signer.to_string(),
+        );
+
+        host_chain
+            .send_messages_and_wait_check_tx(TrackedMsgs::new_single(message, "recover client"))
+            .map_err(Error::relayer)
+    }
+}
+
+impl Runnable for TxRecoverClientCmd {
+    fn run(&self) {
+        match self.execute() {
+            Ok(responses) => Output::success(responses).exit(),
+            Err(error) => Output::error(error).exit(),
+        }
+    }
+}
+
+fn recover_client_any(
+    subject_client_id: &ClientId,
+    substitute_client_id: &ClientId,
+    signer: String,
+) -> Any {
+    let message = MsgRecoverClient {
+        subject_client_id: subject_client_id.to_string(),
+        substitute_client_id: substitute_client_id.to_string(),
+        signer,
+    };
+
+    Any {
+        type_url: RECOVER_CLIENT_TYPE_URL.to_string(),
+        value: message.encode_to_vec(),
     }
 }
 
@@ -617,15 +722,17 @@ impl OutputBuffer {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_trust_threshold, TxCreateClientCmd, TxUpdateClientCmd, TxUpgradeClientCmd,
-        TxUpgradeClientsCmd,
+        parse_trust_threshold, recover_client_any, TxCreateClientCmd, TxRecoverClientCmd,
+        TxUpdateClientCmd, TxUpgradeClientCmd, TxUpgradeClientsCmd, RECOVER_CLIENT_TYPE_URL,
     };
 
     use std::str::FromStr;
 
     use abscissa_core::clap::Parser;
     use humantime::Duration;
+    use ibc_proto::ibc::core::client::v1::MsgRecoverClient;
     use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ClientId};
+    use prost::Message;
     use tendermint_light_client_verifier::types::TrustThreshold;
 
     #[test]
@@ -641,6 +748,63 @@ mod tests {
         let threshold = parse_trust_threshold("\t3 / 5  ").unwrap();
         assert_eq!(threshold.numerator(), 3);
         assert_eq!(threshold.denominator(), 5);
+    }
+
+    #[test]
+    fn test_recover_client_arguments() {
+        assert_eq!(
+            TxRecoverClientCmd {
+                host_chain_id: ChainId::from_string("cardano-local"),
+                subject_client_id: ClientId::from_str("07-tendermint-0").unwrap(),
+                substitute_client_id: ClientId::from_str("07-tendermint-1").unwrap(),
+                key_name: Some("deployment-authority".to_string()),
+            },
+            TxRecoverClientCmd::parse_from([
+                "test",
+                "--host-chain",
+                "cardano-local",
+                "--subject-client",
+                "07-tendermint-0",
+                "--substitute-client",
+                "07-tendermint-1",
+                "--key-name",
+                "deployment-authority",
+            ])
+        );
+    }
+
+    #[test]
+    fn test_recover_client_requires_both_client_ids() {
+        assert!(TxRecoverClientCmd::try_parse_from([
+            "test",
+            "--host-chain",
+            "cardano-local",
+            "--subject-client",
+            "07-tendermint-0",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn test_recover_client_message_encoding() {
+        let subject_client_id = ClientId::from_str("07-tendermint-0").unwrap();
+        let substitute_client_id = ClientId::from_str("07-tendermint-1").unwrap();
+
+        let any = recover_client_any(
+            &subject_client_id,
+            &substitute_client_id,
+            "addr_test1_recovery_authority".to_string(),
+        );
+
+        assert_eq!(any.type_url, RECOVER_CLIENT_TYPE_URL);
+        assert_eq!(
+            MsgRecoverClient::decode(any.value.as_slice()).unwrap(),
+            MsgRecoverClient {
+                subject_client_id: subject_client_id.to_string(),
+                substitute_client_id: substitute_client_id.to_string(),
+                signer: "addr_test1_recovery_authority".to_string(),
+            }
+        );
     }
 
     #[test]

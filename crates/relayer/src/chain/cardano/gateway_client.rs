@@ -875,6 +875,9 @@ impl GatewayClient {
             "/ibc.core.client.v1.MsgUpdateClient" => {
                 self.build_update_client_tx(message_data).await
             }
+            "/ibc.core.client.v1.MsgRecoverClient" => {
+                self.build_recover_client_tx(message_data).await
+            }
 
             // IBC Connection messages
             "/ibc.core.connection.v1.MsgConnectionOpenInit" => {
@@ -1011,6 +1014,44 @@ impl GatewayClient {
         Ok(UnsignedTx {
             cbor_hex,
             description: format!("{message_description} (client_id: {client_id})"),
+        })
+    }
+
+    async fn build_recover_client_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use super::generated::ibc::core::client::v1::MsgRecoverClient;
+        use prost::Message;
+
+        let msg = MsgRecoverClient::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgRecoverClient: {e}")))?;
+
+        let subject_client_id = msg.subject_client_id.clone();
+        let substitute_client_id = msg.substitute_client_id.clone();
+
+        let mut client = GenClientMsgClient::new(self.channel.clone());
+        let response = client
+            .recover_client(tonic::Request::new(msg))
+            .await?
+            .into_inner();
+
+        let unsigned_tx_any = response.unsigned_tx.ok_or_else(|| {
+            Error::Transaction("No unsigned_tx in RecoverClient response".to_string())
+        })?;
+
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {e}")))?;
+
+        tracing::info!(
+            "RecoverClient: received unsigned CBOR (length: {}), subject_client_id: {}, substitute_client_id: {}",
+            cbor_hex.len(),
+            subject_client_id,
+            substitute_client_id
+        );
+
+        Ok(UnsignedTx {
+            cbor_hex,
+            description: format!(
+                "MsgRecoverClient (subject_client_id: {subject_client_id}, substitute_client_id: {substitute_client_id})"
+            ),
         })
     }
 
@@ -2050,6 +2091,8 @@ fn parse_cardano_native_asset_quantity(amount: &str, denom: &str) -> Result<u64,
 mod tests {
     use super::*;
     use ibc_proto::cosmos::base::v1beta1::Coin as ProtoCoin;
+    use ibc_proto::ibc::core::client::v1::MsgRecoverClient as CanonicalMsgRecoverClient;
+    use prost::Message;
 
     fn gateway_uri(value: &str) -> Uri {
         value.parse().expect("valid test URI")
@@ -2057,6 +2100,24 @@ mod tests {
 
     fn denom_hash(full_denom: &str) -> [u8; 32] {
         Sha256::digest(full_denom.as_bytes()).into()
+    }
+
+    #[test]
+    fn gateway_recover_client_request_matches_canonical_wire_format() {
+        let canonical = CanonicalMsgRecoverClient {
+            subject_client_id: "07-tendermint-0".to_string(),
+            substitute_client_id: "07-tendermint-1".to_string(),
+            signer: "addr_test1_recovery_authority".to_string(),
+        };
+
+        let decoded = super::super::generated::ibc::core::client::v1::MsgRecoverClient::decode(
+            canonical.encode_to_vec().as_slice(),
+        )
+        .unwrap();
+
+        assert_eq!(decoded.subject_client_id, canonical.subject_client_id);
+        assert_eq!(decoded.substitute_client_id, canonical.substitute_client_id);
+        assert_eq!(decoded.signer, canonical.signer);
     }
 
     #[test]

@@ -30,7 +30,7 @@ use super::generated::ibc::core::{
         MsgChannelOpenConfirm, MsgChannelOpenInit, MsgChannelOpenTry, MsgRecvPacket, MsgTimeout,
         MsgTimeoutOnClose,
     },
-    client::v1::{MsgCreateClient, MsgUpdateClient},
+    client::v1::{MsgCreateClient, MsgRecoverClient, MsgUpdateClient},
     connection::v1::{
         MsgConnectionOpenAck, MsgConnectionOpenConfirm, MsgConnectionOpenInit, MsgConnectionOpenTry,
     },
@@ -82,10 +82,17 @@ struct ModuleRoot {
     reference_script: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsensusHistoryFormat {
+    Legacy,
+    ProofBackedV1,
+}
+
 /// A policy loaded from an operator-pinned bridge manifest.
 #[derive(Clone, Debug)]
 pub struct TransactionSigningPolicy {
     network_id: u8,
+    consensus_history_format: ConsensusHistoryFormat,
     limits: SigningPolicyLimits,
     protocol_addresses: HashSet<Vec<u8>>,
     scripts: HashMap<String, ScriptRoot>,
@@ -113,6 +120,7 @@ pub struct SigningIntent {
     external_output: Option<ExternalOutputIntent>,
     transfer: Option<TransferIntent>,
     state_sequence: Option<u64>,
+    recovery_substitute_sequence: Option<u64>,
     packet: Option<PacketIntent>,
     acknowledgement: Option<Vec<u8>>,
     prune_sequence: Option<u64>,
@@ -224,6 +232,12 @@ struct OperationRequirements<'a> {
 
 enum ChannelRedeemerIntent<'a> {
     Constructor(u64),
+    ProofBackedClientUpdate,
+    ClientRecovery {
+        substitute_policy: Vec<u8>,
+        substitute_name: Vec<u8>,
+        history_format: ConsensusHistoryFormat,
+    },
     Packet {
         alternative: u64,
         packet: &'a PacketIntent,
@@ -237,6 +251,28 @@ impl ChannelRedeemerIntent<'_> {
     fn matches(&self, data: &PlutusData) -> bool {
         match self {
             Self::Constructor(alternative) => constructor_fields(data, *alternative).is_some(),
+            // Check the versioned shape here; authenticated history and the
+            // Tendermint message are verified by the pinned on-chain scripts.
+            // The support withdrawal is separately bound to this exact client.
+            Self::ProofBackedClientUpdate => constructor_fields(data, 0)
+                .filter(|fields| fields.len() == 3)
+                .is_some_and(|fields| {
+                    matches!(&fields[1], PlutusData::Array(witnesses) if witnesses.len() <= 2)
+                        && history_siblings_shape(&fields[2], true)
+                }),
+            Self::ClientRecovery {
+                substitute_policy,
+                substitute_name,
+                history_format,
+            } => constructor_fields(data, 1)
+                .filter(|fields| match history_format {
+                    ConsensusHistoryFormat::Legacy => fields.len() == 1,
+                    ConsensusHistoryFormat::ProofBackedV1 => {
+                        fields.len() == 2 && history_siblings_shape(&fields[1], false)
+                    }
+                })
+                .and_then(|fields| fields.first())
+                .is_some_and(|token| auth_token_matches(token, substitute_policy, substitute_name)),
             Self::Packet {
                 alternative,
                 packet,
@@ -310,6 +346,15 @@ impl TransactionSigningPolicy {
 
         let manifest: JsonValue =
             serde_json::from_str(contents).map_err(|error| error.to_string())?;
+        // The operator-pinned format selects an ABI; transaction data must not
+        // choose a weaker legacy authorization path for a proof-backed deployment.
+        let consensus_history_format = match manifest.get("consensus_history_format") {
+            None => ConsensusHistoryFormat::Legacy,
+            Some(JsonValue::String(format)) if format == "proof-backed-v1" => {
+                ConsensusHistoryFormat::ProofBackedV1
+            }
+            Some(_) => return Err("unsupported consensus_history_format".to_string()),
+        };
         let validators = object_field(&manifest, &["validators"])
             .ok_or_else(|| "manifest has no validators object".to_string())?;
         let host_state = object_field(validators, &["host_state_stt", "hostStateStt"])
@@ -344,6 +389,9 @@ impl TransactionSigningPolicy {
         )?;
 
         let scripts = collect_validator_script_roots(validators)?;
+        if consensus_history_format == ConsensusHistoryFormat::ProofBackedV1 {
+            required_script(&scripts, "recoverclient")?;
+        }
         let voucher_policy = required_script(&scripts, "mintvoucher")?.hash.clone();
 
         let client_state = StateOutputRoot {
@@ -405,6 +453,7 @@ impl TransactionSigningPolicy {
 
         Ok(Self {
             network_id,
+            consensus_history_format,
             limits,
             protocol_addresses,
             scripts,
@@ -439,8 +488,20 @@ impl TransactionSigningPolicy {
                     false,
                 ),
                 "/ibc.core.client.v1.MsgUpdateClient" => {
-                    (vec!["spendclient"], vec![], StateOutputKind::Client, false)
+                    let scripts =
+                        if self.consensus_history_format == ConsensusHistoryFormat::ProofBackedV1 {
+                            vec!["spendclient", "recoverclient"]
+                        } else {
+                            vec!["spendclient"]
+                        };
+                    (scripts, vec![], StateOutputKind::Client, false)
                 }
+                "/ibc.core.client.v1.MsgRecoverClient" => (
+                    vec!["spendclient", "recoverclient"],
+                    vec![],
+                    StateOutputKind::Client,
+                    false,
+                ),
                 "/ibc.core.connection.v1.MsgConnectionOpenInit" => (
                     vec!["mintconnectionstt"],
                     vec!["mintconnectionstt"],
@@ -619,9 +680,7 @@ impl TransactionSigningPolicy {
         if body.certificates.is_some() {
             return Err(reject("certificates are not authorized".to_string()));
         }
-        if body.withdrawals.is_some() {
-            return Err(reject("withdrawals are not authorized".to_string()));
-        }
+        self.validate_withdrawals(body, intent, &reject)?;
         if body.auxiliary_data_hash.is_some() {
             return Err(reject("auxiliary data hash is not authorized".to_string()));
         }
@@ -762,6 +821,53 @@ impl TransactionSigningPolicy {
         )?;
         self.validate_wallet_delta(body, &signer_address, intent, resolved_inputs, &reject)?;
 
+        Ok(())
+    }
+
+    fn validate_withdrawals<F>(
+        &self,
+        body: &pallas_primitives::conway::MintedTransactionBody<'_>,
+        intent: &SigningIntent,
+        reject: &F,
+    ) -> Result<(), Error>
+    where
+        F: Fn(String) -> Error,
+    {
+        let requires_withdrawal = intent.operation == "/ibc.core.client.v1.MsgRecoverClient"
+            || (intent.operation == "/ibc.core.client.v1.MsgUpdateClient"
+                && self.consensus_history_format == ConsensusHistoryFormat::ProofBackedV1);
+        if !requires_withdrawal {
+            if body.withdrawals.is_some() {
+                return Err(reject("withdrawals are not authorized".to_string()));
+            }
+            return Ok(());
+        }
+
+        let withdrawals = body.withdrawals.as_ref().ok_or_else(|| {
+            reject("client transition requires its validator withdrawal".to_string())
+        })?;
+        if withdrawals.len() != 1 {
+            return Err(reject(
+                "client transition requires exactly one validator withdrawal".to_string(),
+            ));
+        }
+
+        let recovery_script = required_script(&self.scripts, "recoverclient").map_err(reject)?;
+        let expected_reward_account = [
+            &[0xf0 | self.network_id][..],
+            recovery_script.hash.as_slice(),
+        ]
+        .concat();
+        let (reward_account, amount) = withdrawals
+            .iter()
+            .next()
+            .expect("non-empty withdrawal map has one entry");
+        if reward_account.as_slice() != expected_reward_account || *amount != 0 {
+            return Err(reject(
+                "client transition withdrawal does not execute the pinned recovery validator with zero value"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -1307,7 +1413,7 @@ impl TransactionSigningPolicy {
         let host_alternative = match intent.operation.as_str() {
             "HostStateHeartbeat" => 10,
             "/ibc.core.client.v1.MsgCreateClient" => 0,
-            "/ibc.core.client.v1.MsgUpdateClient" => 4,
+            "/ibc.core.client.v1.MsgUpdateClient" | "/ibc.core.client.v1.MsgRecoverClient" => 4,
             "/ibc.core.connection.v1.MsgConnectionOpenInit"
             | "/ibc.core.connection.v1.MsgConnectionOpenTry" => 1,
             "/ibc.core.connection.v1.MsgConnectionOpenAck"
@@ -1347,7 +1453,27 @@ impl TransactionSigningPolicy {
 
         let expected = match intent.operation.as_str() {
             "/ibc.core.client.v1.MsgUpdateClient" => {
-                Some((&self.client_state, ChannelRedeemerIntent::Constructor(0)))
+                let expected =
+                    if self.consensus_history_format == ConsensusHistoryFormat::ProofBackedV1 {
+                        ChannelRedeemerIntent::ProofBackedClientUpdate
+                    } else {
+                        ChannelRedeemerIntent::Constructor(0)
+                    };
+                Some((&self.client_state, expected))
+            }
+            "/ibc.core.client.v1.MsgRecoverClient" => {
+                let substitute_sequence = intent.recovery_substitute_sequence.ok_or_else(|| {
+                    reject("recovery substitute client sequence is missing".to_string())
+                })?;
+                Some((
+                    &self.client_state,
+                    ChannelRedeemerIntent::ClientRecovery {
+                        history_format: self.consensus_history_format,
+                        substitute_policy: self.client_state.policy.clone(),
+                        substitute_name: self
+                            .state_token_name(StateOutputKind::Client, substitute_sequence),
+                    },
+                ))
             }
             "/ibc.core.connection.v1.MsgConnectionOpenAck" => Some((
                 &self.connection_state,
@@ -1447,6 +1573,71 @@ impl TransactionSigningPolicy {
         if !expected.matches(actual) {
             return Err(reject(
                 "redeemer attached to the message-selected protocol state input does not match the original IBC message"
+                    .to_string(),
+            ));
+        }
+        if intent.operation == "/ibc.core.client.v1.MsgRecoverClient" {
+            let substitute_sequence = intent.recovery_substitute_sequence.ok_or_else(|| {
+                reject("recovery substitute client sequence is missing".to_string())
+            })?;
+            let substitute_name =
+                self.state_token_name(StateOutputKind::Client, substitute_sequence);
+            self.validate_client_withdrawal_redeemer(
+                redeemers,
+                &token_name,
+                Some(&substitute_name),
+                reject,
+            )?;
+        } else if intent.operation == "/ibc.core.client.v1.MsgUpdateClient"
+            && self.consensus_history_format == ConsensusHistoryFormat::ProofBackedV1
+        {
+            self.validate_client_withdrawal_redeemer(redeemers, &token_name, None, reject)?;
+        }
+        Ok(())
+    }
+
+    fn validate_client_withdrawal_redeemer<F>(
+        &self,
+        redeemers: &pallas_primitives::conway::Redeemers,
+        subject_name: &[u8],
+        substitute_name: Option<&[u8]>,
+        reject: &F,
+    ) -> Result<(), Error>
+    where
+        F: Fn(String) -> Error,
+    {
+        let mut rewards = redeemers
+            .iter()
+            .filter(|(key, _)| key.tag == pallas_primitives::conway::RedeemerTag::Reward);
+        let (key, value) = rewards
+            .next()
+            .ok_or_else(|| reject("client transition has no withdrawal redeemer".to_string()))?;
+        if rewards.next().is_some() || key.index != 0 {
+            return Err(reject(
+                "client transition must have exactly one withdrawal redeemer at index zero"
+                    .to_string(),
+            ));
+        }
+        // RecoverClientWithdrawal is constructor 0 with both requested clients;
+        // CheckClientHistory is constructor 1 with only the requested subject.
+        // Never accept the recovery branch as authorization for an ordinary update.
+        let (alternative, arity) = if substitute_name.is_some() {
+            (0, 2)
+        } else {
+            (1, 1)
+        };
+        let fields = constructor_fields(&value.data, alternative)
+            .filter(|fields| fields.len() == arity)
+            .ok_or_else(|| {
+                reject("client transition withdrawal redeemer is malformed".to_string())
+            })?;
+        if !auth_token_matches(&fields[0], &self.client_state.policy, subject_name)
+            || substitute_name.is_some_and(|name| {
+                !auth_token_matches(&fields[1], &self.client_state.policy, name)
+            })
+        {
+            return Err(reject(
+                "client transition withdrawal redeemer does not match the requested clients"
                     .to_string(),
             ));
         }
@@ -2065,11 +2256,31 @@ fn plutus_bytes(data: &PlutusData) -> Option<&[u8]> {
     Some(bytes.as_slice())
 }
 
+fn history_siblings_shape(data: &PlutusData, allow_empty: bool) -> bool {
+    let PlutusData::Array(siblings) = data else {
+        return false;
+    };
+    (allow_empty && siblings.is_empty())
+        || (siblings.len() == 64
+            && siblings
+                .iter()
+                .all(|sibling| plutus_bytes(sibling).is_some_and(|bytes| bytes.len() == 32)))
+}
+
 fn plutus_u64(data: &PlutusData) -> Option<u64> {
     let PlutusData::BigInt(BigInt::Int(value)) = data else {
         return None;
     };
     u64::try_from(i128::from(*value)).ok()
+}
+
+fn auth_token_matches(data: &PlutusData, policy: &[u8], name: &[u8]) -> bool {
+    constructor_fields(data, 0)
+        .filter(|fields| fields.len() == 2)
+        .is_some_and(|fields| {
+            fields.first().and_then(plutus_bytes) == Some(policy)
+                && fields.get(1).and_then(plutus_bytes) == Some(name)
+        })
 }
 
 fn plutus_height(data: &PlutusData) -> Option<(u64, u64)> {
@@ -2177,6 +2388,7 @@ impl SigningIntent {
             external_output: None,
             transfer: None,
             state_sequence: None,
+            recovery_substitute_sequence: None,
             packet: None,
             acknowledgement: None,
             prune_sequence: None,
@@ -2193,6 +2405,7 @@ impl SigningIntent {
         let mut transfer = None;
         let mut module_port = None;
         let mut state_sequence = None;
+        let mut recovery_substitute_sequence = None;
         let mut packet_intent = None;
         let mut acknowledgement = None;
         let mut prune_sequence = None;
@@ -2206,6 +2419,21 @@ impl SigningIntent {
             "/ibc.core.client.v1.MsgUpdateClient" => {
                 let msg = MsgUpdateClient::decode(message).map_err(decode_error)?;
                 state_sequence = Some(parse_identifier_sequence(&msg.client_id, None)?);
+                msg.signer
+            }
+            "/ibc.core.client.v1.MsgRecoverClient" => {
+                let msg = MsgRecoverClient::decode(message).map_err(decode_error)?;
+                let subject_sequence =
+                    parse_identifier_sequence(&msg.subject_client_id, Some("07-tendermint"))?;
+                let substitute_sequence =
+                    parse_identifier_sequence(&msg.substitute_client_id, Some("07-tendermint"))?;
+                if subject_sequence == substitute_sequence {
+                    return Err(Error::Signer(
+                        "recovery subject and substitute clients must be different".to_string(),
+                    ));
+                }
+                state_sequence = Some(subject_sequence);
+                recovery_substitute_sequence = Some(substitute_sequence);
                 msg.signer
             }
             "/ibc.core.connection.v1.MsgConnectionOpenInit" => {
@@ -2449,6 +2677,7 @@ impl SigningIntent {
             external_output,
             transfer,
             state_sequence,
+            recovery_substitute_sequence,
             packet: packet_intent,
             acknowledgement,
             prune_sequence,
@@ -3030,6 +3259,7 @@ fn parse_identifier_sequence(
         || expected_prefix.is_some_and(|expected| prefix != expected)
         || sequence.is_empty()
         || sequence.len() > 8
+        || (sequence.len() > 1 && sequence.starts_with('0'))
         || !sequence.bytes().all(|byte| byte.is_ascii_digit())
     {
         return Err(Error::Signer(format!(
@@ -3129,6 +3359,7 @@ fn decode_fixed_hex(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::cardano::utxo_resolver::ResolvedAsset;
     use pallas_codec::minicbor;
 
     fn limits() -> SigningPolicyLimits {
@@ -3152,9 +3383,10 @@ mod tests {
                         "script_hash": "{}",
                         "ref_utxo": {{"tx_hash": "{}", "output_index": 0}}
                     }},
-                    "spend_client": {{"address": "70{}"}},
+                    "spend_client": {{"address": "70{}", "script_hash": "{}", "ref_utxo": {{"tx_hash": "{}", "output_index": 0}}}},
                     "spend_connection": {{"address": "70{}"}},
                     "spend_channel": {{"address": "70{}"}},
+                    "recover_client": {{"script_hash": "{}", "ref_utxo": {{"tx_hash": "{}", "output_index": 0}}}},
                     "mint_client_stt": {{"script_hash": "{}", "ref_utxo": {{"tx_hash": "{}", "output_index": 0}}}},
                     "mint_connection_stt": {{"script_hash": "{}", "ref_utxo": {{"tx_hash": "{}", "output_index": 0}}}},
                     "mint_channel_stt": {{"script_hash": "{}", "ref_utxo": {{"tx_hash": "{}", "output_index": 0}}}},
@@ -3177,8 +3409,12 @@ mod tests {
             "21".repeat(28),
             "31".repeat(32),
             "12".repeat(28),
+            "22".repeat(28),
+            "32".repeat(32),
             "13".repeat(28),
             "14".repeat(28),
+            "20".repeat(28),
+            "30".repeat(32),
             "25".repeat(28),
             "35".repeat(32),
             "26".repeat(28),
@@ -3232,6 +3468,1113 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("message signer does not match"));
+    }
+
+    #[test]
+    fn recovery_intent_binds_both_tendermint_clients() {
+        let signer = format!("60{}", "99".repeat(28));
+        let message = MsgRecoverClient {
+            subject_client_id: "07-tendermint-7".to_string(),
+            substitute_client_id: "07-tendermint-12".to_string(),
+            signer: signer.clone(),
+        }
+        .encode_to_vec();
+        let intent =
+            SigningIntent::ibc("/ibc.core.client.v1.MsgRecoverClient", &message, &signer, 0)
+                .unwrap();
+
+        assert_eq!(intent.state_sequence, Some(7));
+        assert_eq!(intent.recovery_substitute_sequence, Some(12));
+
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let requirements = policy.operation_requirements(&intent).unwrap();
+        assert_eq!(requirements.state_output, StateOutputKind::Client);
+        assert_eq!(
+            requirements.required_scripts,
+            vec!["spendclient", "recoverclient"]
+        );
+        assert!(requirements.required_mint_scripts.is_empty());
+    }
+
+    #[test]
+    fn recovery_intent_rejects_the_same_or_non_tendermint_client() {
+        let signer = format!("60{}", "99".repeat(28));
+        for (subject, substitute) in [
+            ("07-tendermint-7", "07-tendermint-7"),
+            ("08-cardano-7", "07-tendermint-12"),
+        ] {
+            let message = MsgRecoverClient {
+                subject_client_id: subject.to_string(),
+                substitute_client_id: substitute.to_string(),
+                signer: signer.clone(),
+            }
+            .encode_to_vec();
+            assert!(SigningIntent::ibc(
+                "/ibc.core.client.v1.MsgRecoverClient",
+                &message,
+                &signer,
+                0,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn identifier_sequences_must_use_canonical_decimal() {
+        assert_eq!(
+            parse_identifier_sequence("07-tendermint-0", Some("07-tendermint")).unwrap(),
+            0
+        );
+        assert_eq!(
+            parse_identifier_sequence("07-tendermint-7", Some("07-tendermint")).unwrap(),
+            7
+        );
+        for identifier in ["07-tendermint-00", "07-tendermint-0007"] {
+            assert!(parse_identifier_sequence(identifier, Some("07-tendermint")).is_err());
+        }
+    }
+
+    #[test]
+    fn recovery_spend_redeemer_binds_the_substitute_token() {
+        let policy = vec![0x25; 28];
+        let name = b"substitute".to_vec();
+        let mut encoded = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut encoded);
+        encoder.tag(minicbor::data::Tag::Unassigned(122)).unwrap();
+        encoder.array(1).unwrap();
+        encoder.tag(minicbor::data::Tag::Unassigned(121)).unwrap();
+        encoder.array(2).unwrap();
+        encoder.bytes(&policy).unwrap();
+        encoder.bytes(&name).unwrap();
+        let redeemer: PlutusData = minicbor::decode(&encoded).unwrap();
+
+        assert!(ChannelRedeemerIntent::ClientRecovery {
+            substitute_policy: policy.clone(),
+            substitute_name: name.clone(),
+            history_format: ConsensusHistoryFormat::Legacy,
+        }
+        .matches(&redeemer));
+        assert!(!ChannelRedeemerIntent::ClientRecovery {
+            substitute_policy: policy,
+            substitute_name: b"another-client".to_vec(),
+            history_format: ConsensusHistoryFormat::Legacy,
+        }
+        .matches(&redeemer));
+    }
+
+    const RECOVERY_HOST_INPUT_ID: [u8; 32] = [0x41; 32];
+    const RECOVERY_SUBJECT_INPUT_ID: [u8; 32] = [0x42; 32];
+    const RECOVERY_SIGNER_INPUT_ID: [u8; 32] = [0x43; 32];
+    const RECOVERY_SUBSTITUTE_REFERENCE_ID: [u8; 32] = [0x44; 32];
+
+    fn recovery_signer() -> String {
+        format!("60{}", "99".repeat(28))
+    }
+
+    fn recovery_intent() -> SigningIntent {
+        let signer = recovery_signer();
+        let message = MsgRecoverClient {
+            subject_client_id: "07-tendermint-7".to_string(),
+            substitute_client_id: "07-tendermint-12".to_string(),
+            signer: signer.clone(),
+        }
+        .encode_to_vec();
+        SigningIntent::ibc("/ibc.core.client.v1.MsgRecoverClient", &message, &signer, 0).unwrap()
+    }
+
+    fn encode_transaction_input(
+        encoder: &mut minicbor::Encoder<&mut Vec<u8>>,
+        transaction_id: &[u8],
+        output_index: u64,
+    ) {
+        encoder
+            .array(2)
+            .unwrap()
+            .bytes(transaction_id)
+            .unwrap()
+            .u64(output_index)
+            .unwrap();
+    }
+
+    fn encode_single_asset_output(
+        encoder: &mut minicbor::Encoder<&mut Vec<u8>>,
+        address: &[u8],
+        policy: &[u8],
+        name: &[u8],
+    ) {
+        encoder
+            .array(3)
+            .unwrap()
+            .bytes(address)
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .u64(2_000_000)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .bytes(policy)
+            .unwrap()
+            .map(1)
+            .unwrap()
+            .bytes(name)
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .null()
+            .unwrap();
+    }
+
+    fn encode_auth_token(
+        encoder: &mut minicbor::Encoder<&mut Vec<u8>>,
+        policy: &[u8],
+        name: &[u8],
+    ) {
+        encoder
+            .tag(minicbor::data::Tag::Unassigned(121))
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .bytes(policy)
+            .unwrap()
+            .bytes(name)
+            .unwrap();
+    }
+
+    fn recovery_transaction(
+        policy: &TransactionSigningPolicy,
+        spend_substitute_sequence: u64,
+    ) -> Vec<u8> {
+        let signer_address = hex::decode(recovery_signer()).unwrap();
+        let subject_name = policy.state_token_name(StateOutputKind::Client, 7);
+        let substitute_name = policy.state_token_name(StateOutputKind::Client, 12);
+        let spend_substitute_name =
+            policy.state_token_name(StateOutputKind::Client, spend_substitute_sequence);
+        let recovery_script = required_script(&policy.scripts, "recoverclient").unwrap();
+        let mut reference_inputs = vec![
+            policy.host_state_reference.clone(),
+            required_script(&policy.scripts, "spendclient")
+                .unwrap()
+                .reference
+                .clone(),
+            recovery_script.reference.clone(),
+            (RECOVERY_SUBSTITUTE_REFERENCE_ID.to_vec(), 0),
+        ];
+        reference_inputs.sort_unstable();
+
+        let mut encoded = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut encoded);
+        encoder
+            .array(4)
+            .unwrap()
+            .map(7)
+            .unwrap()
+            .u8(0)
+            .unwrap()
+            .array(3)
+            .unwrap();
+        encode_transaction_input(&mut encoder, &RECOVERY_HOST_INPUT_ID, 0);
+        encode_transaction_input(&mut encoder, &RECOVERY_SUBJECT_INPUT_ID, 0);
+        encode_transaction_input(&mut encoder, &RECOVERY_SIGNER_INPUT_ID, 0);
+
+        encoder.u8(1).unwrap().array(3).unwrap();
+        encode_single_asset_output(
+            &mut encoder,
+            &policy.host_state_address,
+            &policy.host_state_nft_policy,
+            &policy.host_state_nft_name,
+        );
+        encode_single_asset_output(
+            &mut encoder,
+            &policy.client_state.address,
+            &policy.client_state.policy,
+            &subject_name,
+        );
+        encoder
+            .array(3)
+            .unwrap()
+            .bytes(&signer_address)
+            .unwrap()
+            .u64(2_500_000)
+            .unwrap()
+            .null()
+            .unwrap()
+            .u8(2)
+            .unwrap()
+            .u64(500_000)
+            .unwrap()
+            .u8(3)
+            .unwrap()
+            .u64(1_000)
+            .unwrap()
+            .u8(5)
+            .unwrap()
+            .map(1)
+            .unwrap();
+        encoder
+            .bytes(&[&[0xf0][..], recovery_script.hash.as_slice()].concat())
+            .unwrap()
+            .u64(0)
+            .unwrap()
+            .u8(14)
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .bytes(&[0x99; 28])
+            .unwrap()
+            .u8(18)
+            .unwrap()
+            .array(reference_inputs.len() as u64)
+            .unwrap();
+        for (transaction_id, output_index) in reference_inputs {
+            encode_transaction_input(&mut encoder, &transaction_id, output_index);
+        }
+
+        encoder.map(1).unwrap().u8(5).unwrap().array(3).unwrap();
+
+        // HostState UpdateClient, Spend[0].
+        encoder
+            .array(4)
+            .unwrap()
+            .u8(0)
+            .unwrap()
+            .u32(0)
+            .unwrap()
+            .tag(minicbor::data::Tag::Unassigned(125))
+            .unwrap()
+            .array(3)
+            .unwrap()
+            .array(0)
+            .unwrap()
+            .array(0)
+            .unwrap()
+            .array(0)
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .u64(1)
+            .unwrap();
+
+        // SpendClient RecoverClient, Spend[1].
+        encoder
+            .array(4)
+            .unwrap()
+            .u8(0)
+            .unwrap()
+            .u32(1)
+            .unwrap()
+            .tag(minicbor::data::Tag::Unassigned(122))
+            .unwrap()
+            .array(1)
+            .unwrap();
+        encode_auth_token(
+            &mut encoder,
+            &policy.client_state.policy,
+            &spend_substitute_name,
+        );
+        encoder.array(2).unwrap().u64(1).unwrap().u64(1).unwrap();
+
+        // RecoverClient withdrawal, Reward[0].
+        encoder
+            .array(4)
+            .unwrap()
+            .u8(3)
+            .unwrap()
+            .u32(0)
+            .unwrap()
+            .tag(minicbor::data::Tag::Unassigned(121))
+            .unwrap()
+            .array(2)
+            .unwrap();
+        encode_auth_token(&mut encoder, &policy.client_state.policy, &subject_name);
+        encode_auth_token(&mut encoder, &policy.client_state.policy, &substitute_name);
+        encoder
+            .array(2)
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .u64(1)
+            .unwrap()
+            .bool(true)
+            .unwrap()
+            .null()
+            .unwrap();
+        encoded
+    }
+
+    fn recovery_resolved_inputs(policy: &TransactionSigningPolicy) -> ResolvedTransactionInputs {
+        let mut resolved = ResolvedTransactionInputs::default();
+        resolved.regular.insert(
+            TransactionOutRef {
+                transaction_id: RECOVERY_HOST_INPUT_ID,
+                output_index: 0,
+            },
+            ResolvedInput {
+                address: policy.host_state_address.clone(),
+                lovelace: 2_000_000,
+                assets: vec![ResolvedAsset {
+                    policy_id: policy.host_state_nft_policy.clone().try_into().unwrap(),
+                    asset_name: policy.host_state_nft_name.clone(),
+                    quantity: 1,
+                }],
+            },
+        );
+        resolved.regular.insert(
+            TransactionOutRef {
+                transaction_id: RECOVERY_SUBJECT_INPUT_ID,
+                output_index: 0,
+            },
+            ResolvedInput {
+                address: policy.client_state.address.clone(),
+                lovelace: 2_000_000,
+                assets: vec![ResolvedAsset {
+                    policy_id: policy.client_state.policy.clone().try_into().unwrap(),
+                    asset_name: policy.state_token_name(StateOutputKind::Client, 7),
+                    quantity: 1,
+                }],
+            },
+        );
+        resolved.regular.insert(
+            TransactionOutRef {
+                transaction_id: RECOVERY_SIGNER_INPUT_ID,
+                output_index: 0,
+            },
+            ResolvedInput {
+                address: hex::decode(recovery_signer()).unwrap(),
+                lovelace: 3_000_000,
+                assets: Vec::new(),
+            },
+        );
+        resolved
+    }
+
+    fn validate_recovery_transaction(
+        policy: &TransactionSigningPolicy,
+        spend_substitute_sequence: u64,
+    ) -> Result<(), Error> {
+        let encoded = recovery_transaction(policy, spend_substitute_sequence);
+        let mut decoder = minicbor::Decoder::new(&encoded);
+        let transaction: MintedTx<'_> = decoder.decode().unwrap();
+        assert_eq!(decoder.position(), encoded.len());
+        policy.validate(
+            &transaction,
+            encoded.len(),
+            &recovery_signer(),
+            &recovery_intent(),
+            &recovery_resolved_inputs(policy),
+        )
+    }
+
+    #[test]
+    fn complete_recovery_transaction_matches_signing_policy() {
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        validate_recovery_transaction(&policy, 12).unwrap();
+    }
+
+    #[test]
+    fn complete_recovery_rejects_wrong_substitute_token() {
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let error = validate_recovery_transaction(&policy, 13).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("state input does not match the original IBC message"));
+    }
+
+    fn proof_backed_policy() -> TransactionSigningPolicy {
+        let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
+        value["consensus_history_format"] = "proof-backed-v1".into();
+        TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).unwrap()
+    }
+
+    fn update_intent() -> SigningIntent {
+        let signer = recovery_signer();
+        let message = MsgUpdateClient {
+            client_id: "07-tendermint-7".to_string(),
+            client_message: None,
+            signer: signer.clone(),
+        }
+        .encode_to_vec();
+        SigningIntent::ibc("/ibc.core.client.v1.MsgUpdateClient", &message, &signer, 0).unwrap()
+    }
+
+    fn data_constructor(alternative: u64, fields: Vec<PlutusData>) -> PlutusData {
+        PlutusData::Constr(pallas_primitives::alonzo::Constr {
+            tag: 121 + alternative,
+            any_constructor: None,
+            fields,
+        })
+    }
+
+    fn data_token(policy: &[u8], name: &[u8]) -> PlutusData {
+        data_constructor(
+            0,
+            vec![
+                PlutusData::BoundedBytes(policy.to_vec().into()),
+                PlutusData::BoundedBytes(name.to_vec().into()),
+            ],
+        )
+    }
+
+    fn data_siblings(count: usize, bytes: usize) -> PlutusData {
+        PlutusData::Array(vec![PlutusData::BoundedBytes(vec![0; bytes].into()); count])
+    }
+
+    fn edit_redeemers(
+        tx: &mut pallas_primitives::conway::Tx,
+        edit: impl FnOnce(
+            &mut Vec<(
+                pallas_primitives::conway::RedeemersKey,
+                pallas_primitives::conway::RedeemersValue,
+            )>,
+        ),
+    ) {
+        let mut values = tx
+            .transaction_witness_set
+            .redeemer
+            .as_ref()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        edit(&mut values);
+        tx.transaction_witness_set.redeemer = Some(pallas_primitives::conway::Redeemers::from(
+            pallas_codec::utils::NonEmptyKeyValuePairs::try_from(values).unwrap(),
+        ));
+    }
+
+    fn proof_backed_transaction(
+        policy: &TransactionSigningPolicy,
+        recovery: bool,
+    ) -> pallas_primitives::conway::Tx {
+        use pallas_primitives::conway::RedeemerTag;
+        // Reuse the complete legacy policy fixture (including trusted wallet
+        // resolution), replacing only the versioned client/HostState ABI.
+        let mut tx: pallas_primitives::conway::Tx =
+            minicbor::decode(&recovery_transaction(policy, 12)).unwrap();
+        let subject = data_token(
+            &policy.client_state.policy,
+            &policy.state_token_name(StateOutputKind::Client, 7),
+        );
+        let substitute = data_token(
+            &policy.client_state.policy,
+            &policy.state_token_name(StateOutputKind::Client, 12),
+        );
+        edit_redeemers(&mut tx, |redeemers| {
+            for (key, value) in redeemers {
+                value.data = match (key.tag, key.index) {
+                    (RedeemerTag::Spend, 0) => data_constructor(
+                        4,
+                        vec![PlutusData::Array(vec![]), PlutusData::Array(vec![])],
+                    ),
+                    (RedeemerTag::Spend, 1) if recovery => {
+                        data_constructor(1, vec![substitute.clone(), data_siblings(64, 32)])
+                    }
+                    (RedeemerTag::Spend, 1) => data_constructor(
+                        0,
+                        vec![
+                            data_constructor(0, vec![]),
+                            PlutusData::Array(vec![]),
+                            data_siblings(64, 32),
+                        ],
+                    ),
+                    (RedeemerTag::Reward, 0) if recovery => {
+                        data_constructor(0, vec![subject.clone(), substitute.clone()])
+                    }
+                    (RedeemerTag::Reward, 0) => data_constructor(1, vec![subject.clone()]),
+                    _ => panic!("unexpected fixture redeemer"),
+                };
+            }
+        });
+        tx
+    }
+
+    fn validate_client_fixture(
+        policy: &TransactionSigningPolicy,
+        tx: &pallas_primitives::conway::Tx,
+        recovery: bool,
+    ) -> Result<(), Error> {
+        let encoded = minicbor::to_vec(tx).unwrap();
+        let transaction: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+        policy.validate(
+            &transaction,
+            encoded.len(),
+            &recovery_signer(),
+            &if recovery {
+                recovery_intent()
+            } else {
+                update_intent()
+            },
+            &recovery_resolved_inputs(policy),
+        )
+    }
+
+    #[test]
+    fn history_format_is_operator_pinned_and_unknown_formats_fail_closed() {
+        let legacy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        assert_eq!(
+            legacy.consensus_history_format,
+            ConsensusHistoryFormat::Legacy
+        );
+        assert_eq!(
+            proof_backed_policy().consensus_history_format,
+            ConsensusHistoryFormat::ProofBackedV1
+        );
+        for format in [
+            JsonValue::Null,
+            true.into(),
+            1.into(),
+            "unknown".into(),
+            "".into(),
+        ] {
+            let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
+            value["consensus_history_format"] = format;
+            assert!(
+                TransactionSigningPolicy::from_json(&value.to_string(), 0, limits())
+                    .unwrap_err()
+                    .contains("unsupported consensus_history_format")
+            );
+        }
+        let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
+        value["consensus_history_format"] = "proof-backed-v1".into();
+        value["validators"]
+            .as_object_mut()
+            .unwrap()
+            .remove("recover_client");
+        assert!(TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).is_err());
+    }
+
+    #[test]
+    fn complete_proof_backed_update_and_recovery_match_signing_policy() {
+        use pallas_primitives::conway::RedeemerTag;
+        let policy = proof_backed_policy();
+        for recovery in [false, true] {
+            validate_client_fixture(
+                &policy,
+                &proof_backed_transaction(&policy, recovery),
+                recovery,
+            )
+            .unwrap();
+        }
+        let mut freeze = proof_backed_transaction(&policy, false);
+        edit_redeemers(&mut freeze, |values| {
+            let (_, value) = values
+                .iter_mut()
+                .find(|(key, _)| key.tag == RedeemerTag::Spend && key.index == 1)
+                .unwrap();
+            let PlutusData::Constr(constructor) = &mut value.data else {
+                unreachable!()
+            };
+            constructor.fields[2] = PlutusData::Array(vec![]);
+        });
+        // Empty insertion proofs are the freeze ABI. Classification/signatures
+        // remain the pinned validator's responsibility, not this shape check.
+        validate_client_fixture(&policy, &freeze, false).unwrap();
+        let requirements = policy.operation_requirements(&update_intent()).unwrap();
+        assert_eq!(
+            requirements.required_scripts,
+            vec!["spendclient", "recoverclient"]
+        );
+        assert!(requirements.required_mint_scripts.is_empty());
+    }
+
+    #[test]
+    fn actual_evaluated_proof_backed_transactions_match_signing_policy() {
+        // Exported only after the matching signed transaction was evaluated and
+        // accepted by the production Aiken emulator fixture. These roots and
+        // resolved inputs stand in for operator-pinned deployment data and the
+        // independent Kupo resolver, never data inferred from transaction outputs.
+        let fixture: JsonValue =
+            serde_json::from_str(include_str!("fixtures/proof_backed_history_signing.json"))
+                .unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0]["name"], "update");
+        assert_eq!(cases[1]["name"], "recovery");
+        for case in cases {
+            let mut pinned: JsonValue = serde_json::from_str(&manifest()).unwrap();
+            for role in [
+                "host_state_stt",
+                "spend_client",
+                "recover_client",
+                "mint_client_stt",
+            ] {
+                pinned["validators"][role] = case["manifest"]["validators"][role].clone();
+            }
+            pinned["host_state_nft"] = case["manifest"]["host_state_nft"].clone();
+            pinned["consensus_history_format"] =
+                case["manifest"]["consensus_history_format"].clone();
+            let ledger_sized_limits = SigningPolicyLimits {
+                max_tx_size_bytes: 16_384,
+                ..limits()
+            };
+            let policy =
+                TransactionSigningPolicy::from_json(&pinned.to_string(), 0, ledger_sized_limits)
+                    .unwrap();
+            let signer = case["signer_address"].as_str().unwrap();
+            let operation = case["operation"].as_str().unwrap();
+            let client_id = case["client_id"].as_str().unwrap().to_string();
+            let message = match operation {
+                "/ibc.core.client.v1.MsgUpdateClient" => MsgUpdateClient {
+                    client_id,
+                    client_message: None,
+                    signer: signer.to_string(),
+                }
+                .encode_to_vec(),
+                "/ibc.core.client.v1.MsgRecoverClient" => MsgRecoverClient {
+                    subject_client_id: client_id,
+                    substitute_client_id: case["substitute_client_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                    signer: signer.to_string(),
+                }
+                .encode_to_vec(),
+                _ => panic!("unexpected fixture operation"),
+            };
+            let intent = SigningIntent::ibc(operation, &message, signer, 0).unwrap();
+            let mut resolved = ResolvedTransactionInputs::default();
+            for (kind, inputs) in [
+                ("regular", &mut resolved.regular),
+                ("collateral", &mut resolved.collateral),
+            ] {
+                for input in case["resolved_inputs"][kind].as_array().unwrap() {
+                    let reference = TransactionOutRef {
+                        transaction_id: hex::decode(input["tx_hash"].as_str().unwrap())
+                            .unwrap()
+                            .try_into()
+                            .unwrap(),
+                        output_index: input["output_index"].as_u64().unwrap(),
+                    };
+                    let value = ResolvedInput {
+                        address: hex::decode(input["address"].as_str().unwrap()).unwrap(),
+                        lovelace: input["lovelace"].as_str().unwrap().parse().unwrap(),
+                        assets: input["assets"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|asset| ResolvedAsset {
+                                policy_id: hex::decode(asset["policy_id"].as_str().unwrap())
+                                    .unwrap()
+                                    .try_into()
+                                    .unwrap(),
+                                asset_name: hex::decode(asset["asset_name"].as_str().unwrap())
+                                    .unwrap(),
+                                quantity: asset["quantity"].as_str().unwrap().parse().unwrap(),
+                            })
+                            .collect(),
+                    };
+                    assert!(inputs.insert(reference, value).is_none());
+                }
+            }
+            let encoded = hex::decode(case["unsigned_tx_cbor"].as_str().unwrap()).unwrap();
+            let mut decoder = minicbor::Decoder::new(&encoded);
+            let transaction: MintedTx<'_> = decoder.decode().unwrap();
+            assert_eq!(decoder.position(), encoded.len());
+            policy
+                .validate(&transaction, encoded.len(), signer, &intent, &resolved)
+                .unwrap_or_else(|error| panic!("{}: {error}", case["name"]));
+        }
+    }
+
+    #[test]
+    fn history_format_never_falls_back_to_legacy_authorization() {
+        use pallas_primitives::conway::RedeemerTag;
+        let policy = proof_backed_policy();
+        let legacy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let update = proof_backed_transaction(&policy, false);
+        assert!(validate_client_fixture(&legacy, &update, false).is_err());
+        assert!(
+            validate_client_fixture(&legacy, &proof_backed_transaction(&policy, true), true)
+                .is_err()
+        );
+        // Legacy update ABI still permits no withdrawal. The proof-backed mode
+        // cannot accept that same transaction even with identical pinned roots.
+        let mut legacy_update = update;
+        legacy_update.transaction_body.withdrawals = None;
+        edit_redeemers(&mut legacy_update, |values| {
+            values.retain(|(key, _)| key.tag != RedeemerTag::Reward);
+            values
+                .iter_mut()
+                .find(|(key, _)| key.tag == RedeemerTag::Spend && key.index == 1)
+                .unwrap()
+                .1
+                .data = data_constructor(0, vec![data_constructor(0, vec![])]);
+        });
+        validate_client_fixture(&legacy, &legacy_update, false).unwrap();
+        assert!(validate_client_fixture(&policy, &legacy_update, false).is_err());
+        assert!(validate_recovery_transaction(&policy, 12).is_err());
+    }
+
+    #[test]
+    fn proof_backed_client_transitions_reject_missing_or_unpinned_support_reference() {
+        let policy = proof_backed_policy();
+        let expected = required_script(&policy.scripts, "recoverclient")
+            .unwrap()
+            .reference
+            .clone();
+        for recovery in [false, true] {
+            let mut tx = proof_backed_transaction(&policy, recovery);
+            let mut references = tx
+                .transaction_body
+                .reference_inputs
+                .clone()
+                .unwrap()
+                .to_vec();
+            references
+                .retain(|input| (input.transaction_id.as_ref().to_vec(), input.index) != expected);
+            tx.transaction_body.reference_inputs = Some(references.clone().try_into().unwrap());
+            assert!(validate_client_fixture(&policy, &tx, recovery)
+                .unwrap_err()
+                .to_string()
+                .contains("pinned recoverclient reference script is missing"));
+            references.push(pallas_primitives::conway::TransactionInput {
+                transaction_id: [0x77; 32].into(),
+                index: 0,
+            });
+            tx.transaction_body.reference_inputs = Some(references.try_into().unwrap());
+            assert!(validate_client_fixture(&policy, &tx, recovery).is_err());
+        }
+    }
+
+    #[test]
+    fn proof_backed_client_transitions_reject_invalid_withdrawal_accounts_and_values() {
+        let policy = proof_backed_policy();
+        let credential = required_script(&policy.scripts, "recoverclient")
+            .unwrap()
+            .hash
+            .clone();
+        let valid_account = [&[0xf0][..], credential.as_slice()].concat();
+        for recovery in [false, true] {
+            for withdrawals in [
+                None,
+                Some(vec![(valid_account.clone(), 1)]),
+                Some(vec![([&[0xf1][..], credential.as_slice()].concat(), 0)]),
+                Some(vec![([&[0xe0][..], credential.as_slice()].concat(), 0)]),
+                Some(vec![(vec![0xf0; 29], 0)]),
+                Some(vec![(valid_account.clone(), 0), (vec![0xf0; 29], 0)]),
+            ] {
+                let mut tx = proof_backed_transaction(&policy, recovery);
+                tx.transaction_body.withdrawals = withdrawals.map(|values| {
+                    values
+                        .into_iter()
+                        .map(|(account, amount)| (account.into(), amount))
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .unwrap()
+                });
+                let error = validate_client_fixture(&policy, &tx, recovery)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("withdrawal"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn proof_backed_mode_keeps_no_mint_and_unrelated_withdrawal_prohibitions() {
+        let policy = proof_backed_policy();
+        for recovery in [false, true] {
+            let mut tx = proof_backed_transaction(&policy, recovery);
+            tx.transaction_body.mint = Some(
+                vec![(
+                    policy.client_state.policy.as_slice().into(),
+                    vec![(vec![1].into(), 1i64.try_into().unwrap())]
+                        .try_into()
+                        .unwrap(),
+                )]
+                .try_into()
+                .unwrap(),
+            );
+            assert!(validate_client_fixture(&policy, &tx, recovery)
+                .unwrap_err()
+                .to_string()
+                .contains("is not authorized for this IBC operation"));
+        }
+        let encoded = minicbor::to_vec(proof_backed_transaction(&policy, false)).unwrap();
+        let tx: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+        for operation in [
+            "HostStateHeartbeat",
+            "/ibc.core.client.v1.MsgCreateClient",
+            "/ibc.core.channel.v1.MsgRecvPacket",
+        ] {
+            let intent = bare_intent(operation, None);
+            assert!(policy
+                .validate_withdrawals(&tx.transaction_body, &intent, &Error::Signer)
+                .unwrap_err()
+                .to_string()
+                .contains("withdrawals are not authorized"));
+        }
+    }
+
+    #[test]
+    fn proof_backed_client_transitions_bind_exact_reward_branch_index_and_clients() {
+        use pallas_primitives::conway::RedeemerTag;
+        let policy = proof_backed_policy();
+        let subject = data_token(
+            &policy.client_state.policy,
+            &policy.state_token_name(StateOutputKind::Client, 7),
+        );
+        let substitute = data_token(
+            &policy.client_state.policy,
+            &policy.state_token_name(StateOutputKind::Client, 12),
+        );
+        for recovery in [false, true] {
+            let wrong_branch = if recovery {
+                data_constructor(1, vec![subject.clone()])
+            } else {
+                data_constructor(0, vec![subject.clone(), substitute.clone()])
+            };
+            let correct_branch = if recovery { 0 } else { 1 };
+            let mut wrong_client_fields = vec![substitute.clone()];
+            if recovery {
+                wrong_client_fields.push(substitute.clone());
+            }
+            let mut wrong_policy_fields = vec![data_token(
+                &[0x77; 28],
+                &policy.state_token_name(StateOutputKind::Client, 7),
+            )];
+            if recovery {
+                wrong_policy_fields.push(substitute.clone());
+            }
+            let bad_data = vec![
+                wrong_branch,
+                data_constructor(correct_branch, vec![]),
+                data_constructor(
+                    correct_branch,
+                    vec![subject.clone(), substitute.clone(), subject.clone()],
+                ),
+                data_constructor(correct_branch, wrong_client_fields),
+                data_constructor(correct_branch, wrong_policy_fields),
+            ];
+            for data in bad_data {
+                let mut tx = proof_backed_transaction(&policy, recovery);
+                edit_redeemers(&mut tx, |values| {
+                    values
+                        .iter_mut()
+                        .find(|(key, _)| key.tag == RedeemerTag::Reward)
+                        .unwrap()
+                        .1
+                        .data = data;
+                });
+                assert!(validate_client_fixture(&policy, &tx, recovery)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("withdrawal redeemer"));
+            }
+            for mutation in 0..3 {
+                let mut tx = proof_backed_transaction(&policy, recovery);
+                edit_redeemers(&mut tx, |values| {
+                    let position = values
+                        .iter()
+                        .position(|(key, _)| key.tag == RedeemerTag::Reward)
+                        .unwrap();
+                    match mutation {
+                        0 => {
+                            values.remove(position);
+                        }
+                        1 => {
+                            values[position].0.index = 1;
+                        }
+                        _ => {
+                            values.push(values[position].clone());
+                        }
+                    }
+                });
+                assert!(validate_client_fixture(&policy, &tx, recovery)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("withdrawal redeemer"));
+            }
+        }
+        let mut tx = proof_backed_transaction(&policy, true);
+        edit_redeemers(&mut tx, |values| {
+            values
+                .iter_mut()
+                .find(|(key, _)| key.tag == RedeemerTag::Reward)
+                .unwrap()
+                .1
+                .data = data_constructor(0, vec![subject.clone(), subject]);
+        });
+        assert!(validate_client_fixture(&policy, &tx, true).is_err());
+    }
+
+    #[test]
+    fn proof_backed_spend_shapes_and_recovery_substitute_are_strict() {
+        let policy = proof_backed_policy();
+        let substitute_name = policy.state_token_name(StateOutputKind::Client, 12);
+        let token = data_token(&policy.client_state.policy, &substitute_name);
+        let expected = ChannelRedeemerIntent::ClientRecovery {
+            substitute_policy: policy.client_state.policy.clone(),
+            substitute_name,
+            history_format: ConsensusHistoryFormat::ProofBackedV1,
+        };
+        for (count, bytes) in [(0, 32), (63, 32), (65, 32), (64, 31), (64, 33)] {
+            assert!(!expected.matches(&data_constructor(
+                1,
+                vec![token.clone(), data_siblings(count, bytes)]
+            )));
+        }
+        assert!(!expected.matches(&data_constructor(1, vec![token.clone()])));
+        assert!(!expected.matches(&data_constructor(
+            1,
+            vec![token.clone(), data_siblings(64, 32), token.clone()]
+        )));
+        assert!(!expected.matches(&data_constructor(
+            1,
+            vec![
+                data_token(&policy.client_state.policy, b"other"),
+                data_siblings(64, 32)
+            ]
+        )));
+        assert!(expected.matches(&data_constructor(1, vec![token, data_siblings(64, 32)])));
+        let update = ChannelRedeemerIntent::ProofBackedClientUpdate;
+        for count in [0, 64] {
+            assert!(update.matches(&data_constructor(
+                0,
+                vec![
+                    data_constructor(0, vec![]),
+                    PlutusData::Array(vec![]),
+                    data_siblings(count, 32)
+                ]
+            )));
+        }
+        assert!(!update.matches(&data_constructor(0, vec![])));
+        assert!(!update.matches(&data_constructor(
+            0,
+            vec![
+                data_constructor(0, vec![]),
+                PlutusData::Array(vec![]),
+                data_siblings(63, 32)
+            ]
+        )));
+        assert!(!update.matches(&data_constructor(
+            0,
+            vec![
+                data_constructor(0, vec![]),
+                PlutusData::Array(vec![data_constructor(0, vec![]); 3]),
+                data_siblings(64, 32)
+            ]
+        )));
+    }
+
+    fn transaction_with_withdrawal(reward_account: &[u8], amount: u64) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut encoded);
+        encoder.array(4).unwrap();
+        encoder.map(4).unwrap();
+        encoder.u8(0).unwrap();
+        encoder.array(0).unwrap();
+        encoder.u8(1).unwrap();
+        encoder.array(0).unwrap();
+        encoder.u8(2).unwrap();
+        encoder.u64(1).unwrap();
+        encoder.u8(5).unwrap();
+        encoder.map(1).unwrap();
+        encoder.bytes(reward_account).unwrap();
+        encoder.u64(amount).unwrap();
+        encoder.map(0).unwrap();
+        encoder.bool(true).unwrap();
+        encoder.null().unwrap();
+        encoded
+    }
+
+    #[test]
+    fn only_the_pinned_zero_value_recovery_withdrawal_is_authorized() {
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let recovery_script = required_script(&policy.scripts, "recoverclient").unwrap();
+        let reward_account = [&[0xf0][..], recovery_script.hash.as_slice()].concat();
+        let encoded = transaction_with_withdrawal(&reward_account, 0);
+        let tx: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+        let recovery_intent = bare_intent("/ibc.core.client.v1.MsgRecoverClient", None);
+        let reject = |reason| Error::Signer(reason);
+
+        policy
+            .validate_withdrawals(&tx.transaction_body, &recovery_intent, &reject)
+            .unwrap();
+
+        let encoded = transaction_with_withdrawal(&reward_account, 1);
+        let tx: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+        assert!(policy
+            .validate_withdrawals(&tx.transaction_body, &recovery_intent, &reject)
+            .is_err());
+
+        let encoded = transaction_with_withdrawal(&reward_account, 0);
+        let tx: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+        assert!(policy
+            .validate_withdrawals(
+                &tx.transaction_body,
+                &bare_intent("/ibc.core.client.v1.MsgUpdateClient", None),
+                &reject,
+            )
+            .is_err());
+    }
+
+    fn recovery_withdrawal_redeemer_data(
+        policy: &[u8],
+        subject_name: &[u8],
+        substitute_name: &[u8],
+    ) -> PlutusData {
+        let mut encoded = Vec::new();
+        let mut encoder = minicbor::Encoder::new(&mut encoded);
+        encoder.tag(minicbor::data::Tag::Unassigned(121)).unwrap();
+        encoder.array(2).unwrap();
+        for name in [subject_name, substitute_name] {
+            encoder.tag(minicbor::data::Tag::Unassigned(121)).unwrap();
+            encoder.array(2).unwrap();
+            encoder.bytes(policy).unwrap();
+            encoder.bytes(name).unwrap();
+        }
+        minicbor::decode(&encoded).unwrap()
+    }
+
+    #[test]
+    fn recovery_withdrawal_redeemer_binds_subject_and_substitute_tokens() {
+        use pallas_codec::utils::NonEmptyKeyValuePairs;
+        use pallas_primitives::conway::{
+            ExUnits, RedeemerTag, Redeemers, RedeemersKey, RedeemersValue,
+        };
+
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let subject_name = policy.state_token_name(StateOutputKind::Client, 7);
+        let substitute_name = policy.state_token_name(StateOutputKind::Client, 12);
+        let data = recovery_withdrawal_redeemer_data(
+            &policy.client_state.policy,
+            &subject_name,
+            &substitute_name,
+        );
+        let pairs: NonEmptyKeyValuePairs<_, _> = vec![(
+            RedeemersKey {
+                tag: RedeemerTag::Reward,
+                index: 0,
+            },
+            RedeemersValue {
+                data,
+                ex_units: ExUnits { mem: 1, steps: 1 },
+            },
+        )]
+        .try_into()
+        .unwrap();
+        let redeemers = Redeemers::from(pairs);
+        let reject = |reason| Error::Signer(reason);
+
+        policy
+            .validate_client_withdrawal_redeemer(
+                &redeemers,
+                &subject_name,
+                Some(&substitute_name),
+                &reject,
+            )
+            .unwrap();
+        assert!(policy
+            .validate_client_withdrawal_redeemer(
+                &redeemers,
+                &substitute_name,
+                Some(&subject_name),
+                &reject,
+            )
+            .is_err());
     }
 
     fn transfer_message(denom: String, signer: String) -> Vec<u8> {
@@ -3347,6 +4690,7 @@ mod tests {
             external_output: None,
             transfer: None,
             state_sequence: None,
+            recovery_substitute_sequence: None,
             packet: None,
             acknowledgement: None,
             prune_sequence: None,
