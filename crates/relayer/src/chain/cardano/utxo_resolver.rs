@@ -415,11 +415,8 @@ fn parse_kupo_output(output: KupoMatch) -> Result<ResolvedInput, Error> {
     let mut asset_ids = BTreeSet::new();
 
     for (unit, quantity) in output.value.assets {
-        let (policy, name) = unit.split_once('.').ok_or_else(|| {
-            Error::Query(format!(
-                "Kupo asset unit '{unit}' must use policy-id.asset-name form"
-            ))
-        })?;
+        // Kupo omits the separator when the asset name is empty.
+        let (policy, name) = unit.split_once('.').unwrap_or((&unit, ""));
         if name.contains('.') {
             return Err(Error::Query(format!(
                 "Kupo asset unit '{unit}' contains multiple separators"
@@ -736,6 +733,86 @@ mod tests {
                     || error.to_string().contains("duplicate unspent output"),
                 "unexpected error: {error}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolves_assets_with_empty_and_nonempty_names() {
+        let policy = "bb".repeat(28);
+        for empty_name_unit in [policy.clone(), format!("{policy}.")] {
+            let mut output = kupo_output(0);
+            output["value"]["assets"] = json!({
+                empty_name_unit: 1,
+                format!("{policy}.01"): "2",
+            });
+            let body = serde_json::to_string(&vec![output, kupo_output(1)]).unwrap();
+            let (endpoint, server) = mock_kupo(body, None);
+            let resolver = KupoInputResolver::new_with_security(&endpoint, None, None).unwrap();
+            let resolved = resolver
+                .resolve_unsigned_transaction(&unsigned_tx_fixture(false))
+                .await;
+            server.join().unwrap();
+            let resolved = resolved.unwrap();
+            assert_eq!(
+                resolved.regular.values().next().unwrap().assets,
+                vec![
+                    ResolvedAsset {
+                        policy_id: [0xbb; 28],
+                        asset_name: vec![],
+                        quantity: 1,
+                    },
+                    ResolvedAsset {
+                        policy_id: [0xbb; 28],
+                        asset_name: vec![0x01],
+                        quantity: 2,
+                    },
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_empty_name_asset_aliases_are_rejected() {
+        let policy = "bb".repeat(28);
+        let mut output = kupo_output(0);
+        output["value"]["assets"] = json!({policy.clone(): "1", format!("{policy}."): "2"});
+        let error = parse_kupo_output(serde_json::from_value(output).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("duplicate normalized asset"));
+    }
+
+    #[test]
+    fn malformed_kupo_asset_units_are_rejected() {
+        let policy = "bb".repeat(28);
+        for unit in [
+            String::new(),
+            "bb".repeat(27),
+            "bb".repeat(29),
+            "gg".repeat(28),
+            format!("{policy}.0"),
+            format!("{policy}.gg"),
+            format!("{policy}.{}", "01".repeat(33)),
+            format!("{policy}.."),
+        ] {
+            let mut output = kupo_output(0);
+            output["value"]["assets"] = json!({unit.clone(): "1"});
+            assert!(
+                parse_kupo_output(serde_json::from_value(output).unwrap()).is_err(),
+                "accepted malformed asset unit: {unit}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_empty_name_asset_quantities_are_rejected() {
+        for quantity in [
+            json!(0),
+            json!("0"),
+            json!("-1"),
+            json!("18446744073709551616"),
+        ] {
+            let mut output = kupo_output(0);
+            output["value"]["assets"] = json!({"bb".repeat(28): quantity});
+            assert!(parse_kupo_output(serde_json::from_value(output).unwrap()).is_err());
         }
     }
 
