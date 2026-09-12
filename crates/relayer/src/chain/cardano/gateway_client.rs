@@ -220,9 +220,12 @@ fn decode_update_client_transactions(
         });
     }
 
-    if client_message_type_url != Some(TENDERMINT_HEADER_TYPE_URL) {
+    if !matches!(
+        client_message_type_url,
+        Some(TENDERMINT_HEADER_TYPE_URL | TENDERMINT_MISBEHAVIOR_TYPE_URL)
+    ) {
         return Err(Error::Transaction(format!(
-            "Gateway returned {} for {}, but transaction chaining is only supported for MsgUpdateClient<TendermintHeader>",
+            "Gateway returned {} for {}, but transaction chaining is only supported for Tendermint headers or misbehaviour",
             TENDERMINT_UPDATE_TX_CHAIN_TYPE_URL,
             describe_update_client_message(client_message_type_url)
         )));
@@ -2557,20 +2560,25 @@ mod tests {
     }
 
     #[test]
-    fn chain_is_rejected_for_tendermint_misbehaviour() {
-        let err = decode_update_client_transactions(
+    fn chain_is_accepted_for_tendermint_misbehaviour_only() {
+        let built = decode_update_client_transactions(
             Some(TENDERMINT_MISBEHAVIOR_TYPE_URL),
             chain_any(1, vec!["a100".to_string()], false),
             "misbehaviour",
         )
-        .unwrap_err();
-
-        match err {
-            Error::Transaction(msg) => {
-                assert!(msg.contains("only supported for MsgUpdateClient<TendermintHeader>"));
-                assert!(msg.contains(TENDERMINT_UPDATE_TX_CHAIN_TYPE_URL));
-            }
-            other => panic!("unexpected error: {other:?}"),
+        .unwrap();
+        assert_eq!(built.kind, BuiltIbcTxKind::TendermintUpdateChain);
+        for other_type in [
+            MITHRIL_MISBEHAVIOUR_TYPE_URL,
+            PROBABILISTIC_MISBEHAVIOUR_TYPE_URL,
+            "/unknown.Misbehaviour",
+        ] {
+            assert!(decode_update_client_transactions(
+                Some(other_type),
+                chain_any(1, vec!["a100".to_string()], false),
+                "misbehaviour"
+            )
+            .is_err());
         }
     }
 

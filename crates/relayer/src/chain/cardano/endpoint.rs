@@ -234,7 +234,7 @@ fn ensure_tendermint_phase_actions(
             }
         }
         BuiltIbcTxKind::LegacyTendermintUpdateStep => {
-            if actions.len() != 1 || actions[0].action == TendermintSessionAction::Finalize {
+            if actions.len() != 1 || actions[0].action.is_finalization() {
                 return Err(Error::send_tx(
                     "legacy Tendermint update marker must contain one tree-neutral staged transaction"
                         .to_string(),
@@ -242,7 +242,7 @@ fn ensure_tendermint_phase_actions(
             }
         }
         BuiltIbcTxKind::TendermintUpdateChain if !rebuild_after_submission => {
-            if actions.len() != 1 || actions[0].action != TendermintSessionAction::Finalize {
+            if actions.len() != 1 || !actions[0].action.is_finalization() {
                 return Err(Error::send_tx(
                     "final Tendermint update phase must contain exactly one finalization transaction"
                         .to_string(),
@@ -284,7 +284,8 @@ fn ensure_tendermint_phase_actions(
                                 .to_string(),
                         ));
                     }
-                    TendermintSessionAction::Finalize => {
+                    TendermintSessionAction::Finalize
+                    | TendermintSessionAction::FinalizeMisbehaviour => {
                         return Err(Error::send_tx(
                             "tree-neutral Tendermint update phase contains a finalization transaction"
                                 .to_string(),
@@ -324,13 +325,15 @@ fn ensure_completed_tendermint_chain_has_update_event(
     final_response: &TxSubmitResponse,
 ) -> Result<(), Error> {
     if staged_update_started
-        && !final_response
-            .events
-            .iter()
-            .any(|event| event.event_type == "update_client")
+        && !final_response.events.iter().any(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "update_client" | "client_misbehaviour"
+            )
+        })
     {
         return Err(Error::send_tx(format!(
-            "Final Tendermint update transaction {} returned no update_client event",
+            "Final Tendermint update transaction {} returned no update_client event or client_misbehaviour event",
             final_response.tx_hash
         )));
     }
@@ -4338,6 +4341,8 @@ mod tests {
         ValidatedTendermintSessionAction {
             action,
             token_name: vec![token_name; 32],
+            second_token_name: (action == TendermintSessionAction::FinalizeMisbehaviour)
+                .then(|| vec![token_name + 1; 32]),
         }
     }
 
@@ -4546,6 +4551,36 @@ mod tests {
     }
 
     #[test]
+    fn misbehaviour_finalization_is_only_allowed_as_one_final_transaction() {
+        let finalize = staged_action(TendermintSessionAction::FinalizeMisbehaviour, 1);
+        ensure_tendermint_phase_actions(
+            BuiltIbcTxKind::TendermintUpdateChain,
+            false,
+            &[finalize.clone()],
+        )
+        .unwrap();
+        for (kind, rebuild, actions) in [
+            (
+                BuiltIbcTxKind::TendermintUpdateChain,
+                true,
+                vec![finalize.clone()],
+            ),
+            (
+                BuiltIbcTxKind::LegacyTendermintUpdateStep,
+                false,
+                vec![finalize.clone()],
+            ),
+            (
+                BuiltIbcTxKind::TendermintUpdateChain,
+                false,
+                vec![staged_action(TendermintSessionAction::Advance, 1), finalize],
+            ),
+        ] {
+            assert!(ensure_tendermint_phase_actions(kind, rebuild, &actions).is_err());
+        }
+    }
+
+    #[test]
     fn completed_tendermint_chain_requires_an_update_client_event() {
         let empty = TxSubmitResponse {
             tx_hash: "final-without-event".to_string(),
@@ -4566,6 +4601,14 @@ mod tests {
             }],
         };
         ensure_completed_tendermint_chain_has_update_event(true, &update).unwrap();
+        let frozen = TxSubmitResponse {
+            events: vec![IbcEvent {
+                event_type: "client_misbehaviour".into(),
+                attributes: vec![],
+            }],
+            ..update
+        };
+        ensure_completed_tendermint_chain_has_update_event(true, &frozen).unwrap();
     }
 
     #[test]
