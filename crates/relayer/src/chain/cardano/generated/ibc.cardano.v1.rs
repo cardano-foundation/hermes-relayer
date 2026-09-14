@@ -56,6 +56,24 @@ pub struct SubmitSignedTxRequest {
     #[prost(string, tag = "2")]
     pub description: ::prost::alloc::string::String,
 }
+/// TendermintUpdateTxChain carries one dependency-ordered transaction phase.
+/// A phase contains tree-neutral session transactions or one final client and
+/// HostState update.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TendermintUpdateTxChain {
+    /// Envelope version. The only currently supported value is 1.
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    /// Unsigned Cardano transaction bodies, CBOR-encoded as UTF-8 hex, in
+    /// dependency order. The protocol limit is 100 entries.
+    #[prost(string, repeated, tag = "2")]
+    pub unsigned_tx_cbor: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// True when the last tree-neutral transaction is a confirmed phase boundary.
+    /// Hermes must rebuild and continue the original MsgUpdateClient after either
+    /// verification reaches a Complete session or session cleanup finishes.
+    #[prost(bool, tag = "3")]
+    pub rebuild_after_submission: bool,
+}
 /// SubmitSignedTxResponse contains the result of submitting a signed transaction.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SubmitSignedTxResponse {
@@ -76,6 +94,9 @@ pub struct ObserveTxRequest {
     /// Blake2b-256 hash of the Cardano transaction body, encoded as 64 hex digits.
     #[prost(string, tag = "1")]
     pub tx_hash: ::prost::alloc::string::String,
+    /// Allows observation of a confirmed transaction that intentionally has no HostState update.
+    #[prost(bool, tag = "2")]
+    pub allow_untracked: bool,
 }
 /// ObserveTxResponse contains the confirmed inclusion height and IBC events.
 #[derive(Clone, PartialEq, ::prost::Message)]
