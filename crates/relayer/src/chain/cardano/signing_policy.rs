@@ -925,7 +925,7 @@ impl TransactionSigningPolicy {
                     minted_identifier = true;
                 } else if expected_reference_name
                     .as_ref()
-                    .map_or(true, |expected| expected.as_slice() != name.as_slice())
+                    .is_none_or(|expected| expected.as_slice() != name.as_slice())
                 {
                     return Err(reject(
                         "trace-registry prelude mints an unexpected voucher reference token"
