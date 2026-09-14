@@ -75,6 +75,7 @@ pub struct BuiltIbcTx {
     pub kind: BuiltIbcTxKind,
     pub rebuild_after_submission: bool,
 }
+pub const TRACE_REGISTRY_PRELUDE_TYPE_URL: &str = "/ibc.cardano.v1.TraceRegistryPrelude";
 
 /// Unsigned transaction response from Gateway
 #[derive(Debug, Clone)]
@@ -1602,7 +1603,14 @@ impl GatewayClient {
 
         Ok(UnsignedTx {
             cbor_hex,
-            description: format!("MsgRecvPacket (sequence: {})", sequence),
+            description: if unsigned_tx_any.type_url == TRACE_REGISTRY_PRELUDE_TYPE_URL {
+                format!(
+                    "TraceRegistryPrelude MsgRecvPacket (sequence: {})",
+                    sequence
+                )
+            } else {
+                format!("MsgRecvPacket (sequence: {})", sequence)
+            },
         })
     }
 
@@ -1917,11 +1925,16 @@ impl GatewayClient {
 
     /// Wait for a transaction submitted through Hermes's trusted node path and
     /// finalize the matching pending Gateway state update by body hash only.
-    pub async fn observe_tx(&self, tx_hash: &str) -> Result<TxSubmitResponse, Error> {
+    pub async fn observe_tx(
+        &self,
+        tx_hash: &str,
+        allow_untracked: bool,
+    ) -> Result<TxSubmitResponse, Error> {
         let mut client = CardanoMsgClient::new(self.channel.clone());
         let response: ObserveTxResponse = client
             .observe_tx(tonic::Request::new(ObserveTxRequest {
                 tx_hash: tx_hash.to_string(),
+                allow_untracked,
             }))
             .await?
             .into_inner();

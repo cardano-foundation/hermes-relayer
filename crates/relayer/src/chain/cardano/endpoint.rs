@@ -340,6 +340,28 @@ fn ensure_completed_tendermint_chain_has_update_event(
 
     Ok(())
 }
+fn validate_trace_registry_prelude(
+    requested: bool,
+    message_type_url: &str,
+    kind: BuiltIbcTxKind,
+    transaction_count: usize,
+    rebuild_after_submission: bool,
+    already_completed: bool,
+) -> Result<(), Error> {
+    if requested
+        && (message_type_url != "/ibc.core.channel.v1.MsgRecvPacket"
+            || kind != BuiltIbcTxKind::Singleton
+            || transaction_count != 1
+            || rebuild_after_submission
+            || already_completed)
+    {
+        return Err(Error::send_tx(
+            "Gateway returned an invalid or repeated trace-registry prelude".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl CardanoChainEndpoint {
     async fn resolve_signing_intent_denom(&self, intent: &mut SigningIntent) -> Result<(), Error> {
         let Some(hash) = intent.unresolved_ibc_denom_hash().map(str::to_owned) else {
@@ -452,16 +474,17 @@ impl CardanoChainEndpoint {
         signed_tx: &super::signer::SignedTransaction,
     ) -> Result<TxSubmitResponse, Error> {
         self.submit_signed_transaction(signed_tx, false).await?;
-        self.observe_signed_transaction(signed_tx).await
+        self.observe_signed_transaction(signed_tx, false).await
     }
 
     async fn observe_signed_transaction(
         &self,
         signed_tx: &super::signer::SignedTransaction,
+        allow_untracked: bool,
     ) -> Result<TxSubmitResponse, Error> {
         let response = self
             .gateway_client
-            .observe_tx(&signed_tx.tx_hash)
+            .observe_tx(&signed_tx.tx_hash, allow_untracked)
             .await
             .map_err(|error| {
                 Error::send_tx(format!(
@@ -521,6 +544,7 @@ impl CardanoChainEndpoint {
         let mut completed_chain_transactions = 0usize;
         let mut completed_rebuild_phases = 0usize;
         let mut staged_update_started = false;
+        let mut trace_registry_prelude_completed = false;
 
         loop {
             let built = self
@@ -536,6 +560,19 @@ impl CardanoChainEndpoint {
                         ))
                     }
                 })?;
+
+            let trace_registry_prelude = built
+                .transactions
+                .iter()
+                .any(|transaction| transaction.description.starts_with("TraceRegistryPrelude "));
+            validate_trace_registry_prelude(
+                trace_registry_prelude,
+                message_type_url,
+                built.kind,
+                built.transactions.len(),
+                built.rebuild_after_submission,
+                trace_registry_prelude_completed,
+            )?;
 
             ensure_tendermint_phase_budget(
                 built.kind,
@@ -574,8 +611,25 @@ impl CardanoChainEndpoint {
                     })?,
                 )
             };
-            let phase_signing_intent = staged_signing_intent
+            let prelude_signing_intent = if trace_registry_prelude {
+                Some(
+                    SigningIntent::trace_registry_prelude(
+                        message_value,
+                        &expected_signer,
+                        self.config.network_id,
+                    )
+                    .map_err(|error| {
+                        Error::send_tx(format!(
+                            "Failed to authorize trace-registry prelude: {error}"
+                        ))
+                    })?,
+                )
+            } else {
+                None
+            };
+            let phase_signing_intent = prelude_signing_intent
                 .as_ref()
+                .or(staged_signing_intent.as_ref())
                 .unwrap_or(&direct_signing_intent);
 
             let mut overlay = TrustedUtxoOverlay::new();
@@ -649,7 +703,7 @@ impl CardanoChainEndpoint {
                 Error::send_tx("Gateway transaction set had no final transaction".to_string())
             })?;
             let final_response = self
-                .observe_signed_transaction(final_signed_transaction)
+                .observe_signed_transaction(final_signed_transaction, trace_registry_prelude)
                 .await?;
             let included_height = final_response.height.ok_or_else(|| {
                 Error::send_tx(format!(
@@ -663,6 +717,14 @@ impl CardanoChainEndpoint {
                 included_height,
                 total - 1
             );
+
+            if trace_registry_prelude {
+                ensure_intermediate_has_no_events(&final_response)?;
+                self.wait_for_gateway_accepted_height(included_height)
+                    .await?;
+                trace_registry_prelude_completed = true;
+                continue;
+            }
 
             if let Some(step_number) = legacy_step_number {
                 ensure_intermediate_has_no_events(&final_response)?;
@@ -4304,6 +4366,31 @@ fn cardano_latest_height_unhealthy_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trace_registry_prelude_is_only_allowed_once_for_a_single_receive() {
+        let recv = "/ibc.core.channel.v1.MsgRecvPacket";
+        let update = "/ibc.core.client.v1.MsgUpdateClient";
+        let singleton = BuiltIbcTxKind::Singleton;
+        let staged = BuiltIbcTxKind::TendermintUpdateChain;
+        validate_trace_registry_prelude(true, recv, singleton, 1, false, false).unwrap();
+        for (message, kind, count, rebuild, completed) in [
+            (update, singleton, 1, false, false),
+            (recv, staged, 1, false, false),
+            (recv, singleton, 2, false, false),
+            (recv, singleton, 1, true, false),
+            (recv, singleton, 1, false, true),
+        ] {
+            assert!(validate_trace_registry_prelude(
+                true, message, kind, count, rebuild, completed,
+            )
+            .is_err());
+        }
+        // Ordinary receive after the prelude and staged updates retain their own rules.
+        validate_trace_registry_prelude(false, recv, singleton, 1, false, true).unwrap();
+        validate_trace_registry_prelude(false, update, staged, 100, true, false).unwrap();
+    }
+
     use crate::chain::cardano::error::Error as CardanoError;
     use crate::chain::cardano::gateway_client::IbcEvent;
     use crate::client_state::AnyClientState;
