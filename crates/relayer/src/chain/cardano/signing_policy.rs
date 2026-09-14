@@ -444,6 +444,12 @@ impl TransactionSigningPolicy {
         let (mut required_scripts, required_mint_scripts, state_output, needs_module) =
             match intent.operation.as_str() {
                 "HostStateHeartbeat" => (vec![], vec![], StateOutputKind::None, false),
+                "TraceRegistryPrelude" => (
+                    vec!["spendtraceregistry", "mintvoucher"],
+                    vec![],
+                    StateOutputKind::None,
+                    false,
+                ),
                 "/ibc.core.client.v1.MsgCreateClient" => (
                     vec!["mintclientstt"],
                     vec!["mintclientstt"],
@@ -750,6 +756,21 @@ impl TransactionSigningPolicy {
             ));
         }
 
+        if intent.operation == "TraceRegistryPrelude" {
+            self.validate_trace_registry_prelude(
+                body,
+                &signer_address,
+                intent,
+                witnesses.redeemer.as_deref(),
+                resolved_inputs,
+                &reference_set,
+                &reject,
+            )?;
+            self.validate_collateral(body, &signer_address, &input_set, resolved_inputs, &reject)?;
+            self.validate_wallet_delta(body, &signer_address, intent, resolved_inputs, &reject)?;
+            return Ok(());
+        }
+
         self.validate_resolved_inputs(
             body,
             &signer_address,
@@ -758,6 +779,7 @@ impl TransactionSigningPolicy {
             resolved_inputs,
             &reject,
         )?;
+
         self.validate_message_binding(
             body,
             witnesses.redeemer.as_deref(),
@@ -778,6 +800,178 @@ impl TransactionSigningPolicy {
         )?;
         self.validate_wallet_delta(body, &signer_address, intent, resolved_inputs, &reject)?;
 
+        Ok(())
+    }
+
+    fn validate_trace_registry_prelude<F>(
+        &self,
+        body: &pallas_primitives::conway::MintedTransactionBody<'_>,
+        signer_address: &[u8],
+        intent: &SigningIntent,
+        redeemers: Option<&pallas_primitives::conway::Redeemers>,
+        resolved_inputs: &ResolvedTransactionInputs,
+        reference_inputs: &HashSet<OutRef>,
+        reject: &F,
+    ) -> Result<(), Error>
+    where
+        F: Fn(String) -> Error,
+    {
+        let transaction_inputs: BTreeSet<_> = body
+            .inputs
+            .iter()
+            .map(TransactionOutRef::from_transaction_input)
+            .collect();
+        let resolved_regular: BTreeSet<_> = resolved_inputs.regular.keys().cloned().collect();
+        if transaction_inputs != resolved_regular {
+            return Err(reject(
+                "trusted UTxO resolution does not exactly cover the trace-registry prelude inputs"
+                    .to_string(),
+            ));
+        }
+
+        let mut signer_input_count = 0usize;
+        for input in resolved_inputs.regular.values() {
+            validate_address_network(&input.address, self.network_id).map_err(reject)?;
+            if input.address == signer_address {
+                signer_input_count += 1;
+            } else if input.address != self.trace_registry_address {
+                return Err(reject(
+                    "trace-registry prelude spends an unauthorized protocol input".to_string(),
+                ));
+            }
+        }
+        if signer_input_count == 0 {
+            return Err(reject(
+                "trace-registry prelude does not consume an input owned by the configured signer"
+                    .to_string(),
+            ));
+        }
+
+        let mut trace_outputs = 0usize;
+        for output in body.outputs.iter().map(unpack_output) {
+            validate_address_network(&output.address, self.network_id).map_err(reject)?;
+            if output.has_script_ref {
+                return Err(reject(
+                    "trace-registry prelude outputs may not install scripts".to_string(),
+                ));
+            }
+            if output.address == signer_address {
+                continue;
+            }
+            if output.address == self.voucher_metadata_address {
+                continue;
+            }
+            if output.address != self.trace_registry_address {
+                return Err(reject(
+                    "trace-registry prelude pays an unauthorized address".to_string(),
+                ));
+            }
+            if output.assets.is_empty()
+                || !output.assets.iter().all(|(policy, _, quantity)| {
+                    policy == &self.trace_registry_policy && *quantity == 1
+                })
+            {
+                return Err(reject(
+                    "trace-registry prelude output contains unauthorized assets".to_string(),
+                ));
+            }
+            trace_outputs += 1;
+        }
+        if trace_outputs == 0 || trace_outputs > 3 {
+            return Err(reject(
+                "trace-registry prelude must create between one and three registry outputs"
+                    .to_string(),
+            ));
+        }
+
+        let expected_reference_name =
+            intent
+                .transfer
+                .as_ref()
+                .and_then(|transfer| match expected_asset(transfer) {
+                    ExpectedAsset::Voucher {
+                        reference_name: Some(name),
+                        ..
+                    } => Some(name),
+                    _ => None,
+                });
+        let mut minted_reference = false;
+        let mut minted_identifier = false;
+        if let Some(mint) = body.mint.as_ref() {
+            for (policy, assets) in mint.iter() {
+                let is_identifier = policy.as_ref()
+                    == required_script(&self.scripts, "mintidentifier")
+                        .map_err(reject)?
+                        .hash
+                        .as_slice();
+                let is_voucher = policy.as_ref() == self.voucher_policy.as_slice();
+                if (!is_identifier && !is_voucher) || assets.len() != 1 {
+                    return Err(reject(
+                        "trace-registry prelude may only mint the voucher reference and registry identifier"
+                            .to_string(),
+                    ));
+                }
+                let Some((name, quantity)) = assets.iter().next() else {
+                    return Err(reject(
+                        "trace-registry prelude contains an empty mint policy".to_string(),
+                    ));
+                };
+                if i64::from(*quantity) != 1 {
+                    return Err(reject(
+                        "trace-registry prelude mint quantities must be one".to_string(),
+                    ));
+                }
+                if is_identifier {
+                    minted_identifier = true;
+                } else if expected_reference_name
+                    .as_ref()
+                    .map_or(true, |expected| expected.as_slice() != name.as_slice())
+                {
+                    return Err(reject(
+                        "trace-registry prelude mints an unexpected voucher reference token"
+                            .to_string(),
+                    ));
+                } else {
+                    minted_reference = true;
+                }
+            }
+        }
+        if !minted_reference {
+            return Err(reject(
+                "trace-registry prelude must mint the expected voucher reference token".to_string(),
+            ));
+        }
+        if minted_identifier {
+            let root = required_script(&self.scripts, "mintidentifier").map_err(reject)?;
+            if !reference_inputs.contains(&root.reference) {
+                return Err(reject(
+                    "trace-registry prelude is missing its pinned identifier reference script"
+                        .to_string(),
+                ));
+            }
+        }
+        if redeemers.is_none() {
+            return Err(reject(
+                "trace-registry prelude has no script redeemers".to_string(),
+            ));
+        }
+        if let Some(reference_name) = expected_reference_name {
+            let metadata_outputs = body
+                .outputs
+                .iter()
+                .map(unpack_output)
+                .filter(|output| output.address == self.voucher_metadata_address)
+                .collect::<Vec<_>>();
+            if metadata_outputs.len() != 1
+                || metadata_outputs[0].assets.len() != 1
+                || metadata_outputs[0].assets[0] != (self.voucher_policy.clone(), reference_name, 1)
+            {
+                return Err(reject(
+                    "trace-registry prelude must publish exactly one expected voucher metadata output"
+                        .to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -2302,6 +2496,21 @@ fn is_cardano_token_unit(denom: &str) -> bool {
 }
 
 impl SigningIntent {
+    pub fn trace_registry_prelude(
+        message: &[u8],
+        expected_signer: &str,
+        network_id: u8,
+    ) -> Result<Self, Error> {
+        let mut intent = Self::ibc(
+            "/ibc.core.channel.v1.MsgRecvPacket",
+            message,
+            expected_signer,
+            network_id,
+        )?;
+        intent.operation = "TraceRegistryPrelude".to_string();
+        Ok(intent)
+    }
+
     pub fn heartbeat(signer: &str, expected_signer: &str, network_id: u8) -> Result<Self, Error> {
         validate_request_signer(signer, expected_signer, network_id, "HostStateHeartbeat")?;
         Ok(Self {

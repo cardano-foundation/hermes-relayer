@@ -232,6 +232,15 @@ impl CardanoChainEndpoint {
         &self,
         signed_tx: &super::signer::SignedTransaction,
     ) -> Result<TxSubmitResponse, Error> {
+        self.submit_and_observe_signed_transaction_with_mode(signed_tx, false)
+            .await
+    }
+
+    async fn submit_and_observe_signed_transaction_with_mode(
+        &self,
+        signed_tx: &super::signer::SignedTransaction,
+        allow_untracked: bool,
+    ) -> Result<TxSubmitResponse, Error> {
         let submitted_hash = self
             .transaction_evaluator
             .submit_signed_transaction(&signed_tx.cbor)
@@ -245,7 +254,7 @@ impl CardanoChainEndpoint {
 
         let response = self
             .gateway_client
-            .observe_tx(&signed_tx.tx_hash)
+            .observe_tx(&signed_tx.tx_hash, allow_untracked)
             .await
             .map_err(|error| {
                 Error::send_tx(format!(
@@ -261,6 +270,28 @@ impl CardanoChainEndpoint {
             )));
         }
         Ok(response)
+    }
+
+    async fn sign_submit_and_wait(
+        &self,
+        unsigned_tx: &super::gateway_client::UnsignedTx,
+        intent: &SigningIntent,
+        allow_untracked: bool,
+    ) -> Result<(TxSubmitResponse, ICSHeight), Error> {
+        let signed_tx = self
+            .sign_transaction_helper(&unsigned_tx.cbor_hex, intent)
+            .await?;
+        tracing::debug!("Signed transaction, CBOR length: {}", signed_tx.cbor.len());
+        let tx_response = self
+            .submit_and_observe_signed_transaction_with_mode(&signed_tx, allow_untracked)
+            .await?;
+        let included_height = tx_response
+            .height
+            .ok_or_else(|| Error::send_tx("No height in transaction response".to_string()))?;
+        let certified_height = self
+            .wait_for_gateway_accepted_height(included_height)
+            .await?;
+        Ok((tx_response, certified_height))
     }
 
     /// Initialize the event source for monitoring Cardano chain events
@@ -800,7 +831,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     .await?;
 
                 // Step 1: Build unsigned transaction via Gateway
-                let unsigned_tx = self
+                let mut unsigned_tx = self
                     .gateway_client
                     .build_ibc_tx(&msg.type_url, msg.value.clone())
                     .await
@@ -808,21 +839,24 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
                 tracing::debug!("Built unsigned tx: {}", unsigned_tx.description);
 
-                // Step 2: Sign transaction with keyring
-                let signed_tx = self
-                    .sign_transaction_helper(&unsigned_tx.cbor_hex, &signing_intent)
-                    .await?;
+                let trace_registry_prelude = unsigned_tx.description.starts_with("TraceRegistryPrelude ");
+                let (mut tx_response, mut certified_height) = if trace_registry_prelude {
+                    let prelude_intent = SigningIntent::trace_registry_prelude(
+                        &msg.value,
+                        &expected_signer,
+                        self.config.network_id,
+                    )
+                    .map_err(|error| {
+                        Error::send_tx(format!(
+                            "Failed to authorize trace-registry prelude: {error}"
+                        ))
+                    })?;
+                    self.sign_submit_and_wait(&unsigned_tx, &prelude_intent, true).await?
+                } else {
+                    self.sign_submit_and_wait(&unsigned_tx, &signing_intent, false).await?
+                };
 
-                tracing::debug!("Signed transaction, CBOR length: {}", signed_tx.cbor.len());
-
-                // Step 3: Submit the immutable signed envelope through trusted
-                // Ogmios. The Gateway receives only its body hash to verify
-                // inclusion and finalize the matching pending state update.
-                let tx_response = self
-                    .submit_and_observe_signed_transaction(&signed_tx)
-                    .await?;
-
-                let tx_hash = tx_response.tx_hash.clone();
+                let mut tx_hash = tx_response.tx_hash.clone();
                 let event_count = tx_response.events.len();
 
                 if event_count == 0 {
@@ -844,29 +878,49 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     );
                 }
 
-                // Step 4: Parse events from transaction result
-                let included_height = tx_response.height.ok_or_else(|| {
-                    Error::send_tx("No height in transaction response".to_string())
-                })?;
-
                 tracing::info!(
-                    "Transaction submitted: {} at height {}",
+                    "Transaction submitted: {} at certified height {}",
                     tx_response.tx_hash,
-                    included_height
+                    certified_height
                 );
 
-                // Ensure the transaction is also accepted by the active Cardano light-client mode
-                // before we treat it as "committed" from the perspective of IBC relaying.
-                let certified_height = self
-                    .wait_for_gateway_accepted_height(included_height)
-                    .await?;
-                if certified_height.revision_height() != included_height.revision_height() {
+                if let Some(included_height) = tx_response.height {
+                    if certified_height.revision_height() != included_height.revision_height() {
                     tracing::info!(
                         "Transaction {} inclusion height {} is now certified at {}",
                         tx_response.tx_hash,
                         included_height,
                         certified_height
                     );
+                    }
+                }
+
+                if trace_registry_prelude {
+                    // The registry transaction is now committed. Building the
+                    // same RecvPacket request again makes the Gateway resolve
+                    // the trace as an existing mapping and produces the small
+                    // normal receive transaction.
+                    unsigned_tx = self
+                        .gateway_client
+                        .build_ibc_tx(&msg.type_url, msg.value.clone())
+                        .await
+                        .map_err(|e| {
+                            Error::send_tx(format!(
+                                "Failed to build receive transaction after trace registration: {}",
+                                e
+                            ))
+                        })?;
+                    if unsigned_tx.description.starts_with("TraceRegistryPrelude ") {
+                        return Err(Error::send_tx(
+                            "Gateway did not observe the committed trace-registry prelude before building the receive transaction".to_string(),
+                        ));
+                    }
+                    let (follow_up_response, follow_up_height) = self
+                        .sign_submit_and_wait(&unsigned_tx, &signing_intent, false)
+                        .await?;
+                    tx_response = follow_up_response;
+                    certified_height = follow_up_height;
+                    tx_hash = tx_response.tx_hash.clone();
                 }
 
                 // Log all events for debugging

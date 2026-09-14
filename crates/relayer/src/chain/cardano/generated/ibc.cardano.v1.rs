@@ -76,6 +76,9 @@ pub struct ObserveTxRequest {
     /// Blake2b-256 hash of the Cardano transaction body, encoded as 64 hex digits.
     #[prost(string, tag = "1")]
     pub tx_hash: ::prost::alloc::string::String,
+    /// Allows observation of a confirmed transaction that intentionally has no HostState update.
+    #[prost(bool, tag = "2")]
+    pub allow_untracked: bool,
 }
 /// ObserveTxResponse contains the confirmed inclusion height and IBC events.
 #[derive(Clone, PartialEq, ::prost::Message)]
