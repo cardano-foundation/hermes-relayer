@@ -4024,11 +4024,8 @@ fn plutus_output_reference(data: &PlutusData) -> Option<TransactionOutRef> {
     if fields.len() != 2 {
         return None;
     }
-    let transaction_id_fields = constructor_fields(&fields[0], 0)?;
-    if transaction_id_fields.len() != 1 {
-        return None;
-    }
-    let transaction_id: [u8; 32] = plutus_bytes(&transaction_id_fields[0])?.try_into().ok()?;
+    // Aiken's OutputReference stores the transaction hash directly as bytes.
+    let transaction_id: [u8; 32] = plutus_bytes(&fields[0])?.try_into().ok()?;
     Some(TransactionOutRef {
         transaction_id,
         output_index: plutus_u64(&fields[1])?,
@@ -5079,6 +5076,59 @@ mod tests {
             any_constructor: None,
             fields,
         })
+    }
+
+    #[test]
+    fn plutus_output_reference_accepts_gateway_seed_cbor() {
+        // Lucid Data.to({ transactionId: '91'.repeat(32), outputIndex: 2n },
+        // Data.Object({ transactionId: Data.Bytes(), outputIndex: Data.Integer() })).
+        // Aiken's OutputReference has a bare byte-string transaction ID.
+        let cbor = hex::decode(
+            "d8799f5820919191919191919191919191919191919191919191919191919191919191919102ff",
+        )
+        .unwrap();
+        let seed: PlutusData = minicbor::decode(&cbor).unwrap();
+        let reference = plutus_output_reference(&seed).expect("gateway seed must decode");
+        assert_eq!(reference.transaction_id, [0x91; 32]);
+        assert_eq!(reference.output_index, 2);
+    }
+
+    #[test]
+    fn plutus_output_reference_rejects_malformed_seeds() {
+        let hash = PlutusData::BoundedBytes(vec![0x91; 32].into());
+        let index = PlutusData::BigInt(BigInt::Int(2.into()));
+        let malformed = [
+            data_constructor(1, vec![hash.clone(), index.clone()]),
+            data_constructor(0, vec![hash.clone()]),
+            data_constructor(0, vec![hash.clone(), index.clone(), index.clone()]),
+            data_constructor(
+                0,
+                vec![data_constructor(0, vec![hash.clone()]), index.clone()],
+            ),
+            data_constructor(
+                0,
+                vec![
+                    PlutusData::BoundedBytes(vec![0x91; 31].into()),
+                    index.clone(),
+                ],
+            ),
+            data_constructor(
+                0,
+                vec![
+                    PlutusData::BoundedBytes(vec![0x91; 33].into()),
+                    index.clone(),
+                ],
+            ),
+            data_constructor(0, vec![index.clone(), index]),
+            data_constructor(0, vec![hash.clone(), hash.clone()]),
+            data_constructor(0, vec![hash, PlutusData::BigInt(BigInt::Int((-1).into()))]),
+        ];
+        for seed in malformed {
+            assert!(
+                plutus_output_reference(&seed).is_none(),
+                "accepted {seed:?}"
+            );
+        }
     }
 
     fn data_token(policy: &[u8], name: &[u8]) -> PlutusData {
