@@ -111,6 +111,16 @@ pub struct ClientState {
     pub latest_checkpoint_timestamp: u64,
     #[prost(bytes = "vec", tag = "30")]
     pub packet_lane_policy_id: Vec<u8>,
+    #[prost(message, repeated, tag = "31")]
+    pub epoch_context_challenges: Vec<EpochContextChallenge>,
+}
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct EpochContextChallenge {
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+    #[prost(uint64, tag = "2")]
+    pub usable_after_unix_ns: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]

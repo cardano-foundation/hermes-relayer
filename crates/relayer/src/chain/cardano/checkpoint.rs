@@ -28,6 +28,21 @@ pub(crate) fn is_probabilistic_checkpoint_update(message: &Any) -> Result<bool, 
     }
 }
 
+pub(crate) fn is_probabilistic_epoch_proposal(message: &Any) -> Result<bool, String> {
+    if message.type_url != UPDATE_CLIENT_TYPE_URL {
+        return Ok(false);
+    }
+    let update = RawMsgUpdateClient::decode(message.value.as_slice()).map_err(|e| e.to_string())?;
+    let Some(header) = update.client_message else {
+        return Err("missing client message".to_string());
+    };
+    if header.type_url != PROBABILISTIC_HEADER_TYPE_URL {
+        return Ok(false);
+    }
+    let header = ProbabilisticHeader::decode(header.value.as_slice()).map_err(|e| e.to_string())?;
+    Ok(header.new_epoch_context.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,5 +68,35 @@ mod tests {
         };
 
         assert!(is_probabilistic_checkpoint_update(&message).unwrap());
+    }
+    #[test]
+    fn epoch_proposal_detection_includes_root_bearing_updates() {
+        for checkpoint in [false, true] {
+            for proposal in [false, true] {
+                let header = ProbabilisticHeader {
+                    is_checkpoint: checkpoint,
+                    new_epoch_context: proposal.then_some(raw::EpochContext::default()),
+                    ..Default::default()
+                };
+                let update = RawMsgUpdateClient {
+                    client_id: "08-cardano-probabilistic-0".into(),
+                    client_message: Some(Any {
+                        type_url: PROBABILISTIC_HEADER_TYPE_URL.into(),
+                        value: header.encode_to_vec(),
+                    }),
+                    signer: "signer".into(),
+                };
+                let message = Any {
+                    type_url: UPDATE_CLIENT_TYPE_URL.into(),
+                    value: update.encode_to_vec(),
+                };
+                assert_eq!(is_probabilistic_epoch_proposal(&message).unwrap(), proposal);
+            }
+        }
+        assert!(is_probabilistic_epoch_proposal(&Any {
+            type_url: UPDATE_CLIENT_TYPE_URL.into(),
+            value: vec![255],
+        })
+        .is_err());
     }
 }

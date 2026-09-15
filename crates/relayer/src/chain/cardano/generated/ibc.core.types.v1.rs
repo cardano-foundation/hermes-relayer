@@ -106,6 +106,8 @@ pub struct QueryIbcHeaderRequest {
     pub trusted_height: u64,
     #[prost(uint64, tag = "2")]
     pub height: u64,
+    #[prost(bool, tag = "3")]
+    pub checkpoint_only: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct QueryIbcHeaderResponse {
