@@ -12,6 +12,7 @@ use super::generated::ibc::cardano::v1::{
 use super::generated::ibc::core::channel::v1::msg_client::MsgClient as GenChannelMsgClient;
 use super::generated::ibc::core::client::v1::msg_client::MsgClient as GenClientMsgClient;
 use super::generated::ibc::core::connection::v1::msg_client::MsgClient as GenConnectionMsgClient;
+use super::transfer::packet_sender_payment_key;
 use ibc_proto::google::protobuf::Any as ProtoAny;
 use ibc_proto::ibc::core::channel::v1::query_client::QueryClient as ChannelQueryClient;
 use ibc_proto::ibc::core::channel::v1::{
@@ -1659,49 +1660,22 @@ impl GatewayClient {
         let msg = MsgTransfer::decode(&message_data[..])
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgTransfer: {}", e)))?;
 
-        let token_info = msg
-            .token
-            .as_ref()
-            .ok_or_else(|| Error::Transaction("MsgTransfer missing token".to_string()))?;
-        let token = cardano_transfer_token_from_canonical(token_info)?;
-
-        let timeout_height =
-            msg.timeout_height
-                .map(|height| super::generated::ibc::core::client::v1::Height {
-                    revision_number: height.revision_number,
-                    revision_height: height.revision_height,
-                });
-
-        // The Gateway expects MsgTransfer under `ibc.core.channel.v1` and includes a `signer`
-        // field. In canonical IBC, the sender is the signer for MsgTransfer.
-        let sender = msg.sender;
+        let gateway_msg = cardano_transfer_request(&msg)?;
 
         tracing::info!(
             "Preparing transfer request for gateway: source_port={} source_channel={} receiver={} sender={} token={:?} amount={:?} timeout_height={:?} timeout_timestamp={} memo_len={}",
             msg.source_port,
             msg.source_channel,
             msg.receiver,
-            sender,
-            token_info.denom.as_str(),
-            token.amount,
-            timeout_height
+            gateway_msg.sender,
+            gateway_msg.token.as_ref().map(|token| token.denom.as_str()),
+            gateway_msg.token.as_ref().map(|token| token.amount),
+            gateway_msg.timeout_height
                 .as_ref()
                 .map(|height| format!("{}-{}", height.revision_number, height.revision_height)),
             msg.timeout_timestamp,
             msg.memo.len(),
         );
-
-        let gateway_msg = super::generated::ibc::core::channel::v1::MsgTransfer {
-            source_port: msg.source_port,
-            source_channel: msg.source_channel.clone(),
-            token: Some(token),
-            sender: sender.clone(),
-            receiver: msg.receiver,
-            timeout_height,
-            timeout_timestamp: msg.timeout_timestamp,
-            memo: msg.memo,
-            signer: sender,
-        };
 
         let mut client = GenChannelMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(gateway_msg);
@@ -2193,6 +2167,32 @@ fn invalid_submit_signed_tx_height(raw_height: &str) -> Error {
     ))
 }
 
+fn cardano_transfer_request(
+    msg: &ibc_proto::ibc::applications::transfer::v1::MsgTransfer,
+) -> Result<super::generated::ibc::core::channel::v1::MsgTransfer, Error> {
+    let token = msg
+        .token
+        .as_ref()
+        .ok_or_else(|| Error::Transaction("MsgTransfer missing token".to_string()))?;
+    Ok(super::generated::ibc::core::channel::v1::MsgTransfer {
+        source_port: msg.source_port.clone(),
+        source_channel: msg.source_channel.clone(),
+        token: Some(cardano_transfer_token_from_canonical(token)?),
+        sender: packet_sender_payment_key(&msg.sender).map_err(Error::Transaction)?,
+        receiver: msg.receiver.clone(),
+        timeout_height: msg.timeout_height.as_ref().map(|height| {
+            super::generated::ibc::core::client::v1::Height {
+                revision_number: height.revision_number,
+                revision_height: height.revision_height,
+            }
+        }),
+        timeout_timestamp: msg.timeout_timestamp,
+        memo: msg.memo.clone(),
+        // Keep the complete original address in the separate signer field.
+        signer: msg.sender.clone(),
+    })
+}
+
 /// Convert canonical ICS-20 transfer token data into the Gateway's Cardano transfer token.
 ///
 /// Canonical ICS-20 encodes amounts as decimal strings and Hermes models them as `U256`.
@@ -2421,6 +2421,45 @@ mod tests {
             denom: "lovelace".to_string(),
             amount: amount.to_string(),
         }
+    }
+
+    #[test]
+    fn transfer_request_changes_only_packet_sender_not_wallet_or_other_fields() {
+        let canonical = ibc_proto::ibc::applications::transfer::v1::MsgTransfer {
+            source_port: "transfer".to_string(),
+            source_channel: "channel-7".to_string(),
+            token: Some(transfer_coin("1000")),
+            sender: format!("60{}", "ab".repeat(28)),
+            receiver: "cosmos1receiver".to_string(),
+            timeout_height: Some(ibc_proto::ibc::core::client::v1::Height {
+                revision_number: 1,
+                revision_height: 42,
+            }),
+            timeout_timestamp: 123_456_789,
+            memo: "keep this memo".to_string(),
+        };
+        let request = cardano_transfer_request(&canonical).unwrap();
+        let wire = super::super::generated::ibc::core::channel::v1::MsgTransfer::decode(
+            request.encode_to_vec().as_slice(),
+        )
+        .unwrap();
+        assert_eq!(wire.sender, "ab".repeat(28));
+        assert_eq!(wire.signer, canonical.sender);
+        assert_eq!(wire.source_port, canonical.source_port);
+        assert_eq!(wire.source_channel, canonical.source_channel);
+        assert_eq!(
+            wire.token.as_ref().unwrap().denom,
+            canonical.token.as_ref().unwrap().denom
+        );
+        assert_eq!(
+            wire.token.as_ref().unwrap().amount.to_string(),
+            canonical.token.as_ref().unwrap().amount
+        );
+        assert_eq!(wire.receiver, canonical.receiver);
+        assert_eq!(wire.timeout_height.as_ref().unwrap().revision_number, 1);
+        assert_eq!(wire.timeout_height.as_ref().unwrap().revision_height, 42);
+        assert_eq!(wire.timeout_timestamp, canonical.timeout_timestamp);
+        assert_eq!(wire.memo, canonical.memo);
     }
 
     #[test]
