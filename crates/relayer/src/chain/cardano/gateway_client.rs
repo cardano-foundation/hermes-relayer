@@ -75,7 +75,6 @@ pub struct BuiltIbcTx {
     pub kind: BuiltIbcTxKind,
     pub rebuild_after_submission: bool,
 }
-pub const TRACE_REGISTRY_PRELUDE_TYPE_URL: &str = "/ibc.cardano.v1.TraceRegistryPrelude";
 
 /// Unsigned transaction response from Gateway
 #[derive(Debug, Clone)]
@@ -1601,16 +1600,15 @@ impl GatewayClient {
             sequence
         );
 
+        if !unsigned_tx_any.type_url.is_empty() {
+            return Err(Error::Transaction(format!(
+                "Unsupported RecvPacket transaction profile {}: first-seen voucher receive must atomically spend the channel and mint both voucher tokens",
+                unsigned_tx_any.type_url
+            )));
+        }
         Ok(UnsignedTx {
             cbor_hex,
-            description: if unsigned_tx_any.type_url == TRACE_REGISTRY_PRELUDE_TYPE_URL {
-                format!(
-                    "TraceRegistryPrelude MsgRecvPacket (sequence: {})",
-                    sequence
-                )
-            } else {
-                format!("MsgRecvPacket (sequence: {})", sequence)
-            },
+            description: format!("MsgRecvPacket (sequence: {})", sequence),
         })
     }
 
@@ -1695,7 +1693,8 @@ impl GatewayClient {
             source_port: msg.source_port,
             source_channel: msg.source_channel.clone(),
             token: Some(token),
-            sender: sender.clone(),
+            sender: super::signing_policy::transfer_sender_key_hash(&sender)
+                .map_err(Error::Transaction)?,
             receiver: msg.receiver,
             timeout_height,
             timeout_timestamp: msg.timeout_timestamp,

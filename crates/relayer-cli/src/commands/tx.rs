@@ -6,6 +6,7 @@ use ibc_relayer::config::Config;
 mod channel;
 pub(crate) mod client;
 mod connection;
+mod heartbeat;
 mod packet;
 mod transfer;
 mod upgrade;
@@ -14,6 +15,8 @@ mod upgrade;
 #[allow(clippy::large_enum_variant)]
 #[derive(Command, Debug, Parser, Runnable)]
 pub enum TxCmd {
+    /// Refresh a Cardano HostState epoch anchor using the configured authority
+    HostStateHeartbeat(heartbeat::TxHostStateHeartbeatCmd),
     /// Initialize a connection (ConnectionOpenInit)
     ConnInit(connection::TxConnInitCmd),
 

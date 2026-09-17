@@ -396,6 +396,51 @@ impl TransactionSigningPolicy {
             }
             Some(_) => return Err("unsupported consensus_history_format".to_string()),
         };
+        if let Some(migration) = manifest.get("migration") {
+            if migration.get("profile").and_then(JsonValue::as_str)
+                != Some("cardano-ibc-compatible-v1")
+            {
+                return Err("unsupported migration profile".to_string());
+            }
+            if consensus_history_format != ConsensusHistoryFormat::ProofBackedV1 {
+                return Err("migration requires an exported proof-backed-v1 bridge manifest; do not pin a raw handler file".to_string());
+            }
+            let generation = required_string(migration, &["generation"], "migration generation")?;
+            if generation.starts_with('0')
+                || generation.parse::<u64>().ok().filter(|n| *n > 0).is_none()
+            {
+                return Err("invalid migration generation".to_string());
+            }
+            decode_fixed_hex(
+                required_string(migration, &["compatibility"], "migration compatibility")?,
+                32,
+                "migration compatibility",
+            )?;
+            let unit = decode_hex(
+                required_string(migration, &["registryUnit"], "migration registry unit")?,
+                "migration registry unit",
+            )?;
+            if unit.len() != 28 + b"ibc_implementation_registry".len()
+                || &unit[28..] != b"ibc_implementation_registry"
+            {
+                return Err("invalid migration registry identity".to_string());
+            }
+            let address = decode_address(
+                required_string(
+                    migration,
+                    &["registryAddress"],
+                    "migration registry address",
+                )?,
+                network_id,
+            )?;
+            if !matches!(address.first().map(|byte| byte >> 4), Some(1 | 3 | 7)) {
+                return Err("migration registry must have a script payment credential".to_string());
+            }
+            // This validates the operator-pinned profile only. Exact current
+            // registry custody/phase is enforced by the scripts during the
+            // mandatory independent Ogmios evaluation before signing. Never
+            // pin the mutable registry out-ref: approvals consume it too.
+        }
         let validators = object_field(&manifest, &["validators"])
             .ok_or_else(|| "manifest has no validators object".to_string())?;
         let host_state = object_field(validators, &["host_state_stt", "hostStateStt"])
@@ -562,11 +607,8 @@ impl TransactionSigningPolicy {
         let (mut required_scripts, required_mint_scripts, state_output, needs_module) =
             match intent.operation.as_str() {
                 "HostStateHeartbeat" => (vec![], vec![], StateOutputKind::None, false),
-                "TraceRegistryPrelude" => (
-                    vec!["spendtraceregistry", "mintvoucher"],
-                    vec![],
-                    StateOutputKind::None,
-                    false,
+                "TraceRegistryPrelude" => return Err(
+                    "Standalone trace-registry prelude cannot satisfy the voucher policy; require an atomic receive".to_string()
                 ),
                 "/ibc.core.client.v1.MsgCreateClient" => (
                     vec!["mintclientstt"],
@@ -3688,7 +3730,7 @@ impl SigningIntent {
                     source_channel: Some(msg.source_channel.clone()),
                     destination_port: None,
                     destination_channel: None,
-                    sender: msg.sender.clone(),
+                    sender: transfer_sender_key_hash(&msg.sender).map_err(Error::Signer)?,
                     receiver: msg.receiver,
                     memo: msg.memo,
                     timeout_revision_number,
@@ -4423,6 +4465,31 @@ fn parse_out_ref(value: &JsonValue) -> Result<(Vec<u8>, u64), String> {
     Ok((tx_hash, index))
 }
 
+/// ICS-20 refunds on Cardano are addressed by a 28-byte payment key hash.
+/// Keep the complete address separately as the transaction signer identity.
+pub(crate) fn transfer_sender_key_hash(value: &str) -> Result<String, String> {
+    let bytes = if value.starts_with("addr") {
+        let (hrp, data, _) = bech32::decode(value)
+            .map_err(|error| format!("invalid Cardano transfer sender: {error}"))?;
+        if hrp != "addr" && hrp != "addr_test" {
+            return Err("unsupported Cardano transfer sender prefix".to_string());
+        }
+        Vec::<u8>::from_base32(&data).map_err(|error| error.to_string())?
+    } else {
+        decode_hex(value, "Cardano transfer sender")?
+    };
+    if bytes.len() == 28 {
+        return Ok(hex::encode(bytes));
+    }
+    if bytes.len() != 29 || !matches!(bytes[0], 0x60 | 0x61) {
+        return Err(
+            "Cardano transfer sender must be a payment key hash or Shelley enterprise key address"
+                .to_string(),
+        );
+    }
+    Ok(hex::encode(&bytes[1..]))
+}
+
 fn decode_address(value: &str, network_id: u8) -> Result<Vec<u8>, String> {
     let value = value.trim();
     let mut bytes = if value.starts_with("addr") {
@@ -5092,6 +5159,44 @@ mod tests {
         let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
         value["consensus_history_format"] = "proof-backed-v1".into();
         TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).unwrap()
+    }
+
+    #[test]
+    fn migration_profile_is_explicit_and_cannot_select_legacy_authorization() {
+        let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
+        value["consensus_history_format"] = "proof-backed-v1".into();
+        value["migration"] = serde_json::json!({
+            "profile": "cardano-ibc-compatible-v1", "generation": "2",
+            "compatibility": "ab".repeat(32),
+            "registryUnit": format!("{}{}", "cd".repeat(28), hex::encode(b"ibc_implementation_registry")),
+            "registryAddress": format!("70{}", "ef".repeat(28))
+        });
+        TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).unwrap();
+        for (key, bad) in [
+            ("profile", "future"),
+            ("generation", "0"),
+            ("generation", "02"),
+            ("compatibility", "ab"),
+            ("registryUnit", "cd"),
+            ("registryAddress", "bad"),
+        ] {
+            let mut changed = value.clone();
+            changed["migration"][key] = bad.into();
+            assert!(
+                TransactionSigningPolicy::from_json(&changed.to_string(), 0, limits()).is_err(),
+                "{key}"
+            );
+        }
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("consensus_history_format");
+        value["consensusHistoryFormat"] = "proof-backed-v1".into();
+        assert!(
+            TransactionSigningPolicy::from_json(&value.to_string(), 0, limits())
+                .unwrap_err()
+                .contains("raw handler")
+        );
     }
 
     fn update_intent() -> SigningIntent {
@@ -6750,6 +6855,47 @@ mod tests {
             memo: String::new(),
         }
         .encode_to_vec()
+    }
+
+    #[test]
+    fn outbound_sender_preserves_refund_key_and_separate_signer_address() {
+        use bech32::ToBase32;
+        let key = "99".repeat(28);
+        let signer = format!("60{key}");
+        let address = bech32::encode(
+            "addr_test",
+            hex::decode(&signer).unwrap().to_base32(),
+            bech32::Variant::Bech32,
+        )
+        .unwrap();
+        for sender in [&key, &signer, &address] {
+            assert_eq!(transfer_sender_key_hash(sender).unwrap(), key);
+        }
+        let message = transfer_message("lovelace".to_string(), signer.clone());
+        let intent = SigningIntent::ibc(
+            "/ibc.applications.transfer.v1.MsgTransfer",
+            &message,
+            &signer,
+            0,
+        )
+        .unwrap();
+        assert_eq!(intent.transfer.unwrap().sender, key);
+        for invalid in [
+            format!("70{key}"),
+            format!("60{key}00"),
+            format!("00{key}{key}"),
+            "99".repeat(27),
+        ] {
+            assert!(transfer_sender_key_hash(&invalid).is_err());
+        }
+        let wrong_signer = format!("60{}", "88".repeat(28));
+        assert!(SigningIntent::ibc(
+            "/ibc.applications.transfer.v1.MsgTransfer",
+            &message,
+            &wrong_signer,
+            0
+        )
+        .is_err());
     }
 
     #[test]

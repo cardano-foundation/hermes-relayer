@@ -342,21 +342,15 @@ fn ensure_completed_tendermint_chain_has_update_event(
 }
 fn validate_trace_registry_prelude(
     requested: bool,
-    message_type_url: &str,
-    kind: BuiltIbcTxKind,
-    transaction_count: usize,
-    rebuild_after_submission: bool,
-    already_completed: bool,
+    _message_type_url: &str,
+    _kind: BuiltIbcTxKind,
+    _transaction_count: usize,
+    _rebuild_after_submission: bool,
+    _already_completed: bool,
 ) -> Result<(), Error> {
-    if requested
-        && (message_type_url != "/ibc.core.channel.v1.MsgRecvPacket"
-            || kind != BuiltIbcTxKind::Singleton
-            || transaction_count != 1
-            || rebuild_after_submission
-            || already_completed)
-    {
+    if requested {
         return Err(Error::send_tx(
-            "Gateway returned an invalid or repeated trace-registry prelude".to_string(),
+            "Standalone trace-registry prelude is unsupported: the voucher policy requires an atomic receive".to_string(),
         ));
     }
     Ok(())
@@ -4368,12 +4362,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trace_registry_prelude_is_only_allowed_once_for_a_single_receive() {
+    fn trace_registry_prelude_is_rejected_even_for_a_single_valid_receive() {
         let recv = "/ibc.core.channel.v1.MsgRecvPacket";
         let update = "/ibc.core.client.v1.MsgUpdateClient";
         let singleton = BuiltIbcTxKind::Singleton;
         let staged = BuiltIbcTxKind::TendermintUpdateChain;
-        validate_trace_registry_prelude(true, recv, singleton, 1, false, false).unwrap();
+        assert!(
+            validate_trace_registry_prelude(true, recv, singleton, 1, false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("requires an atomic receive")
+        );
         for (message, kind, count, rebuild, completed) in [
             (update, singleton, 1, false, false),
             (recv, staged, 1, false, false),
@@ -4386,7 +4385,7 @@ mod tests {
             )
             .is_err());
         }
-        // Ordinary receive after the prelude and staged updates retain their own rules.
+        // Ordinary receives and staged updates retain their own rules.
         validate_trace_registry_prelude(false, recv, singleton, 1, false, true).unwrap();
         validate_trace_registry_prelude(false, update, staged, 100, true, false).unwrap();
     }

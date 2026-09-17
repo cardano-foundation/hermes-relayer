@@ -1518,6 +1518,72 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         self.build_update_client_and_send(QueryHeight::Latest, None)
     }
 
+    /// Build proof-bearing updates, or establish that the exact proof root is
+    /// already retained. A later checkpoint cursor alone cannot satisfy this.
+    /// Packet scheduling handles checkpoint submission separately.
+    pub fn wait_and_build_update_client_for_proof(
+        &self,
+        height: Height,
+    ) -> Result<Vec<Any>, ForeignClientError> {
+        let messages = self.wait_and_build_update_client(height)?;
+        if messages.is_empty() {
+            self.require_consensus_state_for_proof(height)?;
+        }
+        Ok(messages)
+    }
+
+    /// Prepare updates that can be followed by a membership proof at `height`.
+    /// A Cardano checkpoint advances authenticated header continuity but installs
+    /// no state root/processed-time entry. Commit checkpoint catch-up separately
+    /// before a handshake; batching it with the handshake cannot verify its proof.
+    pub fn prepare_update_client_for_proof(
+        &self,
+        height: Height,
+    ) -> Result<Vec<Any>, ForeignClientError> {
+        let messages = self.wait_and_build_update_client_for_proof(height)?;
+        let checkpoint = messages
+            .iter()
+            .try_fold(false, |found, message| {
+                is_probabilistic_checkpoint_update(message)
+                    .map(|is_checkpoint| found || is_checkpoint)
+            })
+            .map_err(|error| ForeignClientError::checkpoint_update(self.dst_chain.id(), error))?;
+        if !checkpoint {
+            return Ok(messages);
+        }
+        self.build_update_client_and_send(QueryHeight::Specific(height), None)?;
+        // Re-read canonical client state. A local successful submission is not
+        // permission to pretend that the requested proof root exists.
+        let remaining = self.wait_and_build_update_client_for_proof(height)?;
+        for message in &remaining {
+            if is_probabilistic_checkpoint_update(message).map_err(|error| {
+                ForeignClientError::checkpoint_update(self.dst_chain.id(), error)
+            })? {
+                return Err(ForeignClientError::checkpoint_update(
+                    self.dst_chain.id(),
+                    format!("checkpoint catch-up did not establish proof height {height}; retry from canonical state"),
+                ));
+            }
+        }
+        Ok(remaining)
+    }
+
+    fn require_consensus_state_for_proof(&self, height: Height) -> Result<(), ForeignClientError> {
+        self.dst_chain().query_consensus_state(
+            QueryConsensusStateRequest {
+                client_id: self.id().clone(),
+                consensus_height: height,
+                query_height: QueryHeight::Latest,
+            },
+            IncludeProof::No,
+        ).map_err(|error| ForeignClientError::client_update(
+            self.dst_chain.id(),
+            format!("proof consensus state at {height} is unavailable; rebuild proofs at a retained root-bearing anchor (a checkpoint cursor is insufficient)"),
+            error,
+        ))?;
+        Ok(())
+    }
+
     #[instrument(
         name = "foreign_client.build_update_client_and_send",
         level = "error",
@@ -2265,8 +2331,27 @@ pub fn fetch_ccv_consumer_id(
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Duration;
+
+    use ibc_proto::google::protobuf::Any;
+    use ibc_relayer_types::clients::ics08_cardano_probabilistic::{
+        client_state::ClientState as ProbabilisticClientState,
+        consensus_state::ConsensusState as ProbabilisticConsensusState,
+    };
+    use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentRoot;
+    use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ClientId};
+    use ibc_relayer_types::timestamp::Timestamp;
+
+    use crate::chain::endpoint::ChainStatus;
+    use crate::chain::handle::{BaseChainHandle, ChainRequest};
+    use crate::client_state::AnyClientState;
+    use crate::consensus_state::AnyConsensusState;
+    use crate::error::Error as RelayerError;
+
     use super::{
-        client_type_allows_missing_update_header, should_skip_client_update, ClientType, Height,
+        client_type_allows_missing_update_header, should_skip_client_update, ClientType,
+        ForeignClient, ForeignClientError, Height,
     };
 
     fn height(revision_height: u64) -> Height {
@@ -2325,5 +2410,207 @@ mod tests {
             height(4),
             height(33),
         ));
+    }
+
+    #[derive(Default)]
+    struct ProofPreparationRequests {
+        consensus_heights: Vec<Height>,
+        client_state_queries: usize,
+        application_status_queries: usize,
+        submissions: usize,
+    }
+
+    // Exercise the real helper through the runtime request/reply boundary. The
+    // cursor at 50 authenticates headers, while only the listed heights have
+    // roots that can verify a handshake proof.
+    fn prepare_proof_with_checkpoint_cursor(
+        exact_root_exists: bool,
+        packet_path: bool,
+    ) -> (
+        Result<Vec<Any>, ForeignClientError>,
+        ProofPreparationRequests,
+        ProofPreparationRequests,
+    ) {
+        let source_id = ChainId::from_string("cardano-0");
+        let client_id: ClientId = "08-cardano-probabilistic-0".parse().unwrap();
+        let client_state = AnyClientState::Probabilistic(ProbabilisticClientState {
+            chain_id: source_id.clone(),
+            latest_height: height(if exact_root_exists { 33 } else { 10 }),
+            frozen_height: None,
+            current_epoch: 0,
+            trusting_period: Duration::from_secs(60),
+            upgrade_path: vec![],
+            host_state_nft_policy_id: vec![1; 28],
+            host_state_nft_token_name: b"hostState".to_vec(),
+            epoch_stake_distribution: vec![],
+            epoch_nonce: vec![0; 32],
+            slots_per_kes_period: 100,
+            current_epoch_start_slot: 1,
+            current_epoch_end_slot_exclusive: 1_000,
+            system_start_unix_ns: 1,
+            slot_length_ns: 1_000_000_000,
+            epoch_contexts: vec![],
+            latest_checkpoint_height: Some(height(50)),
+            latest_checkpoint_block_hash: "02".repeat(32),
+            latest_checkpoint_epoch: 0,
+            max_kes_evolutions: 62,
+            latest_checkpoint_operational_certificate_counters: vec![],
+            operational_certificate_counter_history_start_height: Some(height(10)),
+            active_slot_coefficient_numerator: 1,
+            active_slot_coefficient_denominator: 20,
+            max_clock_drift: Duration::from_secs(10),
+            latest_checkpoint_slot: 50,
+            latest_checkpoint_timestamp: 100_000_000_000,
+        });
+        let consensus_state = AnyConsensusState::Probabilistic(ProbabilisticConsensusState {
+            root: CommitmentRoot::from_bytes(&[1; 32]),
+            timestamp: 100_000_000_000,
+            accepted_block_hash: "01".repeat(32),
+            accepted_epoch: 0,
+            unique_pools_count: 1,
+            unique_stake_bps: 10_000,
+            security_score_bps: 10_000,
+        });
+
+        let (source_sender, source_receiver) = crossbeam_channel::unbounded();
+        let source = BaseChainHandle::new(source_id, source_sender);
+        let source_runtime = thread::spawn(move || {
+            let mut requests = ProofPreparationRequests::default();
+            for (_, request) in source_receiver {
+                match request {
+                    ChainRequest::QueryApplicationStatus { reply_to } => {
+                        requests.application_status_queries += 1;
+                        reply_to
+                            .send(Ok(ChainStatus {
+                                height: height(60),
+                                timestamp: Timestamp::from_nanoseconds(110_000_000_000).unwrap(),
+                            }))
+                            .unwrap();
+                    }
+                    ChainRequest::SendMessagesAndWaitCommit { reply_to, .. } => {
+                        requests.submissions += 1;
+                        reply_to
+                            .send(Err(RelayerError::query("unexpected submission".into())))
+                            .unwrap();
+                    }
+                    ChainRequest::SendMessagesAndWaitCheckTx { reply_to, .. } => {
+                        requests.submissions += 1;
+                        reply_to
+                            .send(Err(RelayerError::query("unexpected submission".into())))
+                            .unwrap();
+                    }
+                    unexpected => panic!("unexpected source request: {unexpected:?}"),
+                }
+            }
+            requests
+        });
+
+        let (destination_sender, destination_receiver) = crossbeam_channel::unbounded();
+        let destination =
+            BaseChainHandle::new(ChainId::from_string("cosmos-0"), destination_sender);
+        let expected_client_id = client_id.clone();
+        let destination_runtime = thread::spawn(move || {
+            let mut requests = ProofPreparationRequests::default();
+            for (_, request) in destination_receiver {
+                match request {
+                    ChainRequest::QueryConsensusState {
+                        request, reply_to, ..
+                    } => {
+                        assert_eq!(request.client_id, expected_client_id);
+                        requests.consensus_heights.push(request.consensus_height);
+                        let available = request.consensus_height == height(10)
+                            || (exact_root_exists && request.consensus_height == height(33));
+                        let response = if available {
+                            Ok((consensus_state.clone(), None))
+                        } else {
+                            Err(RelayerError::query("missing exact consensus root".into()))
+                        };
+                        reply_to.send(response).unwrap();
+                    }
+                    ChainRequest::QueryClientState {
+                        request, reply_to, ..
+                    } => {
+                        assert_eq!(request.client_id, expected_client_id);
+                        requests.client_state_queries += 1;
+                        reply_to.send(Ok((client_state.clone(), None))).unwrap();
+                    }
+                    ChainRequest::SendMessagesAndWaitCommit { reply_to, .. } => {
+                        requests.submissions += 1;
+                        reply_to
+                            .send(Err(RelayerError::query("unexpected submission".into())))
+                            .unwrap();
+                    }
+                    ChainRequest::SendMessagesAndWaitCheckTx { reply_to, .. } => {
+                        requests.submissions += 1;
+                        reply_to
+                            .send(Err(RelayerError::query("unexpected submission".into())))
+                            .unwrap();
+                    }
+                    unexpected => panic!("unexpected destination request: {unexpected:?}"),
+                }
+            }
+            requests
+        });
+
+        let client = ForeignClient::restore(client_id, destination, source);
+        let result = if packet_path {
+            client.wait_and_build_update_client_for_proof(height(33))
+        } else {
+            client.prepare_update_client_for_proof(height(33))
+        };
+        drop(client);
+        (
+            result,
+            source_runtime.join().unwrap(),
+            destination_runtime.join().unwrap(),
+        )
+    }
+
+    #[test]
+    fn prepare_update_client_for_proof_accepts_existing_exact_root_without_sending() {
+        let (result, source, destination) = prepare_proof_with_checkpoint_cursor(true, false);
+
+        assert!(result.expect("the exact proof root exists").is_empty());
+        assert_eq!(destination.consensus_heights, vec![height(33), height(33)]);
+        assert_eq!(destination.client_state_queries, 0);
+        assert_eq!(source.application_status_queries, 0);
+        assert_eq!(source.submissions + destination.submissions, 0);
+    }
+
+    #[test]
+    fn prepare_update_client_for_proof_rejects_missing_root_behind_checkpoint_without_sending() {
+        let (result, source, destination) = prepare_proof_with_checkpoint_cursor(false, false);
+
+        let error = result.expect_err("a later checkpoint cannot supply the missing proof root");
+        assert!(error
+            .to_string()
+            .contains("proof consensus state at 0-33 is unavailable"));
+        assert!(error
+            .to_string()
+            .contains("a checkpoint cursor is insufficient"));
+        assert_eq!(
+            destination.consensus_heights,
+            vec![height(33), height(10), height(33)]
+        );
+        assert_eq!(destination.client_state_queries, 1);
+        assert_eq!(source.application_status_queries, 2);
+        assert_eq!(source.submissions + destination.submissions, 0);
+    }
+
+    #[test]
+    fn packet_update_requires_the_exact_root_when_cursor_is_a_later_checkpoint() {
+        for present in [false, true] {
+            let (result, source, destination) = prepare_proof_with_checkpoint_cursor(present, true);
+            if present {
+                assert!(result.expect("packet root is retained").is_empty());
+            } else {
+                assert!(result
+                    .expect_err("checkpoint cannot authenticate this packet proof")
+                    .to_string()
+                    .contains("proof consensus state at 0-33 is unavailable"));
+            }
+            assert_eq!(destination.consensus_heights.last(), Some(&height(33)));
+            assert_eq!(source.submissions + destination.submissions, 0);
+        }
     }
 }
