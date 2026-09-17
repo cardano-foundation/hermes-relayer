@@ -398,7 +398,7 @@ impl TransactionSigningPolicy {
         };
         if let Some(migration) = manifest.get("migration") {
             if migration.get("profile").and_then(JsonValue::as_str)
-                != Some("cardano-ibc-compatible-v1")
+                != Some("cardano-ibc-compatible-v2")
             {
                 return Err("unsupported migration profile".to_string());
             }
@@ -5166,7 +5166,7 @@ mod tests {
         let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
         value["consensus_history_format"] = "proof-backed-v1".into();
         value["migration"] = serde_json::json!({
-            "profile": "cardano-ibc-compatible-v1", "generation": "2",
+            "profile": "cardano-ibc-compatible-v2", "generation": "2",
             "compatibility": "ab".repeat(32),
             "registryUnit": format!("{}{}", "cd".repeat(28), hex::encode(b"ibc_implementation_registry")),
             "registryAddress": format!("70{}", "ef".repeat(28))
