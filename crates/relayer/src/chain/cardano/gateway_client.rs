@@ -475,6 +475,16 @@ impl GatewayClient {
         trusted_height: Height,
         height: Height,
     ) -> Result<AnyHeader, Error> {
+        self.query_header_with_mode(trusted_height, height, false)
+            .await
+    }
+
+    pub async fn query_header_with_mode(
+        &self,
+        trusted_height: Height,
+        height: Height,
+        checkpoint_only: bool,
+    ) -> Result<AnyHeader, Error> {
         use super::generated::ibc::core::types::v1::query_client::QueryClient as TypesQueryClient;
         use super::generated::ibc::core::types::v1::QueryIbcHeaderRequest;
 
@@ -498,6 +508,7 @@ impl GatewayClient {
         let request = tonic::Request::new(QueryIbcHeaderRequest {
             trusted_height: effective_trusted_height.revision_height(),
             height: height.revision_height(),
+            checkpoint_only,
         });
 
         let response = client.ibc_header(request).await?.into_inner();

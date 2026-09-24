@@ -1646,7 +1646,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
         let witness_header = self
             .rt
-            .block_on(witness_gateway_client.query_header(trusted_height, target_height))
+            .block_on(witness_gateway_client.query_header_with_mode(
+                trusted_height,
+                target_height,
+                matches!(submitted_header, AnyHeader::Probabilistic(_)),
+            ))
             .map_err(|e| {
                 Error::query(format!(
                     "failed to independently query Cardano header at {target_height}: {e}"
@@ -3695,10 +3699,14 @@ fn cardano_headers_conflict(
                 )));
             }
 
-            let cheap_conflict = !submitted
-                .host_state_tx_hash
-                .trim()
-                .eq_ignore_ascii_case(witness.host_state_tx_hash.trim())
+            let context_conflict = match (&submitted.new_epoch_context, &witness.new_epoch_context)
+            {
+                (Some(left), Some(right)) if left.epoch == right.epoch => {
+                    !probabilistic_epoch_contexts_equal(left, right)
+                }
+                _ => false,
+            };
+            let cheap_conflict = context_conflict
                 || !submitted
                     .anchor_block
                     .hash
@@ -3715,6 +3723,12 @@ fn cardano_headers_conflict(
                     witness.anchor_block.hash,
                 );
                 return Ok(true);
+            }
+
+            // A rootless witness with identical authenticated blocks/context
+            // is not a conflict merely because it omits HostState proof fields.
+            if submitted.is_checkpoint || witness.is_checkpoint {
+                return Ok(false);
             }
 
             let submitted_root = extract_ibc_state_root_from_host_state_tx(
@@ -3757,6 +3771,24 @@ fn cardano_headers_conflict(
             witness.client_type()
         ))),
     }
+}
+
+fn probabilistic_epoch_contexts_equal(
+    left: &ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::EpochContext,
+    right: &ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::EpochContext,
+) -> bool {
+    let normalize =
+        |context: &ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::EpochContext| {
+            let mut context = context.clone();
+            for pool in &mut context.stake_distribution {
+                pool.pool_id = pool.pool_id.to_lowercase();
+            }
+            context
+                .stake_distribution
+                .sort_by(|a, b| a.pool_id.cmp(&b.pool_id));
+            context
+        };
+    normalize(left) == normalize(right)
 }
 
 fn probabilistic_windows_conflict_by_block_height(
@@ -4875,6 +4907,7 @@ mod tests {
             max_clock_drift: Duration::from_secs(10),
             latest_checkpoint_slot: 10,
             latest_checkpoint_timestamp: 11,
+            epoch_context_challenges: vec![],
         })
     }
 
@@ -5127,6 +5160,46 @@ mod tests {
             evidence.misbehaviour,
             AnyMisbehaviour::Probabilistic(_)
         ));
+    }
+
+    #[test]
+    fn probabilistic_rootless_witness_detects_context_and_fork_conflicts() {
+        use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
+        let mut submitted = probabilistic_header(10, "same-anchor");
+        submitted.new_epoch_context = Some(raw::EpochContext {
+            epoch: 7,
+            epoch_nonce: vec![1; 32],
+            stake_distribution: vec![raw::StakeDistributionEntry {
+                pool_id: "pool-a".into(),
+                stake: 100,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut witness = submitted.clone();
+        witness.is_checkpoint = true;
+        witness.host_state_tx_hash.clear();
+        let conflicts = |witness| {
+            cardano_headers_conflict(
+                &AnyHeader::Probabilistic(submitted.clone()),
+                &AnyHeader::Probabilistic(witness),
+                &probabilistic_client_state(),
+            )
+            .unwrap()
+        };
+        assert!(!conflicts(witness.clone()));
+        witness
+            .new_epoch_context
+            .as_mut()
+            .unwrap()
+            .stake_distribution[0]
+            .pool_id = "POOL-A".into();
+        assert!(!conflicts(witness.clone()));
+        witness.new_epoch_context.as_mut().unwrap().epoch_nonce = vec![2; 32];
+        assert!(conflicts(witness.clone()));
+        witness.new_epoch_context = submitted.new_epoch_context.clone();
+        witness.anchor_block.hash = "honest-fork".into();
+        assert!(conflicts(witness));
     }
 
     #[test]

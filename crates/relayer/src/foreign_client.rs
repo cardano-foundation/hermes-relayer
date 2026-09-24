@@ -1075,7 +1075,49 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         &self,
         target_height: Height,
     ) -> Result<Vec<Any>, ForeignClientError> {
-        self.wait_and_build_update_client_with_trusted(target_height, None)
+        // A packet must never share the transaction that starts an epoch's
+        // challenge timer: the proof-use rejection would roll that timer back.
+        for _ in 0..MAX_PROBABILISTIC_CHECKPOINT_UPDATES {
+            self.wait_for_probabilistic_epoch_challenge()?;
+            let messages = self.wait_and_build_update_client_with_trusted(target_height, None)?;
+            let (state, _) = self.validated_client_state()?;
+            let legacy_epoch = matches!(&state, AnyClientState::Probabilistic(state)
+                if state.epoch_context_challenges.is_empty());
+            let Some(first) = messages.first() else {
+                return Ok(messages);
+            };
+            let proposal = crate::chain::cardano::checkpoint::is_probabilistic_epoch_proposal(
+                first,
+            )
+            .map_err(|error| ForeignClientError::checkpoint_update(self.dst_chain.id(), error))?;
+            if !proposal && !legacy_epoch {
+                return Ok(messages);
+            }
+            let before_height = state.latest_verified_height();
+            self.dst_chain()
+                .send_messages_and_wait_commit(TrackedMsgs::new_single(
+                    first.clone(),
+                    "probabilistic epoch proposal",
+                ))
+                .map_err(|error| {
+                    ForeignClientError::client_update(
+                        self.dst_chain.id(),
+                        "failed committing epoch proposal".to_string(),
+                        error,
+                    )
+                })?;
+            let after_height = self.validated_client_state()?.0.latest_verified_height();
+            if after_height <= before_height {
+                return Err(ForeignClientError::checkpoint_update(
+                    self.dst_chain.id(),
+                    "epoch proposal transaction did not advance the client".to_string(),
+                ));
+            }
+        }
+        Err(ForeignClientError::checkpoint_update(
+            self.dst_chain.id(),
+            "too many epoch proposals while preparing packet proofs".to_string(),
+        ))
     }
 
     /// Returns a trusted height that is lower than the target height, so
@@ -1281,6 +1323,41 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             ))
         } else {
             Ok(())
+        }
+    }
+
+    /// Use committed host timestamps, never a local wall clock or estimated
+    /// block cadence. Recheck client status so a challenge freeze stops waiting.
+    fn wait_for_probabilistic_epoch_challenge(&self) -> Result<(), ForeignClientError> {
+        loop {
+            let (state, _) = self.validated_client_state()?;
+            let AnyClientState::Probabilistic(state) = state else {
+                return Ok(());
+            };
+            let deadline = state
+                .epoch_context_challenges
+                .iter()
+                .map(|challenge| challenge.usable_after_unix_ns)
+                .max()
+                .unwrap_or(0);
+            if deadline == 0 {
+                return Ok(());
+            }
+            let status = self
+                .dst_chain()
+                .query_application_status()
+                .map_err(|error| {
+                    ForeignClientError::client_update(
+                        self.dst_chain.id(),
+                        "failed querying epoch challenge host time".to_string(),
+                        error,
+                    )
+                })?;
+            if status.timestamp.nanoseconds() >= deadline {
+                return Ok(());
+            }
+            debug!(client_id = %self.id, deadline, "waiting for epoch context challenge window");
+            thread::sleep(Duration::from_secs(1));
         }
     }
 
@@ -1546,6 +1623,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         let mut next_trusted_height = trusted_height;
 
         for _ in 0..MAX_PROBABILISTIC_CHECKPOINT_UPDATES {
+            self.wait_for_probabilistic_epoch_challenge()?;
             let new_msgs =
                 self.wait_and_build_update_client_with_trusted(target_height, next_trusted_height)?;
 
