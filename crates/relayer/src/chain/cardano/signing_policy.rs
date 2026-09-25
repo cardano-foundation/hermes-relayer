@@ -6827,7 +6827,7 @@ mod tests {
             PlutusData::Constr(pallas_primitives::alonzo::Constr {
                 tag: 121,
                 any_constructor: None,
-                fields: fields.into(),
+                fields,
             })
         };
         let packet_json = serde_json::json!({
