@@ -3688,7 +3688,8 @@ impl SigningIntent {
                     source_channel: Some(msg.source_channel.clone()),
                     destination_port: None,
                     destination_channel: None,
-                    sender: msg.sender.clone(),
+                    sender: outbound_transfer_sender(&msg.sender, network_id)
+                        .map_err(Error::Signer)?,
                     receiver: msg.receiver,
                     memo: msg.memo,
                     timeout_revision_number,
@@ -4441,6 +4442,19 @@ fn decode_address(value: &str, network_id: u8) -> Result<Vec<u8>, String> {
     }
     validate_address_network(&bytes, network_id)?;
     Ok(bytes)
+}
+
+fn outbound_transfer_sender(value: &str, network_id: u8) -> Result<String, String> {
+    let address = decode_address(value, network_id)?;
+    match address.as_slice() {
+        [header, payment_key_hash @ ..] if *header >> 4 == 6 && payment_key_hash.len() == 28 => {
+            Ok(hex::encode(payment_key_hash))
+        }
+        _ => Err(
+            "Cardano transfer sender must be a payment key hash or key enterprise address"
+                .to_string(),
+        ),
+    }
 }
 
 fn validate_address_network(address: &[u8], network_id: u8) -> Result<(), String> {
@@ -6750,6 +6764,104 @@ mod tests {
             memo: String::new(),
         }
         .encode_to_vec()
+    }
+
+    #[test]
+    fn outbound_transfer_sender_uses_payment_key_hash_without_relaxing_signer_check() {
+        use bech32::ToBase32;
+
+        let payment_key_hash = "99".repeat(28);
+        let signer = format!("60{payment_key_hash}");
+        let bech32_signer = bech32::encode(
+            "addr_test",
+            hex::decode(&signer).unwrap().to_base32(),
+            bech32::Variant::Bech32,
+        )
+        .unwrap();
+
+        for sender in [signer.clone(), bech32_signer, payment_key_hash.clone()] {
+            let message = transfer_message("lovelace".to_string(), sender);
+            let intent = SigningIntent::ibc(
+                "/ibc.applications.transfer.v1.MsgTransfer",
+                &message,
+                &signer,
+                0,
+            )
+            .unwrap();
+            assert_eq!(intent.transfer.unwrap().sender, payment_key_hash);
+        }
+
+        for sender in [
+            format!("60{}", "98".repeat(28)),
+            format!("61{payment_key_hash}"),
+            format!("70{payment_key_hash}"),
+            format!("60{}", "99".repeat(27)),
+        ] {
+            let message = transfer_message("lovelace".to_string(), sender);
+            assert!(SigningIntent::ibc(
+                "/ibc.applications.transfer.v1.MsgTransfer",
+                &message,
+                &signer,
+                0,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn outbound_transfer_packet_still_binds_the_sender_to_the_message() {
+        let payment_key_hash = "99".repeat(28);
+        let signer = format!("60{payment_key_hash}");
+        let message = transfer_message("lovelace".to_string(), signer.clone());
+        let intent = SigningIntent::ibc(
+            "/ibc.applications.transfer.v1.MsgTransfer",
+            &message,
+            &signer,
+            0,
+        )
+        .unwrap();
+        let transfer = intent.transfer.as_ref().unwrap();
+        let bytes = |value: &[u8]| PlutusData::BoundedBytes(value.to_vec().into());
+        let integer = |value: i64| PlutusData::BigInt(BigInt::Int(value.into()));
+        let constructor = |fields: Vec<PlutusData>| {
+            PlutusData::Constr(pallas_primitives::alonzo::Constr {
+                tag: 121,
+                any_constructor: None,
+                fields,
+            })
+        };
+        let packet_json = serde_json::json!({
+            "denom": LOVELACE_HEX,
+            "amount": "42",
+            "sender": payment_key_hash,
+            "receiver": "destination",
+            "memo": "",
+        });
+        let fields = vec![
+            integer(1),
+            bytes(b"transfer"),
+            bytes(b"channel-0"),
+            bytes(b"transfer"),
+            bytes(b"channel-1"),
+            bytes(&serde_json::to_vec(&packet_json).unwrap()),
+            constructor(vec![integer(0), integer(0)]),
+            integer(1),
+        ];
+        assert!(outbound_transfer_packet_matches(
+            &constructor(fields.clone()),
+            transfer
+        ));
+
+        for altered_sender in [signer, "98".repeat(28)] {
+            let mut altered_packet = packet_json.clone();
+            altered_packet["sender"] = serde_json::Value::String(altered_sender);
+            let mut altered_fields = fields.clone();
+            altered_fields[5] = bytes(&serde_json::to_vec(&altered_packet).unwrap());
+            assert!(!outbound_transfer_packet_matches(
+                &constructor(altered_fields),
+                transfer,
+            ));
+        }
     }
 
     #[test]
