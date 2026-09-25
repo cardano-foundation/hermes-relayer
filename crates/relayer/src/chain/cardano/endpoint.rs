@@ -1502,6 +1502,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 return Ok(HostStateHeartbeatOutcome::NotRequired {
                     current_epoch: build.current_epoch,
                     host_state_epoch: build.host_state_epoch,
+                    next_check_delay_ms: build.next_check_delay_ms,
                 });
             }
 
@@ -1524,6 +1525,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 height: response.height,
                 current_epoch: build.current_epoch,
                 previous_host_state_epoch: build.host_state_epoch,
+                next_check_delay_ms: build.next_check_delay_ms,
             })
         })
     }

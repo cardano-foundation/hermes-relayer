@@ -97,6 +97,7 @@ pub struct HostStateHeartbeatBuild {
     pub heartbeat_required: bool,
     pub current_epoch: u64,
     pub host_state_epoch: u64,
+    pub next_check_delay_ms: u64,
     pub unsigned_tx: Option<UnsignedTx>,
 }
 
@@ -1844,8 +1845,8 @@ impl GatewayClient {
         })
     }
 
-    /// Ask the Gateway to build a HostState heartbeat only if the current
-    /// Cardano epoch does not already contain a HostState anchor.
+    /// Ask the Gateway to build a HostState heartbeat after the epoch midpoint
+    /// only if no HostState transaction has occurred in that epoch.
     pub async fn build_host_state_heartbeat(
         &self,
         signer: &str,
@@ -1881,6 +1882,7 @@ impl GatewayClient {
             heartbeat_required: response.heartbeat_required,
             current_epoch: response.current_epoch,
             host_state_epoch: response.host_state_epoch,
+            next_check_delay_ms: response.next_check_delay_ms,
             unsigned_tx,
         })
     }

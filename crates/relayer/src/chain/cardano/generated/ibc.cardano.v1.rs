@@ -7,8 +7,8 @@ pub struct BuildHostStateHeartbeatRequest {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BuildHostStateHeartbeatResponse {
-    /// False when an ordinary IBC transaction or heartbeat has already refreshed
-    /// HostState in the current epoch.
+    /// False before the epoch midpoint or when HostState was already refreshed
+    /// in the current epoch.
     #[prost(bool, tag = "1")]
     pub heartbeat_required: bool,
     #[prost(uint64, tag = "2")]
@@ -19,6 +19,9 @@ pub struct BuildHostStateHeartbeatResponse {
     /// unsigned Cardano transaction CBOR encoded as UTF-8 hex.
     #[prost(message, optional, tag = "4")]
     pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
+    /// Suggested delay until Hermes checks again.
+    #[prost(uint64, tag = "5")]
+    pub next_check_delay_ms: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MsgPrunePacketHistory {
