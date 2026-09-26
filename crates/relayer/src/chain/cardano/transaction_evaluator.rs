@@ -24,11 +24,13 @@ use super::utxo_resolver::{OgmiosAdditionalUtxo, TrustedUtxoOverlay};
 
 const OGMIOS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_OGMIOS_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_OGMIOS_ERROR_DETAILS_BYTES: usize = 2 * 1024;
 const OGMIOS_API_KEY_HEADER: HeaderName = HeaderName::from_static("dmtr-api-key");
 const OGMIOS_VALIDITY_INTERVAL_ERROR_CODE: i64 = 3118;
 const OGMIOS_UNKNOWN_INPUT_ERROR_CODE: i64 = 3117;
 const OGMIOS_SUBMISSION_MAX_RETRIES: usize = 5;
 const OGMIOS_DEPENDENCY_MAX_RETRIES: usize = 40;
+const OGMIOS_HTTP_UNAUTHORIZED_MAX_RETRIES: usize = 20;
 const CARDANO_SLOT_LENGTH: Duration = Duration::from_secs(1);
 const OGMIOS_SUBMISSION_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
@@ -36,6 +38,7 @@ const OGMIOS_SUBMISSION_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 struct SubmissionRetryPolicy {
     max_validity_retries: usize,
     max_dependency_retries: usize,
+    max_http_unauthorized_retries: usize,
     allow_dependency_retry: bool,
     slot_length: Duration,
     backoff: Duration,
@@ -46,6 +49,7 @@ impl Default for SubmissionRetryPolicy {
         Self {
             max_validity_retries: OGMIOS_SUBMISSION_MAX_RETRIES,
             max_dependency_retries: OGMIOS_DEPENDENCY_MAX_RETRIES,
+            max_http_unauthorized_retries: OGMIOS_HTTP_UNAUTHORIZED_MAX_RETRIES,
             allow_dependency_retry: false,
             slot_length: CARDANO_SLOT_LENGTH,
             backoff: OGMIOS_SUBMISSION_RETRY_BACKOFF,
@@ -182,25 +186,42 @@ impl OgmiosTransactionEvaluator {
             },
             id: 1,
         };
-        let mut request_builder = self
-            .client
-            .post(self.endpoint.clone())
-            .header(CONTENT_TYPE, "application/json")
-            .json(&request);
-        if let Some(api_key) = &self.api_key {
-            request_builder = request_builder.header(OGMIOS_API_KEY_HEADER, api_key.clone());
-        }
+        let mut http_unauthorized_retries = 0usize;
+        let mut response = loop {
+            let mut request_builder = self
+                .client
+                .post(self.endpoint.clone())
+                .header(CONTENT_TYPE, "application/json")
+                .json(&request);
+            if let Some(api_key) = &self.api_key {
+                request_builder = request_builder.header(OGMIOS_API_KEY_HEADER, api_key.clone());
+            }
 
-        let mut response = request_builder.send().await.map_err(|error| {
-            Error::Transaction(format!(
-                "trusted Ogmios transaction evaluation request failed: {}",
-                error.without_url()
-            ))
-        })?;
+            let response = request_builder.send().await.map_err(|error| {
+                Error::Transaction(format!(
+                    "trusted Ogmios transaction evaluation request failed: {}",
+                    error.without_url()
+                ))
+            })?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                && http_unauthorized_retries < OGMIOS_HTTP_UNAUTHORIZED_MAX_RETRIES
+            {
+                http_unauthorized_retries += 1;
+                tracing::warn!(
+                    retry = http_unauthorized_retries,
+                    max_retries = OGMIOS_HTTP_UNAUTHORIZED_MAX_RETRIES,
+                    "Trusted Ogmios returned HTTP 401; retrying evaluation of the same transaction"
+                );
+                tokio::time::sleep(OGMIOS_SUBMISSION_RETRY_BACKOFF).await;
+                continue;
+            }
+            break response;
+        };
         let status = response.status();
         if !status.is_success() {
+            let details = http_error_details(&mut response, self.api_key.as_ref()).await;
             return Err(Error::Transaction(format!(
-                "trusted Ogmios returned HTTP {status} while evaluating the transaction"
+                "trusted Ogmios returned HTTP {status} while evaluating the transaction{details}"
             )));
         }
         if response
@@ -377,6 +398,7 @@ impl OgmiosTransactionEvaluator {
 
         let mut validity_retries = 0usize;
         let mut dependency_retries = 0usize;
+        let mut http_unauthorized_retries = 0usize;
         loop {
             let mut request_builder = self
                 .client
@@ -394,9 +416,22 @@ impl OgmiosTransactionEvaluator {
                 ))
             })?;
             let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                && http_unauthorized_retries < retry_policy.max_http_unauthorized_retries
+            {
+                http_unauthorized_retries += 1;
+                tracing::warn!(
+                    retry = http_unauthorized_retries,
+                    max_retries = retry_policy.max_http_unauthorized_retries,
+                    "Trusted Ogmios returned HTTP 401; retrying the exact signed transaction bytes"
+                );
+                tokio::time::sleep(retry_policy.backoff).await;
+                continue;
+            }
             if !status.is_success() {
+                let details = http_error_details(&mut response, self.api_key.as_ref()).await;
                 return Err(Error::Transaction(format!(
-                    "trusted Ogmios returned HTTP {status} while submitting the transaction"
+                    "trusted Ogmios returned HTTP {status} while submitting the transaction{details}"
                 )));
             }
             if response
@@ -594,6 +629,61 @@ fn redeemer_purpose(tag: RedeemerTag) -> RedeemerPurpose {
         RedeemerTag::Vote => RedeemerPurpose::Vote,
         RedeemerTag::Propose => RedeemerPurpose::Propose,
     }
+}
+
+async fn http_error_details(
+    response: &mut reqwest::Response,
+    api_key: Option<&HeaderValue>,
+) -> String {
+    let api_key = match api_key {
+        Some(value) => match value.to_str() {
+            Ok(value) if value.len() <= MAX_OGMIOS_ERROR_DETAILS_BYTES => Some(value),
+            _ => {
+                return "; response body omitted because the API key cannot be safely redacted"
+                    .to_string()
+            }
+        },
+        None => None,
+    };
+    // Read enough extra bytes to redact a key that begins at the excerpt boundary.
+    let limit = MAX_OGMIOS_ERROR_DETAILS_BYTES + api_key.map(str::len).unwrap_or(0) + 1;
+    let mut bytes = Vec::new();
+    while bytes.len() < limit {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                bytes.extend_from_slice(&chunk[..chunk.len().min(limit - bytes.len())])
+            }
+            Ok(None) => break,
+            Err(_) => return "; response body could not be read".to_string(),
+        }
+    }
+    let truncated = bytes.len() > MAX_OGMIOS_ERROR_DETAILS_BYTES;
+    let mut redacted = Vec::new();
+    let mut index = 0;
+    while index < bytes.len().min(MAX_OGMIOS_ERROR_DETAILS_BYTES) {
+        if let Some(api_key) = api_key.filter(|key| bytes[index..].starts_with(key.as_bytes())) {
+            redacted.extend_from_slice(b"[redacted]");
+            index += api_key.len();
+        } else {
+            redacted.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let body = String::from_utf8_lossy(&redacted);
+    let escaped: String = body.chars().flat_map(char::escape_debug).collect();
+    let excerpt: String = escaped
+        .chars()
+        .take(MAX_OGMIOS_ERROR_DETAILS_BYTES)
+        .collect();
+    if excerpt.is_empty() {
+        return String::new();
+    }
+    let suffix = if truncated || excerpt.len() < escaped.len() {
+        " [truncated]"
+    } else {
+        ""
+    };
+    format!("; response body: {excerpt}{suffix}")
 }
 
 #[derive(Debug, Serialize)]
@@ -928,55 +1018,66 @@ mod tests {
         expected_cbor: Vec<u8>,
         response_body: String,
     ) -> (String, thread::JoinHandle<()>) {
+        mock_ogmios_http_responses(expected_cbor, vec![(200, response_body)])
+    }
+
+    fn mock_ogmios_http_responses(
+        expected_cbor: Vec<u8>,
+        responses: Vec<(u16, String)>,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 4096];
-            let header_end = loop {
-                let read = stream.read(&mut buffer).unwrap();
-                assert!(read > 0, "client closed before sending HTTP headers");
-                request.extend_from_slice(&buffer[..read]);
-                if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n")
-                {
-                    break position + 4;
+            for (status, response_body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let header_end = loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0, "client closed before sending HTTP headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(position) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        break position + 4;
+                    }
+                };
+                let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(str::trim)
+                            .map(str::parse::<usize>)
+                    })
+                    .transpose()
+                    .unwrap()
+                    .unwrap();
+                while request.len() - header_end < content_length {
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0, "client closed before sending HTTP body");
+                    request.extend_from_slice(&buffer[..read]);
                 }
-            };
-            let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length:")
-                        .map(str::trim)
-                        .map(str::parse::<usize>)
-                })
-                .transpose()
-                .unwrap()
-                .unwrap();
-            while request.len() - header_end < content_length {
-                let read = stream.read(&mut buffer).unwrap();
-                assert!(read > 0, "client closed before sending HTTP body");
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let payload: JsonValue =
-                serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
-            assert_eq!(payload["jsonrpc"], "2.0");
-            assert_eq!(payload["method"], "evaluateTransaction");
-            assert_eq!(payload["id"], 1);
-            assert_eq!(
-                payload["params"]["transaction"]["cbor"],
-                hex::encode(expected_cbor)
-            );
-            assert_eq!(payload["params"]["additionalUtxo"], serde_json::json!([]));
+                let payload: JsonValue =
+                    serde_json::from_slice(&request[header_end..header_end + content_length])
+                        .unwrap();
+                assert_eq!(payload["jsonrpc"], "2.0");
+                assert_eq!(payload["method"], "evaluateTransaction");
+                assert_eq!(payload["id"], 1);
+                assert_eq!(
+                    payload["params"]["transaction"]["cbor"],
+                    hex::encode(&expected_cbor)
+                );
+                assert_eq!(payload["params"]["additionalUtxo"], serde_json::json!([]));
 
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                let response = format!(
+                "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 response_body.len(),
                 response_body
             );
-            stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(response.as_bytes()).unwrap();
+            }
         });
         (format!("http://{address}"), handle)
     }
@@ -992,10 +1093,23 @@ mod tests {
         expected_cbor: Vec<u8>,
         response_bodies: Vec<String>,
     ) -> (String, thread::JoinHandle<()>) {
+        mock_submit_ogmios_http_responses(
+            expected_cbor,
+            response_bodies
+                .into_iter()
+                .map(|body| (200, body))
+                .collect(),
+        )
+    }
+
+    fn mock_submit_ogmios_http_responses(
+        expected_cbor: Vec<u8>,
+        responses: Vec<(u16, String)>,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
-            for response_body in response_bodies {
+            for (status, response_body) in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0u8; 4096];
@@ -1038,7 +1152,7 @@ mod tests {
                 );
 
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     response_body.len(),
                     response_body
                 );
@@ -1070,6 +1184,7 @@ mod tests {
         SubmissionRetryPolicy {
             max_validity_retries: max_retries,
             max_dependency_retries: max_retries,
+            max_http_unauthorized_retries: max_retries,
             allow_dependency_retry: false,
             slot_length: Duration::ZERO,
             backoff: Duration::ZERO,
@@ -1120,6 +1235,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retries_the_same_evaluation_after_transient_http_401() {
+        let transaction = unsigned_tx_with_redeemers();
+        let (endpoint, server) = mock_ogmios_http_responses(
+            transaction.clone(),
+            vec![(401, String::new()), (200, successful_evaluation())],
+        );
+        let evaluator =
+            OgmiosTransactionEvaluator::new_with_security(&endpoint, None, None).unwrap();
+
+        let results = evaluator
+            .evaluate_unsigned_transaction(&transaction)
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn includes_http_evaluation_error_body() {
+        let transaction = unsigned_tx_with_redeemers();
+        let (endpoint, server) = mock_ogmios_http_responses(
+            transaction.clone(),
+            vec![(400, "invalid additional input\ntry again".to_string())],
+        );
+        let evaluator =
+            OgmiosTransactionEvaluator::new_with_security(&endpoint, None, None).unwrap();
+
+        let error = evaluator
+            .evaluate_unsigned_transaction(&transaction)
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("HTTP 400"));
+        assert!(error
+            .to_string()
+            .contains("invalid additional input\\ntry again"));
+    }
+
+    #[tokio::test]
     async fn submits_exact_signed_cbor_through_trusted_ogmios() {
         let transaction = vec![0x84, 0x01, 0x02, 0x03];
         let expected_id = "ab".repeat(32);
@@ -1140,6 +1296,79 @@ mod tests {
         server.join().unwrap();
 
         assert_eq!(transaction_id, expected_id);
+    }
+
+    #[tokio::test]
+    async fn retries_exact_signed_cbor_after_transient_http_401() {
+        let transaction = vec![0x84, 0x01, 0x02, 0x03];
+        let expected_id = "ab".repeat(32);
+        let success = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": { "transaction": { "id": expected_id } }
+        })
+        .to_string();
+        let (endpoint, server) = mock_submit_ogmios_http_responses(
+            transaction.clone(),
+            vec![(401, String::new()), (200, success)],
+        );
+        let evaluator =
+            OgmiosTransactionEvaluator::new_with_security(&endpoint, None, None).unwrap();
+
+        let transaction_id = evaluator
+            .submit_signed_transaction_with_retry_policy(&transaction, immediate_retry_policy(1))
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(transaction_id, expected_id);
+    }
+
+    #[tokio::test]
+    async fn http_401_submission_retries_are_bounded() {
+        let transaction = vec![0x84, 0x01, 0x02, 0x03];
+        let (endpoint, server) = mock_submit_ogmios_http_responses(
+            transaction.clone(),
+            vec![(401, String::new()), (401, String::new())],
+        );
+        let evaluator =
+            OgmiosTransactionEvaluator::new_with_security(&endpoint, None, None).unwrap();
+
+        let error = evaluator
+            .submit_signed_transaction_with_retry_policy(&transaction, immediate_retry_policy(1))
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert!(error.to_string().contains("HTTP 401"));
+    }
+
+    #[tokio::test]
+    async fn bounds_and_redacts_http_submission_error_body() {
+        let transaction = vec![0x84, 0x01, 0x02, 0x03];
+        let response_body = format!(
+            "{}sensitive-test-key rejected {}",
+            "x".repeat(MAX_OGMIOS_ERROR_DETAILS_BYTES - 20),
+            "y".repeat(MAX_OGMIOS_ERROR_DETAILS_BYTES)
+        );
+        let (endpoint, server) =
+            mock_submit_ogmios_http_responses(transaction.clone(), vec![(400, response_body)]);
+        let mut evaluator =
+            OgmiosTransactionEvaluator::new_with_security(&endpoint, None, None).unwrap();
+        evaluator.api_key = Some(api_key_header("sensitive-test-key").unwrap());
+
+        let error = evaluator
+            .submit_signed_transaction(&transaction)
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+
+        let message = error.to_string();
+        assert!(message.contains("HTTP 400"));
+        assert!(message.contains("[redacted]"));
+        assert!(message.contains("[truncated]"));
+        assert!(!message.contains("sensitive-test-key"));
+        assert!(message.len() < MAX_OGMIOS_ERROR_DETAILS_BYTES + 200);
     }
 
     #[tokio::test]

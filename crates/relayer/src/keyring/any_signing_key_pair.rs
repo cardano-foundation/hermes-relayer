@@ -1,6 +1,8 @@
 use serde::Serialize;
 
-use super::{Ed25519KeyPair, KeyType, NamadaKeyPair, Secp256k1KeyPair, SigningKeyPair};
+#[cfg(feature = "namada")]
+use super::NamadaKeyPair;
+use super::{Ed25519KeyPair, KeyType, Secp256k1KeyPair, SigningKeyPair};
 use crate::chain::cardano::CardanoSigningKeyPair;
 
 #[derive(Clone, Debug, Serialize)]
@@ -9,6 +11,7 @@ use crate::chain::cardano::CardanoSigningKeyPair;
 pub enum AnySigningKeyPair {
     Secp256k1(Secp256k1KeyPair),
     Ed25519(Ed25519KeyPair),
+    #[cfg(feature = "namada")]
     Namada(NamadaKeyPair),
     Cardano(CardanoSigningKeyPair),
 }
@@ -18,6 +21,7 @@ impl AnySigningKeyPair {
         match self {
             Self::Secp256k1(key_pair) => key_pair.account(),
             Self::Ed25519(key_pair) => key_pair.account(),
+            #[cfg(feature = "namada")]
             Self::Namada(key_pair) => key_pair.account(),
             Self::Cardano(key_pair) => key_pair.account(),
         }
@@ -27,6 +31,7 @@ impl AnySigningKeyPair {
         match self {
             Self::Secp256k1(_) => Secp256k1KeyPair::KEY_TYPE,
             Self::Ed25519(_) => Ed25519KeyPair::KEY_TYPE,
+            #[cfg(feature = "namada")]
             Self::Namada(_) => NamadaKeyPair::KEY_TYPE,
             Self::Cardano(_) => CardanoSigningKeyPair::KEY_TYPE,
         }
@@ -36,6 +41,7 @@ impl AnySigningKeyPair {
         match self {
             Self::Secp256k1(key_pair) => key_pair.as_any(),
             Self::Ed25519(key_pair) => key_pair.as_any(),
+            #[cfg(feature = "namada")]
             Self::Namada(key_pair) => key_pair.as_any(),
             Self::Cardano(key_pair) => key_pair.as_any(),
         }
@@ -56,6 +62,7 @@ impl From<Ed25519KeyPair> for AnySigningKeyPair {
     }
 }
 
+#[cfg(feature = "namada")]
 impl From<NamadaKeyPair> for AnySigningKeyPair {
     fn from(key_pair: NamadaKeyPair) -> Self {
         Self::Namada(key_pair)
