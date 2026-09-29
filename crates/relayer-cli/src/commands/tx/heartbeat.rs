@@ -24,9 +24,9 @@ impl Runnable for TxHostStateHeartbeatCmd {
         match chain.submit_host_state_heartbeat() {
             Ok(HostStateHeartbeatOutcome::Unsupported) =>
                 Output::error("Selected chain does not support Cardano HostState heartbeats").exit(),
-            Ok(HostStateHeartbeatOutcome::NotRequired { current_epoch, host_state_epoch }) =>
+            Ok(HostStateHeartbeatOutcome::NotRequired { current_epoch, host_state_epoch, .. }) =>
                 Output::success(serde_json::json!({ "required": false, "current_epoch": current_epoch, "host_state_epoch": host_state_epoch })).exit(),
-            Ok(HostStateHeartbeatOutcome::Submitted { tx_hash, height, current_epoch, previous_host_state_epoch }) =>
+            Ok(HostStateHeartbeatOutcome::Submitted { tx_hash, height, current_epoch, previous_host_state_epoch, .. }) =>
                 Output::success(serde_json::json!({ "required": true, "tx_hash": tx_hash, "height": height, "current_epoch": current_epoch, "previous_host_state_epoch": previous_host_state_epoch })).exit(),
             Err(error) => Output::error(error).exit(),
         }
