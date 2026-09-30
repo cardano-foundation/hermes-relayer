@@ -4,6 +4,9 @@
 //! this module is derived from operator-pinned deployment data and the original
 //! IBC message, so a compromised Gateway cannot choose what Hermes authorizes.
 
+#[path = "packet_signing.rs"]
+mod packet_signing;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -103,6 +106,7 @@ pub struct TransactionSigningPolicy {
     trace_registry_policy: Vec<u8>,
     voucher_metadata_address: Vec<u8>,
     voucher_policy: Vec<u8>,
+    packet_lanes: packet_signing::PacketRoots,
 }
 
 /// Authorization derived exclusively from the request Hermes intended to send.
@@ -117,6 +121,7 @@ pub struct SigningIntent {
     packet: Option<PacketIntent>,
     acknowledgement: Option<Vec<u8>>,
     prune_sequence: Option<u64>,
+    funded_intent: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug)]
@@ -355,7 +360,8 @@ impl TransactionSigningPolicy {
             "HostState token name",
         )?;
 
-        let scripts = collect_validator_script_roots(validators)?;
+        let mut scripts = collect_validator_script_roots(validators)?;
+        let packet_lanes = packet_signing::PacketRoots::load(&manifest, network_id, &mut scripts)?;
         let voucher_policy = required_script(&scripts, "mintvoucher")?.hash.clone();
 
         let client_state = StateOutputRoot {
@@ -434,6 +440,7 @@ impl TransactionSigningPolicy {
             trace_registry_policy,
             voucher_metadata_address,
             voucher_policy,
+            packet_lanes,
         })
     }
 
@@ -441,6 +448,19 @@ impl TransactionSigningPolicy {
         &'a self,
         intent: &SigningIntent,
     ) -> Result<OperationRequirements<'a>, String> {
+        if packet_signing::is_lane_operation(intent) {
+            return Ok(OperationRequirements {
+                required_scripts: if intent.operation == "/ibc.applications.transfer.v1.MsgTransfer"
+                {
+                    vec![]
+                } else {
+                    vec!["packetstate", "packetbatch", "packetguard"]
+                },
+                required_mint_scripts: vec![],
+                state_output: StateOutputKind::None,
+                module: None,
+            });
+        }
         let (mut required_scripts, required_mint_scripts, state_output, needs_module) =
             match intent.operation.as_str() {
                 "HostStateHeartbeat" => (vec![], vec![], StateOutputKind::None, false),
@@ -676,10 +696,11 @@ impl TransactionSigningPolicy {
             return Err(reject("transaction contains duplicate inputs".to_string()));
         }
 
-        let reference_inputs = body
+        let reference_inputs: Vec<_> = body
             .reference_inputs
             .as_ref()
-            .ok_or_else(|| reject("transaction has no reference inputs".to_string()))?;
+            .map(|inputs| inputs.iter().collect())
+            .unwrap_or_default();
         if reference_inputs.len() > MAX_REFERENCE_INPUTS {
             return Err(reject(format!(
                 "reference input count exceeds {MAX_REFERENCE_INPUTS}"
@@ -694,7 +715,9 @@ impl TransactionSigningPolicy {
                 "transaction contains duplicate reference inputs".to_string(),
             ));
         }
-        if !reference_set.contains(&self.host_state_reference) {
+        if !packet_signing::is_lane_operation(intent)
+            && !reference_set.contains(&self.host_state_reference)
+        {
             return Err(reject(
                 "pinned HostState reference script is missing".to_string(),
             ));
@@ -754,6 +777,21 @@ impl TransactionSigningPolicy {
             return Err(reject(
                 "embedded scripts are forbidden; pinned reference scripts are required".to_string(),
             ));
+        }
+
+        if packet_signing::is_lane_operation(intent) {
+            self.validate_packet_lanes(
+                body,
+                witnesses.redeemer.as_deref(),
+                &signer_address,
+                intent,
+                resolved_inputs,
+                &reference_set,
+                &reject,
+            )?;
+            self.validate_collateral(body, &signer_address, &input_set, resolved_inputs, &reject)?;
+            self.validate_wallet_delta(body, &signer_address, intent, resolved_inputs, &reject)?;
+            return Ok(());
         }
 
         if intent.operation == "TraceRegistryPrelude" {
@@ -2479,6 +2517,7 @@ fn outbound_packet_denom(transfer: &TransferIntent) -> Option<String> {
     if source_prefix
         .as_deref()
         .is_some_and(|prefix| denom.starts_with(prefix))
+        || denom.contains("/channel-")
         || is_cardano_token_unit(denom)
     {
         return Some(denom.to_string());
@@ -2496,6 +2535,41 @@ fn is_cardano_token_unit(denom: &str) -> bool {
 }
 
 impl SigningIntent {
+    pub fn uses_packet_lanes(&self) -> bool {
+        packet_signing::is_lane_operation(self)
+    }
+
+    pub fn packet_initialization(original: &Self) -> Self {
+        let mut intent = original.clone();
+        intent.operation = "InitializePacketLanes".into();
+        intent.transfer = None;
+        intent.external_output = None;
+        intent
+    }
+
+    pub fn packet_batch(
+        original: &Self,
+        intent_hash: &str,
+        initialize: bool,
+    ) -> Result<Self, Error> {
+        let mut intent = original.clone();
+        intent.operation = if initialize {
+            "InitializePacketLanes"
+        } else {
+            "PacketBatch"
+        }
+        .to_string();
+        intent.transfer = None;
+        intent.external_output = None;
+        intent.funded_intent = Some(
+            hex::decode(intent_hash)
+                .map_err(|e| Error::Signer(e.to_string()))?
+                .try_into()
+                .map_err(|_| Error::Signer("invalid funded intent hash".to_string()))?,
+        );
+        Ok(intent)
+    }
+
     pub fn trace_registry_prelude(
         message: &[u8],
         expected_signer: &str,
@@ -2523,6 +2597,7 @@ impl SigningIntent {
             packet: None,
             acknowledgement: None,
             prune_sequence: None,
+            funded_intent: None,
         })
     }
 
@@ -2812,6 +2887,7 @@ impl SigningIntent {
             packet: packet_intent,
             acknowledgement,
             prune_sequence,
+            funded_intent: None,
         })
     }
 
@@ -3506,7 +3582,7 @@ mod tests {
     }
 
     fn manifest() -> String {
-        format!(
+        let raw = format!(
             r#"{{
                 "validators": {{
                     "host_state_stt": {{
@@ -3572,7 +3648,35 @@ mod tests {
             "16".repeat(28),
             "17".repeat(28),
             "2e".repeat(28),
-        )
+        );
+        let mut manifest: JsonValue = serde_json::from_str(&raw).unwrap();
+        manifest["packet_state"] = serde_json::json!({
+            "format": "packet-lanes-v1",
+            "state": {"address": format!("70{}", "41".repeat(28)), "script_hash": "41".repeat(28), "ref_utxo": {"tx_hash": "51".repeat(32), "output_index": 0}},
+            "batch": {"address": format!("70{}", "42".repeat(28)), "script_hash": "42".repeat(28), "ref_utxo": {"tx_hash": "52".repeat(32), "output_index": 0}},
+            "guard": {"address": format!("70{}", "43".repeat(28)), "script_hash": "43".repeat(28), "ref_utxo": {"tx_hash": "53".repeat(32), "output_index": 0}},
+        });
+        let mut operations = serde_json::Map::new();
+        for (index, name) in [
+            "send",
+            "acknowledge",
+            "timeout",
+            "reject",
+            "receive",
+            "prune",
+            "timeout_on_close",
+            "retire",
+            "funds",
+            "send_funds",
+        ]
+        .iter()
+        .enumerate()
+        {
+            operations.insert((*name).into(), serde_json::json!({"script_hash": format!("{:02x}", 0x60 + index).repeat(28),
+                "ref_utxo": {"tx_hash": format!("{:02x}", 0x70 + index).repeat(32), "output_index": 0}}));
+        }
+        manifest["packet_state"]["operations"] = operations.into();
+        manifest.to_string()
     }
 
     #[test]
@@ -3941,6 +4045,7 @@ mod tests {
                 output_index: 0,
             },
             ResolvedInput {
+                inline_datum: None,
                 address: policy.host_state_address.clone(),
                 lovelace: 2_000_000,
                 assets: vec![ResolvedAsset {
@@ -3956,6 +4061,7 @@ mod tests {
                 output_index: 0,
             },
             ResolvedInput {
+                inline_datum: None,
                 address: policy.client_state.address.clone(),
                 lovelace: 2_000_000,
                 assets: vec![ResolvedAsset {
@@ -3971,6 +4077,7 @@ mod tests {
                 output_index: 0,
             },
             ResolvedInput {
+                inline_datum: None,
                 address: hex::decode(recovery_signer()).unwrap(),
                 lovelace: 3_000_000,
                 assets: Vec::new(),
@@ -4206,7 +4313,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_voucher_burn_requires_transfer_module_state() {
+    fn funded_voucher_admission_does_not_spend_protocol_state() {
         let signer = format!("60{}", "99".repeat(28));
         let message = transfer_message("transfer/channel-0/uatom".to_string(), signer.clone());
         let intent = SigningIntent::ibc(
@@ -4223,16 +4330,15 @@ mod tests {
 
         let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
         let requirements = policy.operation_requirements(&intent).unwrap();
+        assert!(requirements.module.is_none());
+        assert!(requirements.required_scripts.is_empty());
+        let batch = SigningIntent::packet_batch(&intent, &"aa".repeat(32), false).unwrap();
+        let batch_requirements = policy.operation_requirements(&batch).unwrap();
+        assert!(batch_requirements.module.is_none());
         assert_eq!(
-            requirements
-                .module
-                .expect("voucher burns spend transfer module state")
-                .reference_script,
-            "spendtransfermodule"
+            batch_requirements.required_scripts,
+            vec!["packetstate", "packetbatch", "packetguard"]
         );
-        assert!(requirements
-            .required_scripts
-            .contains(&"spendtransfermodule"));
     }
 
     fn bare_intent(operation: &str, module_port: Option<&str>) -> SigningIntent {
@@ -4246,6 +4352,7 @@ mod tests {
             packet: None,
             acknowledgement: None,
             prune_sequence: None,
+            funded_intent: None,
         }
     }
 

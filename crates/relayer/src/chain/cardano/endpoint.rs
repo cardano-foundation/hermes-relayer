@@ -11,7 +11,6 @@ use super::utxo_resolver::KupoInputResolver;
 
 use ibc_relayer_types::clients::ics08_cardano::consensus_state::ConsensusState as MithrilConsensusState;
 use ibc_relayer_types::clients::ics08_cardano::misbehaviour::Misbehaviour as MithrilMisbehaviour;
-use ibc_relayer_types::clients::ics08_cardano_probabilistic::consensus_state::ConsensusState as ProbabilisticConsensusState;
 use ibc_relayer_types::clients::ics08_cardano_probabilistic::misbehaviour::Misbehaviour as ProbabilisticMisbehaviour;
 
 use crate::account::Balance;
@@ -270,6 +269,91 @@ impl CardanoChainEndpoint {
             )));
         }
         Ok(response)
+    }
+
+    async fn sign_submit_until_included(
+        &self,
+        unsigned_tx: &super::gateway_client::UnsignedTx,
+        intent: &SigningIntent,
+    ) -> Result<(TxSubmitResponse, ICSHeight), Error> {
+        let signed = self
+            .sign_transaction_helper(&unsigned_tx.cbor_hex, intent)
+            .await?;
+        let response = self
+            .submit_and_observe_signed_transaction_with_mode(&signed, true)
+            .await?;
+        let height = response
+            .height
+            .ok_or_else(|| Error::send_tx("Missing inclusion height".into()))?;
+        Ok((response, height))
+    }
+
+    async fn complete_funded_intent(
+        &self,
+        original: &SigningIntent,
+        port: &str,
+        channel: &str,
+        hash: &str,
+    ) -> Result<TxSubmitResponse, Error> {
+        let mut last_error = String::new();
+        // Rebuild from included state after a competing spend or rollback. Never
+        // create another funded intent here, because its inclusion may be ambiguous.
+        for _ in 0..32 {
+            let result = async {
+                let built = self
+                    .gateway_client
+                    .build_packet_batch(&self.signer_address, port, channel, hash)
+                    .await
+                    .map_err(|e| Error::send_tx(e.to_string()))?;
+                match built.stage.as_str() {
+                    "included" => {
+                        if built.included_tx_hash.is_empty() {
+                            return Err(Error::send_tx("Missing consuming transaction".into()));
+                        }
+                        let response = self
+                            .gateway_client
+                            .observe_tx(&built.included_tx_hash, true)
+                            .await
+                            .map_err(|e| Error::send_tx(e.to_string()))?;
+                        assert_submitted_tx_hash(&built.included_tx_hash, &response.tx_hash)?;
+                        Ok(Some(response))
+                    }
+                    "initialize" | "send" => {
+                        let intent = SigningIntent::packet_batch(
+                            original,
+                            hash,
+                            built.stage == "initialize",
+                        )
+                        .map_err(|e| Error::send_tx(e.to_string()))?;
+                        let unsigned = built
+                            .unsigned_tx
+                            .ok_or_else(|| Error::send_tx("Missing batch transaction".into()))?;
+                        let unsigned = super::gateway_client::UnsignedTx {
+                            cbor_hex: hex::encode(unsigned.value),
+                            description: built.stage.clone(),
+                        };
+                        let (response, _) =
+                            self.sign_submit_until_included(&unsigned, &intent).await?;
+                        Ok(if built.stage == "send" {
+                            Some(response)
+                        } else {
+                            None
+                        })
+                    }
+                    stage => Err(Error::send_tx(format!(
+                        "Funded intent cannot advance in stage {stage}"
+                    ))),
+                }
+            }
+            .await;
+            match result {
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => continue,
+                Err(error) => last_error = error.to_string(),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        Err(Error::send_tx(format!("Funded intent {hash} remains pending. Resume this intent rather than funding it again: {last_error}")))
     }
 
     async fn sign_submit_and_wait(
@@ -813,8 +897,34 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // Block on async operations using the runtime
         self.rt.block_on(async {
             let mut all_events = Vec::new();
+            let mut funded = Vec::new();
+            let transfers_only = tracked_msgs.msgs.iter().all(|msg| msg.type_url == "/ibc.applications.transfer.v1.MsgTransfer");
+            // Admit every transfer before waiting for any counterparty evidence.
+            for msg in tracked_msgs.msgs.iter().filter(|msg| transfers_only && msg.type_url == "/ibc.applications.transfer.v1.MsgTransfer") {
+                let request: ibc_proto::ibc::applications::transfer::v1::MsgTransfer = prost::Message::decode(msg.value.as_slice())
+                    .map_err(|e| Error::send_tx(e.to_string()))?;
+                let mut intent = SigningIntent::ibc(&msg.type_url, &msg.value, &self.signer_address, self.config.network_id)
+                    .map_err(|e| Error::send_tx(e.to_string()))?;
+                self.resolve_signing_intent_denom(&mut intent).await?;
+                let unsigned = self.gateway_client.build_ibc_tx(&msg.type_url, msg.value.clone()).await
+                    .map_err(|e| Error::send_tx(e.to_string()))?;
+                let (included, _) = self.sign_submit_until_included(&unsigned, &intent).await?;
+                funded.push((intent, request.source_port, request.source_channel, included.tx_hash));
+            }
+            let mut completed_batches = std::collections::HashSet::new();
+            for (intent, port, channel, hash) in funded {
+                let response = self.complete_funded_intent(&intent, &port, &channel, &hash).await?;
+                if !completed_batches.insert(response.tx_hash.clone()) { continue; }
+                let height = response.height.ok_or_else(|| Error::send_tx("Missing batch inclusion height".into()))?;
+                let events = response.events.into_iter().map(|event| super::generated::ibc::cardano::v1::Event {
+                    r#type: event.event_type,
+                    attributes: event.attributes.into_iter().map(|(key,value)| super::generated::ibc::cardano::v1::EventAttribute {key,value}).collect(),
+                }).collect();
+                let events = super::event_parser::parse_events(events, height).map_err(|e| Error::send_tx(e.to_string()))?;
+                all_events.extend(events.into_iter().map(|event| IbcEventWithHeight::new(event,height)));
+            }
 
-            for msg in tracked_msgs.msgs.iter() {
+            for msg in tracked_msgs.msgs.iter().filter(|_| !transfers_only) {
                 tracing::debug!("Processing message type: {:?}", msg.type_url);
 
                 let expected_signer = self.get_signer()?.to_string();
@@ -839,6 +949,16 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
                 tracing::debug!("Built unsigned tx: {}", unsigned_tx.description);
 
+                let mut initializations = 0;
+                while unsigned_tx.description == "InitializePacketLanes" {
+                    if initializations >= 64 { return Err(Error::send_tx("Packet initialization limit reached. Resume the receive request".into())); }
+                    let intent = SigningIntent::packet_initialization(&signing_intent);
+                    self.sign_submit_until_included(&unsigned_tx, &intent).await?;
+                    unsigned_tx = self.gateway_client.build_ibc_tx(&msg.type_url, msg.value.clone()).await
+                        .map_err(|e| Error::send_tx(e.to_string()))?;
+                    initializations += 1;
+                }
+
                 let trace_registry_prelude = unsigned_tx.description.starts_with("TraceRegistryPrelude ");
                 let (mut tx_response, mut certified_height) = if trace_registry_prelude {
                     let prelude_intent = SigningIntent::trace_registry_prelude(
@@ -852,6 +972,15 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         ))
                     })?;
                     self.sign_submit_and_wait(&unsigned_tx, &prelude_intent, true).await?
+                } else if msg.type_url == "/ibc.applications.transfer.v1.MsgTransfer" {
+                    let request: ibc_proto::ibc::applications::transfer::v1::MsgTransfer = prost::Message::decode(msg.value.as_slice())
+                        .map_err(|e| Error::send_tx(e.to_string()))?;
+                    let (funded, _) = self.sign_submit_until_included(&unsigned_tx, &signing_intent).await?;
+                    let response = self.complete_funded_intent(&signing_intent, &request.source_port, &request.source_channel, &funded.tx_hash).await?;
+                    let height = response.height.ok_or_else(|| Error::send_tx("Missing inclusion height".into()))?;
+                    (response,height)
+                } else if signing_intent.uses_packet_lanes() {
+                    self.sign_submit_until_included(&unsigned_tx, &signing_intent).await?
                 } else {
                     self.sign_submit_and_wait(&unsigned_tx, &signing_intent, false).await?
                 };
@@ -2829,6 +2958,33 @@ impl ChainEndpoint for CardanoChainEndpoint {
             Error::query("missing Cardano header while building consensus state".to_string())
         })?;
 
+        if let AnyHeader::Probabilistic(expected) = &header {
+            let response = self
+                .rt
+                .block_on(self.gateway_client.query_new_client(header_height))
+                .map_err(|error| Error::query(error.to_string()))?;
+            let raw = response
+                .consensus_state
+                .ok_or_else(|| Error::query("missing packet consensus snapshot".to_string()))?;
+            let state = AnyConsensusState::try_from(ibc_proto::google::protobuf::Any {
+                type_url: raw.type_url,
+                value: raw.value,
+            })
+            .map_err(|error| Error::query(error.to_string()))?;
+            if let AnyConsensusState::Probabilistic(consensus) = &state {
+                if consensus.accepted_block_hash != expected.anchor_block.hash {
+                    return Err(Error::query(
+                        "packet consensus snapshot is on a different block".to_string(),
+                    ));
+                }
+            } else {
+                return Err(Error::query(
+                    "unexpected consensus snapshot type".to_string(),
+                ));
+            }
+            return Ok(state);
+        }
+
         let ibc_state_root = extract_ibc_state_root_from_host_state_tx(
             &header,
             &light_block.host_state_nft_policy_id,
@@ -2842,17 +2998,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 header.mithril_stake_distribution_certificate,
                 header.transaction_snapshot_certificate.hash,
             ))),
-            AnyHeader::Probabilistic(header) => {
-                Ok(AnyConsensusState::from(ProbabilisticConsensusState {
-                    root: CommitmentRoot::from_bytes(&ibc_state_root),
-                    timestamp: header.timestamp.nanoseconds(),
-                    accepted_block_hash: header.anchor_block.hash,
-                    accepted_epoch: header.anchor_block.epoch,
-                    unique_pools_count: 0,
-                    unique_stake_bps: 0,
-                    security_score_bps: 0,
-                }))
-            }
+            AnyHeader::Probabilistic(_) => unreachable!("handled packet snapshot above"),
             AnyHeader::Tendermint(_) => Err(Error::query(
                 "Cardano build_consensus_state received a Tendermint header".to_string(),
             )),
@@ -4145,6 +4291,7 @@ mod tests {
             current_epoch: 0,
             trusting_period: Duration::from_secs(60),
             upgrade_path: vec![],
+            packet_lane_policy_id: vec![0x41; 28],
             host_state_nft_policy_id: HOST_STATE_NFT_POLICY_ID.to_vec(),
             host_state_nft_token_name: HOST_STATE_NFT_TOKEN_NAME.to_vec(),
             epoch_stake_distribution: vec![],

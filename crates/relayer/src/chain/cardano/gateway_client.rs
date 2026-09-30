@@ -178,6 +178,27 @@ impl Interceptor for GatewayAuthInterceptor {
 }
 
 impl GatewayClient {
+    pub async fn build_packet_batch(
+        &self,
+        signer: &str,
+        port: &str,
+        channel: &str,
+        intent_hash: &str,
+    ) -> Result<super::generated::ibc::cardano::v1::BuildPacketBatchResponse, Error> {
+        let mut client = CardanoMsgClient::new(self.channel.clone());
+        Ok(client
+            .build_packet_batch(tonic::Request::new(
+                super::generated::ibc::cardano::v1::BuildPacketBatchRequest {
+                    signer: signer.to_string(),
+                    port_id: port.to_string(),
+                    channel_id: channel.to_string(),
+                    intent_tx_hash: intent_hash.to_string(),
+                },
+            ))
+            .await?
+            .into_inner())
+    }
+
     /// Create a new Gateway client and establish a gRPC connection
     pub async fn new(endpoint: String) -> Result<Self, Error> {
         Self::new_with_security(endpoint, None, None).await
@@ -1477,7 +1498,9 @@ impl GatewayClient {
 
         Ok(UnsignedTx {
             cbor_hex,
-            description: if unsigned_tx_any.type_url == TRACE_REGISTRY_PRELUDE_TYPE_URL {
+            description: if unsigned_tx_any.type_url == "/ibc.cardano.v1.InitializePacketLanes" {
+                "InitializePacketLanes".into()
+            } else if unsigned_tx_any.type_url == TRACE_REGISTRY_PRELUDE_TYPE_URL {
                 format!(
                     "TraceRegistryPrelude MsgRecvPacket (sequence: {})",
                     sequence
