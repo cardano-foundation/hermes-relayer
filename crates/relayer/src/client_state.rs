@@ -263,6 +263,7 @@ mod tests {
                 nanos: 0,
             }),
             host_state_nft_policy_id: vec![1; 28],
+            packet_lane_policy_id: vec![4; 28],
             epoch_stake_distribution: vec![stake_entry.clone()],
             epoch_nonce: vec![2; 32],
             slots_per_kes_period: 129_600,
