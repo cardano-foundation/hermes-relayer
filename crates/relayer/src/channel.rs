@@ -886,7 +886,7 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Channel<ChainA, ChainB> {
             self.src_chain().clone(),
         );
 
-        client.wait_and_build_update_client(height).map_err(|e| {
+        client.prepare_update_client_for_proof(height).map_err(|e| {
             ChannelError::client_operation(self.dst_client_id().clone(), self.dst_chain().id(), e)
         })
     }

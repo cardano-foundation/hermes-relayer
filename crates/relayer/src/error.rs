@@ -36,11 +36,31 @@ use ibc_relayer_types::proofs::ProofError;
 
 use crate::chain::cosmos::version;
 use crate::chain::cosmos::BLOCK_MAX_BYTES_MAX_FRACTION;
+#[cfg(feature = "namada")]
 use crate::chain::namada::error::Error as NamadaError;
 use crate::config::Error as ConfigError;
 use crate::event::source;
 use crate::keyring::{errors::Error as KeyringError, KeyType};
 use crate::sdk_error::SdkError;
+#[cfg(not(feature = "namada"))]
+use namada_disabled::Error as NamadaError;
+
+/// Stand-in for the Namada backend error when the `namada` feature is disabled.
+///
+/// `define_error!` does not support conditionally compiled variants, so the
+/// `Namada` variant of [`Error`] is kept in every build; without the feature,
+/// it is never constructed.
+#[cfg(not(feature = "namada"))]
+mod namada_disabled {
+    use flex_error::define_error;
+
+    define_error! {
+        Error {
+            Disabled
+                |_| { "Namada support is not enabled in this build" },
+        }
+    }
+}
 
 define_error! {
     Error {

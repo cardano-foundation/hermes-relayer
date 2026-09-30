@@ -210,9 +210,14 @@ impl Runnable for TxUpdateClientCmd {
         if let Some(restart_params) = self.genesis_restart_params() {
             match config.find_chain_mut(&reference_chain_id) {
                 Some(chain_config) => match chain_config {
-                    ChainConfig::CosmosSdk(chain_config) | ChainConfig::Namada(chain_config) => {
+                    ChainConfig::CosmosSdk(chain_config) => {
                         chain_config.genesis_restart = Some(restart_params)
                     }
+                    #[cfg(feature = "namada")]
+                    ChainConfig::Namada(chain_config) => {
+                        chain_config.genesis_restart = Some(restart_params)
+                    }
+                    #[cfg(feature = "penumbra")]
                     ChainConfig::Penumbra(chain_config) => {
                         chain_config.genesis_restart = Some(restart_params)
                     }

@@ -14,7 +14,7 @@ use std::path::Path;
 use bech32::FromBase32;
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
-use pallas_codec::utils::Nullable;
+use pallas_codec::{minicbor, utils::Nullable};
 use pallas_primitives::alonzo::{BigInt, PlutusData, Value as LegacyValue};
 use pallas_primitives::conway::{
     MintedTransactionOutput, MintedTx, NetworkId, PseudoTransactionOutput, Value,
@@ -39,6 +39,9 @@ use super::generated::ibc::core::{
     },
 };
 use super::utxo_resolver::{ResolvedInput, ResolvedTransactionInputs, TransactionOutRef};
+use ibc_relayer_types::clients::ics07_tendermint::{
+    header::TENDERMINT_HEADER_TYPE_URL, misbehaviour::TENDERMINT_MISBEHAVIOR_TYPE_URL,
+};
 
 const LOVELACE: &str = "lovelace";
 const LOVELACE_HEX: &str = "6c6f76656c616365";
@@ -48,6 +51,8 @@ const MAX_INPUTS: usize = 128;
 const MAX_OUTPUTS: usize = 128;
 const MAX_REFERENCE_INPUTS: usize = 128;
 const MAX_COLLATERAL_INPUTS: usize = 3;
+const MAX_TENDERMINT_SESSION_BATCH_SIZE: usize = 6;
+const TENDERMINT_SESSION_TOKEN_NAME_BYTES: usize = 32;
 
 /// Limits that bound the wallet value a transaction may put at risk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,10 +90,17 @@ struct ModuleRoot {
     reference_script: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsensusHistoryFormat {
+    Legacy,
+    ProofBackedV1,
+}
+
 /// A policy loaded from an operator-pinned bridge manifest.
 #[derive(Clone, Debug)]
 pub struct TransactionSigningPolicy {
     network_id: u8,
+    consensus_history_format: ConsensusHistoryFormat,
     limits: SigningPolicyLimits,
     protocol_addresses: HashSet<Vec<u8>>,
     scripts: HashMap<String, ScriptRoot>,
@@ -107,6 +119,7 @@ pub struct TransactionSigningPolicy {
     voucher_metadata_address: Vec<u8>,
     voucher_policy: Vec<u8>,
     packet_lanes: packet_signing::PacketRoots,
+    tendermint_session: Option<StateOutputRoot>,
 }
 
 /// Authorization derived exclusively from the request Hermes intended to send.
@@ -122,6 +135,8 @@ pub struct SigningIntent {
     acknowledgement: Option<Vec<u8>>,
     prune_sequence: Option<u64>,
     funded_intent: Option<[u8; 32]>,
+    staged_tendermint: bool,
+    staged_misbehaviour: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +226,7 @@ struct OutputValue {
     coin: u64,
     assets: Vec<(Vec<u8>, Vec<u8>, u64)>,
     has_script_ref: bool,
+    has_inline_datum: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,13 +242,46 @@ struct OperationRequirements<'a> {
     required_mint_scripts: Vec<&'static str>,
     state_output: StateOutputKind,
     module: Option<&'a ModuleRoot>,
+    requires_host_state: bool,
+    tendermint_session: Option<ValidatedTendermintSessionAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TendermintSessionAction {
+    Initialize,
+    Advance,
+    Cancel,
+    Finalize,
+    FinalizeMisbehaviour,
+}
+
+impl TendermintSessionAction {
+    pub(crate) fn is_finalization(self) -> bool {
+        matches!(self, Self::Finalize | Self::FinalizeMisbehaviour)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ValidatedTendermintSessionAction {
+    pub(crate) action: TendermintSessionAction,
+    pub(crate) token_name: Vec<u8>,
+    pub(crate) second_token_name: Option<Vec<u8>>,
+}
+
+impl ValidatedTendermintSessionAction {
+    fn token_names(&self) -> impl Iterator<Item = &[u8]> {
+        std::iter::once(self.token_name.as_slice()).chain(self.second_token_name.as_deref())
+    }
 }
 
 enum ChannelRedeemerIntent<'a> {
     Constructor(u64),
+    ProofBackedClientUpdate,
     ClientRecovery {
+        alternative: u64,
         substitute_policy: Vec<u8>,
         substitute_name: Vec<u8>,
+        history_format: ConsensusHistoryFormat,
     },
     Packet {
         alternative: u64,
@@ -247,11 +296,27 @@ impl ChannelRedeemerIntent<'_> {
     fn matches(&self, data: &PlutusData) -> bool {
         match self {
             Self::Constructor(alternative) => constructor_fields(data, *alternative).is_some(),
+            // Check the versioned shape here; authenticated history and the
+            // Tendermint message are verified by the pinned on-chain scripts.
+            // The support withdrawal is separately bound to this exact client.
+            Self::ProofBackedClientUpdate => constructor_fields(data, 0)
+                .filter(|fields| fields.len() == 3)
+                .is_some_and(|fields| {
+                    matches!(&fields[1], PlutusData::Array(witnesses) if witnesses.len() <= 2)
+                        && history_siblings_shape(&fields[2], true)
+                }),
             Self::ClientRecovery {
+                alternative,
                 substitute_policy,
                 substitute_name,
-            } => constructor_fields(data, 1)
-                .filter(|fields| fields.len() == 1)
+                history_format,
+            } => constructor_fields(data, *alternative)
+                .filter(|fields| match history_format {
+                    ConsensusHistoryFormat::Legacy => fields.len() == 1,
+                    ConsensusHistoryFormat::ProofBackedV1 => {
+                        fields.len() == 2 && history_siblings_shape(&fields[1], false)
+                    }
+                })
                 .and_then(|fields| fields.first())
                 .is_some_and(|token| auth_token_matches(token, substitute_policy, substitute_name)),
             Self::Packet {
@@ -327,6 +392,60 @@ impl TransactionSigningPolicy {
 
         let manifest: JsonValue =
             serde_json::from_str(contents).map_err(|error| error.to_string())?;
+        // The operator-pinned format selects an ABI; transaction data must not
+        // choose a weaker legacy authorization path for a proof-backed deployment.
+        let consensus_history_format = match manifest.get("consensus_history_format") {
+            None => ConsensusHistoryFormat::Legacy,
+            Some(JsonValue::String(format)) if format == "proof-backed-v1" => {
+                ConsensusHistoryFormat::ProofBackedV1
+            }
+            Some(_) => return Err("unsupported consensus_history_format".to_string()),
+        };
+        if let Some(migration) = manifest.get("migration") {
+            if migration.get("profile").and_then(JsonValue::as_str)
+                != Some("cardano-ibc-compatible-v3")
+            {
+                return Err("unsupported migration profile".to_string());
+            }
+            if consensus_history_format != ConsensusHistoryFormat::ProofBackedV1 {
+                return Err("migration requires an exported proof-backed-v1 bridge manifest; do not pin a raw handler file".to_string());
+            }
+            let generation = required_string(migration, &["generation"], "migration generation")?;
+            if generation.starts_with('0')
+                || generation.parse::<u64>().ok().filter(|n| *n > 0).is_none()
+            {
+                return Err("invalid migration generation".to_string());
+            }
+            decode_fixed_hex(
+                required_string(migration, &["compatibility"], "migration compatibility")?,
+                32,
+                "migration compatibility",
+            )?;
+            let unit = decode_hex(
+                required_string(migration, &["registryUnit"], "migration registry unit")?,
+                "migration registry unit",
+            )?;
+            if unit.len() != 28 + b"ibc_implementation_registry".len()
+                || &unit[28..] != b"ibc_implementation_registry"
+            {
+                return Err("invalid migration registry identity".to_string());
+            }
+            let address = decode_address(
+                required_string(
+                    migration,
+                    &["registryAddress"],
+                    "migration registry address",
+                )?,
+                network_id,
+            )?;
+            if !matches!(address.first().map(|byte| byte >> 4), Some(1 | 3 | 7)) {
+                return Err("migration registry must have a script payment credential".to_string());
+            }
+            // This validates the operator-pinned profile only. Exact current
+            // registry custody/phase is enforced by the scripts during the
+            // mandatory independent Ogmios evaluation before signing. Never
+            // pin the mutable registry out-ref: approvals consume it too.
+        }
         let validators = object_field(&manifest, &["validators"])
             .ok_or_else(|| "manifest has no validators object".to_string())?;
         let host_state = object_field(validators, &["host_state_stt", "hostStateStt"])
@@ -362,6 +481,9 @@ impl TransactionSigningPolicy {
 
         let mut scripts = collect_validator_script_roots(validators)?;
         let packet_lanes = packet_signing::PacketRoots::load(&manifest, network_id, &mut scripts)?;
+        if consensus_history_format == ConsensusHistoryFormat::ProofBackedV1 {
+            required_script(&scripts, "recoverclient")?;
+        }
         let voucher_policy = required_script(&scripts, "mintvoucher")?.hash.clone();
 
         let client_state = StateOutputRoot {
@@ -410,6 +532,37 @@ impl TransactionSigningPolicy {
             &["voucher_metadata", "voucherMetadata"],
             network_id,
         )?;
+        let session_spend = object_field(
+            validators,
+            &[
+                "spend_tendermint_update_session",
+                "spendTendermintUpdateSession",
+            ],
+        );
+        let session_mint = object_field(
+            validators,
+            &[
+                "mint_tendermint_update_session",
+                "mintTendermintUpdateSession",
+            ],
+        );
+        let tendermint_session = match (session_spend, session_mint) {
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(
+                    "manifest must configure both staged Tendermint session validators".to_string(),
+                )
+            }
+            (Some(spend), Some(_)) => Some(StateOutputRoot {
+                address: decode_address(
+                    required_string(spend, &["address"], "staged Tendermint session address")?,
+                    network_id,
+                )?,
+                policy: required_script(&scripts, "minttendermintupdatesession")?
+                    .hash
+                    .clone(),
+            }),
+        };
 
         let mut protocol_addresses = HashSet::from([
             host_state_address.clone(),
@@ -420,9 +573,18 @@ impl TransactionSigningPolicy {
             voucher_metadata_address.clone(),
         ]);
         protocol_addresses.extend(modules.values().map(|module| module.address.clone()));
+        if let Some(session) = &tendermint_session {
+            if protocol_addresses.contains(&session.address) {
+                return Err(
+                    "staged Tendermint session address overlaps another protocol role".to_string(),
+                );
+            }
+            protocol_addresses.insert(session.address.clone());
+        }
 
         Ok(Self {
             network_id,
+            consensus_history_format,
             limits,
             protocol_addresses,
             scripts,
@@ -441,6 +603,7 @@ impl TransactionSigningPolicy {
             voucher_metadata_address,
             voucher_policy,
             packet_lanes,
+            tendermint_session,
         })
     }
 
@@ -450,6 +613,8 @@ impl TransactionSigningPolicy {
     ) -> Result<OperationRequirements<'a>, String> {
         if packet_signing::is_lane_operation(intent) {
             return Ok(OperationRequirements {
+                requires_host_state: false,
+                tendermint_session: None,
                 required_scripts: if intent.operation == "/ibc.applications.transfer.v1.MsgTransfer"
                 {
                     vec![]
@@ -464,11 +629,8 @@ impl TransactionSigningPolicy {
         let (mut required_scripts, required_mint_scripts, state_output, needs_module) =
             match intent.operation.as_str() {
                 "HostStateHeartbeat" => (vec![], vec![], StateOutputKind::None, false),
-                "TraceRegistryPrelude" => (
-                    vec!["spendtraceregistry", "mintvoucher"],
-                    vec![],
-                    StateOutputKind::None,
-                    false,
+                "TraceRegistryPrelude" => return Err(
+                    "Standalone trace-registry prelude cannot satisfy the voucher policy; require an atomic receive".to_string()
                 ),
                 "/ibc.core.client.v1.MsgCreateClient" => (
                     vec!["mintclientstt"],
@@ -477,7 +639,13 @@ impl TransactionSigningPolicy {
                     false,
                 ),
                 "/ibc.core.client.v1.MsgUpdateClient" => {
-                    (vec!["spendclient"], vec![], StateOutputKind::Client, false)
+                    let scripts =
+                        if self.consensus_history_format == ConsensusHistoryFormat::ProofBackedV1 {
+                            vec!["spendclient", "recoverclient"]
+                        } else {
+                            vec!["spendclient"]
+                        };
+                    (scripts, vec![], StateOutputKind::Client, false)
                 }
                 "/ibc.core.client.v1.MsgRecoverClient" => (
                     vec!["spendclient", "recoverclient"],
@@ -599,6 +767,122 @@ impl TransactionSigningPolicy {
             required_mint_scripts,
             state_output,
             module,
+            requires_host_state: true,
+            tendermint_session: None,
+        })
+    }
+
+    fn staged_tendermint_requirements<'a>(
+        &'a self,
+        body: &pallas_primitives::conway::MintedTransactionBody<'_>,
+        intent: &SigningIntent,
+        resolved_inputs: &ResolvedTransactionInputs,
+    ) -> Result<OperationRequirements<'a>, String> {
+        if intent.operation != "/ibc.core.client.v1.MsgUpdateClient" {
+            return Err("staged Tendermint intent is not an MsgUpdateClient".to_string());
+        }
+        let session = self.tendermint_session.as_ref().ok_or_else(|| {
+            "pinned manifest has no staged Tendermint session validators".to_string()
+        })?;
+        let requirement = classify_tendermint_session_transaction(
+            body,
+            resolved_inputs,
+            session,
+            &self.host_state_address,
+            &self.client_state.address,
+        )?;
+        if requirement.action.is_finalization()
+            && (requirement.action == TendermintSessionAction::FinalizeMisbehaviour)
+                != intent.staged_misbehaviour
+        {
+            return Err(
+                "staged finalization does not match the requested header or misbehaviour"
+                    .to_string(),
+            );
+        }
+        let (mut required_scripts, required_mint_scripts, state_output, requires_host_state) =
+            match requirement.action {
+                TendermintSessionAction::Initialize => (
+                    vec!["minttendermintupdatesession"],
+                    vec!["minttendermintupdatesession"],
+                    StateOutputKind::None,
+                    false,
+                ),
+                TendermintSessionAction::Advance => (
+                    vec!["spendtendermintupdatesession"],
+                    vec![],
+                    StateOutputKind::None,
+                    false,
+                ),
+                TendermintSessionAction::Cancel => (
+                    vec![
+                        "spendtendermintupdatesession",
+                        "minttendermintupdatesession",
+                    ],
+                    vec!["minttendermintupdatesession"],
+                    StateOutputKind::None,
+                    false,
+                ),
+                TendermintSessionAction::Finalize
+                | TendermintSessionAction::FinalizeMisbehaviour => (
+                    vec![
+                        "spendclient",
+                        "spendtendermintupdatesession",
+                        "minttendermintupdatesession",
+                    ],
+                    vec!["minttendermintupdatesession"],
+                    StateOutputKind::Client,
+                    true,
+                ),
+            };
+        if requirement.action.is_finalization()
+            && self.consensus_history_format == ConsensusHistoryFormat::ProofBackedV1
+        {
+            required_scripts.push("recoverclient");
+        }
+        Ok(OperationRequirements {
+            required_scripts,
+            required_mint_scripts,
+            state_output,
+            module: None,
+            requires_host_state,
+            tendermint_session: Some(requirement),
+        })
+    }
+
+    /// Classify the staged action from the same exact transaction body and
+    /// trusted inputs used by the signing policy. Callers use this result to
+    /// enforce the transaction-chain protocol around individually valid links.
+    pub(crate) fn staged_tendermint_action(
+        &self,
+        transaction_cbor: &[u8],
+        resolved_inputs: &ResolvedTransactionInputs,
+    ) -> Result<ValidatedTendermintSessionAction, Error> {
+        let mut decoder = minicbor::Decoder::new(transaction_cbor);
+        let tx: MintedTx<'_> = decoder.decode().map_err(|error| {
+            Error::CborDecode(format!(
+                "failed to decode staged Tendermint transaction: {error:?}"
+            ))
+        })?;
+        if decoder.position() != transaction_cbor.len() {
+            return Err(Error::CborDecode(
+                "failed to decode staged Tendermint transaction: trailing CBOR data".to_string(),
+            ));
+        }
+        let session = self.tendermint_session.as_ref().ok_or_else(|| {
+            Error::Signer("pinned manifest has no staged Tendermint session validators".to_string())
+        })?;
+        classify_tendermint_session_transaction(
+            &tx.transaction_body,
+            resolved_inputs,
+            session,
+            &self.host_state_address,
+            &self.client_state.address,
+        )
+        .map_err(|reason| {
+            Error::Signer(format!(
+                "refusing to classify staged Tendermint transaction: {reason}"
+            ))
         })
     }
 
@@ -617,7 +901,12 @@ impl TransactionSigningPolicy {
                 intent.operation
             ))
         };
-        let requirements = self.operation_requirements(intent).map_err(reject)?;
+        let requirements = if intent.staged_tendermint {
+            self.staged_tendermint_requirements(&tx.transaction_body, intent, resolved_inputs)
+                .map_err(reject)?
+        } else {
+            self.operation_requirements(intent).map_err(reject)?
+        };
         if intent.unresolved_ibc_denom_hash().is_some() {
             return Err(reject(
                 "hashed ICS-20 denomination was not resolved and verified".to_string(),
@@ -663,7 +952,15 @@ impl TransactionSigningPolicy {
         if body.certificates.is_some() {
             return Err(reject("certificates are not authorized".to_string()));
         }
-        self.validate_withdrawals(body, intent, &reject)?;
+        self.validate_withdrawals(
+            body,
+            intent,
+            requirements
+                .tendermint_session
+                .as_ref()
+                .is_some_and(|session| session.action.is_finalization()),
+            &reject,
+        )?;
         if body.auxiliary_data_hash.is_some() {
             return Err(reject("auxiliary data hash is not authorized".to_string()));
         }
@@ -716,6 +1013,7 @@ impl TransactionSigningPolicy {
             ));
         }
         if !packet_signing::is_lane_operation(intent)
+            && requirements.requires_host_state
             && !reference_set.contains(&self.host_state_reference)
         {
             return Err(reject(
@@ -789,7 +1087,7 @@ impl TransactionSigningPolicy {
                 &reference_set,
                 &reject,
             )?;
-            self.validate_collateral(body, &signer_address, &input_set, resolved_inputs, &reject)?;
+            self.validate_collateral(body, &signer_address, resolved_inputs, &reject)?;
             self.validate_wallet_delta(body, &signer_address, intent, resolved_inputs, &reject)?;
             return Ok(());
         }
@@ -804,7 +1102,7 @@ impl TransactionSigningPolicy {
                 &reference_set,
                 &reject,
             )?;
-            self.validate_collateral(body, &signer_address, &input_set, resolved_inputs, &reject)?;
+            self.validate_collateral(body, &signer_address, resolved_inputs, &reject)?;
             self.validate_wallet_delta(body, &signer_address, intent, resolved_inputs, &reject)?;
             return Ok(());
         }
@@ -821,12 +1119,14 @@ impl TransactionSigningPolicy {
         self.validate_message_binding(
             body,
             witnesses.redeemer.as_deref(),
+            &signer_address,
             intent,
+            &requirements,
             resolved_inputs,
             &reject,
         )?;
 
-        self.validate_collateral(body, &signer_address, &input_set, resolved_inputs, &reject)?;
+        self.validate_collateral(body, &signer_address, resolved_inputs, &reject)?;
         self.validate_mint(body, intent, &requirements, &reference_set, &reject)?;
         self.validate_outputs(
             body,
@@ -1017,12 +1317,17 @@ impl TransactionSigningPolicy {
         &self,
         body: &pallas_primitives::conway::MintedTransactionBody<'_>,
         intent: &SigningIntent,
+        staged_finalization: bool,
         reject: &F,
     ) -> Result<(), Error>
     where
         F: Fn(String) -> Error,
     {
-        if intent.operation != "/ibc.core.client.v1.MsgRecoverClient" {
+        let requires_withdrawal = intent.operation == "/ibc.core.client.v1.MsgRecoverClient"
+            || (intent.operation == "/ibc.core.client.v1.MsgUpdateClient"
+                && (!intent.staged_tendermint || staged_finalization)
+                && self.consensus_history_format == ConsensusHistoryFormat::ProofBackedV1);
+        if !requires_withdrawal {
             if body.withdrawals.is_some() {
                 return Err(reject("withdrawals are not authorized".to_string()));
             }
@@ -1030,11 +1335,11 @@ impl TransactionSigningPolicy {
         }
 
         let withdrawals = body.withdrawals.as_ref().ok_or_else(|| {
-            reject("client recovery requires its validator withdrawal".to_string())
+            reject("client transition requires its validator withdrawal".to_string())
         })?;
         if withdrawals.len() != 1 {
             return Err(reject(
-                "client recovery requires exactly one validator withdrawal".to_string(),
+                "client transition requires exactly one validator withdrawal".to_string(),
             ));
         }
 
@@ -1050,7 +1355,7 @@ impl TransactionSigningPolicy {
             .expect("non-empty withdrawal map has one entry");
         if reward_account.as_slice() != expected_reward_account || *amount != 0 {
             return Err(reject(
-                "client recovery withdrawal does not execute the pinned recovery validator with zero value"
+                "client transition withdrawal does not execute the pinned recovery validator with zero value"
                     .to_string(),
             ));
         }
@@ -1095,6 +1400,22 @@ impl TransactionSigningPolicy {
             ));
         }
 
+        // CIP-40 permits a wallet output to fund success and collateral failure.
+        // The trusted resolver reads it once; reject inconsistent records from
+        // any other caller before checking those mutually exclusive balances.
+        for (out_ref, collateral) in &resolved_inputs.collateral {
+            if resolved_inputs
+                .regular
+                .get(out_ref)
+                .is_some_and(|regular| regular != collateral)
+            {
+                return Err(reject(
+                    "trusted UTxO resolution disagrees for a shared regular/collateral input"
+                        .to_string(),
+                ));
+            }
+        }
+
         let expected_state = match requirements.state_output {
             StateOutputKind::None => None,
             StateOutputKind::Client => Some(&self.client_state),
@@ -1105,10 +1426,15 @@ impl TransactionSigningPolicy {
             .state_sequence
             .zip(expected_state)
             .map(|(sequence, _)| self.state_token_name(requirements.state_output, sequence));
+        let expected_session = requirements
+            .tendermint_session
+            .as_ref()
+            .zip(self.tendermint_session.as_ref());
 
         let mut signer_input_count = 0usize;
         let mut host_state_nft_quantity = 0u64;
         let mut expected_state_quantity = 0u64;
+        let mut expected_session_quantity = 0u64;
         for input in resolved_inputs.regular.values() {
             validate_address_network(&input.address, self.network_id).map_err(reject)?;
             if input.address == signer_address {
@@ -1116,8 +1442,10 @@ impl TransactionSigningPolicy {
                 continue;
             }
 
-            let allowed_protocol_input = input.address == self.host_state_address
+            let allowed_protocol_input = (requirements.requires_host_state
+                && input.address == self.host_state_address)
                 || expected_state.is_some_and(|state| input.address == state.address)
+                || expected_session.is_some_and(|(_, session)| input.address == session.address)
                 || requirements
                     .module
                     .is_some_and(|module| input.address == module.address)
@@ -1177,6 +1505,23 @@ impl TransactionSigningPolicy {
                             })?;
                     }
                 }
+                if let Some((requirement, session)) = expected_session {
+                    if input.address == session.address
+                        && asset.policy_id.as_slice() == session.policy
+                        && requirement
+                            .token_names()
+                            .any(|name| asset.asset_name == name)
+                    {
+                        expected_session_quantity = expected_session_quantity
+                            .checked_add(asset.quantity)
+                            .ok_or_else(|| {
+                                reject(
+                                    "staged Tendermint session NFT input quantity overflows u64"
+                                        .to_string(),
+                                )
+                            })?;
+                    }
+                }
             }
 
             if input.address == self.host_state_address
@@ -1202,6 +1547,21 @@ impl TransactionSigningPolicy {
                     ));
                 }
             }
+            if let Some((requirement, session)) = expected_session {
+                if input.address == session.address
+                    && (input.assets.len() != 1
+                        || input.assets[0].policy_id.as_slice() != session.policy
+                        || !requirement
+                            .token_names()
+                            .any(|name| input.assets[0].asset_name == name)
+                        || input.assets[0].quantity != 1)
+                {
+                    return Err(reject(
+                        "staged Tendermint session input does not contain exactly its pinned NFT"
+                            .to_string(),
+                    ));
+                }
+            }
         }
 
         if signer_input_count == 0 {
@@ -1209,14 +1569,31 @@ impl TransactionSigningPolicy {
                 "transaction does not consume an input owned by the configured signer".to_string(),
             ));
         }
-        if host_state_nft_quantity != 1 {
+        let expected_host_state_quantity = u64::from(requirements.requires_host_state);
+        if host_state_nft_quantity != expected_host_state_quantity {
             return Err(reject(format!(
-                "expected exactly one HostState NFT in regular inputs, found {host_state_nft_quantity}"
+                "expected {expected_host_state_quantity} HostState NFTs in regular inputs, found {host_state_nft_quantity}"
             )));
         }
         if expected_state_name.is_some() && expected_state_quantity != 1 {
             return Err(reject(format!(
                 "expected exactly one message-selected protocol state token in regular inputs, found {expected_state_quantity}"
+            )));
+        }
+        let expected_session_input_quantity =
+            requirements
+                .tendermint_session
+                .as_ref()
+                .map_or(0, |session| {
+                    if session.action == TendermintSessionAction::Initialize {
+                        0
+                    } else {
+                        session.token_names().count() as u64
+                    }
+                });
+        if expected_session_quantity != expected_session_input_quantity {
+            return Err(reject(format!(
+                "expected {expected_session_input_quantity} staged Tendermint session NFTs in regular inputs, found {expected_session_quantity}"
             )));
         }
 
@@ -1227,7 +1604,6 @@ impl TransactionSigningPolicy {
         &self,
         body: &pallas_primitives::conway::MintedTransactionBody<'_>,
         signer_address: &[u8],
-        inputs: &HashSet<(String, u64)>,
         resolved_inputs: &ResolvedTransactionInputs,
         reject: &F,
     ) -> Result<(), Error>
@@ -1281,10 +1657,8 @@ impl TransactionSigningPolicy {
                 let mut collateral_assets = BTreeMap::new();
                 for input in collateral.iter() {
                     let out_ref = (input.transaction_id.to_string(), input.index);
-                    if inputs.contains(&out_ref) || !seen.insert(out_ref) {
-                        return Err(reject(
-                            "collateral inputs overlap or contain duplicates".to_string(),
-                        ));
+                    if !seen.insert(out_ref) {
+                        return Err(reject("collateral inputs contain duplicates".to_string()));
                     }
                     let resolved = resolved_inputs.collateral_input(input).ok_or_else(|| {
                         reject("trusted UTxO resolution is missing a collateral input".to_string())
@@ -1336,6 +1710,22 @@ impl TransactionSigningPolicy {
     {
         let mut voucher_assets = Vec::new();
         let mut actual_policies = HashSet::new();
+        let expected_session_mint =
+            requirements
+                .tendermint_session
+                .as_ref()
+                .and_then(|requirement| {
+                    let quantity = match requirement.action {
+                        TendermintSessionAction::Initialize => 1,
+                        TendermintSessionAction::Cancel
+                        | TendermintSessionAction::Finalize
+                        | TendermintSessionAction::FinalizeMisbehaviour => -1,
+                        TendermintSessionAction::Advance => return None,
+                    };
+                    self.tendermint_session
+                        .as_ref()
+                        .map(|session| (session.policy.as_slice(), requirement, quantity))
+                });
 
         if let Some(mint) = body.mint.as_ref() {
             for (policy, assets) in mint.iter() {
@@ -1345,9 +1735,14 @@ impl TransactionSigningPolicy {
                         "HostState NFT minting or burning is forbidden".to_string(),
                     ));
                 }
-                if policy.as_ref() != self.voucher_policy.as_slice() && assets.len() != 1 {
+                let expected_asset_count = expected_session_mint
+                    .filter(|(expected_policy, _, _)| policy.as_ref() == *expected_policy)
+                    .map_or(1, |(_, requirement, _)| requirement.token_names().count());
+                if policy.as_ref() != self.voucher_policy.as_slice()
+                    && assets.len() != expected_asset_count
+                {
                     return Err(reject(format!(
-                        "bridge authorization policy {policy} must mint exactly one asset"
+                        "bridge authorization policy {policy} must mint exactly {expected_asset_count} asset(s)"
                     )));
                 }
                 for (name, quantity) in assets.iter() {
@@ -1359,6 +1754,17 @@ impl TransactionSigningPolicy {
                     }
                     if policy.as_ref() == self.voucher_policy.as_slice() {
                         voucher_assets.push((name.as_slice().to_vec(), quantity));
+                    } else if expected_session_mint.is_some_and(
+                        |(expected_policy, requirement, expected_quantity)| {
+                            policy.as_ref() == expected_policy
+                                && requirement
+                                    .token_names()
+                                    .any(|expected| name.as_slice() == expected)
+                                && quantity == expected_quantity
+                        },
+                    ) {
+                        // Exact session NFT creation/burn is authorized by the
+                        // staged transaction classification above.
                     } else if quantity != 1 {
                         return Err(reject(format!(
                             "bridge authorization token under policy {policy} must mint exactly one unit"
@@ -1578,11 +1984,259 @@ impl TransactionSigningPolicy {
         .concat()
     }
 
+    fn validate_tendermint_session_redeemers<F>(
+        &self,
+        body: &pallas_primitives::conway::MintedTransactionBody<'_>,
+        redeemers: &pallas_primitives::conway::Redeemers,
+        signer_address: &[u8],
+        intent: &SigningIntent,
+        requirement: &ValidatedTendermintSessionAction,
+        resolved_inputs: &ResolvedTransactionInputs,
+        reject: &F,
+    ) -> Result<(), Error>
+    where
+        F: Fn(String) -> Error,
+    {
+        let session = self
+            .tendermint_session
+            .as_ref()
+            .expect("session requirement needs a configured session root");
+        let expected_client_name = intent
+            .state_sequence
+            .map(|sequence| self.state_token_name(StateOutputKind::Client, sequence))
+            .ok_or_else(|| reject("staged update has no selected client identifier".to_string()))?;
+
+        match requirement.action {
+            TendermintSessionAction::Initialize => {
+                let mint_redeemer =
+                    mint_redeemer_for_policy(body, redeemers, &session.policy).map_err(reject)?;
+                let fields = constructor_fields(mint_redeemer, 0).ok_or_else(|| {
+                    reject("session initialization does not use MintSession".to_string())
+                })?;
+                if fields.len() != 3 {
+                    return Err(reject(
+                        "MintSession redeemer must contain seed, owner, and update plan"
+                            .to_string(),
+                    ));
+                }
+                let seed = plutus_output_reference(&fields[0]).ok_or_else(|| {
+                    reject("MintSession redeemer contains an invalid seed reference".to_string())
+                })?;
+                let seed_input = resolved_inputs.regular.get(&seed).ok_or_else(|| {
+                    reject("MintSession seed is not a regular transaction input".to_string())
+                })?;
+                if seed_input.address != signer_address {
+                    return Err(reject(
+                        "MintSession seed is not owned by the configured relayer".to_string(),
+                    ));
+                }
+                if plutus_bytes(&fields[1]) != signer_address.get(1..) {
+                    return Err(reject(
+                        "MintSession owner is not the configured relayer key".to_string(),
+                    ));
+                }
+                let plan_fields = constructor_fields(&fields[2], 0).ok_or_else(|| {
+                    reject("MintSession update plan has an invalid encoding".to_string())
+                })?;
+                let client_token = plan_fields.first().and_then(plutus_auth_token);
+                if client_token
+                    != Some((
+                        self.client_state.policy.as_slice(),
+                        expected_client_name.as_slice(),
+                    ))
+                {
+                    return Err(reject(
+                        "MintSession update plan targets a different client".to_string(),
+                    ));
+                }
+            }
+            TendermintSessionAction::Advance => {
+                let session_redeemer =
+                    self.session_spend_redeemer(body, redeemers, resolved_inputs, session, reject)?;
+                let batch = constructor_fields(session_redeemer, 0)
+                    .or_else(|| constructor_fields(session_redeemer, 1))
+                    .and_then(|fields| fields.first())
+                    .and_then(|field| match field {
+                        PlutusData::Array(items) => Some(items.len()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        reject(
+                            "session advance must use VerifyTrusted or VerifyTarget with one batch"
+                                .to_string(),
+                        )
+                    })?;
+                if !(1..=MAX_TENDERMINT_SESSION_BATCH_SIZE).contains(&batch) {
+                    return Err(reject(format!(
+                        "staged Tendermint verifier batch must contain between 1 and {MAX_TENDERMINT_SESSION_BATCH_SIZE} entries"
+                    )));
+                }
+            }
+            TendermintSessionAction::Cancel | TendermintSessionAction::Finalize => {
+                let session_redeemer =
+                    self.session_spend_redeemer(body, redeemers, resolved_inputs, session, reject)?;
+                let expected_alternative = if requirement.action == TendermintSessionAction::Cancel
+                {
+                    3
+                } else {
+                    2
+                };
+                if constructor_fields(session_redeemer, expected_alternative)
+                    .is_none_or(|fields| !fields.is_empty())
+                {
+                    return Err(reject(format!(
+                        "session {:?} transaction has the wrong session spend redeemer",
+                        requirement.action
+                    )));
+                }
+                let mint_redeemer =
+                    mint_redeemer_for_policy(body, redeemers, &session.policy).map_err(reject)?;
+                let burned_name = constructor_fields(mint_redeemer, 1)
+                    .filter(|fields| fields.len() == 1)
+                    .and_then(|fields| plutus_bytes(&fields[0]));
+                if burned_name != Some(requirement.token_name.as_slice()) {
+                    return Err(reject(
+                        "BurnSession redeemer does not select the consumed session NFT".to_string(),
+                    ));
+                }
+
+                if requirement.action == TendermintSessionAction::Finalize {
+                    let client_input = selected_state_input(
+                        resolved_inputs,
+                        &self.client_state,
+                        &expected_client_name,
+                    )
+                    .ok_or_else(|| {
+                        reject("staged finalization omits the selected client input".to_string())
+                    })?;
+                    let client_redeemer =
+                        spend_redeemer_for_input(body, redeemers, client_input).map_err(reject)?;
+                    let selected_session = constructor_fields(client_redeemer, 0)
+                        .filter(|fields| match self.consensus_history_format {
+                            ConsensusHistoryFormat::Legacy => fields.len() == 1,
+                            ConsensusHistoryFormat::ProofBackedV1 => fields.len() == 3
+                                && matches!(&fields[1], PlutusData::Array(witnesses) if witnesses.len() <= 2)
+                                && history_siblings_shape(&fields[2], true),
+                        })
+                        .and_then(|fields| plutus_auth_token(&fields[0]));
+                    if selected_session
+                        != Some((session.policy.as_slice(), requirement.token_name.as_slice()))
+                    {
+                        return Err(reject(
+                            "staged client finalization redeemer selects a different session NFT"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            TendermintSessionAction::FinalizeMisbehaviour => {
+                let selected_names: BTreeSet<_> = requirement.token_names().collect();
+                for (out_ref, input) in resolved_inputs
+                    .regular
+                    .iter()
+                    .filter(|(_, input)| input.address == session.address)
+                {
+                    if input.assets.len() != 1
+                        || !selected_names.contains(input.assets[0].asset_name.as_slice())
+                    {
+                        return Err(reject(
+                            "misbehaviour finalization consumes an unrelated session".to_string(),
+                        ));
+                    }
+                    let redeemer =
+                        spend_redeemer_for_input(body, redeemers, out_ref).map_err(reject)?;
+                    if constructor_fields(redeemer, 2).is_none_or(|fields| !fields.is_empty()) {
+                        return Err(reject(
+                            "misbehaviour finalization must finalize both sessions".to_string(),
+                        ));
+                    }
+                }
+                let mint_redeemer =
+                    mint_redeemer_for_policy(body, redeemers, &session.policy).map_err(reject)?;
+                let burned_names = constructor_fields(mint_redeemer, 2)
+                    .filter(|fields| fields.len() == 1)
+                    .and_then(|fields| match &fields[0] {
+                        PlutusData::Array(names) if names.len() == 2 => names
+                            .iter()
+                            .map(plutus_bytes)
+                            .collect::<Option<BTreeSet<_>>>(),
+                        _ => None,
+                    });
+                if burned_names.as_ref() != Some(&selected_names) {
+                    return Err(reject(
+                        "BurnSessions redeemer must select exactly the two consumed session NFTs"
+                            .to_string(),
+                    ));
+                }
+                let client_input = selected_state_input(
+                    resolved_inputs,
+                    &self.client_state,
+                    &expected_client_name,
+                )
+                .ok_or_else(|| {
+                    reject("misbehaviour finalization omits the selected client input".to_string())
+                })?;
+                let client_redeemer =
+                    spend_redeemer_for_input(body, redeemers, client_input).map_err(reject)?;
+                let client_names = constructor_fields(client_redeemer, 3)
+                    .filter(|fields| match self.consensus_history_format {
+                        ConsensusHistoryFormat::Legacy => fields.len() == 2,
+                        ConsensusHistoryFormat::ProofBackedV1 => fields.len() == 3
+                            && matches!(&fields[2], PlutusData::Array(witnesses) if witnesses.len() <= 2),
+                    })
+                    .and_then(|fields| {
+                        fields
+                            .iter()
+                            .take(2)
+                            .map(|field| {
+                                plutus_auth_token(field)
+                                    .filter(|(policy, _)| *policy == session.policy)
+                                    .map(|(_, name)| name)
+                            })
+                            .collect::<Option<BTreeSet<_>>>()
+                    });
+                if client_names.as_ref() != Some(&selected_names) {
+                    return Err(reject("FinalizeMisbehaviour redeemer must select exactly the two consumed session NFTs".to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn session_spend_redeemer<'a, F>(
+        &self,
+        body: &pallas_primitives::conway::MintedTransactionBody<'_>,
+        redeemers: &'a pallas_primitives::conway::Redeemers,
+        resolved_inputs: &ResolvedTransactionInputs,
+        session: &StateOutputRoot,
+        reject: &F,
+    ) -> Result<&'a PlutusData, Error>
+    where
+        F: Fn(String) -> Error,
+    {
+        let mut inputs = resolved_inputs
+            .regular
+            .iter()
+            .filter(|(_, input)| input.address == session.address)
+            .map(|(out_ref, _)| out_ref);
+        let input = inputs
+            .next()
+            .ok_or_else(|| reject("staged Tendermint session input is missing".to_string()))?;
+        if inputs.next().is_some() {
+            return Err(reject(
+                "transaction consumes multiple staged Tendermint sessions".to_string(),
+            ));
+        }
+        spend_redeemer_for_input(body, redeemers, input).map_err(reject)
+    }
+
     fn validate_message_binding<F>(
         &self,
         body: &pallas_primitives::conway::MintedTransactionBody<'_>,
         redeemers: Option<&pallas_primitives::conway::Redeemers>,
+        signer_address: &[u8],
         intent: &SigningIntent,
+        requirements: &OperationRequirements<'_>,
         resolved_inputs: &ResolvedTransactionInputs,
         reject: &F,
     ) -> Result<(), Error>
@@ -1595,6 +2249,21 @@ impl TransactionSigningPolicy {
                     .to_string(),
             )
         })?;
+
+        if let Some(session) = requirements.tendermint_session.as_ref() {
+            self.validate_tendermint_session_redeemers(
+                body,
+                redeemers,
+                signer_address,
+                intent,
+                session,
+                resolved_inputs,
+                reject,
+            )?;
+            if !session.action.is_finalization() {
+                return Ok(());
+            }
+        }
 
         let host_alternative = match intent.operation.as_str() {
             "HostStateHeartbeat" => 10,
@@ -1639,7 +2308,14 @@ impl TransactionSigningPolicy {
 
         let expected = match intent.operation.as_str() {
             "/ibc.core.client.v1.MsgUpdateClient" => {
-                Some((&self.client_state, ChannelRedeemerIntent::Constructor(0)))
+                let expected = if intent.staged_misbehaviour {
+                    ChannelRedeemerIntent::Constructor(3)
+                } else if self.consensus_history_format == ConsensusHistoryFormat::ProofBackedV1 {
+                    ChannelRedeemerIntent::ProofBackedClientUpdate
+                } else {
+                    ChannelRedeemerIntent::Constructor(0)
+                };
+                Some((&self.client_state, expected))
             }
             "/ibc.core.client.v1.MsgRecoverClient" => {
                 let substitute_sequence = intent.recovery_substitute_sequence.ok_or_else(|| {
@@ -1648,6 +2324,12 @@ impl TransactionSigningPolicy {
                 Some((
                     &self.client_state,
                     ChannelRedeemerIntent::ClientRecovery {
+                        alternative: if self.tendermint_session.is_some() {
+                            2
+                        } else {
+                            1
+                        },
+                        history_format: self.consensus_history_format,
                         substitute_policy: self.client_state.policy.clone(),
                         substitute_name: self
                             .state_token_name(StateOutputKind::Client, substitute_sequence),
@@ -1761,21 +2443,33 @@ impl TransactionSigningPolicy {
             })?;
             let substitute_name =
                 self.state_token_name(StateOutputKind::Client, substitute_sequence);
-            self.validate_recovery_withdrawal_redeemer(
+            self.validate_client_withdrawal_redeemer(
                 redeemers,
                 &token_name,
-                &substitute_name,
+                Some(&substitute_name),
+                false,
+                reject,
+            )?;
+        } else if intent.operation == "/ibc.core.client.v1.MsgUpdateClient"
+            && self.consensus_history_format == ConsensusHistoryFormat::ProofBackedV1
+        {
+            self.validate_client_withdrawal_redeemer(
+                redeemers,
+                &token_name,
+                None,
+                intent.staged_tendermint,
                 reject,
             )?;
         }
         Ok(())
     }
 
-    fn validate_recovery_withdrawal_redeemer<F>(
+    fn validate_client_withdrawal_redeemer<F>(
         &self,
         redeemers: &pallas_primitives::conway::Redeemers,
         subject_name: &[u8],
-        substitute_name: &[u8],
+        substitute_name: Option<&[u8]>,
+        staged: bool,
         reject: &F,
     ) -> Result<(), Error>
     where
@@ -1786,23 +2480,36 @@ impl TransactionSigningPolicy {
             .filter(|(key, _)| key.tag == pallas_primitives::conway::RedeemerTag::Reward);
         let (key, value) = rewards
             .next()
-            .ok_or_else(|| reject("client recovery has no withdrawal redeemer".to_string()))?;
+            .ok_or_else(|| reject("client transition has no withdrawal redeemer".to_string()))?;
         if rewards.next().is_some() || key.index != 0 {
             return Err(reject(
-                "client recovery must have exactly one withdrawal redeemer at index zero"
+                "client transition must have exactly one withdrawal redeemer at index zero"
                     .to_string(),
             ));
         }
-        let fields = constructor_fields(&value.data, 0)
-            .filter(|fields| fields.len() == 2)
+        // RecoverClientWithdrawal is constructor 0 with both requested clients;
+        // CheckClientHistory (legacy) is constructor 1; staged history is constructor 4.
+        // Both bind the requested subject.
+        // Never accept the recovery branch as authorization for an ordinary update.
+        let (alternative, arity) = if substitute_name.is_some() {
+            (0, 2)
+        } else if staged {
+            (4, 1)
+        } else {
+            (1, 1)
+        };
+        let fields = constructor_fields(&value.data, alternative)
+            .filter(|fields| fields.len() == arity)
             .ok_or_else(|| {
-                reject("client recovery withdrawal redeemer is malformed".to_string())
+                reject("client transition withdrawal redeemer is malformed".to_string())
             })?;
         if !auth_token_matches(&fields[0], &self.client_state.policy, subject_name)
-            || !auth_token_matches(&fields[1], &self.client_state.policy, substitute_name)
+            || substitute_name.is_some_and(|name| {
+                !auth_token_matches(&fields[1], &self.client_state.policy, name)
+            })
         {
             return Err(reject(
-                "client recovery withdrawal redeemer does not match the requested clients"
+                "client transition withdrawal redeemer does not match the requested clients"
                     .to_string(),
             ));
         }
@@ -1934,6 +2641,7 @@ impl TransactionSigningPolicy {
         let mut module_escrow_output_count = 0usize;
         let mut trace_registry_output_count = 0usize;
         let mut voucher_metadata_output_count = 0usize;
+        let mut tendermint_session_output_count = 0usize;
         let mut protocol_lovelace = 0u64;
 
         let expected_state = match requirements.state_output {
@@ -1946,6 +2654,10 @@ impl TransactionSigningPolicy {
             .state_sequence
             .zip(expected_state)
             .map(|(sequence, _)| self.state_token_name(requirements.state_output, sequence));
+        let expected_session = requirements
+            .tendermint_session
+            .as_ref()
+            .zip(self.tendermint_session.as_ref());
         let expected_asset = intent.transfer.as_ref().map(expected_asset);
         let reference_voucher_name = match expected_asset.as_ref() {
             Some(ExpectedAsset::Voucher {
@@ -2009,6 +2721,12 @@ impl TransactionSigningPolicy {
             }
 
             if output.address == self.host_state_address {
+                if !requirements.requires_host_state {
+                    return Err(reject(
+                        "tree-neutral staged Tendermint transaction creates a HostState output"
+                            .to_string(),
+                    ));
+                }
                 if !is_exact_state_output(
                     output,
                     &self.host_state_nft_policy,
@@ -2016,6 +2734,42 @@ impl TransactionSigningPolicy {
                 ) {
                     return Err(reject(
                         "HostState output contains unauthorized assets or lacks its NFT"
+                            .to_string(),
+                    ));
+                }
+                protocol_lovelace = checked_protocol_coin(protocol_lovelace, output.coin, reject)?;
+                continue;
+            }
+
+            if self
+                .tendermint_session
+                .as_ref()
+                .is_some_and(|session| output.address == session.address)
+            {
+                let (requirement, session) = expected_session.ok_or_else(|| {
+                    reject(
+                        "transaction creates a staged Tendermint session output without a staged intent"
+                            .to_string(),
+                    )
+                })?;
+                if !matches!(
+                    requirement.action,
+                    TendermintSessionAction::Initialize | TendermintSessionAction::Advance
+                ) || !is_exact_state_output(
+                    output,
+                    &session.policy,
+                    Some(&requirement.token_name),
+                ) || !output.has_inline_datum
+                {
+                    return Err(reject(
+                        "staged Tendermint session output must preserve exactly one session NFT and an inline datum"
+                            .to_string(),
+                    ));
+                }
+                tendermint_session_output_count += 1;
+                if tendermint_session_output_count > 1 {
+                    return Err(reject(
+                        "transaction creates multiple staged Tendermint session outputs"
                             .to_string(),
                     ));
                 }
@@ -2181,9 +2935,10 @@ impl TransactionSigningPolicy {
             }
         }
 
-        if host_state_nft_quantity != 1 {
+        let expected_host_state_quantity = u64::from(requirements.requires_host_state);
+        if host_state_nft_quantity != expected_host_state_quantity {
             return Err(reject(format!(
-                "expected exactly one HostState NFT in outputs, found {host_state_nft_quantity}"
+                "expected {expected_host_state_quantity} HostState NFTs in outputs, found {host_state_nft_quantity}"
             )));
         }
         if expected_state.is_some() && state_output_count != 1 {
@@ -2191,6 +2946,22 @@ impl TransactionSigningPolicy {
                 "transaction omits the protocol state output required by this IBC operation"
                     .to_string(),
             ));
+        }
+        let expected_session_outputs = usize::from(
+            requirements
+                .tendermint_session
+                .as_ref()
+                .is_some_and(|session| {
+                    matches!(
+                        session.action,
+                        TendermintSessionAction::Initialize | TendermintSessionAction::Advance
+                    )
+                }),
+        );
+        if tendermint_session_output_count != expected_session_outputs {
+            return Err(reject(format!(
+                "expected {expected_session_outputs} staged Tendermint session outputs, found {tendermint_session_output_count}"
+            )));
         }
         if requirements.module.is_some() && module_output_count == 0 {
             return Err(reject(
@@ -2395,6 +3166,139 @@ impl TransactionSigningPolicy {
     }
 }
 
+fn classify_tendermint_session_transaction(
+    body: &pallas_primitives::conway::MintedTransactionBody<'_>,
+    resolved_inputs: &ResolvedTransactionInputs,
+    session: &StateOutputRoot,
+    host_state_address: &[u8],
+    client_address: &[u8],
+) -> Result<ValidatedTendermintSessionAction, String> {
+    let mut input_names = Vec::new();
+    for input in resolved_inputs.regular.values() {
+        if input.address != session.address {
+            continue;
+        }
+        if input.assets.len() != 1
+            || input.assets[0].policy_id.as_slice() != session.policy
+            || input.assets[0].quantity != 1
+        {
+            return Err(
+                "staged Tendermint session input does not contain exactly one pinned session NFT"
+                    .to_string(),
+            );
+        }
+        input_names.push(input.assets[0].asset_name.clone());
+    }
+
+    let mut output_names = Vec::new();
+    for output in body.outputs.iter().map(unpack_output) {
+        if output.address != session.address {
+            continue;
+        }
+        if output.assets.len() != 1
+            || output.assets[0].0 != session.policy
+            || output.assets[0].2 != 1
+        {
+            return Err(
+                "staged Tendermint session output does not contain exactly one pinned session NFT"
+                    .to_string(),
+            );
+        }
+        output_names.push(output.assets[0].1.clone());
+    }
+
+    let mut mint_entries = Vec::new();
+    if let Some(mint) = body.mint.as_ref() {
+        for (policy, assets) in mint.iter() {
+            if policy.as_ref() != session.policy {
+                continue;
+            }
+            mint_entries.extend(
+                assets
+                    .iter()
+                    .map(|(name, quantity)| (name.as_slice().to_vec(), i64::from(quantity))),
+            );
+        }
+    }
+
+    for name in input_names
+        .iter()
+        .chain(output_names.iter())
+        .chain(mint_entries.iter().map(|(name, _)| name))
+    {
+        if name.len() != TENDERMINT_SESSION_TOKEN_NAME_BYTES {
+            return Err(format!(
+                "staged Tendermint session token name must contain {TENDERMINT_SESSION_TOKEN_NAME_BYTES} bytes"
+            ));
+        }
+    }
+
+    let has_finalization_input = resolved_inputs
+        .regular
+        .values()
+        .any(|input| input.address == host_state_address || input.address == client_address);
+
+    // Two sessions are allowed only when both are consumed and burned by one
+    // finalization. The request and exact script redeemers are checked below.
+    if input_names.len() == 2
+        && input_names[0] != input_names[1]
+        && output_names.is_empty()
+        && mint_entries.len() == 2
+        && mint_entries[0].0 != mint_entries[1].0
+        && mint_entries
+            .iter()
+            .all(|(name, quantity)| *quantity == -1 && input_names.contains(name))
+        && has_finalization_input
+    {
+        input_names.sort();
+        return Ok(ValidatedTendermintSessionAction {
+            action: TendermintSessionAction::FinalizeMisbehaviour,
+            token_name: input_names[0].clone(),
+            second_token_name: Some(input_names[1].clone()),
+        });
+    }
+    if input_names.len() > 1 || output_names.len() > 1 || mint_entries.len() > 1 {
+        return Err(
+            "staged Tendermint transaction contains unauthorized multiple session NFTs".to_string(),
+        );
+    }
+
+    let (action, token_name) = match (
+        input_names.as_slice(),
+        output_names.as_slice(),
+        mint_entries.as_slice(),
+    ) {
+        ([], [output], [(minted, 1)]) if output == minted => {
+            (TendermintSessionAction::Initialize, output.clone())
+        }
+        ([input], [output], []) if input == output => {
+            (TendermintSessionAction::Advance, input.clone())
+        }
+        ([input], [], [(burned, -1)]) if input == burned => {
+            (
+                if has_finalization_input {
+                    TendermintSessionAction::Finalize
+                } else {
+                    TendermintSessionAction::Cancel
+                },
+                input.clone(),
+            )
+        }
+        _ => {
+            return Err(
+                "transaction is not an exact staged Tendermint init, advance, cancel, or finalize shape"
+                    .to_string(),
+            )
+        }
+    };
+
+    Ok(ValidatedTendermintSessionAction {
+        action,
+        token_name,
+        second_token_name: None,
+    })
+}
+
 fn constructor_fields(data: &PlutusData, alternative: u64) -> Option<&[PlutusData]> {
     let PlutusData::Constr(constructor) = data else {
         return None;
@@ -2419,6 +3323,17 @@ fn plutus_bytes(data: &PlutusData) -> Option<&[u8]> {
         return None;
     };
     Some(bytes.as_slice())
+}
+
+fn history_siblings_shape(data: &PlutusData, allow_empty: bool) -> bool {
+    let PlutusData::Array(siblings) = data else {
+        return false;
+    };
+    (allow_empty && siblings.is_empty())
+        || (siblings.len() == 64
+            && siblings
+                .iter()
+                .all(|sibling| plutus_bytes(sibling).is_some_and(|bytes| bytes.len() == 32)))
 }
 
 fn plutus_u64(data: &PlutusData) -> Option<u64> {
@@ -2570,6 +3485,10 @@ impl SigningIntent {
         Ok(intent)
     }
 
+    pub(crate) fn is_staged_tendermint(&self) -> bool {
+        self.staged_tendermint
+    }
+
     pub fn trace_registry_prelude(
         message: &[u8],
         expected_signer: &str,
@@ -2598,7 +3517,44 @@ impl SigningIntent {
             acknowledgement: None,
             prune_sequence: None,
             funded_intent: None,
+            staged_tendermint: false,
+            staged_misbehaviour: false,
         })
+    }
+
+    /// Build the signing intent shared by every transaction in one staged
+    /// Tendermint update. The nested client message is checked here so this
+    /// policy cannot accidentally authorize staged transactions for another
+    /// light-client implementation.
+    pub fn staged_tendermint_update(
+        type_url: &str,
+        message: &[u8],
+        expected_signer: &str,
+        network_id: u8,
+    ) -> Result<Self, Error> {
+        if type_url != "/ibc.core.client.v1.MsgUpdateClient" {
+            return Err(Error::Signer(
+                "staged Tendermint signing requires MsgUpdateClient".to_string(),
+            ));
+        }
+        let update = MsgUpdateClient::decode(message).map_err(decode_error)?;
+        let header = update.client_message.as_ref().ok_or_else(|| {
+            Error::Signer("staged Tendermint update has no client message".to_string())
+        })?;
+        if !matches!(
+            header.type_url.as_str(),
+            TENDERMINT_HEADER_TYPE_URL | TENDERMINT_MISBEHAVIOR_TYPE_URL
+        ) {
+            return Err(Error::Signer(format!(
+                "staged Tendermint update has unsupported client message type {}",
+                header.type_url
+            )));
+        }
+
+        let mut intent = Self::ibc(type_url, message, expected_signer, network_id)?;
+        intent.staged_tendermint = true;
+        intent.staged_misbehaviour = header.type_url == TENDERMINT_MISBEHAVIOR_TYPE_URL;
+        Ok(intent)
     }
 
     pub fn ibc(
@@ -2852,7 +3808,8 @@ impl SigningIntent {
                     source_channel: Some(msg.source_channel.clone()),
                     destination_port: None,
                     destination_channel: None,
-                    sender: msg.sender.clone(),
+                    sender: outbound_transfer_sender(&msg.sender, network_id)
+                        .map_err(Error::Signer)?,
                     receiver: msg.receiver,
                     memo: msg.memo,
                     timeout_revision_number,
@@ -2888,6 +3845,8 @@ impl SigningIntent {
             acknowledgement,
             prune_sequence,
             funded_intent: None,
+            staged_tendermint: false,
+            staged_misbehaviour: false,
         })
     }
 
@@ -3183,6 +4142,81 @@ fn spend_redeemer_for_input<'a>(
     Ok(data)
 }
 
+fn mint_redeemer_for_policy<'a>(
+    body: &pallas_primitives::conway::MintedTransactionBody<'_>,
+    redeemers: &'a pallas_primitives::conway::Redeemers,
+    policy: &[u8],
+) -> Result<&'a PlutusData, String> {
+    let mut policies: Vec<Vec<u8>> = body
+        .mint
+        .as_ref()
+        .into_iter()
+        .flat_map(|mint| mint.iter().map(|(policy, _)| policy.as_ref().to_vec()))
+        .collect();
+    policies.sort_unstable();
+    let index = policies
+        .iter()
+        .position(|candidate| candidate.as_slice() == policy)
+        .ok_or_else(|| "session minting policy is absent from the transaction body".to_string())?;
+    let index = u32::try_from(index)
+        .map_err(|_| "minting policy index exceeds the Cardano redeemer range".to_string())?;
+
+    let mut matching = redeemers.iter().filter(|(key, _)| {
+        key.tag == pallas_primitives::conway::RedeemerTag::Mint && key.index == index
+    });
+    let data = matching
+        .next()
+        .map(|(_, value)| &value.data)
+        .ok_or_else(|| format!("transaction has no Mint[{index}] redeemer for session policy"))?;
+    if matching.next().is_some() {
+        return Err(format!(
+            "transaction has duplicate Mint[{index}] redeemers for session policy"
+        ));
+    }
+    Ok(data)
+}
+
+fn plutus_output_reference(data: &PlutusData) -> Option<TransactionOutRef> {
+    let fields = constructor_fields(data, 0)?;
+    if fields.len() != 2 {
+        return None;
+    }
+    // Aiken's OutputReference stores the transaction hash directly as bytes.
+    let transaction_id: [u8; 32] = plutus_bytes(&fields[0])?.try_into().ok()?;
+    Some(TransactionOutRef {
+        transaction_id,
+        output_index: plutus_u64(&fields[1])?,
+    })
+}
+
+fn plutus_auth_token(data: &PlutusData) -> Option<(&[u8], &[u8])> {
+    let fields = constructor_fields(data, 0)?;
+    if fields.len() != 2 {
+        return None;
+    }
+    Some((plutus_bytes(&fields[0])?, plutus_bytes(&fields[1])?))
+}
+
+fn selected_state_input<'a>(
+    resolved_inputs: &'a ResolvedTransactionInputs,
+    state: &StateOutputRoot,
+    token_name: &[u8],
+) -> Option<&'a TransactionOutRef> {
+    let mut matches = resolved_inputs
+        .regular
+        .iter()
+        .filter_map(|(out_ref, input)| {
+            (input.address == state.address
+                && input.assets.len() == 1
+                && input.assets[0].policy_id.as_slice() == state.policy
+                && input.assets[0].asset_name == token_name
+                && input.assets[0].quantity == 1)
+                .then_some(out_ref)
+        });
+    let selected = matches.next()?;
+    matches.next().is_none().then_some(selected)
+}
+
 fn add_resolved_assets<F>(
     totals: &mut AssetTotals,
     input: &ResolvedInput,
@@ -3229,12 +4263,17 @@ fn unpack_output(output: &MintedTransactionOutput<'_>) -> OutputValue {
             coin: legacy_coin(&output.amount),
             assets: legacy_assets(&output.amount),
             has_script_ref: false,
+            has_inline_datum: false,
         },
         PseudoTransactionOutput::PostAlonzo(output) => OutputValue {
             address: output.address.as_slice().to_vec(),
             coin: conway_coin(&output.value),
             assets: conway_assets(&output.value),
             has_script_ref: output.script_ref.is_some(),
+            has_inline_datum: matches!(
+                output.datum_option.as_ref(),
+                Some(pallas_primitives::babbage::PseudoDatumOption::Data(_))
+            ),
         },
     }
 }
@@ -3506,6 +4545,31 @@ fn parse_out_ref(value: &JsonValue) -> Result<(Vec<u8>, u64), String> {
     Ok((tx_hash, index))
 }
 
+/// ICS-20 refunds on Cardano are addressed by a 28-byte payment key hash.
+/// Keep the complete address separately as the transaction signer identity.
+pub(crate) fn transfer_sender_key_hash(value: &str) -> Result<String, String> {
+    let bytes = if value.starts_with("addr") {
+        let (hrp, data, _) = bech32::decode(value)
+            .map_err(|error| format!("invalid Cardano transfer sender: {error}"))?;
+        if hrp != "addr" && hrp != "addr_test" {
+            return Err("unsupported Cardano transfer sender prefix".to_string());
+        }
+        Vec::<u8>::from_base32(&data).map_err(|error| error.to_string())?
+    } else {
+        decode_hex(value, "Cardano transfer sender")?
+    };
+    if bytes.len() == 28 {
+        return Ok(hex::encode(bytes));
+    }
+    if bytes.len() != 29 || !matches!(bytes[0], 0x60 | 0x61) {
+        return Err(
+            "Cardano transfer sender must be a payment key hash or Shelley enterprise key address"
+                .to_string(),
+        );
+    }
+    Ok(hex::encode(&bytes[1..]))
+}
+
 fn decode_address(value: &str, network_id: u8) -> Result<Vec<u8>, String> {
     let value = value.trim();
     let mut bytes = if value.starts_with("addr") {
@@ -3524,6 +4588,19 @@ fn decode_address(value: &str, network_id: u8) -> Result<Vec<u8>, String> {
     }
     validate_address_network(&bytes, network_id)?;
     Ok(bytes)
+}
+
+fn outbound_transfer_sender(value: &str, network_id: u8) -> Result<String, String> {
+    let address = decode_address(value, network_id)?;
+    match address.as_slice() {
+        [header, payment_key_hash @ ..] if *header >> 4 == 6 && payment_key_hash.len() == 28 => {
+            Ok(hex::encode(payment_key_hash))
+        }
+        _ => Err(
+            "Cardano transfer sender must be a payment key hash or key enterprise address"
+                .to_string(),
+        ),
+    }
 }
 
 fn validate_address_network(address: &[u8], network_id: u8) -> Result<(), String> {
@@ -3688,6 +4765,86 @@ mod tests {
     }
 
     #[test]
+    fn staged_manifest_requires_paired_session_validators() {
+        let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
+        let validators = value["validators"].as_object_mut().unwrap();
+        validators.insert(
+            "spend_tendermint_update_session".to_string(),
+            serde_json::json!({
+                "address": format!("70{}", "18".repeat(28)),
+                "script_hash": "40".repeat(28),
+                "ref_utxo": { "tx_hash": "50".repeat(32), "output_index": 0 }
+            }),
+        );
+        let error = TransactionSigningPolicy::from_json(
+            &serde_json::to_string(&value).unwrap(),
+            0,
+            limits(),
+        )
+        .unwrap_err();
+        assert!(error.contains("both staged Tendermint session validators"));
+
+        value["validators"]["mint_tendermint_update_session"] = serde_json::json!({
+            "script_hash": "41".repeat(28),
+            "ref_utxo": { "tx_hash": "51".repeat(32), "output_index": 0 }
+        });
+        let policy = TransactionSigningPolicy::from_json(
+            &serde_json::to_string(&value).unwrap(),
+            0,
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(policy.protocol_addresses.len(), 8);
+        assert_eq!(policy.tendermint_session.unwrap().policy, vec![0x41; 28]);
+    }
+
+    #[test]
+    fn staged_intent_is_limited_to_tendermint_headers_or_misbehaviour() {
+        let signer = format!("60{}", "99".repeat(28));
+        let update = |type_url: &str| {
+            MsgUpdateClient {
+                client_id: "07-tendermint-12".to_string(),
+                client_message: Some(prost_types::Any {
+                    type_url: type_url.to_string(),
+                    value: Vec::new(),
+                }),
+                signer: signer.clone(),
+            }
+            .encode_to_vec()
+        };
+
+        let intent = SigningIntent::staged_tendermint_update(
+            "/ibc.core.client.v1.MsgUpdateClient",
+            &update(TENDERMINT_HEADER_TYPE_URL),
+            &signer,
+            0,
+        )
+        .unwrap();
+        assert!(intent.staged_tendermint);
+        assert!(!intent.staged_misbehaviour);
+        assert_eq!(intent.state_sequence, Some(12));
+        let evidence = SigningIntent::staged_tendermint_update(
+            "/ibc.core.client.v1.MsgUpdateClient",
+            &update(TENDERMINT_MISBEHAVIOR_TYPE_URL),
+            &signer,
+            0,
+        )
+        .unwrap();
+        assert!(evidence.staged_tendermint && evidence.staged_misbehaviour);
+
+        let error = SigningIntent::staged_tendermint_update(
+            "/ibc.core.client.v1.MsgUpdateClient",
+            &update("/ibc.lightclients.solomachine.v3.Header"),
+            &signer,
+            0,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported client message type"));
+    }
+
+    #[test]
     fn message_signer_must_match_local_key() {
         let message = MsgCreateClient {
             client_state: None,
@@ -3784,13 +4941,17 @@ mod tests {
         let redeemer: PlutusData = minicbor::decode(&encoded).unwrap();
 
         assert!(ChannelRedeemerIntent::ClientRecovery {
+            alternative: 1,
             substitute_policy: policy.clone(),
             substitute_name: name.clone(),
+            history_format: ConsensusHistoryFormat::Legacy,
         }
         .matches(&redeemer));
         assert!(!ChannelRedeemerIntent::ClientRecovery {
+            alternative: 1,
             substitute_policy: policy,
             substitute_name: b"another-client".to_vec(),
+            history_format: ConsensusHistoryFormat::Legacy,
         }
         .matches(&redeemer));
     }
@@ -4118,6 +5279,1573 @@ mod tests {
             .contains("state input does not match the original IBC message"));
     }
 
+    fn proof_backed_policy() -> TransactionSigningPolicy {
+        let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
+        value["consensus_history_format"] = "proof-backed-v1".into();
+        TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).unwrap()
+    }
+
+    #[test]
+    fn migration_profile_is_explicit_and_cannot_select_legacy_authorization() {
+        let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
+        value["consensus_history_format"] = "proof-backed-v1".into();
+        value["migration"] = serde_json::json!({
+            "profile": "cardano-ibc-compatible-v3", "generation": "2",
+            "compatibility": "ab".repeat(32),
+            "registryUnit": format!("{}{}", "cd".repeat(28), hex::encode(b"ibc_implementation_registry")),
+            "registryAddress": format!("70{}", "ef".repeat(28))
+        });
+        TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).unwrap();
+        for (key, bad) in [
+            ("profile", "future"),
+            ("generation", "0"),
+            ("generation", "02"),
+            ("compatibility", "ab"),
+            ("registryUnit", "cd"),
+            ("registryAddress", "bad"),
+        ] {
+            let mut changed = value.clone();
+            changed["migration"][key] = bad.into();
+            assert!(
+                TransactionSigningPolicy::from_json(&changed.to_string(), 0, limits()).is_err(),
+                "{key}"
+            );
+        }
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("consensus_history_format");
+        value["consensusHistoryFormat"] = "proof-backed-v1".into();
+        assert!(
+            TransactionSigningPolicy::from_json(&value.to_string(), 0, limits())
+                .unwrap_err()
+                .contains("raw handler")
+        );
+    }
+
+    fn update_intent() -> SigningIntent {
+        let signer = recovery_signer();
+        let message = MsgUpdateClient {
+            client_id: "07-tendermint-7".to_string(),
+            client_message: None,
+            signer: signer.clone(),
+        }
+        .encode_to_vec();
+        SigningIntent::ibc("/ibc.core.client.v1.MsgUpdateClient", &message, &signer, 0).unwrap()
+    }
+
+    fn data_constructor(alternative: u64, fields: Vec<PlutusData>) -> PlutusData {
+        PlutusData::Constr(pallas_primitives::alonzo::Constr {
+            tag: 121 + alternative,
+            any_constructor: None,
+            fields,
+        })
+    }
+
+    #[test]
+    fn plutus_output_reference_accepts_gateway_seed_cbor() {
+        // Lucid Data.to({ transactionId: '91'.repeat(32), outputIndex: 2n },
+        // Data.Object({ transactionId: Data.Bytes(), outputIndex: Data.Integer() })).
+        // Aiken's OutputReference has a bare byte-string transaction ID.
+        let cbor = hex::decode(
+            "d8799f5820919191919191919191919191919191919191919191919191919191919191919102ff",
+        )
+        .unwrap();
+        let seed: PlutusData = minicbor::decode(&cbor).unwrap();
+        let reference = plutus_output_reference(&seed).expect("gateway seed must decode");
+        assert_eq!(reference.transaction_id, [0x91; 32]);
+        assert_eq!(reference.output_index, 2);
+    }
+
+    #[test]
+    fn plutus_output_reference_rejects_malformed_seeds() {
+        let hash = PlutusData::BoundedBytes(vec![0x91; 32].into());
+        let index = PlutusData::BigInt(BigInt::Int(2.into()));
+        let malformed = [
+            data_constructor(1, vec![hash.clone(), index.clone()]),
+            data_constructor(0, vec![hash.clone()]),
+            data_constructor(0, vec![hash.clone(), index.clone(), index.clone()]),
+            data_constructor(
+                0,
+                vec![data_constructor(0, vec![hash.clone()]), index.clone()],
+            ),
+            data_constructor(
+                0,
+                vec![
+                    PlutusData::BoundedBytes(vec![0x91; 31].into()),
+                    index.clone(),
+                ],
+            ),
+            data_constructor(
+                0,
+                vec![
+                    PlutusData::BoundedBytes(vec![0x91; 33].into()),
+                    index.clone(),
+                ],
+            ),
+            data_constructor(0, vec![index.clone(), index]),
+            data_constructor(0, vec![hash.clone(), hash.clone()]),
+            data_constructor(0, vec![hash, PlutusData::BigInt(BigInt::Int((-1).into()))]),
+        ];
+        for seed in malformed {
+            assert!(
+                plutus_output_reference(&seed).is_none(),
+                "accepted {seed:?}"
+            );
+        }
+    }
+
+    fn data_token(policy: &[u8], name: &[u8]) -> PlutusData {
+        data_constructor(
+            0,
+            vec![
+                PlutusData::BoundedBytes(policy.to_vec().into()),
+                PlutusData::BoundedBytes(name.to_vec().into()),
+            ],
+        )
+    }
+
+    fn data_siblings(count: usize, bytes: usize) -> PlutusData {
+        PlutusData::Array(vec![PlutusData::BoundedBytes(vec![0; bytes].into()); count])
+    }
+
+    fn edit_redeemers(
+        tx: &mut pallas_primitives::conway::Tx,
+        edit: impl FnOnce(
+            &mut Vec<(
+                pallas_primitives::conway::RedeemersKey,
+                pallas_primitives::conway::RedeemersValue,
+            )>,
+        ),
+    ) {
+        let mut values = tx
+            .transaction_witness_set
+            .redeemer
+            .as_ref()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        edit(&mut values);
+        tx.transaction_witness_set.redeemer = Some(pallas_primitives::conway::Redeemers::from(
+            pallas_codec::utils::NonEmptyKeyValuePairs::try_from(values).unwrap(),
+        ));
+    }
+
+    fn proof_backed_transaction(
+        policy: &TransactionSigningPolicy,
+        recovery: bool,
+    ) -> pallas_primitives::conway::Tx {
+        use pallas_primitives::conway::RedeemerTag;
+        // Reuse the complete legacy policy fixture (including trusted wallet
+        // resolution), replacing only the versioned client/HostState ABI.
+        let mut tx: pallas_primitives::conway::Tx =
+            minicbor::decode(&recovery_transaction(policy, 12)).unwrap();
+        let subject = data_token(
+            &policy.client_state.policy,
+            &policy.state_token_name(StateOutputKind::Client, 7),
+        );
+        let substitute = data_token(
+            &policy.client_state.policy,
+            &policy.state_token_name(StateOutputKind::Client, 12),
+        );
+        edit_redeemers(&mut tx, |redeemers| {
+            for (key, value) in redeemers {
+                value.data = match (key.tag, key.index) {
+                    (RedeemerTag::Spend, 0) => data_constructor(
+                        4,
+                        vec![PlutusData::Array(vec![]), PlutusData::Array(vec![])],
+                    ),
+                    (RedeemerTag::Spend, 1) if recovery => {
+                        data_constructor(1, vec![substitute.clone(), data_siblings(64, 32)])
+                    }
+                    (RedeemerTag::Spend, 1) => data_constructor(
+                        0,
+                        vec![
+                            data_constructor(0, vec![]),
+                            PlutusData::Array(vec![]),
+                            data_siblings(64, 32),
+                        ],
+                    ),
+                    (RedeemerTag::Reward, 0) if recovery => {
+                        data_constructor(0, vec![subject.clone(), substitute.clone()])
+                    }
+                    (RedeemerTag::Reward, 0) => data_constructor(1, vec![subject.clone()]),
+                    _ => panic!("unexpected fixture redeemer"),
+                };
+            }
+        });
+        tx
+    }
+
+    fn validate_client_fixture(
+        policy: &TransactionSigningPolicy,
+        tx: &pallas_primitives::conway::Tx,
+        recovery: bool,
+    ) -> Result<(), Error> {
+        let encoded = minicbor::to_vec(tx).unwrap();
+        let transaction: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+        policy.validate(
+            &transaction,
+            encoded.len(),
+            &recovery_signer(),
+            &if recovery {
+                recovery_intent()
+            } else {
+                update_intent()
+            },
+            &recovery_resolved_inputs(policy),
+        )
+    }
+
+    #[test]
+    fn history_format_is_operator_pinned_and_unknown_formats_fail_closed() {
+        let legacy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        assert_eq!(
+            legacy.consensus_history_format,
+            ConsensusHistoryFormat::Legacy
+        );
+        assert_eq!(
+            proof_backed_policy().consensus_history_format,
+            ConsensusHistoryFormat::ProofBackedV1
+        );
+        for format in [
+            JsonValue::Null,
+            true.into(),
+            1.into(),
+            "unknown".into(),
+            "".into(),
+        ] {
+            let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
+            value["consensus_history_format"] = format;
+            assert!(
+                TransactionSigningPolicy::from_json(&value.to_string(), 0, limits())
+                    .unwrap_err()
+                    .contains("unsupported consensus_history_format")
+            );
+        }
+        let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
+        value["consensus_history_format"] = "proof-backed-v1".into();
+        value["validators"]
+            .as_object_mut()
+            .unwrap()
+            .remove("recover_client");
+        assert!(TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).is_err());
+    }
+
+    #[test]
+    fn complete_proof_backed_update_and_recovery_match_signing_policy() {
+        use pallas_primitives::conway::RedeemerTag;
+        let policy = proof_backed_policy();
+        for recovery in [false, true] {
+            validate_client_fixture(
+                &policy,
+                &proof_backed_transaction(&policy, recovery),
+                recovery,
+            )
+            .unwrap();
+        }
+        let mut freeze = proof_backed_transaction(&policy, false);
+        edit_redeemers(&mut freeze, |values| {
+            let (_, value) = values
+                .iter_mut()
+                .find(|(key, _)| key.tag == RedeemerTag::Spend && key.index == 1)
+                .unwrap();
+            let PlutusData::Constr(constructor) = &mut value.data else {
+                unreachable!()
+            };
+            constructor.fields[2] = PlutusData::Array(vec![]);
+        });
+        // Empty insertion proofs are the freeze ABI. Classification/signatures
+        // remain the pinned validator's responsibility, not this shape check.
+        validate_client_fixture(&policy, &freeze, false).unwrap();
+        let requirements = policy.operation_requirements(&update_intent()).unwrap();
+        assert_eq!(
+            requirements.required_scripts,
+            vec!["spendclient", "recoverclient"]
+        );
+        assert!(requirements.required_mint_scripts.is_empty());
+    }
+
+    #[test]
+    fn actual_evaluated_proof_backed_transactions_match_signing_policy() {
+        // Exported only after the matching signed transaction was evaluated and
+        // accepted by the production Aiken emulator fixture. These roots and
+        // resolved inputs stand in for operator-pinned deployment data and the
+        // independent Kupo resolver, never data inferred from transaction outputs.
+        let fixture: JsonValue =
+            serde_json::from_str(include_str!("fixtures/proof_backed_history_signing.json"))
+                .unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0]["name"], "update");
+        assert_eq!(cases[1]["name"], "recovery");
+        for case in cases {
+            let mut pinned: JsonValue = serde_json::from_str(&manifest()).unwrap();
+            for role in [
+                "host_state_stt",
+                "spend_client",
+                "recover_client",
+                "mint_client_stt",
+            ] {
+                pinned["validators"][role] = case["manifest"]["validators"][role].clone();
+            }
+            pinned["host_state_nft"] = case["manifest"]["host_state_nft"].clone();
+            pinned["consensus_history_format"] =
+                case["manifest"]["consensus_history_format"].clone();
+            let ledger_sized_limits = SigningPolicyLimits {
+                max_tx_size_bytes: 16_384,
+                ..limits()
+            };
+            let policy =
+                TransactionSigningPolicy::from_json(&pinned.to_string(), 0, ledger_sized_limits)
+                    .unwrap();
+            let signer = case["signer_address"].as_str().unwrap();
+            let operation = case["operation"].as_str().unwrap();
+            let client_id = case["client_id"].as_str().unwrap().to_string();
+            let message = match operation {
+                "/ibc.core.client.v1.MsgUpdateClient" => MsgUpdateClient {
+                    client_id,
+                    client_message: None,
+                    signer: signer.to_string(),
+                }
+                .encode_to_vec(),
+                "/ibc.core.client.v1.MsgRecoverClient" => MsgRecoverClient {
+                    subject_client_id: client_id,
+                    substitute_client_id: case["substitute_client_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                    signer: signer.to_string(),
+                }
+                .encode_to_vec(),
+                _ => panic!("unexpected fixture operation"),
+            };
+            let intent = SigningIntent::ibc(operation, &message, signer, 0).unwrap();
+            let mut resolved = ResolvedTransactionInputs::default();
+            for (kind, inputs) in [
+                ("regular", &mut resolved.regular),
+                ("collateral", &mut resolved.collateral),
+            ] {
+                for input in case["resolved_inputs"][kind].as_array().unwrap() {
+                    let reference = TransactionOutRef {
+                        transaction_id: hex::decode(input["tx_hash"].as_str().unwrap())
+                            .unwrap()
+                            .try_into()
+                            .unwrap(),
+                        output_index: input["output_index"].as_u64().unwrap(),
+                    };
+                    let value = ResolvedInput {
+                        inline_datum: None,
+                        address: hex::decode(input["address"].as_str().unwrap()).unwrap(),
+                        lovelace: input["lovelace"].as_str().unwrap().parse().unwrap(),
+                        assets: input["assets"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|asset| ResolvedAsset {
+                                policy_id: hex::decode(asset["policy_id"].as_str().unwrap())
+                                    .unwrap()
+                                    .try_into()
+                                    .unwrap(),
+                                asset_name: hex::decode(asset["asset_name"].as_str().unwrap())
+                                    .unwrap(),
+                                quantity: asset["quantity"].as_str().unwrap().parse().unwrap(),
+                            })
+                            .collect(),
+                    };
+                    assert!(inputs.insert(reference, value).is_none());
+                }
+            }
+            let encoded = hex::decode(case["unsigned_tx_cbor"].as_str().unwrap()).unwrap();
+            let mut decoder = minicbor::Decoder::new(&encoded);
+            let transaction: MintedTx<'_> = decoder.decode().unwrap();
+            assert_eq!(decoder.position(), encoded.len());
+            policy
+                .validate(&transaction, encoded.len(), signer, &intent, &resolved)
+                .unwrap_or_else(|error| panic!("{}: {error}", case["name"]));
+        }
+    }
+
+    #[test]
+    fn history_format_never_falls_back_to_legacy_authorization() {
+        use pallas_primitives::conway::RedeemerTag;
+        let policy = proof_backed_policy();
+        let legacy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let update = proof_backed_transaction(&policy, false);
+        assert!(validate_client_fixture(&legacy, &update, false).is_err());
+        assert!(
+            validate_client_fixture(&legacy, &proof_backed_transaction(&policy, true), true)
+                .is_err()
+        );
+        // Legacy update ABI still permits no withdrawal. The proof-backed mode
+        // cannot accept that same transaction even with identical pinned roots.
+        let mut legacy_update = update;
+        legacy_update.transaction_body.withdrawals = None;
+        edit_redeemers(&mut legacy_update, |values| {
+            values.retain(|(key, _)| key.tag != RedeemerTag::Reward);
+            values
+                .iter_mut()
+                .find(|(key, _)| key.tag == RedeemerTag::Spend && key.index == 1)
+                .unwrap()
+                .1
+                .data = data_constructor(0, vec![data_constructor(0, vec![])]);
+        });
+        validate_client_fixture(&legacy, &legacy_update, false).unwrap();
+        assert!(validate_client_fixture(&policy, &legacy_update, false).is_err());
+        assert!(validate_recovery_transaction(&policy, 12).is_err());
+    }
+
+    #[test]
+    fn proof_backed_client_transitions_reject_missing_or_unpinned_support_reference() {
+        let policy = proof_backed_policy();
+        let expected = required_script(&policy.scripts, "recoverclient")
+            .unwrap()
+            .reference
+            .clone();
+        for recovery in [false, true] {
+            let mut tx = proof_backed_transaction(&policy, recovery);
+            let mut references = tx
+                .transaction_body
+                .reference_inputs
+                .clone()
+                .unwrap()
+                .to_vec();
+            references
+                .retain(|input| (input.transaction_id.as_ref().to_vec(), input.index) != expected);
+            tx.transaction_body.reference_inputs = Some(references.clone().try_into().unwrap());
+            assert!(validate_client_fixture(&policy, &tx, recovery)
+                .unwrap_err()
+                .to_string()
+                .contains("pinned recoverclient reference script is missing"));
+            references.push(pallas_primitives::conway::TransactionInput {
+                transaction_id: [0x77; 32].into(),
+                index: 0,
+            });
+            tx.transaction_body.reference_inputs = Some(references.try_into().unwrap());
+            assert!(validate_client_fixture(&policy, &tx, recovery).is_err());
+        }
+    }
+
+    #[test]
+    fn proof_backed_client_transitions_reject_invalid_withdrawal_accounts_and_values() {
+        let policy = proof_backed_policy();
+        let credential = required_script(&policy.scripts, "recoverclient")
+            .unwrap()
+            .hash
+            .clone();
+        let valid_account = [&[0xf0][..], credential.as_slice()].concat();
+        for recovery in [false, true] {
+            for withdrawals in [
+                None,
+                Some(vec![(valid_account.clone(), 1)]),
+                Some(vec![([&[0xf1][..], credential.as_slice()].concat(), 0)]),
+                Some(vec![([&[0xe0][..], credential.as_slice()].concat(), 0)]),
+                Some(vec![(vec![0xf0; 29], 0)]),
+                Some(vec![(valid_account.clone(), 0), (vec![0xf0; 29], 0)]),
+            ] {
+                let mut tx = proof_backed_transaction(&policy, recovery);
+                tx.transaction_body.withdrawals = withdrawals.map(|values| {
+                    values
+                        .into_iter()
+                        .map(|(account, amount)| (account.into(), amount))
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .unwrap()
+                });
+                let error = validate_client_fixture(&policy, &tx, recovery)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("withdrawal"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn proof_backed_mode_keeps_no_mint_and_unrelated_withdrawal_prohibitions() {
+        let policy = proof_backed_policy();
+        for recovery in [false, true] {
+            let mut tx = proof_backed_transaction(&policy, recovery);
+            tx.transaction_body.mint = Some(
+                vec![(
+                    policy.client_state.policy.as_slice().into(),
+                    vec![(vec![1].into(), 1i64.try_into().unwrap())]
+                        .try_into()
+                        .unwrap(),
+                )]
+                .try_into()
+                .unwrap(),
+            );
+            assert!(validate_client_fixture(&policy, &tx, recovery)
+                .unwrap_err()
+                .to_string()
+                .contains("is not authorized for this IBC operation"));
+        }
+        let encoded = minicbor::to_vec(proof_backed_transaction(&policy, false)).unwrap();
+        let tx: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+        for operation in [
+            "HostStateHeartbeat",
+            "/ibc.core.client.v1.MsgCreateClient",
+            "/ibc.core.channel.v1.MsgRecvPacket",
+        ] {
+            let intent = bare_intent(operation, None);
+            assert!(policy
+                .validate_withdrawals(&tx.transaction_body, &intent, false, &Error::Signer)
+                .unwrap_err()
+                .to_string()
+                .contains("withdrawals are not authorized"));
+        }
+    }
+
+    #[test]
+    fn proof_backed_client_transitions_bind_exact_reward_branch_index_and_clients() {
+        use pallas_primitives::conway::RedeemerTag;
+        let policy = proof_backed_policy();
+        let subject = data_token(
+            &policy.client_state.policy,
+            &policy.state_token_name(StateOutputKind::Client, 7),
+        );
+        let substitute = data_token(
+            &policy.client_state.policy,
+            &policy.state_token_name(StateOutputKind::Client, 12),
+        );
+        for recovery in [false, true] {
+            let wrong_branch = if recovery {
+                data_constructor(1, vec![subject.clone()])
+            } else {
+                data_constructor(0, vec![subject.clone(), substitute.clone()])
+            };
+            let correct_branch = if recovery { 0 } else { 1 };
+            let mut wrong_client_fields = vec![substitute.clone()];
+            if recovery {
+                wrong_client_fields.push(substitute.clone());
+            }
+            let mut wrong_policy_fields = vec![data_token(
+                &[0x77; 28],
+                &policy.state_token_name(StateOutputKind::Client, 7),
+            )];
+            if recovery {
+                wrong_policy_fields.push(substitute.clone());
+            }
+            let bad_data = vec![
+                wrong_branch,
+                data_constructor(correct_branch, vec![]),
+                data_constructor(
+                    correct_branch,
+                    vec![subject.clone(), substitute.clone(), subject.clone()],
+                ),
+                data_constructor(correct_branch, wrong_client_fields),
+                data_constructor(correct_branch, wrong_policy_fields),
+            ];
+            for data in bad_data {
+                let mut tx = proof_backed_transaction(&policy, recovery);
+                edit_redeemers(&mut tx, |values| {
+                    values
+                        .iter_mut()
+                        .find(|(key, _)| key.tag == RedeemerTag::Reward)
+                        .unwrap()
+                        .1
+                        .data = data;
+                });
+                assert!(validate_client_fixture(&policy, &tx, recovery)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("withdrawal redeemer"));
+            }
+            for mutation in 0..3 {
+                let mut tx = proof_backed_transaction(&policy, recovery);
+                edit_redeemers(&mut tx, |values| {
+                    let position = values
+                        .iter()
+                        .position(|(key, _)| key.tag == RedeemerTag::Reward)
+                        .unwrap();
+                    match mutation {
+                        0 => {
+                            values.remove(position);
+                        }
+                        1 => {
+                            values[position].0.index = 1;
+                        }
+                        _ => {
+                            values.push(values[position].clone());
+                        }
+                    }
+                });
+                assert!(validate_client_fixture(&policy, &tx, recovery)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("withdrawal redeemer"));
+            }
+        }
+        let mut tx = proof_backed_transaction(&policy, true);
+        edit_redeemers(&mut tx, |values| {
+            values
+                .iter_mut()
+                .find(|(key, _)| key.tag == RedeemerTag::Reward)
+                .unwrap()
+                .1
+                .data = data_constructor(0, vec![subject.clone(), subject]);
+        });
+        assert!(validate_client_fixture(&policy, &tx, true).is_err());
+    }
+
+    #[test]
+    fn proof_backed_spend_shapes_and_recovery_substitute_are_strict() {
+        let policy = proof_backed_policy();
+        let substitute_name = policy.state_token_name(StateOutputKind::Client, 12);
+        let token = data_token(&policy.client_state.policy, &substitute_name);
+        let expected = ChannelRedeemerIntent::ClientRecovery {
+            alternative: 1,
+            substitute_policy: policy.client_state.policy.clone(),
+            substitute_name,
+            history_format: ConsensusHistoryFormat::ProofBackedV1,
+        };
+        for (count, bytes) in [(0, 32), (63, 32), (65, 32), (64, 31), (64, 33)] {
+            assert!(!expected.matches(&data_constructor(
+                1,
+                vec![token.clone(), data_siblings(count, bytes)]
+            )));
+        }
+        assert!(!expected.matches(&data_constructor(1, vec![token.clone()])));
+        assert!(!expected.matches(&data_constructor(
+            1,
+            vec![token.clone(), data_siblings(64, 32), token.clone()]
+        )));
+        assert!(!expected.matches(&data_constructor(
+            1,
+            vec![
+                data_token(&policy.client_state.policy, b"other"),
+                data_siblings(64, 32)
+            ]
+        )));
+        assert!(expected.matches(&data_constructor(1, vec![token, data_siblings(64, 32)])));
+        let update = ChannelRedeemerIntent::ProofBackedClientUpdate;
+        for count in [0, 64] {
+            assert!(update.matches(&data_constructor(
+                0,
+                vec![
+                    data_constructor(0, vec![]),
+                    PlutusData::Array(vec![]),
+                    data_siblings(count, 32)
+                ]
+            )));
+        }
+        assert!(!update.matches(&data_constructor(0, vec![])));
+        assert!(!update.matches(&data_constructor(
+            0,
+            vec![
+                data_constructor(0, vec![]),
+                PlutusData::Array(vec![]),
+                data_siblings(63, 32)
+            ]
+        )));
+        assert!(!update.matches(&data_constructor(
+            0,
+            vec![
+                data_constructor(0, vec![]),
+                PlutusData::Array(vec![data_constructor(0, vec![]); 3]),
+                data_siblings(64, 32)
+            ]
+        )));
+    }
+
+    fn client_transaction(
+        policy: &TransactionSigningPolicy,
+        recovery: bool,
+    ) -> pallas_primitives::conway::Tx {
+        use pallas_primitives::conway::RedeemerTag;
+        let mut tx: pallas_primitives::conway::Tx =
+            minicbor::decode(&recovery_transaction(policy, 12)).unwrap();
+        if !recovery {
+            // Keep the existing legacy update ABI: no withdrawal, SpendClient
+            // constructor zero. This is a signing-policy fixture, not an
+            // on-chain Tendermint verification fixture.
+            tx.transaction_body.withdrawals = None;
+            edit_redeemers(&mut tx, |redeemers| {
+                redeemers.retain(|(key, _)| key.tag != RedeemerTag::Reward);
+                for (key, value) in redeemers {
+                    if key.tag == RedeemerTag::Spend && key.index == 1 {
+                        value.data = data_constructor(0, vec![]);
+                    }
+                }
+            });
+        }
+        tx
+    }
+
+    fn validate_client_fixture_with_inputs(
+        policy: &TransactionSigningPolicy,
+        tx: &pallas_primitives::conway::Tx,
+        recovery: bool,
+        resolved: &ResolvedTransactionInputs,
+    ) -> Result<(), Error> {
+        let encoded = minicbor::to_vec(tx).unwrap();
+        let transaction: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+        policy.validate(
+            &transaction,
+            encoded.len(),
+            &recovery_signer(),
+            &if recovery {
+                recovery_intent()
+            } else {
+                update_intent()
+            },
+            resolved,
+        )
+    }
+
+    fn set_test_wallet_value(
+        output: &mut pallas_primitives::conway::TransactionOutput,
+        lovelace: u64,
+        asset_quantity: Option<u64>,
+    ) {
+        let PseudoTransactionOutput::Legacy(output) = output else {
+            panic!("expected legacy fixture output")
+        };
+        output.amount = match asset_quantity {
+            None => LegacyValue::Coin(lovelace),
+            Some(quantity) => LegacyValue::Multiasset(
+                lovelace,
+                vec![([0xbb; 28].into(), vec![(vec![1].into(), quantity)].into())].into(),
+            ),
+        };
+    }
+
+    fn shared_collateral_fixture(
+        policy: &TransactionSigningPolicy,
+        recovery: bool,
+    ) -> (pallas_primitives::conway::Tx, ResolvedTransactionInputs) {
+        let mut tx = client_transaction(policy, recovery);
+        let mut resolved = recovery_resolved_inputs(policy);
+        let reference = TransactionOutRef {
+            transaction_id: RECOVERY_SIGNER_INPUT_ID,
+            output_index: 0,
+        };
+        let wallet_input = resolved.regular.get_mut(&reference).unwrap();
+        wallet_input.assets.push(ResolvedAsset {
+            policy_id: [0xbb; 28],
+            asset_name: vec![1],
+            quantity: 7,
+        });
+        resolved.collateral.insert(reference, wallet_input.clone());
+        tx.transaction_body.collateral = Some(
+            vec![pallas_primitives::conway::TransactionInput {
+                transaction_id: RECOVERY_SIGNER_INPUT_ID.into(),
+                index: 0,
+            }]
+            .try_into()
+            .unwrap(),
+        );
+        tx.transaction_body.total_collateral = Some(1_000_000);
+        // Success: 3 ADA -> 2.5 ADA + 0.5 ADA fee. Failure: 3 ADA ->
+        // 2 ADA collateral return + 1 ADA collateral. Tokens survive either path.
+        set_test_wallet_value(&mut tx.transaction_body.outputs[2], 2_500_000, Some(7));
+        let mut collateral_return = tx.transaction_body.outputs[2].clone();
+        set_test_wallet_value(&mut collateral_return, 2_000_000, Some(7));
+        tx.transaction_body.collateral_return = Some(collateral_return);
+        (tx, resolved)
+    }
+
+    #[test]
+    fn shared_wallet_input_keeps_success_and_failure_balances_separate() {
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        for recovery in [false, true] {
+            let (tx, resolved) = shared_collateral_fixture(&policy, recovery);
+            validate_client_fixture_with_inputs(&policy, &tx, recovery, &resolved).unwrap();
+            let mut bad_success = tx.clone();
+            set_test_wallet_value(
+                &mut bad_success.transaction_body.outputs[2],
+                2_500_000,
+                Some(6),
+            );
+            assert!(validate_client_fixture_with_inputs(
+                &policy,
+                &bad_success,
+                recovery,
+                &resolved
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unauthorized signer asset"));
+            let mut bad_failure = tx.clone();
+            set_test_wallet_value(
+                bad_failure
+                    .transaction_body
+                    .collateral_return
+                    .as_mut()
+                    .unwrap(),
+                2_000_000,
+                Some(6),
+            );
+            assert!(validate_client_fixture_with_inputs(
+                &policy,
+                &bad_failure,
+                recovery,
+                &resolved
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("preserve all collateral native assets"));
+
+            // A good failure return cannot compensate for excessive success loss.
+            let mut tight_policy = policy.clone();
+            tight_policy.limits.max_wallet_lovelace_top_up = 1;
+            let mut bad_success_value = tx;
+            set_test_wallet_value(
+                &mut bad_success_value.transaction_body.outputs[2],
+                2_000_000,
+                Some(7),
+            );
+            assert!(validate_client_fixture_with_inputs(
+                &tight_policy,
+                &bad_success_value,
+                recovery,
+                &resolved
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("configured top-up allowance"));
+        }
+    }
+
+    #[test]
+    fn shared_wallet_input_rejects_conflicting_trusted_resolution() {
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let (tx, resolved) = shared_collateral_fixture(&policy, false);
+        for mutation in 0..3 {
+            let mut inconsistent = resolved.clone();
+            let collateral = inconsistent.collateral.values_mut().next().unwrap();
+            match mutation {
+                0 => collateral.address[1] ^= 1,
+                1 => collateral.lovelace += 1,
+                _ => collateral.assets[0].quantity += 1,
+            }
+            assert!(
+                validate_client_fixture_with_inputs(&policy, &tx, false, &inconsistent)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("disagrees for a shared regular/collateral input")
+            );
+        }
+    }
+
+    #[test]
+    fn shared_collateral_keeps_duplicate_loss_return_and_ownership_checks() {
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        for recovery in [false, true] {
+            let (tx, resolved) = shared_collateral_fixture(&policy, recovery);
+            for mutation in 0..7 {
+                let mut bad = tx.clone();
+                let expected_error = match mutation {
+                    0 => {
+                        let input = bad
+                            .transaction_body
+                            .collateral
+                            .as_ref()
+                            .unwrap()
+                            .first()
+                            .unwrap()
+                            .clone();
+                        bad.transaction_body.collateral =
+                            Some(vec![input.clone(), input].try_into().unwrap());
+                        "collateral inputs contain duplicates"
+                    }
+                    1 => {
+                        bad.transaction_body.total_collateral = None;
+                        "explicit total collateral"
+                    }
+                    2 => {
+                        bad.transaction_body.total_collateral = Some(0);
+                        "greater than zero"
+                    }
+                    3 => {
+                        bad.transaction_body.total_collateral =
+                            Some(policy.limits.max_total_collateral_lovelace + 1);
+                        "exceeds"
+                    }
+                    4 => {
+                        bad.transaction_body.collateral_return = None;
+                        "explicit collateral return"
+                    }
+                    5 => {
+                        let PseudoTransactionOutput::Legacy(output) =
+                            bad.transaction_body.collateral_return.as_mut().unwrap()
+                        else {
+                            unreachable!()
+                        };
+                        output.address = vec![0x60; 29].into();
+                        "does not pay the configured relayer"
+                    }
+                    _ => {
+                        set_test_wallet_value(
+                            bad.transaction_body.collateral_return.as_mut().unwrap(),
+                            2_000_001,
+                            Some(7),
+                        );
+                        "collateral return is"
+                    }
+                };
+                let error = validate_client_fixture_with_inputs(&policy, &bad, recovery, &resolved)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(expected_error),
+                    "mutation {mutation}: {error}"
+                );
+            }
+            let mut foreign = tx;
+            let mut foreign_resolved = resolved;
+            foreign.transaction_body.collateral = Some(
+                vec![pallas_primitives::conway::TransactionInput {
+                    transaction_id: RECOVERY_HOST_INPUT_ID.into(),
+                    index: 0,
+                }]
+                .try_into()
+                .unwrap(),
+            );
+            foreign_resolved.collateral.clear();
+            let reference = TransactionOutRef {
+                transaction_id: RECOVERY_HOST_INPUT_ID,
+                output_index: 0,
+            };
+            foreign_resolved.collateral.insert(
+                reference.clone(),
+                foreign_resolved.regular[&reference].clone(),
+            );
+            assert!(validate_client_fixture_with_inputs(
+                &policy,
+                &foreign,
+                recovery,
+                &foreign_resolved
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("collateral input is not owned by the configured relayer"));
+        }
+    }
+
+    fn staged_policy() -> TransactionSigningPolicy {
+        let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
+        value["validators"]["spend_tendermint_update_session"] = serde_json::json!({
+            "address": format!("70{}", "18".repeat(28)),
+            "script_hash": "40".repeat(28),
+            "ref_utxo": { "tx_hash": "50".repeat(32), "output_index": 0 }
+        });
+        value["validators"]["mint_tendermint_update_session"] = serde_json::json!({
+            "script_hash": "41".repeat(28),
+            "ref_utxo": { "tx_hash": "51".repeat(32), "output_index": 0 }
+        });
+        TransactionSigningPolicy::from_json(&serde_json::to_string(&value).unwrap(), 0, limits())
+            .unwrap()
+    }
+
+    #[test]
+    fn staged_advance_accepts_shared_wallet_collateral_without_relaxing_its_redeemer() {
+        for proof_backed in [false, true] {
+            let mut policy = staged_policy();
+            if proof_backed {
+                policy.consensus_history_format = ConsensusHistoryFormat::ProofBackedV1;
+            }
+            let session = policy.tendermint_session.as_ref().unwrap();
+            let token_name = vec![0x55; 32];
+            let (mut tx, mut resolved) = shared_collateral_fixture(&policy, false);
+            tx.transaction_body.inputs = tx.transaction_body.inputs[1..].to_vec().into();
+            resolved.regular.remove(&TransactionOutRef {
+                transaction_id: RECOVERY_HOST_INPUT_ID,
+                output_index: 0,
+            });
+            resolved.regular.insert(
+                TransactionOutRef {
+                    transaction_id: RECOVERY_SUBJECT_INPUT_ID,
+                    output_index: 0,
+                },
+                ResolvedInput {
+                    inline_datum: None,
+                    address: session.address.clone(),
+                    lovelace: 2_000_000,
+                    assets: vec![ResolvedAsset {
+                        policy_id: session.policy.clone().try_into().unwrap(),
+                        asset_name: token_name.clone(),
+                        quantity: 1,
+                    }],
+                },
+            );
+
+            // Synthetic policy fixture: the ledger, not the signer, validates the
+            // session datum and validator batch. Preserve the pinned NFT and inline
+            // datum shape required by the staged signer.
+            let mut encoded_output = Vec::new();
+            let mut encoder = minicbor::Encoder::new(&mut encoded_output);
+            encoder
+                .map(3)
+                .unwrap()
+                .u8(0)
+                .unwrap()
+                .bytes(&session.address)
+                .unwrap();
+            encoder
+                .u8(1)
+                .unwrap()
+                .array(2)
+                .unwrap()
+                .u64(2_000_000)
+                .unwrap();
+            encoder.map(1).unwrap().bytes(&session.policy).unwrap();
+            encoder
+                .map(1)
+                .unwrap()
+                .bytes(&token_name)
+                .unwrap()
+                .u64(1)
+                .unwrap();
+            encoder.u8(2).unwrap().array(2).unwrap().u8(1).unwrap();
+            encoder
+                .tag(minicbor::data::Tag::Cbor)
+                .unwrap()
+                .bytes(&[0xd8, 0x79, 0x80])
+                .unwrap();
+            tx.transaction_body.outputs = vec![
+                minicbor::decode(&encoded_output).unwrap(),
+                tx.transaction_body.outputs[2].clone(),
+            ];
+            let session_reference =
+                &required_script(&policy.scripts, "spendtendermintupdatesession")
+                    .unwrap()
+                    .reference;
+            tx.transaction_body.reference_inputs = Some(
+                vec![pallas_primitives::conway::TransactionInput {
+                    transaction_id: session_reference.0.as_slice().into(),
+                    index: session_reference.1,
+                }]
+                .try_into()
+                .unwrap(),
+            );
+            edit_redeemers(&mut tx, |redeemers| {
+                redeemers.truncate(1);
+                redeemers[0].1.data = data_constructor(
+                    1,
+                    vec![PlutusData::Array(vec![data_constructor(0, vec![])])],
+                );
+            });
+            let signer = recovery_signer();
+            let message = MsgUpdateClient {
+                client_id: "07-tendermint-7".to_string(),
+                client_message: Some(prost_types::Any {
+                    type_url: TENDERMINT_HEADER_TYPE_URL.to_string(),
+                    value: Vec::new(),
+                }),
+                signer: signer.clone(),
+            }
+            .encode_to_vec();
+            let intent = SigningIntent::staged_tendermint_update(
+                "/ibc.core.client.v1.MsgUpdateClient",
+                &message,
+                &signer,
+                0,
+            )
+            .unwrap();
+            let validate = |tx: &pallas_primitives::conway::Tx| {
+                let encoded = minicbor::to_vec(tx).unwrap();
+                let transaction: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+                policy.validate(&transaction, encoded.len(), &signer, &intent, &resolved)
+            };
+            validate(&tx).unwrap();
+            edit_redeemers(&mut tx, |redeemers| {
+                redeemers[0].1.data = data_constructor(3, vec![]);
+            });
+            assert!(validate(&tx)
+                .unwrap_err()
+                .to_string()
+                .contains("session advance must use VerifyTrusted or VerifyTarget"));
+        }
+    }
+
+    fn staged_finalization_fixture(
+        policy: &TransactionSigningPolicy,
+        evidence: bool,
+    ) -> (
+        pallas_primitives::conway::Tx,
+        ResolvedTransactionInputs,
+        SigningIntent,
+    ) {
+        use pallas_primitives::conway::{ExUnits, RedeemerTag, RedeemersKey, RedeemersValue};
+        let (mut tx, mut resolved) = shared_collateral_fixture(policy, false);
+        let session = policy.tendermint_session.as_ref().unwrap();
+        let names = if evidence {
+            vec![vec![0x55; 32], vec![0x56; 32]]
+        } else {
+            vec![vec![0x55; 32]]
+        };
+        let mut inputs = tx.transaction_body.inputs.to_vec();
+        for (index, name) in names.iter().enumerate() {
+            let transaction_id = [0x44 + index as u8; 32];
+            inputs.push(pallas_primitives::conway::TransactionInput {
+                transaction_id: transaction_id.into(),
+                index: 0,
+            });
+            resolved.regular.insert(
+                TransactionOutRef {
+                    transaction_id,
+                    output_index: 0,
+                },
+                ResolvedInput {
+                    inline_datum: None,
+                    address: session.address.clone(),
+                    lovelace: 2_000_000,
+                    assets: vec![ResolvedAsset {
+                        policy_id: session.policy.clone().try_into().unwrap(),
+                        asset_name: name.clone(),
+                        quantity: 1,
+                    }],
+                },
+            );
+        }
+        tx.transaction_body.inputs = inputs.into();
+        tx.transaction_body.mint = Some(
+            vec![(
+                session.policy.as_slice().into(),
+                names
+                    .iter()
+                    .map(|name| (name.clone().into(), (-1i64).try_into().unwrap()))
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap(),
+            )]
+            .try_into()
+            .unwrap(),
+        );
+        set_test_wallet_value(
+            &mut tx.transaction_body.outputs[2],
+            2_500_000 + 2_000_000 * names.len() as u64,
+            Some(7),
+        );
+        let mut references: Vec<_> = tx
+            .transaction_body
+            .reference_inputs
+            .as_ref()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        for script in [
+            "spendtendermintupdatesession",
+            "minttendermintupdatesession",
+        ] {
+            let reference = &required_script(&policy.scripts, script).unwrap().reference;
+            references.push(pallas_primitives::conway::TransactionInput {
+                transaction_id: reference.0.as_slice().into(),
+                index: reference.1,
+            });
+        }
+        tx.transaction_body.reference_inputs = Some(references.try_into().unwrap());
+        if policy.consensus_history_format == ConsensusHistoryFormat::ProofBackedV1 {
+            let support = required_script(&policy.scripts, "recoverclient").unwrap();
+            let account = [&[0xf0 | policy.network_id][..], support.hash.as_slice()].concat();
+            tx.transaction_body.withdrawals = Some(vec![(account.into(), 0)].try_into().unwrap());
+            let mut refs = tx
+                .transaction_body
+                .reference_inputs
+                .as_ref()
+                .unwrap()
+                .clone()
+                .to_vec();
+            let support_ref = pallas_primitives::conway::TransactionInput {
+                transaction_id: support.reference.0.as_slice().into(),
+                index: support.reference.1,
+            };
+            if !refs.contains(&support_ref) {
+                refs.push(support_ref);
+            }
+            tx.transaction_body.reference_inputs = Some(refs.try_into().unwrap());
+            edit_redeemers(&mut tx, |redeemers| {
+                redeemers.push((
+                    RedeemersKey {
+                        tag: RedeemerTag::Reward,
+                        index: 0,
+                    },
+                    RedeemersValue {
+                        data: data_constructor(
+                            4,
+                            vec![data_token(
+                                &policy.client_state.policy,
+                                &policy.state_token_name(StateOutputKind::Client, 7),
+                            )],
+                        ),
+                        ex_units: ExUnits { mem: 1, steps: 1 },
+                    },
+                ))
+            });
+        }
+        edit_redeemers(&mut tx, |redeemers| {
+            redeemers
+                .iter_mut()
+                .find(|(key, _)| key.tag == RedeemerTag::Spend && key.index == 1)
+                .unwrap()
+                .1
+                .data = data_constructor(if evidence { 3 } else { 0 }, {
+                let mut fields: Vec<_> = names
+                    .iter()
+                    .map(|name| data_token(&session.policy, name))
+                    .collect();
+                if policy.consensus_history_format == ConsensusHistoryFormat::ProofBackedV1 {
+                    fields.push(PlutusData::Array(vec![]));
+                    if !evidence {
+                        fields.push(PlutusData::Array(vec![
+                            PlutusData::BoundedBytes(
+                                vec![0; 32].into()
+                            );
+                            64
+                        ]));
+                    }
+                }
+                fields
+            });
+            for index in 0..names.len() {
+                redeemers.push((
+                    RedeemersKey {
+                        tag: RedeemerTag::Spend,
+                        index: 3 + index as u32,
+                    },
+                    RedeemersValue {
+                        data: data_constructor(2, vec![]),
+                        ex_units: ExUnits { mem: 1, steps: 1 },
+                    },
+                ));
+            }
+            let burned = names
+                .iter()
+                .map(|name| PlutusData::BoundedBytes(name.clone().into()))
+                .collect::<Vec<_>>();
+            redeemers.push((
+                RedeemersKey {
+                    tag: RedeemerTag::Mint,
+                    index: 0,
+                },
+                RedeemersValue {
+                    data: data_constructor(
+                        if evidence { 2 } else { 1 },
+                        if evidence {
+                            vec![PlutusData::Array(burned)]
+                        } else {
+                            burned
+                        },
+                    ),
+                    ex_units: ExUnits { mem: 1, steps: 1 },
+                },
+            ));
+        });
+        let signer = recovery_signer();
+        let message = MsgUpdateClient {
+            client_id: "07-tendermint-7".into(),
+            signer: signer.clone(),
+            client_message: Some(prost_types::Any {
+                type_url: if evidence {
+                    TENDERMINT_MISBEHAVIOR_TYPE_URL
+                } else {
+                    TENDERMINT_HEADER_TYPE_URL
+                }
+                .into(),
+                value: vec![],
+            }),
+        }
+        .encode_to_vec();
+        let intent = SigningIntent::staged_tendermint_update(
+            "/ibc.core.client.v1.MsgUpdateClient",
+            &message,
+            &signer,
+            0,
+        )
+        .unwrap();
+        (tx, resolved, intent)
+    }
+
+    fn validate_staged_fixture(
+        policy: &TransactionSigningPolicy,
+        tx: &pallas_primitives::conway::Tx,
+        resolved: &ResolvedTransactionInputs,
+        intent: &SigningIntent,
+    ) -> Result<(), Error> {
+        let encoded = minicbor::to_vec(tx).unwrap();
+        let transaction: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+        policy.validate(
+            &transaction,
+            encoded.len(),
+            &recovery_signer(),
+            intent,
+            resolved,
+        )
+    }
+
+    #[test]
+    fn proof_backed_staged_finalization_binds_history_shape_and_support_withdrawal() {
+        use pallas_primitives::conway::RedeemerTag;
+        let mut policy = staged_policy();
+        policy.consensus_history_format = ConsensusHistoryFormat::ProofBackedV1;
+        for evidence in [false, true] {
+            let (tx, resolved, intent) = staged_finalization_fixture(&policy, evidence);
+            validate_staged_fixture(&policy, &tx, &resolved, &intent).unwrap();
+            let mut missing = tx.clone();
+            missing.transaction_body.withdrawals = None;
+            assert!(validate_staged_fixture(&policy, &missing, &resolved, &intent).is_err());
+            let mut wrong_branch = tx.clone();
+            edit_redeemers(&mut wrong_branch, |redeemers| {
+                let reward = &mut redeemers
+                    .iter_mut()
+                    .find(|(key, _)| key.tag == RedeemerTag::Reward)
+                    .unwrap()
+                    .1;
+                reward.data = data_constructor(
+                    1,
+                    vec![data_token(
+                        &policy.client_state.policy,
+                        &policy.state_token_name(StateOutputKind::Client, 7),
+                    )],
+                );
+            });
+            assert!(validate_staged_fixture(&policy, &wrong_branch, &resolved, &intent).is_err());
+            for invalid in 0..4 {
+                let mut changed = tx.clone();
+                edit_redeemers(&mut changed, |redeemers| {
+                    let data = &mut redeemers
+                        .iter_mut()
+                        .find(|(key, _)| key.tag == RedeemerTag::Spend && key.index == 1)
+                        .unwrap()
+                        .1
+                        .data;
+                    let alternative = if evidence { 3 } else { 0 };
+                    let mut fields = constructor_fields(data, alternative).unwrap().to_vec();
+                    match invalid {
+                        0 => {
+                            fields.pop();
+                        }
+                        1 => {
+                            fields[if evidence { 2 } else { 1 }] =
+                                PlutusData::Array(vec![data_constructor(0, vec![]); 3])
+                        }
+                        2 => fields[0] = data_token(&[0xaa; 28], &[0x55; 32]),
+                        _ => fields[2] = PlutusData::BoundedBytes(vec![0; 32].into()),
+                    }
+                    *data = data_constructor(alternative, fields);
+                });
+                assert!(validate_staged_fixture(&policy, &changed, &resolved, &intent).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn staged_finalization_requires_the_requested_header_or_evidence_shape() {
+        let policy = staged_policy();
+        for evidence in [false, true] {
+            let (tx, resolved, mut intent) = staged_finalization_fixture(&policy, evidence);
+            validate_staged_fixture(&policy, &tx, &resolved, &intent).unwrap();
+            intent.staged_misbehaviour = !evidence;
+            assert!(validate_staged_fixture(&policy, &tx, &resolved, &intent)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match the requested header or misbehaviour"));
+        }
+    }
+
+    #[test]
+    fn staged_misbehaviour_rejects_wrong_or_duplicate_session_redeemers() {
+        use pallas_primitives::conway::RedeemerTag;
+        let policy = staged_policy();
+        let session = policy.tendermint_session.as_ref().unwrap();
+        let (tx, resolved, intent) = staged_finalization_fixture(&policy, true);
+        for mutation in 0..8 {
+            let mut bad = tx.clone();
+            edit_redeemers(&mut bad, |redeemers| {
+                let (tag, index, data) = match mutation {
+                    0 | 1 => (
+                        RedeemerTag::Spend,
+                        3 + mutation,
+                        data_constructor(3, vec![]),
+                    ),
+                    2 => (
+                        RedeemerTag::Mint,
+                        0,
+                        data_constructor(1, vec![PlutusData::BoundedBytes(vec![0x55; 32].into())]),
+                    ),
+                    3 => (
+                        RedeemerTag::Mint,
+                        0,
+                        data_constructor(
+                            2,
+                            vec![PlutusData::Array(vec![
+                                PlutusData::BoundedBytes(
+                                    vec![0x55; 32].into()
+                                );
+                                2
+                            ])],
+                        ),
+                    ),
+                    4 => (
+                        RedeemerTag::Spend,
+                        1,
+                        data_constructor(3, vec![data_token(&session.policy, &[0x55; 32]); 2]),
+                    ),
+                    5 => (
+                        RedeemerTag::Spend,
+                        1,
+                        data_constructor(
+                            3,
+                            vec![
+                                data_token(&session.policy, &[0x55; 32]),
+                                data_token(&[0x98; 28], &[0x56; 32]),
+                            ],
+                        ),
+                    ),
+                    6 => (
+                        RedeemerTag::Spend,
+                        1,
+                        data_constructor(0, vec![data_token(&session.policy, &[0x55; 32])]),
+                    ),
+                    _ => (RedeemerTag::Spend, 0, data_constructor(5, vec![])),
+                };
+                redeemers
+                    .iter_mut()
+                    .find(|(key, _)| key.tag == tag && key.index == index)
+                    .unwrap()
+                    .1
+                    .data = data;
+            });
+            assert!(
+                validate_staged_fixture(&policy, &bad, &resolved, &intent).is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_misbehaviour_requires_exactly_two_pinned_session_burns_and_inputs() {
+        let policy = staged_policy();
+        let (tx, resolved, intent) = staged_finalization_fixture(&policy, true);
+        for mutation in 0..8 {
+            let mut bad = tx.clone();
+            let mut bad_inputs = resolved.clone();
+            match mutation {
+                0 => bad.transaction_body.mint = None,
+                1..=3 => {
+                    let session = policy.tendermint_session.as_ref().unwrap();
+                    let entries = if mutation == 1 {
+                        vec![(0x55, -1)]
+                    } else if mutation == 2 {
+                        vec![(0x55, -1), (0x56, 1)]
+                    } else {
+                        vec![(0x55, -1), (0x57, -1)]
+                    };
+                    bad.transaction_body.mint = Some(
+                        vec![(
+                            session.policy.as_slice().into(),
+                            entries
+                                .into_iter()
+                                .map(|(name, quantity)| {
+                                    (
+                                        vec![name; 32].into(),
+                                        i64::from(quantity).try_into().unwrap(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .try_into()
+                                .unwrap(),
+                        )]
+                        .try_into()
+                        .unwrap(),
+                    );
+                }
+                4 | 5 => {
+                    let second = bad_inputs
+                        .regular
+                        .get_mut(&TransactionOutRef {
+                            transaction_id: [0x45; 32],
+                            output_index: 0,
+                        })
+                        .unwrap();
+                    if mutation == 4 {
+                        second.assets[0].asset_name = vec![0x55; 32];
+                    } else {
+                        second.assets[0].policy_id = [0x98; 28];
+                    }
+                }
+                6 => {
+                    let subject = bad_inputs
+                        .regular
+                        .get_mut(&TransactionOutRef {
+                            transaction_id: RECOVERY_SUBJECT_INPUT_ID,
+                            output_index: 0,
+                        })
+                        .unwrap();
+                    subject.assets[0].asset_name =
+                        policy.state_token_name(StateOutputKind::Client, 8);
+                }
+                _ => {
+                    let third = bad_inputs.regular[&TransactionOutRef {
+                        transaction_id: [0x45; 32],
+                        output_index: 0,
+                    }]
+                        .clone();
+                    bad_inputs.regular.insert(
+                        TransactionOutRef {
+                            transaction_id: [0x46; 32],
+                            output_index: 0,
+                        },
+                        third,
+                    );
+                    let mut inputs = bad.transaction_body.inputs.to_vec();
+                    inputs.push(pallas_primitives::conway::TransactionInput {
+                        transaction_id: [0x46; 32].into(),
+                        index: 0,
+                    });
+                    bad.transaction_body.inputs = inputs.into();
+                }
+            }
+            assert!(
+                validate_staged_fixture(&policy, &bad, &bad_inputs, &intent).is_err(),
+                "mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_recovery_uses_its_pinned_constructor_and_exact_substitute() {
+        use pallas_primitives::conway::RedeemerTag;
+        let policy = staged_policy();
+        let mut tx = client_transaction(&policy, true);
+        assert!(validate_client_fixture(&policy, &tx, true).is_err());
+        edit_redeemers(&mut tx, |redeemers| {
+            redeemers
+                .iter_mut()
+                .find(|(key, _)| key.tag == RedeemerTag::Spend && key.index == 1)
+                .unwrap()
+                .1
+                .data = data_constructor(
+                2,
+                vec![data_token(
+                    &policy.client_state.policy,
+                    &policy.state_token_name(StateOutputKind::Client, 12),
+                )],
+            );
+        });
+        validate_client_fixture(&policy, &tx, true).unwrap();
+        let direct = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        assert!(validate_client_fixture(&direct, &tx, true).is_err());
+        edit_redeemers(&mut tx, |redeemers| {
+            redeemers
+                .iter_mut()
+                .find(|(key, _)| key.tag == RedeemerTag::Spend && key.index == 1)
+                .unwrap()
+                .1
+                .data = data_constructor(
+                2,
+                vec![data_token(
+                    &policy.client_state.policy,
+                    &policy.state_token_name(StateOutputKind::Client, 13),
+                )],
+            );
+        });
+        assert!(validate_client_fixture(&policy, &tx, true).is_err());
+    }
+
     fn transaction_with_withdrawal(reward_account: &[u8], amount: u64) -> Vec<u8> {
         let mut encoded = Vec::new();
         let mut encoder = minicbor::Encoder::new(&mut encoded);
@@ -4150,13 +6878,13 @@ mod tests {
         let reject = |reason| Error::Signer(reason);
 
         policy
-            .validate_withdrawals(&tx.transaction_body, &recovery_intent, &reject)
+            .validate_withdrawals(&tx.transaction_body, &recovery_intent, false, &reject)
             .unwrap();
 
         let encoded = transaction_with_withdrawal(&reward_account, 1);
         let tx: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
         assert!(policy
-            .validate_withdrawals(&tx.transaction_body, &recovery_intent, &reject)
+            .validate_withdrawals(&tx.transaction_body, &recovery_intent, false, &reject)
             .is_err());
 
         let encoded = transaction_with_withdrawal(&reward_account, 0);
@@ -4165,6 +6893,7 @@ mod tests {
             .validate_withdrawals(
                 &tx.transaction_body,
                 &bare_intent("/ibc.core.client.v1.MsgUpdateClient", None),
+                false,
                 &reject,
             )
             .is_err());
@@ -4219,18 +6948,20 @@ mod tests {
         let reject = |reason| Error::Signer(reason);
 
         policy
-            .validate_recovery_withdrawal_redeemer(
+            .validate_client_withdrawal_redeemer(
                 &redeemers,
                 &subject_name,
-                &substitute_name,
+                Some(&substitute_name),
+                false,
                 &reject,
             )
             .unwrap();
         assert!(policy
-            .validate_recovery_withdrawal_redeemer(
+            .validate_client_withdrawal_redeemer(
                 &redeemers,
                 &substitute_name,
-                &subject_name,
+                Some(&subject_name),
+                false,
                 &reject,
             )
             .is_err());
@@ -4251,6 +6982,145 @@ mod tests {
             memo: String::new(),
         }
         .encode_to_vec()
+    }
+
+    #[test]
+    fn outbound_sender_preserves_refund_key_and_separate_signer_address() {
+        use bech32::ToBase32;
+        let key = "99".repeat(28);
+        let signer = format!("60{key}");
+        let address = bech32::encode(
+            "addr_test",
+            hex::decode(&signer).unwrap().to_base32(),
+            bech32::Variant::Bech32,
+        )
+        .unwrap();
+        for sender in [&key, &signer, &address] {
+            assert_eq!(transfer_sender_key_hash(sender).unwrap(), key);
+        }
+        let message = transfer_message("lovelace".to_string(), signer.clone());
+        let intent = SigningIntent::ibc(
+            "/ibc.applications.transfer.v1.MsgTransfer",
+            &message,
+            &signer,
+            0,
+        )
+        .unwrap();
+        assert_eq!(intent.transfer.unwrap().sender, key);
+        for invalid in [
+            format!("70{key}"),
+            format!("60{key}00"),
+            format!("00{key}{key}"),
+            "99".repeat(27),
+        ] {
+            assert!(transfer_sender_key_hash(&invalid).is_err());
+        }
+        let wrong_signer = format!("60{}", "88".repeat(28));
+        assert!(SigningIntent::ibc(
+            "/ibc.applications.transfer.v1.MsgTransfer",
+            &message,
+            &wrong_signer,
+            0
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn outbound_transfer_sender_uses_payment_key_hash_without_relaxing_signer_check() {
+        use bech32::ToBase32;
+
+        let payment_key_hash = "99".repeat(28);
+        let signer = format!("60{payment_key_hash}");
+        let bech32_signer = bech32::encode(
+            "addr_test",
+            hex::decode(&signer).unwrap().to_base32(),
+            bech32::Variant::Bech32,
+        )
+        .unwrap();
+
+        for sender in [signer.clone(), bech32_signer, payment_key_hash.clone()] {
+            let message = transfer_message("lovelace".to_string(), sender);
+            let intent = SigningIntent::ibc(
+                "/ibc.applications.transfer.v1.MsgTransfer",
+                &message,
+                &signer,
+                0,
+            )
+            .unwrap();
+            assert_eq!(intent.transfer.unwrap().sender, payment_key_hash);
+        }
+
+        for sender in [
+            format!("60{}", "98".repeat(28)),
+            format!("61{payment_key_hash}"),
+            format!("70{payment_key_hash}"),
+            format!("60{}", "99".repeat(27)),
+        ] {
+            let message = transfer_message("lovelace".to_string(), sender);
+            assert!(SigningIntent::ibc(
+                "/ibc.applications.transfer.v1.MsgTransfer",
+                &message,
+                &signer,
+                0,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn outbound_transfer_packet_still_binds_the_sender_to_the_message() {
+        let payment_key_hash = "99".repeat(28);
+        let signer = format!("60{payment_key_hash}");
+        let message = transfer_message("lovelace".to_string(), signer.clone());
+        let intent = SigningIntent::ibc(
+            "/ibc.applications.transfer.v1.MsgTransfer",
+            &message,
+            &signer,
+            0,
+        )
+        .unwrap();
+        let transfer = intent.transfer.as_ref().unwrap();
+        let bytes = |value: &[u8]| PlutusData::BoundedBytes(value.to_vec().into());
+        let integer = |value: i64| PlutusData::BigInt(BigInt::Int(value.into()));
+        let constructor = |fields: Vec<PlutusData>| {
+            PlutusData::Constr(pallas_primitives::alonzo::Constr {
+                tag: 121,
+                any_constructor: None,
+                fields,
+            })
+        };
+        let packet_json = serde_json::json!({
+            "denom": LOVELACE_HEX,
+            "amount": "42",
+            "sender": payment_key_hash,
+            "receiver": "destination",
+            "memo": "",
+        });
+        let fields = vec![
+            integer(1),
+            bytes(b"transfer"),
+            bytes(b"channel-0"),
+            bytes(b"transfer"),
+            bytes(b"channel-1"),
+            bytes(&serde_json::to_vec(&packet_json).unwrap()),
+            constructor(vec![integer(0), integer(0)]),
+            integer(1),
+        ];
+        assert!(outbound_transfer_packet_matches(
+            &constructor(fields.clone()),
+            transfer
+        ));
+
+        for altered_sender in [signer, "98".repeat(28)] {
+            let mut altered_packet = packet_json.clone();
+            altered_packet["sender"] = serde_json::Value::String(altered_sender);
+            let mut altered_fields = fields.clone();
+            altered_fields[5] = bytes(&serde_json::to_vec(&altered_packet).unwrap());
+            assert!(!outbound_transfer_packet_matches(
+                &constructor(altered_fields),
+                transfer,
+            ));
+        }
     }
 
     #[test]
@@ -4353,6 +7223,8 @@ mod tests {
             acknowledgement: None,
             prune_sequence: None,
             funded_intent: None,
+            staged_tendermint: false,
+            staged_misbehaviour: false,
         }
     }
 

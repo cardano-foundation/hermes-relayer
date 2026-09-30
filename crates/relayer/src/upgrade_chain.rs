@@ -107,14 +107,21 @@ pub fn requires_legacy_upgrade_proposal(
         return Ok(true);
     };
 
+    // Only `Specs::Cosmos` remains when the Penumbra and Namada backends are disabled.
+    #[allow(clippy::infallible_destructuring_match)]
     let version_specs = match version_specs {
         Specs::Cosmos(v) => v,
+        #[cfg(feature = "penumbra")]
         Specs::Penumbra(_) => {
             return Err(UpgradeChainError::submit(
                 dst_chain.id(),
-                crate::chain::namada::error::Error::upgrade().into(),
+                crate::error::Error::temp_penumbra_error(
+                    "Penumbra doesn't support `MsgIbcSoftwareUpgrade` and `UpgradeProposal`"
+                        .to_string(),
+                ),
             ))
         }
+        #[cfg(feature = "namada")]
         Specs::Namada(_) => {
             return Err(UpgradeChainError::submit(
                 dst_chain.id(),

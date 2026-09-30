@@ -337,14 +337,14 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
     pub fn build_update_client_on_dst(&self, height: Height) -> Result<Vec<Any>, LinkError> {
         let client = self.restore_dst_client();
         client
-            .wait_and_build_update_client(height)
+            .wait_and_build_update_client_for_proof(height)
             .map_err(LinkError::client)
     }
 
     pub fn build_update_client_on_src(&self, height: Height) -> Result<Vec<Any>, LinkError> {
         let client = self.restore_src_client();
         client
-            .wait_and_build_update_client(height)
+            .wait_and_build_update_client_for_proof(height)
             .map_err(LinkError::client)
     }
 
@@ -2014,7 +2014,7 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
         // instant in the past, i.e. when this client update was first processed (`processed_time`)
         let scheduled_time = if od.conn_delay_needed() {
             debug!("connection delay must be taken into account: updating client");
-            let target_height = od.proofs_height.increment();
+            let target_height = od.client_update_height(self)?;
             match od.target {
                 OperationalDataTarget::Source => {
                     let update_height = self.update_client_src(target_height, od.tracking_id)?;
@@ -2252,6 +2252,10 @@ fn check_ics20_fields_size(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "relay_path_delay_test.rs"]
+mod delayed_height_tests;
 
 #[cfg(test)]
 mod tests {

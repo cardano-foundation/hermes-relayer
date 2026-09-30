@@ -16,18 +16,34 @@ description  = """
 all-features = true
 
 [features]
-default   = ["flex-error/std", "flex-error/eyre_tracer"]
+default  = ["std"]
+# `std::error::Error` support and the eyre tracer for `flex-error`.
+std      = ["flex-error/std", "flex-error/eyre_tracer"]
+# Penumbra chain backend (opt-in).
+penumbra = [
+    "dep:penumbra-sdk-proto",
+    "dep:penumbra-sdk-wallet",
+    "dep:penumbra-sdk-keys",
+    "dep:penumbra-sdk-ibc",
+    "dep:penumbra-sdk-custody",
+    "dep:penumbra-sdk-fee",
+    "dep:penumbra-sdk-view",
+    "dep:penumbra-sdk-transaction",
+    "dep:pbjson-types",
+]
+# Namada chain backend (opt-in).
+namada   = ["dep:namada_sdk"]
 
 [dependencies]
-penumbra-sdk-proto       = { version = "2.0.0", features = ["box-grpc", "rpc"] }
-penumbra-sdk-wallet      = "2.0.0"
-penumbra-sdk-keys        = "2.0.0"
-penumbra-sdk-ibc         = "2.0.0"
-penumbra-sdk-custody     = "2.0.0"
-penumbra-sdk-fee         = "2.0.0"
-penumbra-sdk-view        = "2.0.0"
-penumbra-sdk-transaction = { version = "2.0.0", features = ["download-proving-keys"] }
-pbjson-types = "0.7"
+penumbra-sdk-proto       = { version = "2.0.0", features = ["box-grpc", "rpc"], optional = true }
+penumbra-sdk-wallet      = { version = "2.0.0", optional = true }
+penumbra-sdk-keys        = { version = "2.0.0", optional = true }
+penumbra-sdk-ibc         = { version = "2.0.0", optional = true }
+penumbra-sdk-custody     = { version = "2.0.0", optional = true }
+penumbra-sdk-fee         = { version = "2.0.0", optional = true }
+penumbra-sdk-view        = { version = "2.0.0", optional = true }
+penumbra-sdk-transaction = { version = "2.0.0", features = ["download-proving-keys"], optional = true }
+pbjson-types             = { version = "0.7", optional = true }
 
 ibc-proto         = { workspace = true, features = ["serde"] }
 ibc-telemetry     = { workspace = true }
@@ -57,7 +73,7 @@ humantime                        = { workspace = true }
 humantime-serde                  = { workspace = true }
 itertools                        = { workspace = true }
 moka                             = { workspace = true, features = ["sync"] }
-namada_sdk                       = { workspace = true }
+namada_sdk                       = { workspace = true, optional = true }
 num-bigint                       = { workspace = true, features = ["serde"] }
 num-rational                     = { workspace = true, features = ["num-bigint", "serde"] }
 once_cell                        = { workspace = true }

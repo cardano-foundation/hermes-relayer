@@ -10,13 +10,14 @@ use abscissa_core::{Command, Runnable};
 use eyre::eyre;
 use hdpath::StandardHDPath;
 use ibc_relayer::{
-    chain::{cardano::signing_key_pair::CardanoSigningKeyPair, namada::wallet::CliWalletUtils},
+    chain::cardano::signing_key_pair::CardanoSigningKeyPair,
     config::{ChainConfig, Config},
     keyring::{
-        AnySigningKeyPair, KeyRing, NamadaKeyPair, Secp256k1KeyPair, SigningKeyPair,
-        SigningKeyPairSized, Store,
+        AnySigningKeyPair, KeyRing, Secp256k1KeyPair, SigningKeyPair, SigningKeyPairSized, Store,
     },
 };
+#[cfg(feature = "namada")]
+use ibc_relayer::{chain::namada::wallet::CliWalletUtils, keyring::NamadaKeyPair};
 use ibc_relayer_types::core::ics24_host::identifier::ChainId;
 use tracing::warn;
 
@@ -222,6 +223,7 @@ pub fn add_key(
             keyring.add_key(key_name, key_pair.clone())?;
             key_pair.into()
         }
+        #[cfg(feature = "namada")]
         ChainConfig::Namada(config) => {
             let mut keyring =
                 KeyRing::new_namada(Store::Test, &config.id, &config.key_store_folder)?;
@@ -252,6 +254,7 @@ pub fn add_key(
             keyring.add_key(key_name, namada_key.clone())?;
             namada_key.into()
         }
+        #[cfg(feature = "penumbra")]
         ChainConfig::Penumbra(_) => unimplemented!("no key storage support for penumbra"),
         ChainConfig::Cardano(config) => {
             let mut keyring = KeyRing::new(
@@ -310,11 +313,13 @@ pub fn restore_key(
             keyring.add_key(key_name, key_pair.clone())?;
             key_pair.into()
         }
+        #[cfg(feature = "namada")]
         ChainConfig::Namada(_) => {
             return Err(eyre!(
                 "Namada key can't be restored here. Use Namada wallet."
             ));
         }
+        #[cfg(feature = "penumbra")]
         ChainConfig::Penumbra(_) => return Err(eyre!("no key storage support for penumbra")),
         ChainConfig::Cardano(config) => {
             let mut keyring = KeyRing::new(

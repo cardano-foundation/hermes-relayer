@@ -844,7 +844,7 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
 
     pub fn build_update_client_on_src(&self, height: Height) -> Result<Vec<Any>, ConnectionError> {
         let client = self.restore_src_client();
-        client.wait_and_build_update_client(height).map_err(|e| {
+        client.prepare_update_client_for_proof(height).map_err(|e| {
             ConnectionError::client_operation(
                 self.src_client_id().clone(),
                 self.src_chain().id(),
@@ -855,7 +855,7 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
 
     pub fn build_update_client_on_dst(&self, height: Height) -> Result<Vec<Any>, ConnectionError> {
         let client = self.restore_dst_client();
-        client.wait_and_build_update_client(height).map_err(|e| {
+        client.prepare_update_client_for_proof(height).map_err(|e| {
             ConnectionError::client_operation(
                 self.dst_client_id().clone(),
                 self.dst_chain().id(),

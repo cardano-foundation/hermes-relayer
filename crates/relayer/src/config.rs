@@ -29,6 +29,7 @@ use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ChannelId, PortId
 use ibc_relayer_types::timestamp::ZERO_DURATION;
 
 use crate::chain::cosmos::config::CosmosSdkConfig;
+#[cfg(feature = "penumbra")]
 use crate::chain::penumbra::config::PenumbraConfig;
 use crate::config::types::ics20_field_size_limit::Ics20FieldSizeLimit;
 use crate::config::types::TrustThreshold;
@@ -323,11 +324,18 @@ impl Config {
             }
 
             match chain_config {
-                ChainConfig::CosmosSdk(cosmos_config) | ChainConfig::Namada(cosmos_config) => {
+                ChainConfig::CosmosSdk(cosmos_config) => {
                     cosmos_config
                         .validate()
                         .map_err(Into::<Diagnostic<Error>>::into)?;
                 }
+                #[cfg(feature = "namada")]
+                ChainConfig::Namada(cosmos_config) => {
+                    cosmos_config
+                        .validate()
+                        .map_err(Into::<Diagnostic<Error>>::into)?;
+                }
+                #[cfg(feature = "penumbra")]
                 ChainConfig::Penumbra { .. } => { /* no-op for now (erwan) */ }
                 ChainConfig::Cardano { .. } => { /* no-op for Cardano */ }
             }
@@ -663,7 +671,9 @@ pub enum EventSourceMode {
 pub enum ChainConfig {
     CosmosSdk(CosmosSdkConfig),
     // Reuse CosmosSdkConfig for tendermint light clients
+    #[cfg(feature = "namada")]
     Namada(CosmosSdkConfig),
+    #[cfg(feature = "penumbra")]
     Penumbra(PenumbraConfig),
     Cardano(crate::chain::cardano::CardanoConfig),
 }
@@ -672,7 +682,9 @@ impl ChainConfig {
     pub fn id(&self) -> &ChainId {
         match self {
             Self::CosmosSdk(config) => &config.id,
+            #[cfg(feature = "namada")]
             Self::Namada(config) => &config.id,
+            #[cfg(feature = "penumbra")]
             Self::Penumbra(config) => &config.id,
             Self::Cardano(config) => &config.id,
         }
@@ -681,7 +693,9 @@ impl ChainConfig {
     pub fn packet_filter(&self) -> &PacketFilter {
         match self {
             Self::CosmosSdk(config) => &config.packet_filter,
+            #[cfg(feature = "namada")]
             Self::Namada(config) => &config.packet_filter,
+            #[cfg(feature = "penumbra")]
             Self::Penumbra(config) => &config.packet_filter,
             Self::Cardano(config) => &config.packet_filter,
         }
@@ -690,7 +704,9 @@ impl ChainConfig {
     pub fn max_block_time(&self) -> Duration {
         match self {
             Self::CosmosSdk(config) => config.max_block_time,
+            #[cfg(feature = "namada")]
             Self::Namada(config) => config.max_block_time,
+            #[cfg(feature = "penumbra")]
             Self::Penumbra(config) => config.max_block_time,
             Self::Cardano(config) => config.max_block_time,
         }
@@ -699,7 +715,9 @@ impl ChainConfig {
     pub fn key_name(&self) -> &String {
         match self {
             Self::CosmosSdk(config) => &config.key_name,
+            #[cfg(feature = "namada")]
             Self::Namada(config) => &config.key_name,
+            #[cfg(feature = "penumbra")]
             Self::Penumbra(config) => &config.stub_key_name,
             Self::Cardano(config) => &config.key_name,
         }
@@ -708,7 +726,9 @@ impl ChainConfig {
     pub fn set_key_name(&mut self, key_name: String) {
         match self {
             Self::CosmosSdk(config) => config.key_name = key_name,
+            #[cfg(feature = "namada")]
             Self::Namada(config) => config.key_name = key_name,
+            #[cfg(feature = "penumbra")]
             Self::Penumbra(_) => { /* no-op */ }
             Self::Cardano(config) => config.key_name = key_name,
         }
@@ -729,6 +749,7 @@ impl ChainConfig {
                     .map(|(key_name, keys)| (key_name, keys.into()))
                     .collect()
             }
+            #[cfg(feature = "namada")]
             ChainConfig::Namada(config) => {
                 let keyring =
                     KeyRing::new_namada(Store::Test, &config.id, &config.key_store_folder)?;
@@ -738,6 +759,7 @@ impl ChainConfig {
                     .map(|(key_name, keys)| (key_name, keys.into()))
                     .collect()
             }
+            #[cfg(feature = "penumbra")]
             ChainConfig::Penumbra(_) => vec![],
             ChainConfig::Cardano(config) => {
                 use crate::chain::cardano::signing_key_pair::CardanoSigningKeyPair;
@@ -761,7 +783,9 @@ impl ChainConfig {
     pub fn trust_threshold(&self) -> TrustThreshold {
         match self {
             Self::CosmosSdk(config) => config.trust_threshold,
+            #[cfg(feature = "namada")]
             Self::Namada(config) => config.trust_threshold,
+            #[cfg(feature = "penumbra")]
             Self::Penumbra(config) => config.trust_threshold,
             Self::Cardano(config) => config.trust_threshold.unwrap_or_default(),
         }
@@ -769,7 +793,10 @@ impl ChainConfig {
 
     pub fn clear_interval(&self) -> Option<u64> {
         match self {
-            Self::CosmosSdk(config) | Self::Namada(config) => config.clear_interval,
+            Self::CosmosSdk(config) => config.clear_interval,
+            #[cfg(feature = "namada")]
+            Self::Namada(config) => config.clear_interval,
+            #[cfg(feature = "penumbra")]
             Self::Penumbra(config) => config.clear_interval,
             Self::Cardano(config) => config.clear_interval,
         }
@@ -777,7 +804,10 @@ impl ChainConfig {
 
     pub fn query_packets_chunk_size(&self) -> usize {
         match self {
-            Self::CosmosSdk(config) | Self::Namada(config) => config.query_packets_chunk_size,
+            Self::CosmosSdk(config) => config.query_packets_chunk_size,
+            #[cfg(feature = "namada")]
+            Self::Namada(config) => config.query_packets_chunk_size,
+            #[cfg(feature = "penumbra")]
             Self::Penumbra(config) => config.query_packets_chunk_size,
             Self::Cardano(config) => config.query_packets_chunk_size,
         }
@@ -785,9 +815,10 @@ impl ChainConfig {
 
     pub fn set_query_packets_chunk_size(&mut self, query_packets_chunk_size: usize) {
         match self {
-            Self::CosmosSdk(config) | Self::Namada(config) => {
-                config.query_packets_chunk_size = query_packets_chunk_size
-            }
+            Self::CosmosSdk(config) => config.query_packets_chunk_size = query_packets_chunk_size,
+            #[cfg(feature = "namada")]
+            Self::Namada(config) => config.query_packets_chunk_size = query_packets_chunk_size,
+            #[cfg(feature = "penumbra")]
             Self::Penumbra(config) => config.query_packets_chunk_size = query_packets_chunk_size,
             Self::Cardano(config) => config.query_packets_chunk_size = query_packets_chunk_size,
         }
@@ -795,12 +826,20 @@ impl ChainConfig {
 
     pub fn excluded_sequences(&self, channel_id: &ChannelId) -> Cow<'_, [Sequence]> {
         match self {
-            Self::CosmosSdk(config) | Self::Namada(config) => config
+            Self::CosmosSdk(config) => config
                 .excluded_sequences
                 .map
                 .get(channel_id)
                 .map(|seqs| Cow::Borrowed(seqs.as_slice()))
                 .unwrap_or_else(|| Cow::Owned(Vec::new())),
+            #[cfg(feature = "namada")]
+            Self::Namada(config) => config
+                .excluded_sequences
+                .map
+                .get(channel_id)
+                .map(|seqs| Cow::Borrowed(seqs.as_slice()))
+                .unwrap_or_else(|| Cow::Owned(Vec::new())),
+            #[cfg(feature = "penumbra")]
             Self::Penumbra(_config) => Cow::Owned(Vec::new()),
             Self::Cardano(_config) => Cow::Owned(Vec::new()),
         }
@@ -808,7 +847,10 @@ impl ChainConfig {
 
     pub fn allow_ccq(&self) -> bool {
         match self {
-            Self::CosmosSdk(config) | Self::Namada(config) => config.allow_ccq,
+            Self::CosmosSdk(config) => config.allow_ccq,
+            #[cfg(feature = "namada")]
+            Self::Namada(config) => config.allow_ccq,
+            #[cfg(feature = "penumbra")]
             Self::Penumbra(_config) => false,
             Self::Cardano(_config) => false,
         }
@@ -816,7 +858,10 @@ impl ChainConfig {
 
     pub fn clock_drift(&self) -> Duration {
         match self {
-            Self::CosmosSdk(config) | Self::Namada(config) => config.clock_drift,
+            Self::CosmosSdk(config) => config.clock_drift,
+            #[cfg(feature = "namada")]
+            Self::Namada(config) => config.clock_drift,
+            #[cfg(feature = "penumbra")]
             Self::Penumbra(config) => config.clock_drift,
             Self::Cardano(config) => config.clock_drift,
         }
@@ -824,7 +869,10 @@ impl ChainConfig {
 
     pub fn keyring_support(&self) -> bool {
         match self {
-            Self::Namada(_) | Self::CosmosSdk(_) => true,
+            Self::CosmosSdk(_) => true,
+            #[cfg(feature = "namada")]
+            Self::Namada(_) => true,
+            #[cfg(feature = "penumbra")]
             Self::Penumbra(_) => false,
             Self::Cardano(_) => true,
         }
@@ -855,11 +903,13 @@ impl<'de> Deserialize<'de> for ChainConfig {
             "CosmosSdk" => CosmosSdkConfig::deserialize(value)
                 .map(Self::CosmosSdk)
                 .map_err(|e| serde::de::Error::custom(format!("invalid CosmosSdk config: {e}"))),
+            #[cfg(feature = "namada")]
             "Namada" => CosmosSdkConfig::deserialize(value)
                 .map(Self::Namada)
                 .map_err(|e| serde::de::Error::custom(format!("invalid Namada config: {e}"))),
             //
             // <-- Add new chain types here -->
+            #[cfg(feature = "penumbra")]
             "Penumbra" => PenumbraConfig::deserialize(value)
                 .map(Self::Penumbra)
                 .map_err(|e| serde::de::Error::custom(format!("invalid Penumbra config: {e}"))),
@@ -867,6 +917,16 @@ impl<'de> Deserialize<'de> for ChainConfig {
                 .map(Self::Cardano)
                 .map_err(|e| serde::de::Error::custom(format!("invalid Cardano config: {e}"))),
             //
+            #[cfg(not(feature = "namada"))]
+            "Namada" => Err(serde::de::Error::custom(
+                "chain type `Namada` is not supported by this build of Hermes, \
+                 rebuild it with the `namada` feature enabled",
+            )),
+            #[cfg(not(feature = "penumbra"))]
+            "Penumbra" => Err(serde::de::Error::custom(
+                "chain type `Penumbra` is not supported by this build of Hermes, \
+                 rebuild it with the `penumbra` feature enabled",
+            )),
             chain_type => Err(serde::de::Error::custom(format!(
                 "unknown chain type: {chain_type}",
             ))),
@@ -1010,6 +1070,28 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(all(feature = "namada", feature = "penumbra")))]
+    fn reject_disabled_chain_backends() {
+        for chain_type in [
+            #[cfg(not(feature = "namada"))]
+            "Namada",
+            #[cfg(not(feature = "penumbra"))]
+            "Penumbra",
+        ] {
+            let err = serde_json::from_value::<ChainConfig>(serde_json::json!({
+                "type": chain_type,
+                "id": "chain-0",
+            }))
+            .unwrap_err();
+
+            assert!(
+                err.to_string().contains("is not supported by this build"),
+                "unexpected error for {chain_type}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_default_chain_type() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1022,10 +1104,7 @@ mod tests {
             super::ChainConfig::CosmosSdk(_) => {
                 // all good
             }
-            super::ChainConfig::Namada(_) => {
-                panic!("Default chain is expected to be CosmosSDK not Namada")
-            }
-            _ => panic!("expected cosmos chain config"),
+            _ => panic!("Default chain is expected to be CosmosSDK"),
         }
     }
 
@@ -1052,18 +1131,13 @@ mod tests {
         let config = load(path).expect("could not parse config");
 
         let excluded_sequences1 = match config.chains.first().unwrap() {
-            ChainConfig::CosmosSdk(chain_config) | ChainConfig::Namada(chain_config) => {
-                chain_config.excluded_sequences.clone()
-            }
-            _ => unimplemented!("test fixtures do not include penunbra yet"),
+            ChainConfig::CosmosSdk(chain_config) => chain_config.excluded_sequences.clone(),
+            _ => panic!("expected cosmos chain config"),
         };
 
         let excluded_sequences2 = match config.chains.last().unwrap() {
-            ChainConfig::CosmosSdk(chain_config) | ChainConfig::Namada(chain_config) => {
-                chain_config.excluded_sequences.clone()
-            }
-            ChainConfig::Penumbra(_) => panic!("expected cosmos chain config"),
-            ChainConfig::Cardano(_) => panic!("expected cosmos chain config"),
+            ChainConfig::CosmosSdk(chain_config) => chain_config.excluded_sequences.clone(),
+            _ => panic!("expected cosmos chain config"),
         };
 
         assert_eq!(excluded_sequences1, excluded_sequences2);

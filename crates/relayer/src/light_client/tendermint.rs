@@ -29,12 +29,14 @@ use ibc_relayer_types::Height as ICSHeight;
 
 use crate::{
     chain::cosmos::{config::CosmosSdkConfig, CosmosSdkChain},
-    chain::penumbra::config::PenumbraConfig,
     client_state::AnyClientState,
     error::Error,
     misbehaviour::{AnyMisbehaviour, MisbehaviourEvidence},
     HERMES_VERSION,
 };
+
+#[cfg(feature = "penumbra")]
+use crate::chain::penumbra::config::PenumbraConfig;
 
 use super::{
     io::{AnyIo, RestartAwareIo},
@@ -290,6 +292,7 @@ fn io_for_addr(
 }
 
 impl LightClient {
+    #[cfg(feature = "penumbra")]
     pub fn from_penumbra_config(config: &PenumbraConfig, peer_id: PeerId) -> Result<Self, Error> {
         let live_io = io_for_addr(&config.rpc_addr, peer_id, Some(config.rpc_timeout))?;
 

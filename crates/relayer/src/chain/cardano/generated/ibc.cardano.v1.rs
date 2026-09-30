@@ -7,8 +7,8 @@ pub struct BuildHostStateHeartbeatRequest {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BuildHostStateHeartbeatResponse {
-    /// False when an ordinary IBC transaction or heartbeat has already refreshed
-    /// HostState in the current epoch.
+    /// False before the epoch midpoint or when HostState was already refreshed
+    /// in the current epoch.
     #[prost(bool, tag = "1")]
     pub heartbeat_required: bool,
     #[prost(uint64, tag = "2")]
@@ -19,6 +19,9 @@ pub struct BuildHostStateHeartbeatResponse {
     /// unsigned Cardano transaction CBOR encoded as UTF-8 hex.
     #[prost(message, optional, tag = "4")]
     pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
+    /// Suggested delay until Hermes checks again.
+    #[prost(uint64, tag = "5")]
+    pub next_check_delay_ms: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MsgPrunePacketHistory {
@@ -55,6 +58,24 @@ pub struct SubmitSignedTxRequest {
     /// Optional description for logging/debugging.
     #[prost(string, tag = "2")]
     pub description: ::prost::alloc::string::String,
+}
+/// TendermintUpdateTxChain carries one dependency-ordered transaction phase.
+/// A phase contains tree-neutral session transactions or one final client and
+/// HostState update.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TendermintUpdateTxChain {
+    /// Envelope version. The only currently supported value is 1.
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    /// Unsigned Cardano transaction bodies, CBOR-encoded as UTF-8 hex, in
+    /// dependency order. The protocol limit is 100 entries.
+    #[prost(string, repeated, tag = "2")]
+    pub unsigned_tx_cbor: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// True when the last tree-neutral transaction is a confirmed phase boundary.
+    /// Hermes must rebuild and continue the original MsgUpdateClient after either
+    /// verification reaches a Complete session or session cleanup finishes.
+    #[prost(bool, tag = "3")]
+    pub rebuild_after_submission: bool,
 }
 /// SubmitSignedTxResponse contains the result of submitting a signed transaction.
 #[derive(Clone, PartialEq, ::prost::Message)]

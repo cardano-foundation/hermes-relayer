@@ -162,10 +162,9 @@ pub struct CardanoConfig {
     #[serde(default = "default_event_replay_window")]
     pub event_replay_window: u64,
 
-    /// How often Hermes checks whether the current Cardano epoch is missing a
-    /// HostState anchor. `None` disables proactive heartbeats. The Gateway is
-    /// authoritative about whether a heartbeat is required, so polling never
-    /// creates more than one successful heartbeat per epoch.
+    /// Retry interval after a failed HostState heartbeat check. Successful
+    /// checks use Gateway's suggested delay until the epoch midpoint, capped
+    /// at one hour to notice rollbacks. `None` disables proactive heartbeats.
     #[serde(default, with = "humantime_serde")]
     pub host_state_heartbeat_interval: Option<Duration>,
 

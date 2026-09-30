@@ -1,7 +1,9 @@
 use core::fmt::{Display, Error as FmtError, Formatter};
 
 use crate::chain::cosmos::version::Specs as CosmosSpecs;
+#[cfg(feature = "namada")]
 use crate::chain::namada::version::Specs as NamadaSpecs;
+#[cfg(feature = "penumbra")]
 use crate::chain::penumbra::version::Specs as PenumbraSpecs;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,6 +26,8 @@ impl Display for ConsensusVersion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Specs {
     Cosmos(CosmosSpecs),
+    #[cfg(feature = "namada")]
     Namada(NamadaSpecs),
+    #[cfg(feature = "penumbra")]
     Penumbra(PenumbraSpecs),
 }

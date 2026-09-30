@@ -14,7 +14,7 @@ publish      = false
 
 [dependencies]
 ibc-relayer-types  = { workspace = true }
-ibc-relayer        = { workspace = true }
+ibc-relayer        = { workspace = true, features = ["std", "penumbra", "namada"] }
 ibc-test-framework = { workspace = true }
 
 byte-unit      = { workspace = true, features = ["serde"] }
