@@ -281,9 +281,9 @@ impl TransactionSigningPolicy {
                 .filter(|f| f.len() == 1)
                 .and_then(|f| plutus_u64(&f[0]))
                 .ok_or_else(|| reject("invalid registry counter".into()))?;
-            if !intent
+            if intent
                 .state_sequence
-                .is_some_and(|requested| channel <= requested)
+                .is_none_or(|requested| channel > requested)
                 || !auth_token_matches(
                     &fields[0],
                     &self.channel_state.policy,
