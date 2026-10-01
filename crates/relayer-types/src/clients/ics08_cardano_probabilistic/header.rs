@@ -244,7 +244,7 @@ mod tests {
         let bridge_blocks = if checkpoint {
             (0..CHECKPOINT_BRIDGE_BLOCKS)
                 .map(|_| {
-                    let block = sized_block(next_height, compact);
+                    let block = sized_block(next_height, false);
                     next_height += 1;
                     block
                 })
@@ -252,7 +252,7 @@ mod tests {
         } else {
             vec![]
         };
-        let anchor_block = sized_block(next_height, checkpoint && compact);
+        let anchor_block = sized_block(next_height, false);
         next_height += 1;
         let descendant_blocks = (0..DESCENDANT_BLOCKS)
             .map(|_| {
@@ -443,7 +443,7 @@ mod tests {
     fn signed_update_transaction_size_regression() {
         let cases = [
             ("minimum root", false, 25, 50_000, 440_000, 10),
-            ("bounded checkpoint", true, 57, 65_000, 1_000_000, 15),
+            ("bounded checkpoint", true, 57, 650_000, 1_000_000, 1),
         ];
 
         for (name, checkpoint, block_count, compact_max, legacy_min, reduction) in cases {

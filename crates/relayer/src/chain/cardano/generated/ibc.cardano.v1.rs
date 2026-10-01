@@ -137,10 +137,10 @@ pub mod cardano_msg_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
-    use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
     /// CardanoMsg defines the Cardano-specific transaction submission service.
     /// This service is used by the Hermes relayer to submit signed Cardano transactions.
     #[derive(Debug, Clone)]
@@ -186,9 +186,8 @@ pub mod cardano_msg_client {
                     <T as tonic::client::GrpcService<tonic::body::BoxBody>>::ResponseBody,
                 >,
             >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::BoxBody>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<http::Request<tonic::body::BoxBody>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             CardanoMsgClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -225,6 +224,24 @@ pub mod cardano_msg_client {
         }
         /// BuildHostStateHeartbeat builds a HostState-only transaction when the
         /// current Cardano epoch does not yet contain a HostState anchor.
+        pub async fn build_packet_batch(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BuildPacketBatchRequest>,
+        ) -> std::result::Result<tonic::Response<super::BuildPacketBatchResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/ibc.cardano.v1.CardanoMsg/BuildPacketBatch");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "ibc.cardano.v1.CardanoMsg",
+                "BuildPacketBatch",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn build_host_state_heartbeat(
             &mut self,
             request: impl tonic::IntoRequest<super::BuildHostStateHeartbeatRequest>,
@@ -232,14 +249,9 @@ pub mod cardano_msg_client {
             tonic::Response<super::BuildHostStateHeartbeatResponse>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic::codec::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/ibc.cardano.v1.CardanoMsg/BuildHostStateHeartbeat",
@@ -257,18 +269,11 @@ pub mod cardano_msg_client {
         pub async fn prune_packet_history(
             &mut self,
             request: impl tonic::IntoRequest<super::MsgPrunePacketHistory>,
-        ) -> std::result::Result<
-            tonic::Response<super::MsgPrunePacketHistoryResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::MsgPrunePacketHistoryResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic::codec::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/ibc.cardano.v1.CardanoMsg/PrunePacketHistory",
@@ -284,25 +289,19 @@ pub mod cardano_msg_client {
         pub async fn submit_signed_tx(
             &mut self,
             request: impl tonic::IntoRequest<super::SubmitSignedTxRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::SubmitSignedTxResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::SubmitSignedTxResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/ibc.cardano.v1.CardanoMsg/SubmitSignedTx",
-            );
+            let path =
+                http::uri::PathAndQuery::from_static("/ibc.cardano.v1.CardanoMsg/SubmitSignedTx");
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("ibc.cardano.v1.CardanoMsg", "SubmitSignedTx"));
+            req.extensions_mut().insert(GrpcMethod::new(
+                "ibc.cardano.v1.CardanoMsg",
+                "SubmitSignedTx",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// ObserveTx waits for a transaction submitted directly by Hermes to be
@@ -312,18 +311,11 @@ pub mod cardano_msg_client {
             &mut self,
             request: impl tonic::IntoRequest<super::ObserveTxRequest>,
         ) -> std::result::Result<tonic::Response<super::ObserveTxResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/ibc.cardano.v1.CardanoMsg/ObserveTx",
-            );
+            let path = http::uri::PathAndQuery::from_static("/ibc.cardano.v1.CardanoMsg/ObserveTx");
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("ibc.cardano.v1.CardanoMsg", "ObserveTx"));
@@ -359,9 +351,7 @@ pub struct BlockEvents {
     pub height: u64,
     /// IBC events that occurred in this block
     #[prost(message, repeated, tag = "2")]
-    pub events: ::prost::alloc::vec::Vec<
-        super::super::core::types::v1::ResponseDeliverTx,
-    >,
+    pub events: ::prost::alloc::vec::Vec<super::super::core::types::v1::ResponseDeliverTx>,
 }
 /// Generated client implementations.
 pub mod query_client {
@@ -370,10 +360,10 @@ pub mod query_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
-    use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
     /// Query provides defines the gRPC querier service for Cardano-specific queries
     #[derive(Debug, Clone)]
     pub struct QueryClient<T> {
@@ -418,9 +408,8 @@ pub mod query_client {
                     <T as tonic::client::GrpcService<tonic::body::BoxBody>>::ResponseBody,
                 >,
             >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::BoxBody>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<http::Request<tonic::body::BoxBody>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             QueryClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -459,26 +448,40 @@ pub mod query_client {
         pub async fn events(
             &mut self,
             request: impl tonic::IntoRequest<super::QueryEventsRequest>,
-        ) -> std::result::Result<
-            tonic::Response<super::QueryEventsResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::QueryEventsResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic::codec::ProstCodec::default();
-            let path = http::uri::PathAndQuery::from_static(
-                "/ibc.cardano.v1.Query/Events",
-            );
+            let path = http::uri::PathAndQuery::from_static("/ibc.cardano.v1.Query/Events");
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("ibc.cardano.v1.Query", "Events"));
             self.inner.unary(req, path, codec).await
         }
     }
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BuildPacketBatchRequest {
+    #[prost(string, tag = "1")]
+    pub signer: String,
+    #[prost(string, tag = "2")]
+    pub port_id: String,
+    #[prost(string, tag = "3")]
+    pub channel_id: String,
+    #[prost(string, tag = "4")]
+    pub intent_tx_hash: String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BuildPacketBatchResponse {
+    #[prost(string, tag = "1")]
+    pub stage: String,
+    #[prost(message, optional, tag = "2")]
+    pub unsigned_tx: Option<::prost_types::Any>,
+    #[prost(string, repeated, tag = "3")]
+    pub intent_tx_hashes: Vec<String>,
+    #[prost(string, tag = "4")]
+    pub included_tx_hash: String,
 }

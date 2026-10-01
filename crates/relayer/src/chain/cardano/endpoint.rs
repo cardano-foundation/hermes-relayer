@@ -6,6 +6,7 @@ use super::config::CardanoConfig;
 use super::gateway_client::{
     BuiltIbcTxKind, GatewayClient, TxSubmitResponse, MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH,
 };
+use super::intent_executor::ExecutorSchedule;
 use super::signing_key_pair::CardanoSigningKeyPair;
 use super::signing_policy::{
     SigningIntent, SigningPolicyLimits, TendermintSessionAction, TransactionSigningPolicy,
@@ -18,7 +19,6 @@ use super::utxo_resolver::{
 
 use ibc_relayer_types::clients::ics08_cardano::consensus_state::ConsensusState as MithrilConsensusState;
 use ibc_relayer_types::clients::ics08_cardano::misbehaviour::Misbehaviour as MithrilMisbehaviour;
-use ibc_relayer_types::clients::ics08_cardano_probabilistic::consensus_state::ConsensusState as ProbabilisticConsensusState;
 use ibc_relayer_types::clients::ics08_cardano_probabilistic::misbehaviour::Misbehaviour as ProbabilisticMisbehaviour;
 
 use crate::account::Balance;
@@ -72,6 +72,7 @@ use ibc_relayer_types::signer::Signer;
 use ibc_relayer_types::Height as ICSHeight;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tendermint_rpc::endpoint::broadcast::tx_sync::Response as TxResponse;
 use tokio::runtime::Runtime as TokioRuntime;
@@ -109,7 +110,14 @@ pub struct CardanoChainEndpoint {
     keyring: KeyRing<CardanoSigningKeyPair>,
     signer_address: String,
     event_source_cmd: Option<crate::event::source::TxEventSourceCmd>,
+    stop_intent_executor: Arc<AtomicBool>,
     pending_new_client_consensus_states: Mutex<HashMap<u64, AnyConsensusState>>,
+}
+
+impl Drop for CardanoChainEndpoint {
+    fn drop(&mut self) {
+        self.stop_intent_executor.store(true, Ordering::Relaxed);
+    }
 }
 
 fn gateway_query_height(query_height: QueryHeight) -> Option<ICSHeight> {
@@ -496,6 +504,97 @@ impl CardanoChainEndpoint {
         Ok(response)
     }
 
+    async fn sign_submit_until_included(
+        &self,
+        unsigned_tx: &super::gateway_client::UnsignedTx,
+        intent: &SigningIntent,
+    ) -> Result<(TxSubmitResponse, ICSHeight), Error> {
+        let signed = self
+            .sign_transaction_helper(
+                &unsigned_tx.cbor_hex,
+                intent,
+                &TrustedUtxoOverlay::default(),
+            )
+            .await?;
+        self.submit_signed_transaction(&signed.transaction, false)
+            .await?;
+        let response = self
+            .observe_signed_transaction(&signed.transaction, true)
+            .await?;
+        let height = response
+            .height
+            .ok_or_else(|| Error::send_tx("Missing inclusion height".into()))?;
+        Ok((response, height))
+    }
+
+    async fn complete_funded_intent(
+        &self,
+        original: &SigningIntent,
+        port: &str,
+        channel: &str,
+        hash: &str,
+    ) -> Result<TxSubmitResponse, Error> {
+        let mut last_error = String::new();
+        // Rebuild from included state after a competing spend or rollback. Never
+        // create another funded intent here, because its inclusion may be ambiguous.
+        for _ in 0..32 {
+            let result = async {
+                let built = self
+                    .gateway_client
+                    .build_packet_batch(&self.signer_address, port, channel, hash)
+                    .await
+                    .map_err(|e| Error::send_tx(e.to_string()))?;
+                match built.stage.as_str() {
+                    "included" => {
+                        if built.included_tx_hash.is_empty() {
+                            return Err(Error::send_tx("Missing consuming transaction".into()));
+                        }
+                        let response = self
+                            .gateway_client
+                            .observe_tx(&built.included_tx_hash, true)
+                            .await
+                            .map_err(|e| Error::send_tx(e.to_string()))?;
+                        assert_submitted_tx_hash(&built.included_tx_hash, &response.tx_hash)?;
+                        Ok(Some(response))
+                    }
+                    "initialize" | "send" => {
+                        let intent = SigningIntent::packet_batch(
+                            original,
+                            hash,
+                            built.stage == "initialize",
+                        )
+                        .map_err(|e| Error::send_tx(e.to_string()))?;
+                        let unsigned = built
+                            .unsigned_tx
+                            .ok_or_else(|| Error::send_tx("Missing batch transaction".into()))?;
+                        let unsigned = super::gateway_client::UnsignedTx {
+                            cbor_hex: hex::encode(unsigned.value),
+                            description: built.stage.clone(),
+                        };
+                        let (response, _) =
+                            self.sign_submit_until_included(&unsigned, &intent).await?;
+                        Ok(if built.stage == "send" {
+                            Some(response)
+                        } else {
+                            None
+                        })
+                    }
+                    stage => Err(Error::send_tx(format!(
+                        "Funded intent cannot advance in stage {stage}"
+                    ))),
+                }
+            }
+            .await;
+            match result {
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => continue,
+                Err(error) => last_error = error.to_string(),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        Err(Error::send_tx(format!("Funded intent {hash} remains pending. Resume this intent rather than funding it again: {last_error}")))
+    }
+
     async fn submit_signed_transaction(
         &self,
         signed_tx: &super::signer::SignedTransaction,
@@ -534,6 +633,7 @@ impl CardanoChainEndpoint {
         self.resolve_signing_intent_denom(&mut direct_signing_intent)
             .await?;
 
+        let mut packet_initializations = 0usize;
         let mut completed_steps = 0usize;
         let mut completed_chain_transactions = 0usize;
         let mut completed_rebuild_phases = 0usize;
@@ -554,6 +654,49 @@ impl CardanoChainEndpoint {
                         ))
                     }
                 })?;
+
+            if direct_signing_intent.uses_packet_lanes() {
+                if built.kind != BuiltIbcTxKind::Singleton
+                    || built.transactions.len() != 1
+                    || built.rebuild_after_submission
+                {
+                    return Err(Error::send_tx(
+                        "Packet operation requires one bounded transaction".into(),
+                    ));
+                }
+                let unsigned = &built.transactions[0];
+                if unsigned.description == "InitializePacketLanes" {
+                    if packet_initializations >= 64 {
+                        return Err(Error::send_tx(
+                            "Packet initialization limit reached. Resume the request".into(),
+                        ));
+                    }
+                    self.sign_submit_until_included(
+                        unsigned,
+                        &SigningIntent::packet_initialization(&direct_signing_intent),
+                    )
+                    .await?;
+                    packet_initializations += 1;
+                    continue;
+                }
+                let (included, _) = self
+                    .sign_submit_until_included(unsigned, &direct_signing_intent)
+                    .await?;
+                if message_type_url == "/ibc.applications.transfer.v1.MsgTransfer" {
+                    let request: ibc_proto::ibc::applications::transfer::v1::MsgTransfer =
+                        prost::Message::decode(message_value)
+                            .map_err(|e| Error::send_tx(e.to_string()))?;
+                    return self
+                        .complete_funded_intent(
+                            &direct_signing_intent,
+                            &request.source_port,
+                            &request.source_channel,
+                            &included.tx_hash,
+                        )
+                        .await;
+                }
+                return Ok(included);
+            }
 
             let trace_registry_prelude = built
                 .transactions
@@ -758,6 +901,107 @@ impl CardanoChainEndpoint {
         }
     }
 
+    async fn execute_pending_intents(&self, schedule: &mut ExecutorSchedule) -> Result<(), Error> {
+        schedule.begin_pass(std::time::Instant::now());
+        use ibc_proto::ibc::core::channel::v1::QueryChannelsResponse;
+        use prost::Message;
+        let bytes = self
+            .gateway_client
+            .query_channels()
+            .await
+            .map_err(|error| Error::query(error.to_string()))?;
+        let channels = QueryChannelsResponse::decode(bytes.as_slice())
+            .map_err(|error| Error::query(error.to_string()))?;
+        for channel in channels.channels {
+            if !schedule.ready(&channel.channel_id, std::time::Instant::now()) {
+                continue;
+            }
+            if channel.port_id != "transfer" || channel.state != 3 {
+                continue;
+            }
+            // One bounded batch per channel per pass. On the next pass the
+            // Gateway reloads included state, including any rolled-back intents.
+            let result = async {
+                let batch = self
+                    .gateway_client
+                    .build_packet_batch(
+                        &self.signer_address,
+                        &channel.port_id,
+                        &channel.channel_id,
+                        "",
+                    )
+                    .await
+                    .map_err(|error| Error::send_tx(error.to_string()))?;
+                if batch.stage == "idle" {
+                    return Ok(false);
+                }
+                if batch.stage != "send" && batch.stage != "initialize" {
+                    return Err(Error::send_tx("unexpected executor batch stage".into()));
+                }
+                let hash = batch
+                    .intent_tx_hashes
+                    .first()
+                    .ok_or_else(|| Error::send_tx("batch has no funded request".into()))?;
+                let intent = SigningIntent::funded_batch(
+                    &channel.port_id,
+                    &channel.channel_id,
+                    hash,
+                    batch.stage == "initialize",
+                )
+                .map_err(|error| Error::send_tx(error.to_string()))?;
+                let unsigned = batch
+                    .unsigned_tx
+                    .ok_or_else(|| Error::send_tx("batch has no transaction".into()))?;
+                self.sign_submit_until_included(
+                    &super::gateway_client::UnsignedTx {
+                        cbor_hex: hex::encode(unsigned.value),
+                        description: batch.stage,
+                    },
+                    &intent,
+                )
+                .await?;
+                Ok::<bool, Error>(true)
+            }
+            .await;
+            match result {
+                Ok(sent) => {
+                    schedule.succeeded(&channel.channel_id, sent);
+                }
+                Err(error) => {
+                    schedule.failed(channel.channel_id.clone(), std::time::Instant::now());
+                    tracing::warn!(channel = %channel.channel_id, %error,
+                        "Funded request batch will retry from canonical state");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn spawn_intent_executor(&self) -> Result<(), Error> {
+        // Use the configured relayer signer and the same pinned script, fee,
+        // collateral and trusted-node evaluation policy as ordinary relay work.
+        let executor = Self::bootstrap(ChainConfig::Cardano(self.config.clone()), self.rt.clone())?;
+        let stop = self.stop_intent_executor.clone();
+        std::thread::spawn(move || {
+            let mut schedule = ExecutorSchedule::default();
+            while !stop.load(Ordering::Relaxed) {
+                if let Err(error) = executor
+                    .rt
+                    .block_on(executor.execute_pending_intents(&mut schedule))
+                {
+                    tracing::warn!(%error, "Funded request discovery will retry");
+                }
+                // Successful inclusion makes new sequencer state available now.
+                // Only idle/error passes wait. Failed channels back off separately.
+                let delay = schedule.delay();
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Initialize the event source for monitoring Cardano chain events
     fn init_event_source(&mut self) -> Result<crate::event::source::TxEventSourceCmd, Error> {
         use super::event_source::CardanoEventSource;
@@ -781,6 +1025,7 @@ impl CardanoChainEndpoint {
         )
         .map_err(Error::event_source)?;
 
+        self.spawn_intent_executor()?;
         thread::spawn(move || event_source.run());
 
         tracing::info!(
@@ -1160,6 +1405,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             transaction_evaluator,
             keyring,
             signer_address,
+            stop_intent_executor: Arc::new(AtomicBool::new(false)),
             event_source_cmd: None, // Initialized lazily on first subscribe() call
             pending_new_client_consensus_states: Mutex::new(HashMap::new()),
         };
@@ -1169,6 +1415,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
     }
 
     fn shutdown(self) -> Result<(), Error> {
+        self.stop_intent_executor.store(true, Ordering::Relaxed);
         tracing::info!("Shutting down Cardano chain endpoint");
         Ok(())
     }
@@ -1277,8 +1524,81 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // Block on async operations using the runtime
         self.rt.block_on(async {
             let mut all_events = Vec::new();
+            let mut funded = Vec::new();
+            let transfers_only = tracked_msgs
+                .msgs
+                .iter()
+                .all(|msg| msg.type_url == "/ibc.applications.transfer.v1.MsgTransfer");
+            // Admit every transfer before waiting for any counterparty evidence.
+            for msg in tracked_msgs.msgs.iter().filter(|msg| {
+                transfers_only && msg.type_url == "/ibc.applications.transfer.v1.MsgTransfer"
+            }) {
+                let request: ibc_proto::ibc::applications::transfer::v1::MsgTransfer =
+                    prost::Message::decode(msg.value.as_slice())
+                        .map_err(|e| Error::send_tx(e.to_string()))?;
+                let mut intent = SigningIntent::ibc(
+                    &msg.type_url,
+                    &msg.value,
+                    &self.signer_address,
+                    self.config.network_id,
+                )
+                .map_err(|e| Error::send_tx(e.to_string()))?;
+                self.resolve_signing_intent_denom(&mut intent).await?;
+                let unsigned = self
+                    .gateway_client
+                    .build_ibc_tx(&msg.type_url, msg.value.clone())
+                    .await
+                    .map_err(|e| Error::send_tx(e.to_string()))?;
+                let (included, _) = self
+                    .sign_submit_until_included(
+                        unsigned.transactions.first().ok_or_else(|| {
+                            Error::send_tx("Missing funded intent transaction".into())
+                        })?,
+                        &intent,
+                    )
+                    .await?;
+                funded.push((
+                    intent,
+                    request.source_port,
+                    request.source_channel,
+                    included.tx_hash,
+                ));
+            }
+            let mut completed_batches = std::collections::HashSet::new();
+            for (intent, port, channel, hash) in funded {
+                let response = self
+                    .complete_funded_intent(&intent, &port, &channel, &hash)
+                    .await?;
+                if !completed_batches.insert(response.tx_hash.clone()) {
+                    continue;
+                }
+                let height = response
+                    .height
+                    .ok_or_else(|| Error::send_tx("Missing batch inclusion height".into()))?;
+                let events = response
+                    .events
+                    .into_iter()
+                    .map(|event| super::generated::ibc::cardano::v1::Event {
+                        r#type: event.event_type,
+                        attributes: event
+                            .attributes
+                            .into_iter()
+                            .map(|(key, value)| {
+                                super::generated::ibc::cardano::v1::EventAttribute { key, value }
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                let events = super::event_parser::parse_events(events, height)
+                    .map_err(|e| Error::send_tx(e.to_string()))?;
+                all_events.extend(
+                    events
+                        .into_iter()
+                        .map(|event| IbcEventWithHeight::new(event, height)),
+                );
+            }
 
-            for msg in tracked_msgs.msgs.iter() {
+            for msg in tracked_msgs.msgs.iter().filter(|_| !transfers_only) {
                 tracing::debug!("Processing message type: {:?}", msg.type_url);
 
                 // Build, sign, and submit. Tendermint header updates repeat this
@@ -1322,9 +1642,20 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
                 // Ensure the transaction is also accepted by the active Cardano light-client mode
                 // before we treat it as "committed" from the perspective of IBC relaying.
-                let certified_height = self
-                    .wait_for_gateway_accepted_height(included_height)
-                    .await?;
+                let uses_lanes = SigningIntent::ibc(
+                    &msg.type_url,
+                    &msg.value,
+                    &self.signer_address,
+                    self.config.network_id,
+                )
+                .map_err(|e| Error::send_tx(e.to_string()))?
+                .uses_packet_lanes();
+                let certified_height = if uses_lanes {
+                    included_height
+                } else {
+                    self.wait_for_gateway_accepted_height(included_height)
+                        .await?
+                };
                 if certified_height.revision_height() != included_height.revision_height() {
                     tracing::info!(
                         "Transaction {} inclusion height {} is now certified at {}",
@@ -3220,6 +3551,33 @@ impl ChainEndpoint for CardanoChainEndpoint {
             Error::query("missing Cardano header while building consensus state".to_string())
         })?;
 
+        if let AnyHeader::Probabilistic(expected) = &header {
+            let response = self
+                .rt
+                .block_on(self.gateway_client.query_new_client(header_height))
+                .map_err(|error| Error::query(error.to_string()))?;
+            let raw = response
+                .consensus_state
+                .ok_or_else(|| Error::query("missing packet consensus snapshot".to_string()))?;
+            let state = AnyConsensusState::try_from(ibc_proto::google::protobuf::Any {
+                type_url: raw.type_url,
+                value: raw.value,
+            })
+            .map_err(|error| Error::query(error.to_string()))?;
+            if let AnyConsensusState::Probabilistic(consensus) = &state {
+                if consensus.accepted_block_hash != expected.anchor_block.hash {
+                    return Err(Error::query(
+                        "packet consensus snapshot is on a different block".to_string(),
+                    ));
+                }
+            } else {
+                return Err(Error::query(
+                    "unexpected consensus snapshot type".to_string(),
+                ));
+            }
+            return Ok(state);
+        }
+
         let ibc_state_root = extract_ibc_state_root_from_host_state_tx(
             &header,
             &light_block.host_state_nft_policy_id,
@@ -3233,17 +3591,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 header.mithril_stake_distribution_certificate,
                 header.transaction_snapshot_certificate.hash,
             ))),
-            AnyHeader::Probabilistic(header) => {
-                Ok(AnyConsensusState::from(ProbabilisticConsensusState {
-                    root: CommitmentRoot::from_bytes(&ibc_state_root),
-                    timestamp: header.timestamp.nanoseconds(),
-                    accepted_block_hash: header.anchor_block.hash,
-                    accepted_epoch: header.anchor_block.epoch,
-                    unique_pools_count: 0,
-                    unique_stake_bps: 0,
-                    security_score_bps: 0,
-                }))
-            }
+            AnyHeader::Probabilistic(_) => unreachable!("handled packet snapshot above"),
             AnyHeader::Tendermint(_) => Err(Error::query(
                 "Cardano build_consensus_state received a Tendermint header".to_string(),
             )),
@@ -4855,6 +5203,7 @@ mod tests {
             current_epoch: 0,
             trusting_period: Duration::from_secs(60),
             upgrade_path: vec![],
+            packet_lane_policy_id: vec![0x41; 28],
             host_state_nft_policy_id: HOST_STATE_NFT_POLICY_ID.to_vec(),
             host_state_nft_token_name: HOST_STATE_NFT_TOKEN_NAME.to_vec(),
             epoch_stake_distribution: vec![],
