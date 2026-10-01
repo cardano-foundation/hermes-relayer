@@ -3462,6 +3462,37 @@ impl SigningIntent {
         intent
     }
 
+    /// Backend execution spends already funded requests, never user wallet funds.
+    pub fn funded_batch(
+        port: &str,
+        channel: &str,
+        hash: &str,
+        initialize: bool,
+    ) -> Result<Self, Error> {
+        if port != "transfer" {
+            return Err(Error::Signer("unsupported intent port".into()));
+        }
+        let sequence = channel
+            .strip_prefix("channel-")
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| Error::Signer("invalid intent channel".into()))?;
+        let original = Self {
+            operation: String::new(),
+            module_port: Some(port.into()),
+            external_output: None,
+            transfer: None,
+            state_sequence: Some(sequence),
+            recovery_substitute_sequence: None,
+            packet: None,
+            acknowledgement: None,
+            prune_sequence: None,
+            funded_intent: None,
+            staged_tendermint: false,
+            staged_misbehaviour: false,
+        };
+        Self::packet_batch(&original, hash, initialize)
+    }
+
     pub fn packet_batch(
         original: &Self,
         intent_hash: &str,
@@ -7209,6 +7240,26 @@ mod tests {
             batch_requirements.required_scripts,
             vec!["packetstate", "packetbatch", "packetguard"]
         );
+    }
+
+    #[test]
+    fn background_batch_authorizes_only_pinned_protocol_work_for_a_funded_request() {
+        let intent =
+            SigningIntent::funded_batch("transfer", "channel-7", &"ab".repeat(32), false).unwrap();
+        assert!(intent.transfer.is_none());
+        assert!(intent.external_output.is_none());
+        assert_eq!(intent.state_sequence, Some(7));
+        assert_eq!(intent.funded_intent, Some([0xab; 32]));
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let requirements = policy.operation_requirements(&intent).unwrap();
+        assert_eq!(
+            requirements.required_scripts,
+            vec!["packetstate", "packetbatch", "packetguard"]
+        );
+        assert!(
+            SigningIntent::funded_batch("other", "channel-7", &"ab".repeat(32), false).is_err()
+        );
+        assert!(SigningIntent::funded_batch("transfer", "channel-7", "bad-hash", false).is_err());
     }
 
     fn bare_intent(operation: &str, module_port: Option<&str>) -> SigningIntent {

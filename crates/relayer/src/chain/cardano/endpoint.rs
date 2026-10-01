@@ -71,6 +71,7 @@ use ibc_relayer_types::signer::Signer;
 use ibc_relayer_types::Height as ICSHeight;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tendermint_rpc::endpoint::broadcast::tx_sync::Response as TxResponse;
 use tokio::runtime::Runtime as TokioRuntime;
@@ -108,7 +109,14 @@ pub struct CardanoChainEndpoint {
     keyring: KeyRing<CardanoSigningKeyPair>,
     signer_address: String,
     event_source_cmd: Option<crate::event::source::TxEventSourceCmd>,
+    stop_intent_executor: Arc<AtomicBool>,
     pending_new_client_consensus_states: Mutex<HashMap<u64, AnyConsensusState>>,
+}
+
+impl Drop for CardanoChainEndpoint {
+    fn drop(&mut self) {
+        self.stop_intent_executor.store(true, Ordering::Relaxed);
+    }
 }
 
 fn gateway_query_height(query_height: QueryHeight) -> Option<ICSHeight> {
@@ -892,6 +900,88 @@ impl CardanoChainEndpoint {
         }
     }
 
+    async fn execute_pending_intents(&self) -> Result<(), Error> {
+        use ibc_proto::ibc::core::channel::v1::QueryChannelsResponse;
+        use prost::Message;
+        let bytes = self
+            .gateway_client
+            .query_channels()
+            .await
+            .map_err(|error| Error::query(error.to_string()))?;
+        let channels = QueryChannelsResponse::decode(bytes.as_slice())
+            .map_err(|error| Error::query(error.to_string()))?;
+        for channel in channels.channels {
+            if channel.port_id != "transfer" || channel.state != 3 {
+                continue;
+            }
+            // One bounded batch per channel per pass. On the next pass the
+            // Gateway reloads included state, including any rolled-back intents.
+            let result = async {
+                let batch = self
+                    .gateway_client
+                    .build_packet_batch(
+                        &self.signer_address,
+                        &channel.port_id,
+                        &channel.channel_id,
+                        "",
+                    )
+                    .await
+                    .map_err(|error| Error::send_tx(error.to_string()))?;
+                if batch.stage == "idle" {
+                    return Ok(());
+                }
+                if batch.stage != "send" && batch.stage != "initialize" {
+                    return Err(Error::send_tx("unexpected executor batch stage".into()));
+                }
+                let hash = batch
+                    .intent_tx_hashes
+                    .first()
+                    .ok_or_else(|| Error::send_tx("batch has no funded request".into()))?;
+                let intent = SigningIntent::funded_batch(
+                    &channel.port_id,
+                    &channel.channel_id,
+                    hash,
+                    batch.stage == "initialize",
+                )
+                .map_err(|error| Error::send_tx(error.to_string()))?;
+                let unsigned = batch
+                    .unsigned_tx
+                    .ok_or_else(|| Error::send_tx("batch has no transaction".into()))?;
+                self.sign_submit_until_included(
+                    &super::gateway_client::UnsignedTx {
+                        cbor_hex: hex::encode(unsigned.value),
+                        description: batch.stage,
+                    },
+                    &intent,
+                )
+                .await?;
+                Ok::<(), Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(channel = %channel.channel_id, %error,
+                    "Funded request batch will retry from canonical state");
+            }
+        }
+        Ok(())
+    }
+
+    fn spawn_intent_executor(&self) -> Result<(), Error> {
+        // Use the configured relayer signer and the same pinned script, fee,
+        // collateral and trusted-node evaluation policy as ordinary relay work.
+        let executor = Self::bootstrap(ChainConfig::Cardano(self.config.clone()), self.rt.clone())?;
+        let stop = self.stop_intent_executor.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if let Err(error) = executor.rt.block_on(executor.execute_pending_intents()) {
+                    tracing::warn!(%error, "Funded request discovery will retry");
+                }
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        });
+        Ok(())
+    }
+
     /// Initialize the event source for monitoring Cardano chain events
     fn init_event_source(&mut self) -> Result<crate::event::source::TxEventSourceCmd, Error> {
         use super::event_source::CardanoEventSource;
@@ -915,6 +1005,7 @@ impl CardanoChainEndpoint {
         )
         .map_err(Error::event_source)?;
 
+        self.spawn_intent_executor()?;
         thread::spawn(move || event_source.run());
 
         tracing::info!(
@@ -1294,6 +1385,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             transaction_evaluator,
             keyring,
             signer_address,
+            stop_intent_executor: Arc::new(AtomicBool::new(false)),
             event_source_cmd: None, // Initialized lazily on first subscribe() call
             pending_new_client_consensus_states: Mutex::new(HashMap::new()),
         };
@@ -1303,6 +1395,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
     }
 
     fn shutdown(self) -> Result<(), Error> {
+        self.stop_intent_executor.store(true, Ordering::Relaxed);
         tracing::info!("Shutting down Cardano chain endpoint");
         Ok(())
     }
