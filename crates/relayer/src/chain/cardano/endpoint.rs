@@ -6,6 +6,7 @@ use super::config::CardanoConfig;
 use super::gateway_client::{
     BuiltIbcTxKind, GatewayClient, TxSubmitResponse, MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH,
 };
+use super::intent_executor::ExecutorSchedule;
 use super::signing_key_pair::CardanoSigningKeyPair;
 use super::signing_policy::{
     SigningIntent, SigningPolicyLimits, TendermintSessionAction, TransactionSigningPolicy,
@@ -900,7 +901,8 @@ impl CardanoChainEndpoint {
         }
     }
 
-    async fn execute_pending_intents(&self) -> Result<(), Error> {
+    async fn execute_pending_intents(&self, schedule: &mut ExecutorSchedule) -> Result<(), Error> {
+        schedule.begin_pass(std::time::Instant::now());
         use ibc_proto::ibc::core::channel::v1::QueryChannelsResponse;
         use prost::Message;
         let bytes = self
@@ -911,6 +913,9 @@ impl CardanoChainEndpoint {
         let channels = QueryChannelsResponse::decode(bytes.as_slice())
             .map_err(|error| Error::query(error.to_string()))?;
         for channel in channels.channels {
+            if !schedule.ready(&channel.channel_id, std::time::Instant::now()) {
+                continue;
+            }
             if channel.port_id != "transfer" || channel.state != 3 {
                 continue;
             }
@@ -928,7 +933,7 @@ impl CardanoChainEndpoint {
                     .await
                     .map_err(|error| Error::send_tx(error.to_string()))?;
                 if batch.stage == "idle" {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if batch.stage != "send" && batch.stage != "initialize" {
                     return Err(Error::send_tx("unexpected executor batch stage".into()));
@@ -955,12 +960,18 @@ impl CardanoChainEndpoint {
                     &intent,
                 )
                 .await?;
-                Ok::<(), Error>(())
+                Ok::<bool, Error>(true)
             }
             .await;
-            if let Err(error) = result {
-                tracing::warn!(channel = %channel.channel_id, %error,
-                    "Funded request batch will retry from canonical state");
+            match result {
+                Ok(sent) => {
+                    schedule.succeeded(&channel.channel_id, sent);
+                }
+                Err(error) => {
+                    schedule.failed(channel.channel_id.clone(), std::time::Instant::now());
+                    tracing::warn!(channel = %channel.channel_id, %error,
+                        "Funded request batch will retry from canonical state");
+                }
             }
         }
         Ok(())
@@ -972,11 +983,20 @@ impl CardanoChainEndpoint {
         let executor = Self::bootstrap(ChainConfig::Cardano(self.config.clone()), self.rt.clone())?;
         let stop = self.stop_intent_executor.clone();
         std::thread::spawn(move || {
+            let mut schedule = ExecutorSchedule::default();
             while !stop.load(Ordering::Relaxed) {
-                if let Err(error) = executor.rt.block_on(executor.execute_pending_intents()) {
+                if let Err(error) = executor
+                    .rt
+                    .block_on(executor.execute_pending_intents(&mut schedule))
+                {
                     tracing::warn!(%error, "Funded request discovery will retry");
                 }
-                std::thread::sleep(std::time::Duration::from_secs(5));
+                // Successful inclusion makes new sequencer state available now.
+                // Only idle/error passes wait. Failed channels back off separately.
+                let delay = schedule.delay();
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
             }
         });
         Ok(())
