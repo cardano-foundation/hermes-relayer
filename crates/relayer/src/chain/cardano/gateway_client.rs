@@ -299,6 +299,27 @@ impl Interceptor for GatewayAuthInterceptor {
 }
 
 impl GatewayClient {
+    pub async fn build_packet_batch(
+        &self,
+        signer: &str,
+        port: &str,
+        channel: &str,
+        intent_hash: &str,
+    ) -> Result<super::generated::ibc::cardano::v1::BuildPacketBatchResponse, Error> {
+        let mut client = CardanoMsgClient::new(self.channel.clone());
+        Ok(client
+            .build_packet_batch(tonic::Request::new(
+                super::generated::ibc::cardano::v1::BuildPacketBatchRequest {
+                    signer: signer.to_string(),
+                    port_id: port.to_string(),
+                    channel_id: channel.to_string(),
+                    intent_tx_hash: intent_hash.to_string(),
+                },
+            ))
+            .await?
+            .into_inner())
+    }
+
     /// Create a new Gateway client and establish a gRPC connection
     pub async fn new(endpoint: String) -> Result<Self, Error> {
         Self::new_with_security(endpoint, None, None).await
@@ -718,13 +739,44 @@ impl GatewayClient {
 
     /// Query all channels
     pub async fn query_channels(&self) -> Result<Vec<u8>, Error> {
+        use ibc_proto::cosmos::base::query::v1beta1::PageRequest;
+        use ibc_proto::ibc::core::channel::v1::QueryChannelsResponse;
         let mut client = ChannelQueryClient::new(self.channel.clone());
-
-        let request = tonic::Request::new(QueryChannelsRequest { pagination: None });
-
-        let response = client.channels(request).await?.into_inner();
-
-        Ok(prost::Message::encode_to_vec(&response))
+        let mut key = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut channels = Vec::new();
+        loop {
+            let response = client
+                .channels(tonic::Request::new(QueryChannelsRequest {
+                    pagination: Some(PageRequest {
+                        key,
+                        offset: 0,
+                        limit: 100,
+                        count_total: false,
+                        reverse: false,
+                    }),
+                }))
+                .await?
+                .into_inner();
+            channels.extend(response.channels);
+            key = response
+                .pagination
+                .map(|page| page.next_key)
+                .unwrap_or_default();
+            if key.is_empty() {
+                break;
+            }
+            if !seen.insert(key.clone()) {
+                return Err(Error::GatewayClient(
+                    "repeated channel pagination cursor".into(),
+                ));
+            }
+        }
+        Ok(prost::Message::encode_to_vec(&QueryChannelsResponse {
+            channels,
+            pagination: None,
+            height: None,
+        }))
     }
 
     /// Query all clients
@@ -1609,7 +1661,11 @@ impl GatewayClient {
         }
         Ok(UnsignedTx {
             cbor_hex,
-            description: format!("MsgRecvPacket (sequence: {})", sequence),
+            description: if unsigned_tx_any.type_url == "/ibc.cardano.v1.InitializePacketLanes" {
+                "InitializePacketLanes".into()
+            } else {
+                format!("MsgRecvPacket (sequence: {})", sequence)
+            },
         })
     }
 

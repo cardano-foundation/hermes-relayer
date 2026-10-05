@@ -26,6 +26,7 @@ pub struct ConsensusState {
     pub unique_pools_count: u64,
     pub unique_stake_bps: u64,
     pub security_score_bps: u64,
+    pub packet_state_snapshot: Vec<u8>,
 }
 
 impl Ics2ConsensusState for ConsensusState {
@@ -67,6 +68,7 @@ impl TryFrom<RawConsensusState> for ConsensusState {
             unique_pools_count: raw.unique_pools_count,
             unique_stake_bps: raw.unique_stake_bps,
             security_score_bps: raw.security_score_bps,
+            packet_state_snapshot: raw.packet_state_snapshot,
         })
     }
 }
@@ -81,6 +83,7 @@ impl From<ConsensusState> for RawConsensusState {
             unique_pools_count: value.unique_pools_count,
             unique_stake_bps: value.unique_stake_bps,
             security_score_bps: value.security_score_bps,
+            packet_state_snapshot: value.packet_state_snapshot,
         }
     }
 }

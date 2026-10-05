@@ -2436,6 +2436,7 @@ mod tests {
         let source_id = ChainId::from_string("cardano-0");
         let client_id: ClientId = "08-cardano-probabilistic-0".parse().unwrap();
         let client_state = AnyClientState::Probabilistic(ProbabilisticClientState {
+            packet_lane_policy_id: vec![0x55; 28],
             chain_id: source_id.clone(),
             latest_height: height(if exact_root_exists { 33 } else { 10 }),
             frozen_height: None,
@@ -2465,6 +2466,7 @@ mod tests {
             latest_checkpoint_timestamp: 100_000_000_000,
         });
         let consensus_state = AnyConsensusState::Probabilistic(ProbabilisticConsensusState {
+            packet_state_snapshot: vec![],
             root: CommitmentRoot::from_bytes(&[1; 32]),
             timestamp: 100_000_000_000,
             accepted_block_hash: "01".repeat(32),
