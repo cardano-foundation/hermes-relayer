@@ -564,13 +564,8 @@ impl CardanoChainEndpoint {
                             built.stage == "initialize",
                         )
                         .map_err(|e| Error::send_tx(e.to_string()))?;
-                        let unsigned = built
-                            .unsigned_tx
-                            .ok_or_else(|| Error::send_tx("Missing batch transaction".into()))?;
-                        let unsigned = super::gateway_client::UnsignedTx {
-                            cbor_hex: hex::encode(unsigned.value),
-                            description: built.stage.clone(),
-                        };
+                        let unsigned = super::gateway_client::UnsignedTx::from_packet_batch(&built)
+                            .map_err(|error| Error::send_tx(error.to_string()))?;
                         let (response, _) =
                             self.sign_submit_until_included(&unsigned, &intent).await?;
                         Ok(if built.stage == "send" {
@@ -949,17 +944,9 @@ impl CardanoChainEndpoint {
                     batch.stage == "initialize",
                 )
                 .map_err(|error| Error::send_tx(error.to_string()))?;
-                let unsigned = batch
-                    .unsigned_tx
-                    .ok_or_else(|| Error::send_tx("batch has no transaction".into()))?;
-                self.sign_submit_until_included(
-                    &super::gateway_client::UnsignedTx {
-                        cbor_hex: hex::encode(unsigned.value),
-                        description: batch.stage,
-                    },
-                    &intent,
-                )
-                .await?;
+                let unsigned = super::gateway_client::UnsignedTx::from_packet_batch(&batch)
+                    .map_err(|error| Error::send_tx(error.to_string()))?;
+                self.sign_submit_until_included(&unsigned, &intent).await?;
                 Ok::<bool, Error>(true)
             }
             .await;

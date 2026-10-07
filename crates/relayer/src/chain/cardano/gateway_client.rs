@@ -83,6 +83,29 @@ pub struct UnsignedTx {
     pub description: String,
 }
 
+impl UnsignedTx {
+    pub fn from_packet_batch(
+        batch: &super::generated::ibc::cardano::v1::BuildPacketBatchResponse,
+    ) -> Result<Self, Error> {
+        let unsigned = batch
+            .unsigned_tx
+            .as_ref()
+            .ok_or_else(|| Error::Transaction("Gateway batch has no transaction".into()))?;
+        // Gateway sends UTF-8 hexadecimal text in Any.value, as it does for
+        // ordinary IBC transactions. Hex-encoding these bytes corrupts the CBOR.
+        let cbor_hex = std::str::from_utf8(&unsigned.value).map_err(|error| {
+            Error::Transaction(format!(
+                "Gateway returned invalid UTF-8 in batch transaction: {error}"
+            ))
+        })?;
+        validate_unsigned_tx_cbor(cbor_hex, 0)?;
+        Ok(Self {
+            cbor_hex: cbor_hex.to_string(),
+            description: batch.stage.clone(),
+        })
+    }
+}
+
 /// Transaction submission response from Gateway
 #[derive(Debug, Clone)]
 pub struct TxSubmitResponse {
@@ -2292,6 +2315,68 @@ mod tests {
 
     fn gateway_uri(value: &str) -> Uri {
         value.parse().expect("valid test URI")
+    }
+
+    #[test]
+    fn gateway_packet_batch_preserves_transaction_bytes_and_body_hash() {
+        use blake2::{digest::consts::U32, Blake2b};
+        use pallas_codec::minicbor;
+        use pallas_primitives::conway::MintedTx;
+
+        // Captured from PacketLaneService.batch and the real runChain/Lucid
+        // completion path, then encoded with Gateway's protobuf encoder.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/gateway-packet-batch.json")).unwrap();
+        let wire = hex::decode(fixture["response_hex"].as_str().unwrap()).unwrap();
+        let batch = super::super::generated::ibc::cardano::v1::BuildPacketBatchResponse::decode(
+            wire.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(batch.stage, "send");
+        assert!(!batch.intent_tx_hashes.is_empty());
+        let unsigned = UnsignedTx::from_packet_batch(&batch).unwrap();
+        assert_eq!(unsigned.description, batch.stage);
+        assert_eq!(
+            unsigned.cbor_hex,
+            fixture["transaction_hex"].as_str().unwrap()
+        );
+        // This is the single hex decode performed before resolving/signing.
+        let bytes = hex::decode(&unsigned.cbor_hex).unwrap();
+        assert_eq!(
+            bytes,
+            hex::decode(fixture["transaction_hex"].as_str().unwrap()).unwrap()
+        );
+        let mut decoder = minicbor::Decoder::new(&bytes);
+        let tx: MintedTx<'_> = decoder.decode().unwrap();
+        assert_eq!(decoder.position(), bytes.len());
+        let hash = Blake2b::<U32>::digest(tx.transaction_body.raw_cbor());
+        assert_eq!(hex::encode(hash), fixture["body_hash"].as_str().unwrap());
+    }
+
+    #[test]
+    fn gateway_packet_batch_rejects_invalid_transaction_encoding() {
+        use super::super::generated::ibc::cardano::v1::BuildPacketBatchResponse;
+
+        for stage in ["initialize", "send"] {
+            for value in [vec![0xff], vec![], b"abc".to_vec(), b"84xz".to_vec()] {
+                let batch = BuildPacketBatchResponse {
+                    stage: stage.to_string(),
+                    unsigned_tx: Some(prost_types::Any {
+                        type_url: String::new(),
+                        value,
+                    }),
+                    ..Default::default()
+                };
+                let error = UnsignedTx::from_packet_batch(&batch).unwrap_err();
+                assert!(matches!(error, Error::Transaction(_)));
+                assert!(error.to_string().contains("Gateway"));
+            }
+            let missing = BuildPacketBatchResponse {
+                stage: stage.to_string(),
+                ..Default::default()
+            };
+            assert!(UnsignedTx::from_packet_batch(&missing).is_err());
+        }
     }
 
     fn denom_hash(full_denom: &str) -> [u8; 32] {
