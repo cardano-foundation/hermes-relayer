@@ -907,61 +907,55 @@ impl CardanoChainEndpoint {
             .map_err(|error| Error::query(error.to_string()))?;
         let channels = QueryChannelsResponse::decode(bytes.as_slice())
             .map_err(|error| Error::query(error.to_string()))?;
-        for channel in channels.channels {
-            if !schedule.ready(&channel.channel_id, std::time::Instant::now()) {
-                continue;
-            }
-            if channel.port_id != "transfer" || channel.state != 3 {
-                continue;
-            }
-            // One bounded batch per channel per pass. On the next pass the
-            // Gateway reloads included state, including any rolled-back intents.
-            let result = async {
-                let batch = self
-                    .gateway_client
-                    .build_packet_batch(
-                        &self.signer_address,
-                        &channel.port_id,
-                        &channel.channel_id,
-                        "",
-                    )
-                    .await
-                    .map_err(|error| Error::send_tx(error.to_string()))?;
-                if batch.stage == "idle" {
-                    return Ok(false);
-                }
-                if batch.stage != "send" && batch.stage != "initialize" {
-                    return Err(Error::send_tx("unexpected executor batch stage".into()));
-                }
-                let hash = batch
-                    .intent_tx_hashes
-                    .first()
-                    .ok_or_else(|| Error::send_tx("batch has no funded request".into()))?;
-                let intent = SigningIntent::funded_batch(
-                    &channel.port_id,
-                    &channel.channel_id,
-                    hash,
-                    batch.stage == "initialize",
-                )
-                .map_err(|error| Error::send_tx(error.to_string()))?;
-                let unsigned = super::gateway_client::UnsignedTx::from_packet_batch(&batch)
-                    .map_err(|error| Error::send_tx(error.to_string()))?;
-                self.sign_submit_until_included(&unsigned, &intent).await?;
-                Ok::<bool, Error>(true)
-            }
+        let eligible = channels
+            .channels
+            .into_iter()
+            .filter(|channel| channel.port_id == "transfer" && channel.state == 3)
+            .map(|channel| channel.channel_id);
+        let failures = schedule
+            .execute(
+                eligible,
+                self.config.packet_executor_concurrency,
+                |channel| async move { self.execute_channel_batch(&channel).await },
+            )
             .await;
-            match result {
-                Ok(sent) => {
-                    schedule.succeeded(&channel.channel_id, sent);
-                }
-                Err(error) => {
-                    schedule.failed(channel.channel_id.clone(), std::time::Instant::now());
-                    tracing::warn!(channel = %channel.channel_id, %error,
-                        "Funded request batch will retry from canonical state");
-                }
-            }
+        for (channel, error) in failures {
+            tracing::warn!(%channel, %error,
+                "Funded request batch will retry from canonical state");
         }
         Ok(())
+    }
+
+    async fn execute_channel_batch(&self, channel: &str) -> Result<bool, Error> {
+        // The Gateway reserves spending and collateral inputs across builds.
+        // Busy shared inputs fail this channel and enter its existing backoff.
+        let batch = self
+            .gateway_client
+            .build_packet_batch(&self.signer_address, "transfer", channel, "")
+            .await
+            .map_err(|error| Error::send_tx(error.to_string()))?;
+        if batch.stage == "idle" {
+            return Ok(false);
+        }
+        if batch.stage != "send" && batch.stage != "initialize" {
+            return Err(Error::send_tx("unexpected executor batch stage".into()));
+        }
+        let hash = batch
+            .intent_tx_hashes
+            .first()
+            .ok_or_else(|| Error::send_tx("batch has no funded request".into()))?;
+        let intent =
+            SigningIntent::funded_batch("transfer", channel, hash, batch.stage == "initialize")
+                .map_err(|error| Error::send_tx(error.to_string()))?;
+        let unsigned = super::gateway_client::UnsignedTx::from_packet_batch(&batch)
+            .map_err(|error| Error::send_tx(error.to_string()))?;
+        tracing::info!(%channel, stage = %batch.stage,
+            intents = batch.intent_tx_hashes.len(), "Executing funded request batch");
+        let (response, height) = self.sign_submit_until_included(&unsigned, &intent).await?;
+        tracing::info!(%channel, tx_hash = %response.tx_hash, %height,
+            stage = %batch.stage, intents = batch.intent_tx_hashes.len(),
+            "Funded request batch included");
+        Ok(true)
     }
 
     fn spawn_intent_executor(&self) -> Result<(), Error> {

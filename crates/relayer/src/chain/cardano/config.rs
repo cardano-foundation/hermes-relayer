@@ -3,6 +3,7 @@
 use ibc_relayer_types::core::ics24_host::identifier::ChainId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -162,6 +163,11 @@ pub struct CardanoConfig {
     #[serde(default = "default_event_replay_window")]
     pub event_replay_window: u64,
 
+    /// Maximum independent channels executing funded batches at once.
+    /// One preserves serial execution. Each channel has at most one batch in flight.
+    #[serde(default = "default_packet_executor_concurrency")]
+    pub packet_executor_concurrency: NonZeroUsize,
+
     /// Retry interval after a failed HostState heartbeat check. Successful
     /// checks use Gateway's suggested delay until the epoch midpoint, capped
     /// at one hour to notice rollbacks. `None` disables proactive heartbeats.
@@ -293,6 +299,10 @@ impl fmt::Debug for CardanoConfig {
             .field("event_poll_interval", &self.event_poll_interval)
             .field("event_replay_window", &self.event_replay_window)
             .field(
+                "packet_executor_concurrency",
+                &self.packet_executor_concurrency,
+            )
+            .field(
                 "host_state_heartbeat_interval",
                 &self.host_state_heartbeat_interval,
             )
@@ -304,6 +314,10 @@ impl fmt::Debug for CardanoConfig {
             .field("mithril_wait_log_interval", &self.mithril_wait_log_interval)
             .finish()
     }
+}
+
+fn default_packet_executor_concurrency() -> NonZeroUsize {
+    NonZeroUsize::new(2).unwrap()
 }
 
 fn default_max_block_time() -> Duration {
@@ -405,6 +419,7 @@ impl Default for CardanoConfig {
             client_refresh_rate: default::client_refresh_rate(),
             event_poll_interval: default_event_poll_interval(),
             event_replay_window: default_event_replay_window(),
+            packet_executor_concurrency: default_packet_executor_concurrency(),
             host_state_heartbeat_interval: None,
             mithril_certification_timeout: default_mithril_certification_timeout(),
             mithril_poll_interval: default_mithril_poll_interval(),
@@ -418,6 +433,27 @@ mod tests {
     use super::CardanoConfig;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn executor_concurrency_defaults_and_rejects_zero() {
+        let config = CardanoConfig::default();
+        assert_eq!(config.packet_executor_concurrency.get(), 2);
+        let encoded = toml::to_string(&config).unwrap();
+        let legacy = encoded.replace("packet_executor_concurrency = 2\n", "");
+        let decoded: CardanoConfig = toml::from_str(&legacy).unwrap();
+        assert_eq!(decoded.packet_executor_concurrency.get(), 2);
+        let serial: CardanoConfig = toml::from_str(&encoded.replace(
+            "packet_executor_concurrency = 2",
+            "packet_executor_concurrency = 1",
+        ))
+        .unwrap();
+        assert_eq!(serial.packet_executor_concurrency.get(), 1);
+        assert!(toml::from_str::<CardanoConfig>(&encoded.replace(
+            "packet_executor_concurrency = 2",
+            "packet_executor_concurrency = 0"
+        ))
+        .is_err());
+    }
 
     #[test]
     fn gateway_security_defaults_preserve_local_development() {
