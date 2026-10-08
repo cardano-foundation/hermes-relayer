@@ -74,11 +74,8 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions-rs/clippy-check@v1
-        with:
-          name: clippy-no-default-features
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: --workspace --no-default-features --all-targets -- -D warnings
+      - name: Check Clippy without default features
+        run: cargo clippy --workspace --no-default-features --all-targets -- -D warnings
 
   # Workspace-wide builds always enable every chain backend, because the test
   # framework requires them, so check the default build and each opt-in
