@@ -317,7 +317,7 @@ impl fmt::Debug for CardanoConfig {
 }
 
 fn default_packet_executor_concurrency() -> NonZeroUsize {
-    NonZeroUsize::new(2).unwrap()
+    NonZeroUsize::new(4).unwrap()
 }
 
 fn default_max_block_time() -> Duration {
@@ -437,19 +437,25 @@ mod tests {
     #[test]
     fn executor_concurrency_defaults_and_rejects_zero() {
         let config = CardanoConfig::default();
-        assert_eq!(config.packet_executor_concurrency.get(), 2);
+        assert_eq!(config.packet_executor_concurrency.get(), 4);
         let encoded = toml::to_string(&config).unwrap();
-        let legacy = encoded.replace("packet_executor_concurrency = 2\n", "");
+        let legacy = encoded.replace("packet_executor_concurrency = 4\n", "");
         let decoded: CardanoConfig = toml::from_str(&legacy).unwrap();
-        assert_eq!(decoded.packet_executor_concurrency.get(), 2);
+        assert_eq!(decoded.packet_executor_concurrency.get(), 4);
         let serial: CardanoConfig = toml::from_str(&encoded.replace(
-            "packet_executor_concurrency = 2",
+            "packet_executor_concurrency = 4",
             "packet_executor_concurrency = 1",
         ))
         .unwrap();
         assert_eq!(serial.packet_executor_concurrency.get(), 1);
-        assert!(toml::from_str::<CardanoConfig>(&encoded.replace(
+        let bounded: CardanoConfig = toml::from_str(&encoded.replace(
+            "packet_executor_concurrency = 4",
             "packet_executor_concurrency = 2",
+        ))
+        .unwrap();
+        assert_eq!(bounded.packet_executor_concurrency.get(), 2);
+        assert!(toml::from_str::<CardanoConfig>(&encoded.replace(
+            "packet_executor_concurrency = 4",
             "packet_executor_concurrency = 0"
         ))
         .is_err());

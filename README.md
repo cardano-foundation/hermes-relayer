@@ -190,7 +190,7 @@ Cardano keys restored from mnemonics use Hermes' current Cardano-shaped SLIP-001
 
 After the source commitment for a received unordered packet has been removed, an operator can prune the corresponding receipt and acknowledgement from Cardano with `hermes tx packet-prune --dst-chain cardano-preview --src-chain injective-888 --src-port transfer --src-channel channel-7 --sequence 12`. The command defaults to the Cardano client’s latest verified source height; for a connection with a nonzero delay, pass an older, delay-matured height such as `--proof-height 888-12345`, which must still be at or above the channel’s receive high-water mark and pruning floor.
 
-Funded intent execution uses `packet_executor_concurrency = 2` by default. Independent channels may build, sign and await inclusion together. Each channel still executes one batch per pass and retries from canonical state after a failure. Set the value to `1` to preserve serial execution. Separate wallet inputs are needed for simultaneous fees and collateral. The send builder still includes at most two intents and pruning remains operator managed.
+Funded intent execution uses `packet_executor_concurrency = 4` by default. Independent channels may build, sign and await inclusion together. Each channel still executes one batch per pass and retries from canonical state after a failure. Set the value to `1` to preserve serial execution. Separate wallet inputs are needed for simultaneous fees and collateral. The send builder still includes at most two intents and pruning remains operator managed.
 
 ### Cardano ICS-20 Amount Range
 
