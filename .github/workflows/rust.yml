@@ -57,11 +57,8 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions-rs/clippy-check@v1
-        with:
-          name: clippy-all-features
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: --workspace --all-features --all-targets -- -D warnings
+      - name: Clippy all features
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
   clippy-no-default-features:
     runs-on: ubuntu-latest
@@ -95,11 +92,9 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions-rs/clippy-check@v1
-        with:
-          name: clippy-chain-backends (${{ matrix.backend }})
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: >-
+      - name: Clippy chain backend
+        run: >-
+            cargo clippy
             -p ibc-relayer-cli -p ibc-relayer-rest -p ibc-chain-registry
             --no-default-features
             ${{ matrix.backend != 'none' && format('--features ibc-relayer-cli/{0}', matrix.backend) || '' }}
