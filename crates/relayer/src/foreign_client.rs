@@ -2654,9 +2654,10 @@ mod tests {
         let (result, source, destination) = prepare_proof_with_checkpoint_cursor(true, false);
 
         assert!(result.expect("the exact proof root exists").is_empty());
-        assert_eq!(destination.consensus_heights, vec![height(33), height(33)]);
-        assert_eq!(destination.client_state_queries, 0);
-        assert_eq!(source.application_status_queries, 0);
+        // Challenge checks also revalidate the client before and after preparing updates.
+        assert_eq!(destination.consensus_heights, vec![height(33); 4]);
+        assert_eq!(destination.client_state_queries, 2);
+        assert_eq!(source.application_status_queries, 2);
         assert_eq!(source.submissions + destination.submissions, 0);
     }
 
@@ -2673,10 +2674,10 @@ mod tests {
             .contains("a checkpoint cursor is insufficient"));
         assert_eq!(
             destination.consensus_heights,
-            vec![height(33), height(10), height(33)]
+            vec![height(10), height(33), height(10), height(10), height(33)]
         );
-        assert_eq!(destination.client_state_queries, 1);
-        assert_eq!(source.application_status_queries, 2);
+        assert_eq!(destination.client_state_queries, 3);
+        assert_eq!(source.application_status_queries, 4);
         assert_eq!(source.submissions + destination.submissions, 0);
     }
 
