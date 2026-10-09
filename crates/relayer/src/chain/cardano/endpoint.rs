@@ -5239,6 +5239,8 @@ mod tests {
             latest_checkpoint_slot: 10,
             latest_checkpoint_timestamp: 11,
             epoch_context_challenges: vec![],
+            latest_checkpoint_nonce_state: None,
+            randomness_stabilisation_window_slots: 0,
         })
     }
 

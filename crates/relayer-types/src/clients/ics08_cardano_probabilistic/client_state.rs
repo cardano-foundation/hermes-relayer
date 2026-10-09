@@ -53,6 +53,8 @@ pub struct ClientState {
     pub latest_checkpoint_timestamp: u64,
     pub packet_lane_policy_id: Vec<u8>,
     pub epoch_context_challenges: Vec<raw::EpochContextChallenge>,
+    pub latest_checkpoint_nonce_state: Option<raw::PraosNonceState>,
+    pub randomness_stabilisation_window_slots: u64,
 }
 
 impl ClientState {
@@ -121,6 +123,8 @@ impl TryFrom<RawClientState> for ClientState {
             latest_checkpoint_timestamp,
             packet_lane_policy_id,
             epoch_context_challenges,
+            latest_checkpoint_nonce_state,
+            randomness_stabilisation_window_slots,
         } = raw;
 
         let chain_id = ChainId::from_string(&raw_chain_id);
@@ -321,6 +325,8 @@ impl TryFrom<RawClientState> for ClientState {
             latest_checkpoint_timestamp,
             packet_lane_policy_id,
             epoch_context_challenges,
+            latest_checkpoint_nonce_state,
+            randomness_stabilisation_window_slots,
         })
     }
 }
@@ -360,6 +366,8 @@ impl From<ClientState> for RawClientState {
             latest_checkpoint_timestamp: value.latest_checkpoint_timestamp,
             packet_lane_policy_id: value.packet_lane_policy_id,
             epoch_context_challenges: value.epoch_context_challenges,
+            latest_checkpoint_nonce_state: value.latest_checkpoint_nonce_state,
+            randomness_stabilisation_window_slots: value.randomness_stabilisation_window_slots,
         }
     }
 }
@@ -503,6 +511,28 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn checkpoint_nonce_state_survives_protobuf_round_trip() {
+        let mut raw = raw_client_state();
+        raw.latest_checkpoint_nonce_state = Some(raw::PraosNonceState {
+            epoch_nonce: vec![2; 32],
+            evolving_nonce: vec![3; 32],
+            candidate_nonce: vec![4; 32],
+            last_applied_block_nonce: vec![5; 32],
+            last_epoch_block_nonce: Vec::new(),
+        });
+        raw.randomness_stabilisation_window_slots = 172_800;
+        let state = ClientState::try_from(raw.clone()).unwrap();
+        let any: Any = state.into();
+        let decoded = ClientState::try_from(any).unwrap();
+        let restored: RawClientState = decoded.into();
+        assert_eq!(
+            restored.latest_checkpoint_nonce_state,
+            raw.latest_checkpoint_nonce_state
+        );
+        assert_eq!(restored.randomness_stabilisation_window_slots, 172_800);
     }
 
     #[test]

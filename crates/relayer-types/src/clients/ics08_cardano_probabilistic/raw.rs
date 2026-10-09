@@ -113,6 +113,27 @@ pub struct ClientState {
     pub packet_lane_policy_id: Vec<u8>,
     #[prost(message, repeated, tag = "31")]
     pub epoch_context_challenges: Vec<EpochContextChallenge>,
+    #[prost(message, optional, tag = "32")]
+    pub latest_checkpoint_nonce_state: Option<PraosNonceState>,
+    #[prost(uint64, tag = "33")]
+    pub randomness_stabilisation_window_slots: u64,
+}
+
+/// Native Praos running values at an authenticated checkpoint.
+/// Empty running values encode NeutralNonce. A missing message is unavailable.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct PraosNonceState {
+    #[prost(bytes = "vec", tag = "1")]
+    pub epoch_nonce: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub evolving_nonce: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub candidate_nonce: Vec<u8>,
+    // Previous-block hash of the last applied header, not its own hash.
+    #[prost(bytes = "vec", tag = "4")]
+    pub last_applied_block_nonce: Vec<u8>,
+    #[prost(bytes = "vec", tag = "5")]
+    pub last_epoch_block_nonce: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
@@ -141,6 +162,8 @@ pub struct ConsensusState {
     pub security_score_bps: u64,
     #[prost(bytes = "vec", tag = "8")]
     pub packet_state_snapshot: Vec<u8>,
+    #[prost(message, optional, tag = "9")]
+    pub nonce_state: Option<PraosNonceState>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]

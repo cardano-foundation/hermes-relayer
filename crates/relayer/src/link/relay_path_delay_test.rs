@@ -25,6 +25,8 @@ fn cardano_client() -> AnyClientState {
     AnyClientState::Probabilistic(ProbabilisticClientState {
         packet_lane_policy_id: vec![0x55; 28],
         epoch_context_challenges: vec![],
+        latest_checkpoint_nonce_state: None,
+        randomness_stabilisation_window_slots: 0,
         chain_id: ChainId::from_string("cardano-0"),
         latest_height: height(33),
         frozen_height: None,
@@ -82,6 +84,7 @@ fn runtime(config: ChainConfig) -> (BaseChainHandle, thread::JoinHandle<Vec<Heig
                         Ok((
                             AnyConsensusState::Probabilistic(ProbabilisticConsensusState {
                                 packet_state_snapshot: vec![],
+                                nonce_state: None,
                                 root: CommitmentRoot::from_bytes(&[1; 32]),
                                 timestamp: 100_000_000_000,
                                 accepted_block_hash: "01".repeat(32),

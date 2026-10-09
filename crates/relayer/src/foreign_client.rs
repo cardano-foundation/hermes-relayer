@@ -2516,6 +2516,8 @@ mod tests {
         let client_state = AnyClientState::Probabilistic(ProbabilisticClientState {
             packet_lane_policy_id: vec![0x55; 28],
             epoch_context_challenges: vec![],
+            latest_checkpoint_nonce_state: None,
+            randomness_stabilisation_window_slots: 0,
             chain_id: source_id.clone(),
             latest_height: height(if exact_root_exists { 33 } else { 10 }),
             frozen_height: None,
@@ -2546,6 +2548,7 @@ mod tests {
         });
         let consensus_state = AnyConsensusState::Probabilistic(ProbabilisticConsensusState {
             packet_state_snapshot: vec![],
+            nonce_state: None,
             root: CommitmentRoot::from_bytes(&[1; 32]),
             timestamp: 100_000_000_000,
             accepted_block_hash: "01".repeat(32),
