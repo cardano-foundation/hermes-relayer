@@ -24,6 +24,7 @@ fn height(n: u64) -> Height {
 fn cardano_client() -> AnyClientState {
     AnyClientState::Probabilistic(ProbabilisticClientState {
         packet_lane_policy_id: vec![0x55; 28],
+        epoch_context_challenges: vec![],
         chain_id: ChainId::from_string("cardano-0"),
         latest_height: height(33),
         frozen_height: None,

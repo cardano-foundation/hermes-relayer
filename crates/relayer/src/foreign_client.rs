@@ -2515,6 +2515,7 @@ mod tests {
         let client_id: ClientId = "08-cardano-probabilistic-0".parse().unwrap();
         let client_state = AnyClientState::Probabilistic(ProbabilisticClientState {
             packet_lane_policy_id: vec![0x55; 28],
+            epoch_context_challenges: vec![],
             chain_id: source_id.clone(),
             latest_height: height(if exact_root_exists { 33 } else { 10 }),
             frozen_height: None,
