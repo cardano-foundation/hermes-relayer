@@ -28,6 +28,7 @@ pub struct ConsensusState {
     pub security_score_bps: u64,
     pub packet_state_snapshot: Vec<u8>,
     pub nonce_state: Option<raw::PraosNonceState>,
+    pub pool_registry: Option<raw::PoolRegistryState>,
 }
 
 impl Ics2ConsensusState for ConsensusState {
@@ -71,6 +72,7 @@ impl TryFrom<RawConsensusState> for ConsensusState {
             security_score_bps: raw.security_score_bps,
             packet_state_snapshot: raw.packet_state_snapshot,
             nonce_state: raw.nonce_state,
+            pool_registry: raw.pool_registry,
         })
     }
 }
@@ -87,6 +89,7 @@ impl From<ConsensusState> for RawConsensusState {
             security_score_bps: value.security_score_bps,
             packet_state_snapshot: value.packet_state_snapshot,
             nonce_state: value.nonce_state,
+            pool_registry: value.pool_registry,
         }
     }
 }
@@ -131,6 +134,7 @@ mod tests {
     fn historical_nonce_state_survives_protobuf_round_trip() {
         let raw = RawConsensusState {
             ibc_state_root: vec![1; 32],
+            pool_registry: Some(raw::test_pool_registry()),
             nonce_state: Some(raw::PraosNonceState {
                 epoch_nonce: vec![2; 32],
                 evolving_nonce: vec![3; 32],
@@ -145,5 +149,6 @@ mod tests {
         let decoded = ConsensusState::try_from(any).unwrap();
         let restored: RawConsensusState = decoded.into();
         assert_eq!(restored.nonce_state, raw.nonce_state);
+        assert_eq!(restored.pool_registry, raw.pool_registry);
     }
 }

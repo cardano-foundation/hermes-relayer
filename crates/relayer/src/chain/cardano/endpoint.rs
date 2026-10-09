@@ -1893,12 +1893,14 @@ impl ChainEndpoint for CardanoChainEndpoint {
             effective_trusted,
             target
         );
-        let header = self
+        let mut header = self
             .rt
             .block_on(self.gateway_client.query_header(effective_trusted, target))
             .map_err(|e| {
                 Error::query(format!("failed to query Cardano header from Gateway: {e}"))
             })?;
+
+        bind_probabilistic_pool_metadata(&mut header, client_state)?;
 
         let (host_state_nft_policy_id, host_state_nft_token_name) = match client_state {
             AnyClientState::Mithril(state) => (
@@ -3587,7 +3589,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &mut self,
         trusted_height: ICSHeight,
         target_height: ICSHeight,
-        _client_state: &AnyClientState,
+        client_state: &AnyClientState,
     ) -> Result<(Self::Header, Vec<Self::Header>), Error> {
         // NOTE: Hermes core logic often requests a client update at `proofs_height + 1`.
         //
@@ -3617,7 +3619,10 @@ impl ChainEndpoint for CardanoChainEndpoint {
             self.gateway_client
                 .query_header(effective_trusted_height, target_height),
         ) {
-            Ok(header) => Ok((header, vec![])),
+            Ok(mut header) => {
+                bind_probabilistic_pool_metadata(&mut header, client_state)?;
+                Ok((header, vec![]))
+            }
             Err(e) => {
                 if !is_recoverable_gateway_header_height_error(&e) {
                     return Err(Error::query(format!("Gateway query_header failed: {e}")));
@@ -4098,6 +4103,52 @@ fn cardano_headers_conflict(
     }
 }
 
+// Compatibility fields come from the destination client's saved registration
+// snapshot. Stake amounts still come from the candidate table. Cosmos repeats
+// these checks while processing authenticated bodies and remains authoritative.
+fn bind_probabilistic_pool_metadata(
+    header: &mut AnyHeader,
+    client: &AnyClientState,
+) -> Result<(), Error> {
+    let (AnyHeader::Probabilistic(header), AnyClientState::Probabilistic(client)) =
+        (header, client)
+    else {
+        return Ok(());
+    };
+    let Some(context) = header.new_epoch_context.as_mut() else {
+        return Ok(());
+    };
+    let registry = client
+        .latest_checkpoint_pool_registry
+        .as_ref()
+        .ok_or_else(|| {
+            Error::query("destination client has no authenticated pool registry".to_string())
+        })?;
+    let bindings = if context.epoch == registry.epoch {
+        &registry.effective
+    } else if registry.epoch.checked_add(1) == Some(context.epoch) {
+        &registry.mark
+    } else {
+        return Err(Error::query(
+            "pool registry cannot supply this epoch snapshot".to_string(),
+        ));
+    };
+    for entry in &mut context.stake_distribution {
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.pool_id == entry.pool_id.to_lowercase())
+            .ok_or_else(|| {
+                Error::query(format!(
+                    "pool {} has no authenticated effective registration",
+                    entry.pool_id
+                ))
+            })?;
+        entry.vrf_key_hash = binding.vrf_key_hash.clone();
+        entry.first_registration_slot = binding.first_registration_slot;
+    }
+    Ok(())
+}
+
 fn probabilistic_epoch_contexts_equal(
     left: &ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::EpochContext,
     right: &ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::EpochContext,
@@ -4105,8 +4156,16 @@ fn probabilistic_epoch_contexts_equal(
     let normalize =
         |context: &ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::EpochContext| {
             let mut context = context.clone();
+            context.epoch_nonce.clear();
+            context.epoch_start_slot = 0;
+            context.epoch_end_slot_exclusive = 0;
+            context.slots_per_kes_period = 0;
             for pool in &mut context.stake_distribution {
                 pool.pool_id = pool.pool_id.to_lowercase();
+                pool.vrf_key_hash.clear();
+                pool.first_registration_slot = 0;
+                pool.relative_stake_numerator = 0;
+                pool.relative_stake_denominator = 0;
             }
             context
                 .stake_distribution
@@ -5240,6 +5299,7 @@ mod tests {
             latest_checkpoint_timestamp: 11,
             epoch_context_challenges: vec![],
             latest_checkpoint_nonce_state: None,
+            latest_checkpoint_pool_registry: None,
             randomness_stabilisation_window_slots: 0,
         })
     }
@@ -5496,6 +5556,60 @@ mod tests {
     }
 
     #[test]
+    fn pool_metadata_uses_the_destination_clients_frozen_snapshot() {
+        use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
+        let mut client = probabilistic_client_state();
+        let AnyClientState::Probabilistic(state) = &mut client else {
+            unreachable!()
+        };
+        let old = raw::PoolRegistrationBinding {
+            pool_id: "pool-a".into(),
+            vrf_key_hash: vec![1; 32],
+            first_registration_slot: 0,
+        };
+        let next = raw::PoolRegistrationBinding {
+            vrf_key_hash: vec![2; 32],
+            ..old.clone()
+        };
+        state.latest_checkpoint_pool_registry = Some(raw::PoolRegistryState {
+            epoch: 7,
+            effective: vec![old],
+            mark: vec![next],
+            ..Default::default()
+        });
+        let mut header = probabilistic_header(11, "anchor");
+        header.new_epoch_context = Some(raw::EpochContext {
+            epoch: 8,
+            stake_distribution: vec![raw::StakeDistributionEntry {
+                pool_id: "pool-a".into(),
+                stake: 123,
+                vrf_key_hash: vec![9; 32],
+                first_registration_slot: 999,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut header = AnyHeader::Probabilistic(header);
+        bind_probabilistic_pool_metadata(&mut header, &client).unwrap();
+        let AnyHeader::Probabilistic(ref mut state) = header else {
+            unreachable!()
+        };
+        let context = state.new_epoch_context.as_mut().unwrap();
+        assert_eq!(context.stake_distribution[0].vrf_key_hash, vec![2; 32]);
+        assert_eq!(context.stake_distribution[0].first_registration_slot, 0);
+        assert_eq!(context.stake_distribution[0].stake, 123);
+        context.epoch = 7;
+        bind_probabilistic_pool_metadata(&mut header, &client).unwrap();
+        let AnyHeader::Probabilistic(ref mut state) = header else {
+            unreachable!()
+        };
+        let context = state.new_epoch_context.as_mut().unwrap();
+        assert_eq!(context.stake_distribution[0].vrf_key_hash, vec![1; 32]);
+        context.stake_distribution[0].pool_id = "invented-pool".into();
+        assert!(bind_probabilistic_pool_metadata(&mut header, &client).is_err());
+    }
+
+    #[test]
     fn probabilistic_rootless_witness_detects_context_and_fork_conflicts() {
         use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
         let mut submitted = probabilistic_header(10, "same-anchor");
@@ -5529,6 +5643,13 @@ mod tests {
             .pool_id = "POOL-A".into();
         assert!(!conflicts(witness.clone()));
         witness.new_epoch_context.as_mut().unwrap().epoch_nonce = vec![2; 32];
+        assert!(!conflicts(witness.clone()));
+        witness
+            .new_epoch_context
+            .as_mut()
+            .unwrap()
+            .stake_distribution[0]
+            .stake += 1;
         assert!(conflicts(witness.clone()));
         witness.new_epoch_context = submitted.new_epoch_context.clone();
         witness.anchor_block.hash = "honest-fork".into();

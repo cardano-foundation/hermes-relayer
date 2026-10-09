@@ -26,7 +26,7 @@ pub struct StakeDistributionEntry {
     pub relative_stake_denominator: u64,
 }
 
-/// During updates only the pool and stake table supplies new trust inputs.
+/// During updates only stake allocation supplies new trust inputs.
 /// The Cosmos verifier compares every other field with values derived from
 /// accepted state or stored network configuration. Mismatches reject updates.
 /// The starting state and network configuration require authenticated or
@@ -36,7 +36,7 @@ pub struct EpochContext {
     /// Must equal the epoch derived from the signed header slot and stored schedule.
     #[prost(uint64, tag = "1")]
     pub epoch: u64,
-    /// Supplied under the challenge model. Headers and nonces do not prove this table.
+    /// Stake allocation is challenged. Identities, VRF keys and ages must match the independent registry.
     #[prost(message, repeated, tag = "2")]
     pub stake_distribution: ::prost::alloc::vec::Vec<StakeDistributionEntry>,
     /// Must equal the locally derived nonce that the Cosmos header verifier uses.
@@ -128,6 +128,45 @@ pub struct ClientState {
     pub latest_checkpoint_nonce_state: Option<PraosNonceState>,
     #[prost(uint64, tag = "33")]
     pub randomness_stabilisation_window_slots: u64,
+    #[prost(message, optional, tag = "34")]
+    pub latest_checkpoint_pool_registry: Option<PoolRegistryState>,
+}
+
+/// Pool identities and keys retained separately from supplied stake amounts.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct PoolRegistrationBinding {
+    #[prost(string, tag = "1")]
+    pub pool_id: String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub vrf_key_hash: Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub first_registration_slot: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct PoolRegistrationRecord {
+    #[prost(message, optional, tag = "1")]
+    pub registration: Option<PoolRegistrationBinding>,
+    #[prost(bool, tag = "2")]
+    pub registered: bool,
+    #[prost(bytes = "vec", tag = "3")]
+    pub pending_vrf_key_hash: Vec<u8>,
+    #[prost(uint64, tag = "4")]
+    pub pending_effective_epoch: u64,
+    #[prost(uint64, tag = "5")]
+    pub retirement_epoch: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct PoolRegistryState {
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+    #[prost(message, repeated, tag = "2")]
+    pub pools: Vec<PoolRegistrationRecord>,
+    #[prost(message, repeated, tag = "3")]
+    pub mark: Vec<PoolRegistrationBinding>,
+    #[prost(message, repeated, tag = "4")]
+    pub effective: Vec<PoolRegistrationBinding>,
 }
 
 /// Native Praos running values at an authenticated checkpoint.
@@ -175,6 +214,8 @@ pub struct ConsensusState {
     pub packet_state_snapshot: Vec<u8>,
     #[prost(message, optional, tag = "9")]
     pub nonce_state: Option<PraosNonceState>,
+    #[prost(message, optional, tag = "10")]
+    pub pool_registry: Option<PoolRegistryState>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
@@ -292,5 +333,26 @@ mod tests {
                 12,
             ]
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_pool_registry() -> PoolRegistryState {
+    let binding = PoolRegistrationBinding {
+        pool_id: "pool-a".to_string(),
+        vrf_key_hash: vec![1; 32],
+        first_registration_slot: 0,
+    };
+    PoolRegistryState {
+        epoch: 7,
+        pools: vec![PoolRegistrationRecord {
+            registration: Some(binding.clone()),
+            registered: true,
+            pending_vrf_key_hash: vec![2; 32],
+            pending_effective_epoch: 8,
+            retirement_epoch: 12,
+        }],
+        mark: vec![binding.clone()],
+        effective: vec![binding],
     }
 }
