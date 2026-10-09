@@ -26,18 +26,29 @@ pub struct StakeDistributionEntry {
     pub relative_stake_denominator: u64,
 }
 
+/// During updates only the pool and stake table supplies new trust inputs.
+/// The Cosmos verifier compares every other field with values derived from
+/// accepted state or stored network configuration. Mismatches reject updates.
+/// The starting state and network configuration require authenticated or
+/// explicitly trusted bootstrap.
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 pub struct EpochContext {
+    /// Must equal the epoch derived from the signed header slot and stored schedule.
     #[prost(uint64, tag = "1")]
     pub epoch: u64,
+    /// Supplied under the challenge model. Headers and nonces do not prove this table.
     #[prost(message, repeated, tag = "2")]
     pub stake_distribution: ::prost::alloc::vec::Vec<StakeDistributionEntry>,
+    /// Must equal the locally derived nonce that the Cosmos header verifier uses.
     #[prost(bytes = "vec", tag = "3")]
     pub epoch_nonce: ::prost::alloc::vec::Vec<u8>,
+    /// Must equal the client parameter fixed at bootstrap.
     #[prost(uint64, tag = "4")]
     pub slots_per_kes_period: u64,
+    /// Must equal the start slot calculated from the stored epoch schedule.
     #[prost(uint64, tag = "5")]
     pub epoch_start_slot: u64,
+    /// Must equal the exclusive end calculated from the same stored schedule.
     #[prost(uint64, tag = "6")]
     pub epoch_end_slot_exclusive: u64,
 }
