@@ -313,6 +313,51 @@ pub struct ProbabilisticHeader {
 }
 
 #[cfg(test)]
+pub(crate) fn test_pool_registry() -> PoolRegistryState {
+    let binding = PoolRegistrationBinding {
+        pool_id: "pool-a".to_string(),
+        vrf_key_hash: vec![1; 32],
+        first_registration_slot: 0,
+    };
+    PoolRegistryState {
+        epoch: 7,
+        pools: vec![PoolRegistrationRecord {
+            registration: Some(binding.clone()),
+            registered: true,
+            pending_vrf_key_hash: vec![2; 32],
+            pending_effective_epoch: 8,
+            retirement_epoch: 12,
+        }],
+        mark: vec![binding.clone()],
+        effective: vec![binding],
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_settlement_credit() -> SettlementCreditState {
+    SettlementCreditState {
+        epoch: 7,
+        reference: vec![PoolSettlementCredit {
+            pool_id: "pool-a".into(),
+            numerator: vec![1],
+            denominator: vec![200],
+        }],
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_pool_production() -> PoolProductionHistory {
+    PoolProductionHistory {
+        epoch: 7,
+        pools: vec![PoolProductionRecord {
+            pool_id: "pool-a".to_string(),
+            completed_epochs_bitmap: 17,
+            produced_current_epoch: true,
+        }],
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use prost::Message;
 
@@ -439,50 +484,5 @@ mod tests {
                 12,
             ]
         );
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_pool_registry() -> PoolRegistryState {
-    let binding = PoolRegistrationBinding {
-        pool_id: "pool-a".to_string(),
-        vrf_key_hash: vec![1; 32],
-        first_registration_slot: 0,
-    };
-    PoolRegistryState {
-        epoch: 7,
-        pools: vec![PoolRegistrationRecord {
-            registration: Some(binding.clone()),
-            registered: true,
-            pending_vrf_key_hash: vec![2; 32],
-            pending_effective_epoch: 8,
-            retirement_epoch: 12,
-        }],
-        mark: vec![binding.clone()],
-        effective: vec![binding],
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_settlement_credit() -> SettlementCreditState {
-    SettlementCreditState {
-        epoch: 7,
-        reference: vec![PoolSettlementCredit {
-            pool_id: "pool-a".into(),
-            numerator: vec![1],
-            denominator: vec![200],
-        }],
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_pool_production() -> PoolProductionHistory {
-    PoolProductionHistory {
-        epoch: 7,
-        pools: vec![PoolProductionRecord {
-            pool_id: "pool-a".to_string(),
-            completed_epochs_bitmap: 17,
-            produced_current_epoch: true,
-        }],
     }
 }
