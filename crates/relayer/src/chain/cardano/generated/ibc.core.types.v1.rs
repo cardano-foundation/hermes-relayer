@@ -100,7 +100,7 @@ pub struct QueryTransactionByHashResponse {
     #[prost(message, repeated, tag = "5")]
     pub events: ::prost::alloc::vec::Vec<Event>,
 }
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct QueryIbcHeaderRequest {
     #[prost(uint64, tag = "1")]
     pub trusted_height: u64,
@@ -108,6 +108,9 @@ pub struct QueryIbcHeaderRequest {
     pub height: u64,
     #[prost(bool, tag = "3")]
     pub checkpoint_only: bool,
+    /// Destination client query hint. Cosmos uses its own saved credit reference.
+    #[prost(bytes = "vec", tag = "4")]
+    pub probabilistic_client_state: Vec<u8>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct QueryIbcHeaderResponse {

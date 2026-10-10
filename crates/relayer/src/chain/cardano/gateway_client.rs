@@ -12,6 +12,7 @@ use super::generated::ibc::cardano::v1::{
 use super::generated::ibc::core::channel::v1::msg_client::MsgClient as GenChannelMsgClient;
 use super::generated::ibc::core::client::v1::msg_client::MsgClient as GenClientMsgClient;
 use super::generated::ibc::core::connection::v1::msg_client::MsgClient as GenConnectionMsgClient;
+use crate::client_state::AnyClientState;
 use ibc_proto::google::protobuf::Any as ProtoAny;
 use ibc_proto::ibc::core::channel::v1::query_client::QueryClient as ChannelQueryClient;
 use ibc_proto::ibc::core::channel::v1::{
@@ -529,6 +530,35 @@ impl GatewayClient {
         height: Height,
         checkpoint_only: bool,
     ) -> Result<AnyHeader, Error> {
+        self.query_header_with_context(trusted_height, height, checkpoint_only, Vec::new())
+            .await
+    }
+
+    pub async fn query_header_for_client(
+        &self,
+        trusted_height: Height,
+        height: Height,
+        client: &AnyClientState,
+    ) -> Result<AnyHeader, Error> {
+        let bytes = match client {
+            AnyClientState::Probabilistic(state) => {
+                use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
+                use prost::Message;
+                raw::ClientState::from(state.clone()).encode_to_vec()
+            }
+            _ => Vec::new(),
+        };
+        self.query_header_with_context(trusted_height, height, false, bytes)
+            .await
+    }
+
+    async fn query_header_with_context(
+        &self,
+        trusted_height: Height,
+        height: Height,
+        checkpoint_only: bool,
+        probabilistic_client_state: Vec<u8>,
+    ) -> Result<AnyHeader, Error> {
         use super::generated::ibc::core::types::v1::query_client::QueryClient as TypesQueryClient;
         use super::generated::ibc::core::types::v1::QueryIbcHeaderRequest;
 
@@ -553,6 +583,7 @@ impl GatewayClient {
             trusted_height: effective_trusted_height.revision_height(),
             height: height.revision_height(),
             checkpoint_only,
+            probabilistic_client_state,
         });
 
         let response = client.ibc_header(request).await?.into_inner();

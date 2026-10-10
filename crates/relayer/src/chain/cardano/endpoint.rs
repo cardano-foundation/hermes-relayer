@@ -1895,7 +1895,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
         );
         let mut header = self
             .rt
-            .block_on(self.gateway_client.query_header(effective_trusted, target))
+            .block_on(self.gateway_client.query_header_for_client(
+                effective_trusted,
+                target,
+                client_state,
+            ))
             .map_err(|e| {
                 Error::query(format!("failed to query Cardano header from Gateway: {e}"))
             })?;
@@ -3615,16 +3619,21 @@ impl ChainEndpoint for CardanoChainEndpoint {
             effective_trusted_height,
             target_height
         );
-        match self.rt.block_on(
-            self.gateway_client
-                .query_header(effective_trusted_height, target_height),
-        ) {
+        match self
+            .rt
+            .block_on(self.gateway_client.query_header_for_client(
+                effective_trusted_height,
+                target_height,
+                client_state,
+            )) {
             Ok(mut header) => {
                 bind_probabilistic_pool_metadata(&mut header, client_state)?;
                 Ok((header, vec![]))
             }
             Err(e) => {
-                if !is_recoverable_gateway_header_height_error(&e) {
+                if matches!(client_state, AnyClientState::Probabilistic(_))
+                    || !is_recoverable_gateway_header_height_error(&e)
+                {
                     return Err(Error::query(format!("Gateway query_header failed: {e}")));
                 }
 
@@ -5300,6 +5309,7 @@ mod tests {
             epoch_context_challenges: vec![],
             latest_checkpoint_nonce_state: None,
             latest_checkpoint_pool_registry: None,
+            latest_checkpoint_settlement_credit: None,
             randomness_stabilisation_window_slots: 0,
         })
     }
