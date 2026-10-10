@@ -196,6 +196,19 @@ impl ChainHandle for BaseChainHandle {
         self.send(|reply_to| ChainRequest::QueryClients { request, reply_to })
     }
 
+    /// Return the production and settlement-credit hint at the trusted checkpoint.
+    fn query_cardano_challenge_context(
+        &self,
+        client_id: ClientId,
+        trusted_height: Height,
+    ) -> Result<Vec<u8>, Error> {
+        self.send(|reply_to| ChainRequest::QueryCardanoChallengeContext {
+            client_id,
+            trusted_height,
+            reply_to,
+        })
+    }
+
     fn query_client_state(
         &self,
         request: QueryClientStateRequest,
@@ -364,10 +377,12 @@ impl ChainHandle for BaseChainHandle {
         &self,
         update_event: UpdateClient,
         client_state: AnyClientState,
+        challenge_context: Option<Vec<u8>>,
     ) -> Result<Option<MisbehaviourEvidence>, Error> {
         self.send(|reply_to| ChainRequest::BuildMisbehaviour {
             client_state,
             update_event,
+            challenge_context,
             reply_to,
         })
     }

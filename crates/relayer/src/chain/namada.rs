@@ -449,6 +449,7 @@ impl ChainEndpoint for NamadaChain {
         &mut self,
         update: &UpdateClient,
         client_state: &AnyClientState,
+        _challenge_context: Option<Vec<u8>>,
     ) -> Result<Option<MisbehaviourEvidence>, Error> {
         crate::time!(
             "check_misbehaviour",

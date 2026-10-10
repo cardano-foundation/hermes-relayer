@@ -2081,12 +2081,33 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 )));
             }
 
+            // A probabilistic witness must use the same saved checkpoint as
+            // destination verification, including a pre-proposal rootless cursor.
+            let challenge_context = match &update_event.header {
+                Some(AnyHeader::Probabilistic(header)) => Some(
+                    self.dst_chain
+                        .query_cardano_challenge_context(self.id.clone(), header.trusted_height)
+                        .map_err(|error| {
+                            ForeignClientError::misbehaviour(
+                                format!(
+                                    "failed querying Cardano challenge checkpoint {}",
+                                    header.trusted_height
+                                ),
+                                error,
+                            )
+                        })?,
+                ),
+                _ => None,
+            };
+
             // Check for misbehaviour according to the specific source chain type.
             // In case of Tendermint client, this will also check the BFT time violation if
             // a header for the event height cannot be retrieved from the witness.
-            let result = self
-                .src_chain
-                .check_misbehaviour(update_event.clone(), client_state.clone());
+            let result = self.src_chain.check_misbehaviour(
+                update_event.clone(),
+                client_state.clone(),
+                challenge_context,
+            );
 
             let misbehavior = match result {
                 // Misbehavior check passed.

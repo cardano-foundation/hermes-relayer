@@ -1934,6 +1934,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &mut self,
         update: &UpdateClient,
         client_state: &AnyClientState,
+        challenge_context: Option<Vec<u8>>,
     ) -> Result<Option<MisbehaviourEvidence>, Error> {
         let Some(submitted_header) = submitted_cardano_update_header(
             update,
@@ -1944,7 +1945,6 @@ impl ChainEndpoint for CardanoChainEndpoint {
         };
 
         let target_height = submitted_header.height();
-        let trusted_height = independent_header_trusted_height(submitted_header)?;
         let witness_gateway_client = self
             .witness_gateway_client
             .as_ref()
@@ -1958,18 +1958,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
             );
         }
 
-        let witness_header = self
-            .rt
-            .block_on(witness_gateway_client.query_header_with_mode(
-                trusted_height,
-                target_height,
-                matches!(submitted_header, AnyHeader::Probabilistic(_)),
-            ))
-            .map_err(|e| {
-                Error::query(format!(
-                    "failed to independently query Cardano header at {target_height}: {e}"
-                ))
-            })?;
+        let witness_header = self.rt.block_on(query_cardano_witness_header(
+            witness_gateway_client,
+            submitted_header,
+            challenge_context,
+        ))?;
 
         cardano_misbehaviour_evidence(update, submitted_header, witness_header, client_state)
     }
@@ -3866,6 +3859,30 @@ fn filter_packet_events_from_block_results(
 // Mithril header is decoded from the Gateway as `google.protobuf.Any`.
 // See `ibc-relayer-types/src/clients/ics08_cardano/header.rs` and
 // `ibc-relayer-types/src/core/ics02_client/header.rs`.
+
+// Shared by the endpoint and the wire regression so challenge requests always
+// carry the destination-owned context with the exact submitted trusted height.
+pub(crate) async fn query_cardano_witness_header(
+    gateway: &GatewayClient,
+    submitted_header: &AnyHeader,
+    challenge_context: Option<Vec<u8>>,
+) -> Result<AnyHeader, Error> {
+    let target_height = submitted_header.height();
+    let trusted_height = independent_header_trusted_height(submitted_header)?;
+    gateway
+        .query_challenge_header(
+            trusted_height,
+            target_height,
+            matches!(submitted_header, AnyHeader::Probabilistic(_)),
+            challenge_context,
+        )
+        .await
+        .map_err(|error| {
+            Error::query(format!(
+                "failed to independently query Cardano header at {target_height}: {error}"
+            ))
+        })
+}
 
 fn independent_header_trusted_height(header: &AnyHeader) -> Result<ICSHeight, Error> {
     match header {
