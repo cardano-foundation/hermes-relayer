@@ -130,6 +130,27 @@ pub struct ClientState {
     pub randomness_stabilisation_window_slots: u64,
     #[prost(message, optional, tag = "34")]
     pub latest_checkpoint_pool_registry: Option<PoolRegistryState>,
+    #[prost(message, optional, tag = "35")]
+    pub latest_checkpoint_settlement_credit: Option<SettlementCreditState>,
+}
+
+/// Epoch reference advances from capped credit once per epoch.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct SettlementCreditState {
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+    #[prost(message, repeated, tag = "2")]
+    pub reference: Vec<PoolSettlementCredit>,
+}
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct PoolSettlementCredit {
+    #[prost(string, tag = "1")]
+    pub pool_id: String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub numerator: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub denominator: Vec<u8>,
 }
 
 /// Pool identities and keys retained separately from supplied stake amounts.
@@ -216,6 +237,8 @@ pub struct ConsensusState {
     pub nonce_state: Option<PraosNonceState>,
     #[prost(message, optional, tag = "10")]
     pub pool_registry: Option<PoolRegistryState>,
+    #[prost(message, optional, tag = "11")]
+    pub settlement_credit: Option<SettlementCreditState>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
@@ -312,6 +335,37 @@ mod tests {
     }
 
     #[test]
+    fn settlement_credit_uses_canonical_client_and_consensus_wire_tags() {
+        let credit = super::test_settlement_credit();
+        // epoch 7 and pool-a's exact 1/200 reference share.
+        let value = vec![
+            0x08, 7, 0x12, 14, 0x0a, 6, b'p', b'o', b'o', b'l', b'-', b'a', 0x12, 1, 1, 0x1a, 1,
+            200,
+        ];
+        assert_eq!(credit.encode_to_vec(), value);
+        let mut client = vec![0x9a, 0x02, value.len() as u8]; // field 35
+        client.extend(&value);
+        assert_eq!(
+            ClientState {
+                latest_checkpoint_settlement_credit: Some(credit.clone()),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            client,
+        );
+        let mut consensus = vec![0x5a, value.len() as u8]; // field 11
+        consensus.extend(&value);
+        assert_eq!(
+            super::ConsensusState {
+                settlement_credit: Some(credit),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            consensus,
+        );
+    }
+
+    #[test]
     fn client_temporal_and_praos_fields_use_canonical_wire_tags() {
         let encoded = ClientState {
             active_slot_coefficient_numerator: 1,
@@ -354,5 +408,17 @@ pub(crate) fn test_pool_registry() -> PoolRegistryState {
         }],
         mark: vec![binding.clone()],
         effective: vec![binding],
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_settlement_credit() -> SettlementCreditState {
+    SettlementCreditState {
+        epoch: 7,
+        reference: vec![PoolSettlementCredit {
+            pool_id: "pool-a".into(),
+            numerator: vec![1],
+            denominator: vec![200],
+        }],
     }
 }
