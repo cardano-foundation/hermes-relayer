@@ -5310,6 +5310,7 @@ mod tests {
             latest_checkpoint_nonce_state: None,
             latest_checkpoint_pool_registry: None,
             latest_checkpoint_settlement_credit: None,
+            latest_checkpoint_pool_production: None,
             randomness_stabilisation_window_slots: 0,
         })
     }
