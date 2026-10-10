@@ -30,6 +30,7 @@ pub struct ConsensusState {
     pub nonce_state: Option<raw::PraosNonceState>,
     pub pool_registry: Option<raw::PoolRegistryState>,
     pub settlement_credit: Option<raw::SettlementCreditState>,
+    pub pool_production: Option<raw::PoolProductionHistory>,
 }
 
 impl Ics2ConsensusState for ConsensusState {
@@ -75,6 +76,7 @@ impl TryFrom<RawConsensusState> for ConsensusState {
             nonce_state: raw.nonce_state,
             pool_registry: raw.pool_registry,
             settlement_credit: raw.settlement_credit,
+            pool_production: raw.pool_production,
         })
     }
 }
@@ -93,6 +95,7 @@ impl From<ConsensusState> for RawConsensusState {
             nonce_state: value.nonce_state,
             pool_registry: value.pool_registry,
             settlement_credit: value.settlement_credit,
+            pool_production: value.pool_production,
         }
     }
 }
@@ -139,6 +142,7 @@ mod tests {
             ibc_state_root: vec![1; 32],
             pool_registry: Some(raw::test_pool_registry()),
             settlement_credit: Some(raw::test_settlement_credit()),
+            pool_production: Some(raw::test_pool_production()),
             nonce_state: Some(raw::PraosNonceState {
                 epoch_nonce: vec![2; 32],
                 evolving_nonce: vec![3; 32],
@@ -155,5 +159,6 @@ mod tests {
         assert_eq!(restored.nonce_state, raw.nonce_state);
         assert_eq!(restored.pool_registry, raw.pool_registry);
         assert_eq!(restored.settlement_credit, raw.settlement_credit);
+        assert_eq!(restored.pool_production, raw.pool_production);
     }
 }

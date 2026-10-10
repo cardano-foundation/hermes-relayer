@@ -210,8 +210,8 @@ where
                             self.build_consensus_state(trusted, target, client_state, reply_to)?
                         },
 
-                        ChainRequest::BuildMisbehaviour { client_state, update_event, reply_to } => {
-                            self.check_misbehaviour(update_event, client_state, reply_to)?
+                        ChainRequest::BuildMisbehaviour { client_state, update_event, challenge_context, reply_to } => {
+                            self.check_misbehaviour(update_event, client_state, challenge_context, reply_to)?
                         },
 
                         ChainRequest::BuildConnectionProofsAndClientState { message_type, connection_id, client_id, height, reply_to } => {
@@ -244,6 +244,11 @@ where
 
                         ChainRequest::QueryClientConnections { request, reply_to } => {
                             self.query_client_connections(request, reply_to)?
+                        },
+
+                        ChainRequest::QueryCardanoChallengeContext { client_id, trusted_height, reply_to } => {
+                            let result = self.chain.query_cardano_challenge_context(client_id, trusted_height);
+                            reply_to.send(result).map_err(Error::send)?;
                         },
 
                         ChainRequest::QueryClientState { request, include_proof, reply_to } => {
@@ -539,9 +544,12 @@ where
         &mut self,
         update_event: UpdateClient,
         client_state: AnyClientState,
+        challenge_context: Option<Vec<u8>>,
         reply_to: ReplyTo<Option<MisbehaviourEvidence>>,
     ) -> Result<(), Error> {
-        let misbehaviour = self.chain.check_misbehaviour(&update_event, &client_state);
+        let misbehaviour =
+            self.chain
+                .check_misbehaviour(&update_event, &client_state, challenge_context);
 
         reply_to.send(misbehaviour).map_err(Error::send)
     }

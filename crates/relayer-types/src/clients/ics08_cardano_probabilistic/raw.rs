@@ -132,6 +132,27 @@ pub struct ClientState {
     pub latest_checkpoint_pool_registry: Option<PoolRegistryState>,
     #[prost(message, optional, tag = "35")]
     pub latest_checkpoint_settlement_credit: Option<SettlementCreditState>,
+    #[prost(message, optional, tag = "36")]
+    pub latest_checkpoint_pool_production: Option<PoolProductionHistory>,
+}
+
+/// Bit 0 is epoch-1 and bit 4 is epoch-5. Current observations never qualify that epoch.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct PoolProductionHistory {
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+    #[prost(message, repeated, tag = "2")]
+    pub pools: Vec<PoolProductionRecord>,
+}
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct PoolProductionRecord {
+    #[prost(string, tag = "1")]
+    pub pool_id: String,
+    #[prost(uint32, tag = "2")]
+    pub completed_epochs_bitmap: u32,
+    #[prost(bool, tag = "3")]
+    pub produced_current_epoch: bool,
 }
 
 /// Epoch reference advances from capped credit once per epoch.
@@ -239,6 +260,8 @@ pub struct ConsensusState {
     pub pool_registry: Option<PoolRegistryState>,
     #[prost(message, optional, tag = "11")]
     pub settlement_credit: Option<SettlementCreditState>,
+    #[prost(message, optional, tag = "12")]
+    pub pool_production: Option<PoolProductionHistory>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
@@ -287,6 +310,51 @@ pub struct ProbabilisticHeader {
     pub new_epoch_context: ::core::option::Option<EpochContext>,
     #[prost(bool, tag = "12")]
     pub is_checkpoint: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn test_pool_registry() -> PoolRegistryState {
+    let binding = PoolRegistrationBinding {
+        pool_id: "pool-a".to_string(),
+        vrf_key_hash: vec![1; 32],
+        first_registration_slot: 0,
+    };
+    PoolRegistryState {
+        epoch: 7,
+        pools: vec![PoolRegistrationRecord {
+            registration: Some(binding.clone()),
+            registered: true,
+            pending_vrf_key_hash: vec![2; 32],
+            pending_effective_epoch: 8,
+            retirement_epoch: 12,
+        }],
+        mark: vec![binding.clone()],
+        effective: vec![binding],
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_settlement_credit() -> SettlementCreditState {
+    SettlementCreditState {
+        epoch: 7,
+        reference: vec![PoolSettlementCredit {
+            pool_id: "pool-a".into(),
+            numerator: vec![1],
+            denominator: vec![200],
+        }],
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_pool_production() -> PoolProductionHistory {
+    PoolProductionHistory {
+        epoch: 7,
+        pools: vec![PoolProductionRecord {
+            pool_id: "pool-a".to_string(),
+            completed_epochs_bitmap: 17,
+            produced_current_epoch: true,
+        }],
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +434,35 @@ mod tests {
     }
 
     #[test]
+    fn pool_production_uses_canonical_client_and_consensus_wire_tags() {
+        let history = super::test_pool_production();
+        let value = vec![
+            0x08, 7, 0x12, 12, 0x0a, 6, b'p', b'o', b'o', b'l', b'-', b'a', 0x10, 17, 0x18, 1,
+        ];
+        assert_eq!(history.encode_to_vec(), value);
+        let mut client = vec![0xa2, 0x02, value.len() as u8]; // field 36
+        client.extend(&value);
+        assert_eq!(
+            ClientState {
+                latest_checkpoint_pool_production: Some(history.clone()),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            client
+        );
+        let mut consensus = vec![0x62, value.len() as u8]; // field 12
+        consensus.extend(&value);
+        assert_eq!(
+            super::ConsensusState {
+                pool_production: Some(history),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            consensus
+        );
+    }
+
+    #[test]
     fn client_temporal_and_praos_fields_use_canonical_wire_tags() {
         let encoded = ClientState {
             active_slot_coefficient_numerator: 1,
@@ -387,38 +484,5 @@ mod tests {
                 12,
             ]
         );
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_pool_registry() -> PoolRegistryState {
-    let binding = PoolRegistrationBinding {
-        pool_id: "pool-a".to_string(),
-        vrf_key_hash: vec![1; 32],
-        first_registration_slot: 0,
-    };
-    PoolRegistryState {
-        epoch: 7,
-        pools: vec![PoolRegistrationRecord {
-            registration: Some(binding.clone()),
-            registered: true,
-            pending_vrf_key_hash: vec![2; 32],
-            pending_effective_epoch: 8,
-            retirement_epoch: 12,
-        }],
-        mark: vec![binding.clone()],
-        effective: vec![binding],
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_settlement_credit() -> SettlementCreditState {
-    SettlementCreditState {
-        epoch: 7,
-        reference: vec![PoolSettlementCredit {
-            pool_id: "pool-a".into(),
-            numerator: vec![1],
-            denominator: vec![200],
-        }],
     }
 }

@@ -148,6 +148,15 @@ where
         self.value().query_clients(request)
     }
 
+    fn query_cardano_challenge_context(
+        &self,
+        client_id: ClientId,
+        trusted_height: Height,
+    ) -> Result<Vec<u8>, Error> {
+        self.value()
+            .query_cardano_challenge_context(client_id, trusted_height)
+    }
+
     fn query_client_state(
         &self,
         request: QueryClientStateRequest,
@@ -287,8 +296,10 @@ where
         &self,
         update: UpdateClient,
         client_state: AnyClientState,
+        challenge_context: Option<Vec<u8>>,
     ) -> Result<Option<MisbehaviourEvidence>, Error> {
-        self.value().check_misbehaviour(update, client_state)
+        self.value()
+            .check_misbehaviour(update, client_state, challenge_context)
     }
 
     fn build_connection_proofs_and_client_state(
