@@ -367,13 +367,22 @@ async fn fetch_all_events(
     }
 
     if let Some(txs_results) = &mut response.txs_results {
-        for tx_result in txs_results {
+        let block = rpc_client.block(height).await.map_err(Error::rpc)?;
+        if block.block.data.len() != txs_results.len() {
+            return Err(Error::collect_events_failed(
+                "block transactions and results differ".to_owned(),
+            ));
+        }
+        for (tx_result, tx) in txs_results.iter_mut().zip(&block.block.data) {
             if tx_result.code != abci::Code::Ok {
                 // Transaction failed, skip it
                 continue;
             }
 
-            events.append(&mut tx_result.events);
+            events.extend(
+                crate::event::tx::hydrate_client_updates(tx.as_ref(), &tx_result.events)
+                    .map_err(Error::collect_events_failed)?,
+            );
         }
     }
 

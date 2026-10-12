@@ -152,7 +152,17 @@ pub fn extract_events(
             )
             .map_err(|_| String::from("tx_result.height: invalid header height of 0"))?;
 
-            for abci_event in &tx_result.result.events {
+            if events
+                .get("tx.code")
+                .is_some_and(|codes| codes.iter().any(|code| code != "0"))
+            {
+                return Ok(events_with_height);
+            }
+            let hydrated = crate::event::tx::hydrate_client_updates(
+                tx_result.tx.as_ref(),
+                &tx_result.result.events,
+            )?;
+            for abci_event in &hydrated {
                 if let Ok(ibc_event) = ibc_event_try_from_abci_event(abci_event) {
                     if query == queries::ibc_client().to_string()
                         && event_is_type_client(&ibc_event)

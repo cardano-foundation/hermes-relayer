@@ -38,6 +38,7 @@ use ibc_relayer_types::{
 pub mod bus;
 pub mod error;
 pub mod source;
+pub mod tx;
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct IbcEventWithHeight {

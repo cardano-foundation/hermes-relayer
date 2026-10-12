@@ -245,6 +245,7 @@ impl Runnable for QueryClientHeaderCmd {
         };
 
         let res = chain.query_txs(QueryTxRequest::Client(QueryClientEventRequest {
+            probabilistic_epoch: None,
             query_height,
             event_id: WithBlockDataType::UpdateClient,
             client_id: self.client_id.clone(),
