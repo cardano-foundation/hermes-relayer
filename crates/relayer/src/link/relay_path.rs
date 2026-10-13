@@ -1121,6 +1121,7 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
     ) -> Result<Height, LinkError> {
         let events_with_heights = chain
             .query_txs(QueryTxRequest::Client(QueryClientEventRequest {
+                probabilistic_epoch: None,
                 query_height: QueryHeight::Latest,
                 event_id: WithBlockDataType::UpdateClient,
                 client_id,

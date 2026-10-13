@@ -611,6 +611,8 @@ impl<T: Display> Display for Qualified<T> {
 /// Query request for a single client event, identified by `event_id`, for `client_id`.
 #[derive(Clone, Debug)]
 pub struct QueryClientEventRequest {
+    /// Find the first probabilistic proposal for this epoch, including rootless updates.
+    pub probabilistic_epoch: Option<u64>,
     pub query_height: QueryHeight,
     pub event_id: WithBlockDataType,
     pub client_id: ClientId,

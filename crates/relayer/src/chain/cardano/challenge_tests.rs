@@ -330,3 +330,196 @@ fn foreign_client_retrieves_trusted_checkpoint_context_before_the_witness_reques
         assert_eq!(source_runtime.join().unwrap(), usize::from(!unavailable));
     }
 }
+
+#[test]
+fn sdk_events_reach_independent_challenge_submission() {
+    use crate::chain::handle::{BaseChainHandle, ChainRequest};
+    use crate::client_state::AnyClientState;
+    use crate::foreign_client::{ForeignClient, MisbehaviourResults};
+    use ibc_relayer_types::clients::ics08_cardano_probabilistic::client_state::ClientState;
+    use ibc_relayer_types::core::ics02_client::header::AnyHeader;
+    use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ClientId};
+    use ibc_relayer_types::events::IbcEvent;
+
+    for (name, data) in [
+        (
+            "root-bearing",
+            include_str!("fixtures/watcher-v8-root-bearing.json"),
+        ),
+        (
+            "rootless",
+            include_str!("fixtures/watcher-v8-rootless.json"),
+        ),
+        (
+            "root-bearing",
+            include_str!("fixtures/watcher-v10-root-bearing.json"),
+        ),
+        (
+            "rootless",
+            include_str!("fixtures/watcher-v10-rootless.json"),
+        ),
+    ] {
+        let fixture: serde_json::Value = serde_json::from_str(data).unwrap();
+        let events: Vec<tendermint::abci::Event> =
+            serde_json::from_value(fixture["events"].clone()).unwrap();
+        let tx = hex::decode(fixture["tx"].as_str().unwrap()).unwrap();
+        let hydrated = crate::event::tx::hydrate_client_updates(&tx, &events).unwrap();
+        let mut recovered = crate::event::source::rpc::extract::extract_events(
+            &ChainId::from_string("cosmos-1"),
+            Height::new(1, 100).unwrap(),
+            &hydrated,
+        )
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.event {
+            IbcEvent::UpdateClient(update) => Some(update),
+            _ => None,
+        });
+        let update = recovered.next().unwrap();
+        assert!(recovered.next().is_none());
+        assert!(update.header.is_some());
+        assert_eq!(update.consensus_height(), Height::new(0, 11).unwrap());
+        let latest_raw = raw::ClientState::decode(
+            hex::decode(fixture["client"].as_str().unwrap())
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        let latest = AnyClientState::Probabilistic(ClientState::try_from(latest_raw).unwrap());
+        let mut context = raw::ClientState::decode(
+            hex::decode(fixture["context"].as_str().unwrap())
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        context.current_epoch = context.latest_checkpoint_epoch;
+        let context = context.encode_to_vec();
+        let witness = raw::ProbabilisticHeader::decode(
+            hex::decode(fixture["witness"].as_str().unwrap())
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        let witness = AnyHeader::Probabilistic(witness.try_into().unwrap());
+        for startup in [false, true] {
+            let (source_sender, source_receiver) = crossbeam_channel::unbounded();
+            let source = BaseChainHandle::new(ChainId::from_string("cardano-0"), source_sender);
+            let expected_context = context.clone();
+            let witness = witness.clone();
+            let source_runtime = std::thread::spawn(move || {
+                for (_, request) in source_receiver {
+                    match request {
+                        ChainRequest::BuildMisbehaviour {
+                            update_event,
+                            client_state,
+                            challenge_context,
+                            reply_to,
+                        } => {
+                            assert_eq!(challenge_context.unwrap(), expected_context);
+                            let submitted = update_event.header.as_ref().unwrap();
+                            reply_to
+                                .send(super::endpoint::cardano_misbehaviour_evidence(
+                                    &update_event,
+                                    submitted,
+                                    witness.clone(),
+                                    &client_state,
+                                ))
+                                .unwrap();
+                        }
+                        ChainRequest::Config { reply_to } => {
+                            let config: crate::config::Config = toml::from_str(include_str!(
+                                "../../../tests/config/fixtures/relayer_conf_example.toml"
+                            ))
+                            .unwrap();
+                            reply_to.send(Ok(config.chains[0].clone())).unwrap();
+                        }
+                        other => panic!("unexpected source request: {other:?}"),
+                    }
+                }
+            });
+            let (destination_sender, destination_receiver) = crossbeam_channel::unbounded();
+            let destination =
+                BaseChainHandle::new(ChainId::from_string("cosmos-1"), destination_sender);
+            let latest = latest.clone();
+            let expected_context = context.clone();
+            let restored_update = update.clone();
+            let output_name = name.to_owned();
+            let destination_runtime = std::thread::spawn(move || {
+                let mut submissions = 0;
+                for (_, request) in destination_receiver {
+                    match request {
+                        ChainRequest::QueryClientState { reply_to, .. } => {
+                            reply_to.send(Ok((latest.clone(), None))).unwrap();
+                        }
+                        ChainRequest::QueryCardanoChallengeContext {
+                            trusted_height,
+                            reply_to,
+                            ..
+                        } => {
+                            assert_eq!(trusted_height, Height::new(0, 10).unwrap());
+                            reply_to.send(Ok(expected_context.clone())).unwrap();
+                        }
+                        ChainRequest::QueryPacketEventDataFromTxs { request, reply_to } => {
+                            assert!(
+                                matches!(request,crate::chain::requests::QueryTxRequest::Client(request) if request.probabilistic_epoch == Some(8))
+                            );
+                            reply_to
+                                .send(Ok(vec![crate::event::IbcEventWithHeight::new(
+                                    IbcEvent::UpdateClient(restored_update.clone()),
+                                    Height::new(1, 100).unwrap(),
+                                )]))
+                                .unwrap();
+                        }
+                        ChainRequest::Signer { reply_to } => {
+                            reply_to
+                                .send(Ok("cosmos1pyysjzgfpyysjzgfpyysjzgfpyysjzgfam50we"
+                                    .parse()
+                                    .unwrap()))
+                                .unwrap();
+                        }
+                        ChainRequest::SendMessagesAndWaitCommit {
+                            tracked_msgs,
+                            reply_to,
+                        } => {
+                            assert_eq!(tracked_msgs.msgs.len(), 1);
+                            let wire = hex::encode(&tracked_msgs.msgs[0].value);
+                            let file = format!(
+                                "{}/src/chain/cardano/fixtures/watcher-challenge-{output_name}.hex",
+                                env!("CARGO_MANIFEST_DIR")
+                            );
+                            if std::env::var_os("UPDATE_WATCHER_FIXTURES").is_some() {
+                                std::fs::write(&file, format!("{wire}\n")).unwrap();
+                            }
+                            assert_eq!(std::fs::read_to_string(&file).unwrap().trim(), wire);
+                            submissions += 1;
+                            reply_to
+                                .send(Ok(vec![crate::event::IbcEventWithHeight::new(
+                                    IbcEvent::ClientMisbehaviour(ibc_relayer_types::core::ics02_client::events::ClientMisbehaviour::from(restored_update.common.clone())),
+                                    Height::new(1, 101).unwrap(),
+                                )]))
+                                .unwrap();
+                        }
+                        other => panic!("unexpected destination request: {other:?}"),
+                    }
+                }
+                submissions
+            });
+            let client = ForeignClient::restore(
+                "08-cardano-probabilistic-0".parse::<ClientId>().unwrap(),
+                destination,
+                source,
+            );
+            assert!(matches!(
+                client.detect_misbehaviour_and_submit_evidence(if startup {
+                    None
+                } else {
+                    Some(update.clone())
+                }),
+                MisbehaviourResults::EvidenceSubmitted(_)
+            ));
+            drop(client);
+            source_runtime.join().unwrap();
+            assert_eq!(destination_runtime.join().unwrap(), 1);
+        }
+    }
+}

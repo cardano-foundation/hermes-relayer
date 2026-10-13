@@ -15,8 +15,8 @@ use tokio::{runtime::Runtime as TokioRuntime, sync::mpsc};
 use tracing::{debug, error, info, instrument, trace};
 
 use tendermint_rpc::{
-    client::CompatMode, event::Event as RpcEvent, query::Query, SubscriptionClient,
-    WebSocketClient, WebSocketClientDriver, WebSocketClientUrl,
+    client::CompatMode, query::Query, Client, SubscriptionClient, WebSocketClient,
+    WebSocketClientDriver, WebSocketClientUrl,
 };
 
 use ibc_relayer_types::{core::ics24_host::identifier::ChainId, events::IbcEvent};
@@ -300,7 +300,12 @@ impl EventSource {
         let subscriptions = core::mem::replace(&mut self.subscriptions, Box::new(stream::empty()));
 
         // Convert the stream of RPC events into a stream of event batches.
-        let batches = stream_batches(subscriptions, self.chain_id.clone(), self.batch_delay);
+        let batches = stream_batches(
+            subscriptions,
+            self.chain_id.clone(),
+            self.batch_delay,
+            self.client.clone(),
+        );
 
         // Needed to be able to poll the stream
         pin_mut!(batches);
@@ -394,29 +399,53 @@ impl EventSource {
 }
 
 /// Collect the IBC events from an RPC event
-fn collect_events(
-    chain_id: &ChainId,
-    event: RpcEvent,
-) -> impl Stream<Item = Result<IbcEventWithHeight>> {
-    let events = extract_events(chain_id, event).unwrap_or_default();
-    stream::iter(events).map(Ok)
-}
-
 /// Convert a stream of RPC event into a stream of event batches
 fn stream_batches(
     subscriptions: Box<SubscriptionStream>,
     chain_id: ChainId,
     batch_delay: Duration,
+    client: WebSocketClient,
 ) -> impl Stream<Item = Result<EventBatch>> {
     let id = chain_id.clone();
 
     // Collect IBC events from each RPC event
     let events = subscriptions
-        .map_ok(move |rpc_event| {
-            trace!(chain = %id, "received an RPC event: {}", rpc_event.query);
-            collect_events(&id, rpc_event)
-        })
         .map_err(Error::canceled_or_generic)
+        .and_then(move |mut rpc_event| {
+            let id = id.clone();
+            let client = client.clone();
+            async move {
+                trace!(chain = %id, "received an RPC event: {}", rpc_event.query);
+                if let tendermint_rpc::event::EventData::Tx { tx_result } = &mut rpc_event.data {
+                    let probabilistic = tx_result.result.events.iter().any(|event| {
+                        event.kind == "update_client"
+                            && event.attributes.iter().any(|attr| {
+                                attr.key_bytes() == b"client_id"
+                                    && attr
+                                        .value_str()
+                                        .is_ok_and(|id| id.starts_with("08-cardano-probabilistic-"))
+                            })
+                    });
+                    if probabilistic {
+                        use sha2::{Digest, Sha256};
+                        let hash = tendermint::Hash::Sha256(Sha256::digest(&tx_result.tx).into());
+                        let committed = client.tx(hash, false).await.map_err(Error::rpc)?;
+                        if committed.tx_result.code.is_err() {
+                            return Ok(stream::iter(Vec::new()));
+                        }
+                        tx_result.result.events = committed.tx_result.events;
+                        tx_result.tx = committed.tx;
+                        rpc_event
+                            .events
+                            .get_or_insert_with(Default::default)
+                            .insert("tx.code".to_owned(), vec!["0".to_owned()]);
+                    }
+                }
+                let events =
+                    extract_events(&id, rpc_event).map_err(Error::collect_events_failed)?;
+                Ok(stream::iter(events.into_iter().map(Ok).collect::<Vec<_>>()))
+            }
+        })
         .try_flatten();
 
     // Group events by height
