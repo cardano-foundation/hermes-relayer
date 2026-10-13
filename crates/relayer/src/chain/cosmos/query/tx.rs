@@ -41,37 +41,40 @@ pub async fn query_txs(
                 }
             );
 
-            // query the first Tx that includes the event matching the client request
-            // Note: it is possible to have multiple Tx-es for same client and consensus height.
-            // In this case it must be true that the client updates were performed with the
-            // same header as the first one, otherwise a subsequent transaction would have
-            // failed on chain. Therefore only one Tx is of interest and current API returns
-            // the first one.
-            let mut response = rpc_client
-                .tx_search(
-                    header_query(&request),
-                    false,
-                    1,
-                    1, // get only the first Tx matching the query
-                    Order::Ascending,
+            let probabilistic = request
+                .client_id
+                .to_string()
+                .starts_with("08-cardano-probabilistic-");
+            let query = if probabilistic {
+                // Rootless updates have no indexed consensus height. Query by
+                // client and match the anchor after recovering the tx message.
+                tendermint_rpc::query::Query::eq(
+                    format!("{}.client_id", request.event_id.as_str()),
+                    request.client_id.to_string(),
                 )
-                .await
-                .map_err(|e| Error::rpc(rpc_address.clone(), e))?;
-
-            if response.txs.is_empty() {
-                return Ok(vec![]);
+            } else {
+                header_query(&request)
+            };
+            let per_page = if probabilistic { 100 } else { 1 };
+            let mut page = 1;
+            loop {
+                let response = rpc_client
+                    .tx_search(query.clone(), false, page, per_page, Order::Ascending)
+                    .await
+                    .map_err(|e| Error::rpc(rpc_address.clone(), e))?;
+                let count = response.txs.len();
+                for tx in response.txs {
+                    if let Some(event) =
+                        update_client_from_tx_search_response(chain_id, &request, tx)?
+                    {
+                        return Ok(vec![event]);
+                    }
+                }
+                if !probabilistic || count < per_page as usize {
+                    return Ok(vec![]);
+                }
+                page += 1;
             }
-
-            // the response must include a single Tx as specified in the query.
-            assert!(
-                response.txs.len() <= 1,
-                "packet_from_tx_search_response: unexpected number of txs"
-            );
-
-            let tx = response.txs.remove(0);
-            let event = update_client_from_tx_search_response(chain_id, &request, tx)?;
-
-            Ok(event.into_iter().collect())
         }
 
         QueryTxRequest::Transaction(tx) => {
@@ -269,9 +272,13 @@ fn update_client_from_tx_search_response(
         }
     };
 
-    Ok(response
-        .tx_result
-        .events
+    if response.tx_result.code.is_err() {
+        return Ok(None);
+    }
+    let hydrated =
+        crate::event::tx::hydrate_client_updates(response.tx.as_ref(), &response.tx_result.events)
+            .map_err(Error::query)?;
+    Ok(hydrated
         .into_iter()
         .filter(|event| event.kind == request.event_id.as_str())
         .flat_map(|event| ibc_event_try_from_abci_event(&event).ok())
@@ -281,7 +288,10 @@ fn update_client_from_tx_search_response(
         })
         .find(|update| {
             update.common.client_id == request.client_id
-                && update.common.consensus_height == request.consensus_height
+                && match request.probabilistic_epoch {
+                    Some(epoch) => matches!(&update.header, Some(ibc_relayer_types::core::ics02_client::header::AnyHeader::Probabilistic(header)) if header.new_epoch_context.as_ref().is_some_and(|context| context.epoch == epoch)),
+                    None => update.common.consensus_height == request.consensus_height,
+                }
         })
         .map(|update| IbcEventWithHeight::new(IbcEvent::UpdateClient(update), height)))
 }
@@ -394,8 +404,16 @@ pub fn all_ibc_events_from_tx_search_response(
             height,
         )]
     } else {
-        let result = deliver_tx_result
-            .events
+        let hydrated = match crate::event::tx::hydrate_client_updates(
+            response.tx.as_ref(),
+            &deliver_tx_result.events,
+        ) {
+            Ok(events) => events,
+            Err(error) => {
+                return vec![IbcEventWithHeight::new(IbcEvent::ChainError(error), height)]
+            }
+        };
+        let result = hydrated
             .iter()
             .flat_map(|event| events::from_tx_response_event(height, event).into_iter())
             .collect::<Vec<_>>();

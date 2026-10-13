@@ -1835,6 +1835,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             let result = self
                 .dst_chain
                 .query_txs(QueryTxRequest::Client(QueryClientEventRequest {
+                    probabilistic_epoch: None,
                     query_height: QueryHeight::Latest,
                     event_id: WithBlockDataType::UpdateClient,
                     client_id: self.id.clone(),
@@ -2017,6 +2018,35 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                     )
                 })?
         };
+
+        // Rootless epoch proposals create no consensus state. Recover the first
+        // proposal from successful transactions when a watcher starts or restarts.
+        if update.is_none() {
+            if let AnyClientState::Probabilistic(state) = &client_state {
+                let events = self
+                    .dst_chain
+                    .query_txs(QueryTxRequest::Client(QueryClientEventRequest {
+                        probabilistic_epoch: Some(state.current_epoch),
+                        query_height: QueryHeight::Latest,
+                        event_id: WithBlockDataType::UpdateClient,
+                        client_id: self.id.clone(),
+                        consensus_height: state.latest_verified_height(),
+                    }))
+                    .map_err(|e| {
+                        ForeignClientError::misbehaviour(
+                            "querying probabilistic epoch proposal".to_owned(),
+                            e,
+                        )
+                    })?;
+                for event in events {
+                    if let IbcEvent::UpdateClient(proposal) = event.event {
+                        if let Some(evidence) = self.detect_misbehaviour(Some(&proposal))? {
+                            return Ok(Some(evidence));
+                        }
+                    }
+                }
+            }
+        }
 
         let consensus_state_heights = if let Some(event) = update {
             vec![event.consensus_height()]

@@ -3933,7 +3933,7 @@ fn submitted_cardano_update_header(
     Ok(Some(submitted_header))
 }
 
-fn cardano_misbehaviour_evidence(
+pub(super) fn cardano_misbehaviour_evidence(
     update: &UpdateClient,
     submitted_header: &AnyHeader,
     witness_header: AnyHeader,
