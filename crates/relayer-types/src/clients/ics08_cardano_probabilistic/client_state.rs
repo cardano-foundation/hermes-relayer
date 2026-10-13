@@ -52,6 +52,7 @@ pub struct ClientState {
     pub latest_checkpoint_slot: u64,
     pub latest_checkpoint_timestamp: u64,
     pub packet_lane_policy_id: Vec<u8>,
+    pub epoch_context_challenges: Vec<raw::EpochContextChallenge>,
 }
 
 impl ClientState {
@@ -119,6 +120,7 @@ impl TryFrom<RawClientState> for ClientState {
             latest_checkpoint_slot,
             latest_checkpoint_timestamp,
             packet_lane_policy_id,
+            epoch_context_challenges,
         } = raw;
 
         let chain_id = ChainId::from_string(&raw_chain_id);
@@ -318,6 +320,7 @@ impl TryFrom<RawClientState> for ClientState {
             latest_checkpoint_slot,
             latest_checkpoint_timestamp,
             packet_lane_policy_id,
+            epoch_context_challenges,
         })
     }
 }
@@ -356,6 +359,7 @@ impl From<ClientState> for RawClientState {
             latest_checkpoint_slot: value.latest_checkpoint_slot,
             latest_checkpoint_timestamp: value.latest_checkpoint_timestamp,
             packet_lane_policy_id: value.packet_lane_policy_id,
+            epoch_context_challenges: value.epoch_context_challenges,
         }
     }
 }
@@ -548,6 +552,10 @@ mod tests {
         }];
         raw.latest_checkpoint_operational_certificate_counters =
             vec![counter(1, 3), counter(2, sequence_above_u32)];
+        raw.epoch_context_challenges = vec![raw::EpochContextChallenge {
+            epoch: 7,
+            usable_after_unix_ns: 1_700_000_180_000_000_000,
+        }];
 
         let any = Any {
             type_url: PROBABILISTIC_CLIENT_STATE_TYPE_URL.to_string(),
@@ -560,6 +568,10 @@ mod tests {
         assert_eq!(decoded.max_clock_drift, Duration::from_secs(10));
         assert_eq!(decoded.latest_checkpoint_slot, 10);
         assert_eq!(decoded.latest_checkpoint_timestamp, 11);
+        assert_eq!(
+            decoded.epoch_context_challenges,
+            raw.epoch_context_challenges
+        );
         assert_eq!(
             decoded.epoch_stake_distribution[0].relative_stake_numerator,
             40
