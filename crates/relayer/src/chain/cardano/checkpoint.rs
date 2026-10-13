@@ -43,10 +43,108 @@ pub(crate) fn is_probabilistic_epoch_proposal(message: &Any) -> Result<bool, Str
     Ok(header.new_epoch_context.is_some())
 }
 
+/// A cross-epoch confirmation proposal may add a response window without
+/// advancing its anchor. Accept that one state change, then wait and retry.
+pub(crate) fn committed_cross_epoch_proposal(
+    before: &crate::client_state::AnyClientState,
+    after: &crate::client_state::AnyClientState,
+    message: &Any,
+) -> Result<bool, String> {
+    use crate::client_state::AnyClientState;
+    let (AnyClientState::Probabilistic(before), AnyClientState::Probabilistic(after)) =
+        (before, after)
+    else {
+        return Ok(false);
+    };
+    newly_proposed_context(&before.clone().into(), &after.clone().into(), message)
+}
+
+fn newly_proposed_context(
+    before: &ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::ClientState,
+    after: &ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::ClientState,
+    message: &Any,
+) -> Result<bool, String> {
+    if message.type_url != UPDATE_CLIENT_TYPE_URL {
+        return Ok(false);
+    }
+    let update = RawMsgUpdateClient::decode(message.value.as_slice()).map_err(|e| e.to_string())?;
+    let Some(header) = update.client_message else {
+        return Ok(false);
+    };
+    if header.type_url != PROBABILISTIC_HEADER_TYPE_URL {
+        return Ok(false);
+    }
+    let header = ProbabilisticHeader::decode(header.value.as_slice()).map_err(|e| e.to_string())?;
+    let (Some(context), Some(anchor)) = (header.new_epoch_context, header.anchor_block) else {
+        return Ok(false);
+    };
+    Ok(context.epoch > anchor.epoch
+        && before.current_epoch == after.current_epoch
+        && before.latest_height == after.latest_height
+        && before.latest_checkpoint_height == after.latest_checkpoint_height
+        && before.latest_checkpoint_block_hash == after.latest_checkpoint_block_hash
+        && before.latest_checkpoint_nonce_state == after.latest_checkpoint_nonce_state
+        && before.latest_checkpoint_pool_production == after.latest_checkpoint_pool_production
+        && before.latest_checkpoint_settlement_credit == after.latest_checkpoint_settlement_credit
+        && before.latest_checkpoint_pool_registry == after.latest_checkpoint_pool_registry
+        && !before
+            .epoch_context_challenges
+            .iter()
+            .any(|row| row.epoch == context.epoch)
+        && after
+            .epoch_context_challenges
+            .iter()
+            .any(|row| row.epoch == context.epoch && row.usable_after_unix_ns > 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
+
+    #[test]
+    fn a_new_response_window_is_progress_but_an_unchanged_retry_is_not() {
+        let before = raw::ClientState {
+            current_epoch: 7,
+            ..Default::default()
+        };
+        let mut after = before.clone();
+        after
+            .epoch_context_challenges
+            .push(raw::EpochContextChallenge {
+                epoch: 8,
+                usable_after_unix_ns: 42,
+            });
+        let header = ProbabilisticHeader {
+            anchor_block: Some(raw::ProbabilisticBlock {
+                epoch: 7,
+                ..Default::default()
+            }),
+            new_epoch_context: Some(raw::EpochContext {
+                epoch: 8,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let update = RawMsgUpdateClient {
+            client_message: Some(Any {
+                type_url: PROBABILISTIC_HEADER_TYPE_URL.into(),
+                value: header.encode_to_vec(),
+            }),
+            ..Default::default()
+        };
+        let message = Any {
+            type_url: UPDATE_CLIENT_TYPE_URL.into(),
+            value: update.encode_to_vec(),
+        };
+        assert!(newly_proposed_context(&before, &after, &message).unwrap());
+        assert!(!newly_proposed_context(&after, &after, &message).unwrap());
+        after.epoch_context_challenges[0].usable_after_unix_ns = 0;
+        assert!(!newly_proposed_context(&before, &after, &message).unwrap());
+        after.epoch_context_challenges[0].usable_after_unix_ns = 42;
+        after.latest_checkpoint_block_hash = "unexpected cursor change".into();
+        assert!(!newly_proposed_context(&before, &after, &message).unwrap());
+    }
 
     #[test]
     fn detects_checkpoint_update_messages() {
