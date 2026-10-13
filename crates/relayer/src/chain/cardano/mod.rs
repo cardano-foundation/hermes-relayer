@@ -33,3 +33,5 @@ pub use utxo_resolver::{
 
 // Type alias matching Cosmos/Penumbra pattern
 pub type CardanoChain = CardanoChainEndpoint;
+
+mod intent_executor;

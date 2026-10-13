@@ -17,9 +17,16 @@ default-run = "hermes"
 [[bin]]
 name = "hermes"
 
+[features]
+default  = []
+# Penumbra chain backend (opt-in).
+penumbra = ["ibc-relayer/penumbra"]
+# Namada chain backend (opt-in).
+namada   = ["ibc-relayer/namada"]
+
 [dependencies]
 ibc-relayer-types  = { workspace = true }
-ibc-relayer        = { workspace = true }
+ibc-relayer        = { workspace = true, features = ["std"] }
 ibc-proto          = { workspace = true }
 ibc-telemetry      = { workspace = true }
 ibc-relayer-rest   = { workspace = true }

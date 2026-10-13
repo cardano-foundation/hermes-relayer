@@ -303,6 +303,35 @@ mod tests {
             "17".repeat(28),
             "2e".repeat(28),
         );
+        let mut manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        manifest["packet_state"] = serde_json::json!({
+            "format": "packet-lanes-v1",
+            "state": {"address": format!("70{}", "41".repeat(28)), "script_hash": "41".repeat(28), "ref_utxo": {"tx_hash": "51".repeat(32), "output_index": 0}},
+            "batch": {"address": format!("70{}", "42".repeat(28)), "script_hash": "42".repeat(28), "ref_utxo": {"tx_hash": "52".repeat(32), "output_index": 0}},
+            "guard": {"address": format!("70{}", "43".repeat(28)), "script_hash": "43".repeat(28), "ref_utxo": {"tx_hash": "53".repeat(32), "output_index": 0}},
+        });
+        let mut operations = serde_json::Map::new();
+        for (index, name) in [
+            "send",
+            "acknowledge",
+            "timeout",
+            "reject",
+            "receive",
+            "prune",
+            "timeout_on_close",
+            "retire",
+            "funds",
+            "send_funds",
+        ]
+        .iter()
+        .enumerate()
+        {
+            operations.insert((*name).into(), serde_json::json!({"script_hash": format!("{:02x}", 0x60 + index).repeat(28),
+                "ref_utxo": {"tx_hash": format!("{:02x}", 0x70 + index).repeat(32), "output_index": 0}}));
+        }
+        manifest["packet_state"]["operations"] = operations.into();
+        manifest["validators"]["verify_proof"] = serde_json::json!({"script_hash": "44".repeat(28), "ref_utxo": {"tx_hash": "54".repeat(32), "output_index": 0}});
+        let manifest = manifest.to_string();
         TransactionSigningPolicy::from_json(
             &manifest,
             0,
@@ -411,6 +440,7 @@ mod tests {
                 output_index: 0,
             },
             ResolvedInput {
+                inline_datum: None,
                 address: hex::decode(keyring.address(0)).unwrap(),
                 lovelace: 3_500_000,
                 assets: Vec::new(),
@@ -422,6 +452,7 @@ mod tests {
                 output_index: 0,
             },
             ResolvedInput {
+                inline_datum: None,
                 address: HOST_ADDRESS.to_vec(),
                 lovelace: 2_000_000,
                 assets: vec![ResolvedAsset {

@@ -65,7 +65,7 @@ pub struct ChainStatus {
 }
 
 /// Result of a chain-level HostState heartbeat attempt. Non-Cardano endpoints
-/// use `Unsupported`; Cardano reports whether an anchor already existed or a
+/// use `Unsupported`; Cardano reports whether a HostState transaction already existed or a
 /// heartbeat transaction was submitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostStateHeartbeatOutcome {
@@ -73,12 +73,14 @@ pub enum HostStateHeartbeatOutcome {
     NotRequired {
         current_epoch: u64,
         host_state_epoch: u64,
+        next_check_delay_ms: u64,
     },
     Submitted {
         tx_hash: String,
         height: Option<ICSHeight>,
         current_epoch: u64,
         previous_host_state_epoch: u64,
+        next_check_delay_ms: u64,
     },
 }
 

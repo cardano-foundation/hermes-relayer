@@ -75,13 +75,35 @@ pub struct BuiltIbcTx {
     pub kind: BuiltIbcTxKind,
     pub rebuild_after_submission: bool,
 }
-pub const TRACE_REGISTRY_PRELUDE_TYPE_URL: &str = "/ibc.cardano.v1.TraceRegistryPrelude";
 
 /// Unsigned transaction response from Gateway
 #[derive(Debug, Clone)]
 pub struct UnsignedTx {
     pub cbor_hex: String,
     pub description: String,
+}
+
+impl UnsignedTx {
+    pub fn from_packet_batch(
+        batch: &super::generated::ibc::cardano::v1::BuildPacketBatchResponse,
+    ) -> Result<Self, Error> {
+        let unsigned = batch
+            .unsigned_tx
+            .as_ref()
+            .ok_or_else(|| Error::Transaction("Gateway batch has no transaction".into()))?;
+        // Gateway sends UTF-8 hexadecimal text in Any.value, as it does for
+        // ordinary IBC transactions. Hex-encoding these bytes corrupts the CBOR.
+        let cbor_hex = std::str::from_utf8(&unsigned.value).map_err(|error| {
+            Error::Transaction(format!(
+                "Gateway returned invalid UTF-8 in batch transaction: {error}"
+            ))
+        })?;
+        validate_unsigned_tx_cbor(cbor_hex, 0)?;
+        Ok(Self {
+            cbor_hex: cbor_hex.to_string(),
+            description: batch.stage.clone(),
+        })
+    }
 }
 
 /// Transaction submission response from Gateway
@@ -97,6 +119,7 @@ pub struct HostStateHeartbeatBuild {
     pub heartbeat_required: bool,
     pub current_epoch: u64,
     pub host_state_epoch: u64,
+    pub next_check_delay_ms: u64,
     pub unsigned_tx: Option<UnsignedTx>,
 }
 
@@ -299,6 +322,27 @@ impl Interceptor for GatewayAuthInterceptor {
 }
 
 impl GatewayClient {
+    pub async fn build_packet_batch(
+        &self,
+        signer: &str,
+        port: &str,
+        channel: &str,
+        intent_hash: &str,
+    ) -> Result<super::generated::ibc::cardano::v1::BuildPacketBatchResponse, Error> {
+        let mut client = CardanoMsgClient::new(self.channel.clone());
+        Ok(client
+            .build_packet_batch(tonic::Request::new(
+                super::generated::ibc::cardano::v1::BuildPacketBatchRequest {
+                    signer: signer.to_string(),
+                    port_id: port.to_string(),
+                    channel_id: channel.to_string(),
+                    intent_tx_hash: intent_hash.to_string(),
+                },
+            ))
+            .await?
+            .into_inner())
+    }
+
     /// Create a new Gateway client and establish a gRPC connection
     pub async fn new(endpoint: String) -> Result<Self, Error> {
         Self::new_with_security(endpoint, None, None).await
@@ -729,13 +773,44 @@ impl GatewayClient {
 
     /// Query all channels
     pub async fn query_channels(&self) -> Result<Vec<u8>, Error> {
+        use ibc_proto::cosmos::base::query::v1beta1::PageRequest;
+        use ibc_proto::ibc::core::channel::v1::QueryChannelsResponse;
         let mut client = ChannelQueryClient::new(self.channel.clone());
-
-        let request = tonic::Request::new(QueryChannelsRequest { pagination: None });
-
-        let response = client.channels(request).await?.into_inner();
-
-        Ok(prost::Message::encode_to_vec(&response))
+        let mut key = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut channels = Vec::new();
+        loop {
+            let response = client
+                .channels(tonic::Request::new(QueryChannelsRequest {
+                    pagination: Some(PageRequest {
+                        key,
+                        offset: 0,
+                        limit: 100,
+                        count_total: false,
+                        reverse: false,
+                    }),
+                }))
+                .await?
+                .into_inner();
+            channels.extend(response.channels);
+            key = response
+                .pagination
+                .map(|page| page.next_key)
+                .unwrap_or_default();
+            if key.is_empty() {
+                break;
+            }
+            if !seen.insert(key.clone()) {
+                return Err(Error::GatewayClient(
+                    "repeated channel pagination cursor".into(),
+                ));
+            }
+        }
+        Ok(prost::Message::encode_to_vec(&QueryChannelsResponse {
+            channels,
+            pagination: None,
+            height: None,
+        }))
     }
 
     /// Query all clients
@@ -1612,13 +1687,16 @@ impl GatewayClient {
             sequence
         );
 
+        if !unsigned_tx_any.type_url.is_empty() {
+            return Err(Error::Transaction(format!(
+                "Unsupported RecvPacket transaction profile {}: first-seen voucher receive must atomically spend the channel and mint both voucher tokens",
+                unsigned_tx_any.type_url
+            )));
+        }
         Ok(UnsignedTx {
             cbor_hex,
-            description: if unsigned_tx_any.type_url == TRACE_REGISTRY_PRELUDE_TYPE_URL {
-                format!(
-                    "TraceRegistryPrelude MsgRecvPacket (sequence: {})",
-                    sequence
-                )
+            description: if unsigned_tx_any.type_url == "/ibc.cardano.v1.InitializePacketLanes" {
+                "InitializePacketLanes".into()
             } else {
                 format!("MsgRecvPacket (sequence: {})", sequence)
             },
@@ -1706,7 +1784,8 @@ impl GatewayClient {
             source_port: msg.source_port,
             source_channel: msg.source_channel.clone(),
             token: Some(token),
-            sender: sender.clone(),
+            sender: super::signing_policy::transfer_sender_key_hash(&sender)
+                .map_err(Error::Transaction)?,
             receiver: msg.receiver,
             timeout_height,
             timeout_timestamp: msg.timeout_timestamp,
@@ -1855,8 +1934,8 @@ impl GatewayClient {
         })
     }
 
-    /// Ask the Gateway to build a HostState heartbeat only if the current
-    /// Cardano epoch does not already contain a HostState anchor.
+    /// Ask the Gateway to build a HostState heartbeat after the epoch midpoint
+    /// only if no HostState transaction has occurred in that epoch.
     pub async fn build_host_state_heartbeat(
         &self,
         signer: &str,
@@ -1892,6 +1971,7 @@ impl GatewayClient {
             heartbeat_required: response.heartbeat_required,
             current_epoch: response.current_epoch,
             host_state_epoch: response.host_state_epoch,
+            next_check_delay_ms: response.next_check_delay_ms,
             unsigned_tx,
         })
     }
@@ -2246,6 +2326,68 @@ mod tests {
 
     fn gateway_uri(value: &str) -> Uri {
         value.parse().expect("valid test URI")
+    }
+
+    #[test]
+    fn gateway_packet_batch_preserves_transaction_bytes_and_body_hash() {
+        use blake2::{digest::consts::U32, Blake2b};
+        use pallas_codec::minicbor;
+        use pallas_primitives::conway::MintedTx;
+
+        // Captured from PacketLaneService.batch and the real runChain/Lucid
+        // completion path, then encoded with Gateway's protobuf encoder.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/gateway-packet-batch.json")).unwrap();
+        let wire = hex::decode(fixture["response_hex"].as_str().unwrap()).unwrap();
+        let batch = super::super::generated::ibc::cardano::v1::BuildPacketBatchResponse::decode(
+            wire.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(batch.stage, "send");
+        assert!(!batch.intent_tx_hashes.is_empty());
+        let unsigned = UnsignedTx::from_packet_batch(&batch).unwrap();
+        assert_eq!(unsigned.description, batch.stage);
+        assert_eq!(
+            unsigned.cbor_hex,
+            fixture["transaction_hex"].as_str().unwrap()
+        );
+        // This is the single hex decode performed before resolving/signing.
+        let bytes = hex::decode(&unsigned.cbor_hex).unwrap();
+        assert_eq!(
+            bytes,
+            hex::decode(fixture["transaction_hex"].as_str().unwrap()).unwrap()
+        );
+        let mut decoder = minicbor::Decoder::new(&bytes);
+        let tx: MintedTx<'_> = decoder.decode().unwrap();
+        assert_eq!(decoder.position(), bytes.len());
+        let hash = Blake2b::<U32>::digest(tx.transaction_body.raw_cbor());
+        assert_eq!(hex::encode(hash), fixture["body_hash"].as_str().unwrap());
+    }
+
+    #[test]
+    fn gateway_packet_batch_rejects_invalid_transaction_encoding() {
+        use super::super::generated::ibc::cardano::v1::BuildPacketBatchResponse;
+
+        for stage in ["initialize", "send"] {
+            for value in [vec![0xff], vec![], b"abc".to_vec(), b"84xz".to_vec()] {
+                let batch = BuildPacketBatchResponse {
+                    stage: stage.to_string(),
+                    unsigned_tx: Some(prost_types::Any {
+                        type_url: String::new(),
+                        value,
+                    }),
+                    ..Default::default()
+                };
+                let error = UnsignedTx::from_packet_batch(&batch).unwrap_err();
+                assert!(matches!(error, Error::Transaction(_)));
+                assert!(error.to_string().contains("Gateway"));
+            }
+            let missing = BuildPacketBatchResponse {
+                stage: stage.to_string(),
+                ..Default::default()
+            };
+            assert!(UnsignedTx::from_packet_batch(&missing).is_err());
+        }
     }
 
     fn denom_hash(full_denom: &str) -> [u8; 32] {

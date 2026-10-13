@@ -124,11 +124,13 @@ pub fn delete_key(config: &ChainConfig, key_name: &str) -> eyre::Result<()> {
             )?;
             keyring.remove_key(key_name)?;
         }
+        #[cfg(feature = "namada")]
         ChainConfig::Namada(config) => {
             let mut keyring =
                 KeyRing::new_namada(Store::Test, &config.id, &config.key_store_folder)?;
             keyring.remove_key(key_name)?;
         }
+        #[cfg(feature = "penumbra")]
         ChainConfig::Penumbra(_) => unimplemented!("no key support for penumbra"),
         ChainConfig::Cardano(config) => {
             let mut keyring: KeyRing<CardanoSigningKeyPair> = KeyRing::new(
@@ -157,6 +159,7 @@ pub fn delete_all_keys(config: &ChainConfig) -> eyre::Result<()> {
                 keyring.remove_key(&key_name)?;
             }
         }
+        #[cfg(feature = "namada")]
         ChainConfig::Namada(config) => {
             let mut keyring =
                 KeyRing::new_namada(Store::Test, &config.id, &config.key_store_folder)?;
@@ -165,6 +168,7 @@ pub fn delete_all_keys(config: &ChainConfig) -> eyre::Result<()> {
                 keyring.remove_key(&key_name)?;
             }
         }
+        #[cfg(feature = "penumbra")]
         ChainConfig::Penumbra(_) => unimplemented!("no key support for penumbra"),
         ChainConfig::Cardano(config) => {
             let mut keyring: KeyRing<CardanoSigningKeyPair> = KeyRing::new(

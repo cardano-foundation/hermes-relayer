@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use bech32::{FromBase32, ToBase32, Variant};
 use blake2::digest::consts::U32;
+use blake2::{digest::VariableOutput, Blake2bVar};
 use blake2::{Blake2b, Digest};
 use pallas_codec::minicbor;
 use pallas_primitives::babbage::PseudoDatumOption;
@@ -71,6 +72,7 @@ pub struct ResolvedInput {
     pub address: Vec<u8>,
     pub lovelace: u64,
     pub assets: Vec<ResolvedAsset>,
+    pub inline_datum: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -395,6 +397,63 @@ impl KupoInputResolver {
         })
     }
 
+    async fn resolve_inline_datum(&self, hash: &str) -> Result<Vec<u8>, Error> {
+        let expected = decode_fixed_hex::<32>(hash, "Kupo datum hash")?;
+        let url = format!(
+            "{}/datums/{}?inline",
+            self.endpoint.as_str().trim_end_matches('/'),
+            hash
+        );
+        let mut request = self.client.get(url).header(ACCEPT, KUPO_ACCEPT);
+        if let Some(api_key) = &self.api_key {
+            request = request.header(KUPO_API_KEY_HEADER, api_key.clone());
+        }
+        let mut response = request.send().await.map_err(|e| {
+            Error::Query(format!(
+                "failed to resolve input datum: {}",
+                e.without_url()
+            ))
+        })?;
+        if !response.status().is_success() {
+            return Err(Error::Query(
+                "input datum is unavailable from trusted Kupo".into(),
+            ));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| Error::Query(format!("failed to read input datum: {}", e.without_url())))?
+        {
+            if body.len().saturating_add(chunk.len()) > 131_200 {
+                return Err(Error::Query("input datum response exceeds limit".into()));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let json: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| Error::Query("invalid input datum response".into()))?;
+        let encoded = json
+            .get("datum")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Query("input datum response has no CBOR".into()))?;
+        let raw = hex::decode(encoded)
+            .map_err(|_| Error::Query("invalid input datum CBOR hex".into()))?;
+        let mut actual = [0u8; 32];
+        let mut hasher = Blake2bVar::new(32).expect("valid Blake2b size");
+        blake2::digest::Update::update(&mut hasher, &raw);
+        hasher
+            .finalize_variable(&mut actual)
+            .expect("matching Blake2b output size");
+        if actual != expected {
+            return Err(Error::Query(
+                "resolved datum does not match authenticated input hash".into(),
+            ));
+        }
+        let _: pallas_primitives::alonzo::PlutusData = minicbor::decode(&raw)
+            .map_err(|_| Error::Query("invalid resolved Plutus datum".into()))?;
+        Ok(raw)
+    }
+
     async fn resolve_transaction_outputs(
         &self,
         transaction_id: [u8; 32],
@@ -474,7 +533,16 @@ impl KupoInputResolver {
                 transaction_id,
                 output_index: matched.output_index,
             };
-            let output = parse_kupo_output(matched)?;
+            let datum_hash = if matched.datum_type.as_deref() == Some("inline") {
+                matched.datum_hash.clone()
+            } else {
+                None
+            };
+            let mut output = parse_kupo_output(matched)?;
+            if let Some(hash) = datum_hash {
+                output.inline_datum = Some(self.resolve_inline_datum(&hash).await?);
+            }
+
             if resolved.insert(out_ref.clone(), output).is_some() {
                 return Err(Error::Query(format!(
                     "trusted Kupo returned duplicate unspent output {}",
@@ -552,6 +620,9 @@ fn trusted_overlay_output(
 
     Ok(TrustedOverlayOutput {
         resolved: ResolvedInput {
+            inline_datum: datum
+                .as_ref()
+                .map(|raw| hex::decode(raw).expect("encoded inline datum")),
             address,
             lovelace,
             assets,
@@ -739,6 +810,10 @@ fn collect_out_refs<'a>(
 
 #[derive(Debug, Deserialize)]
 struct KupoMatch {
+    #[serde(default)]
+    datum_hash: Option<String>,
+    #[serde(default)]
+    datum_type: Option<String>,
     transaction_id: String,
     output_index: u64,
     address: String,
@@ -820,6 +895,7 @@ fn parse_kupo_output(output: KupoMatch) -> Result<ResolvedInput, Error> {
     assets.sort_unstable();
 
     Ok(ResolvedInput {
+        inline_datum: None,
         address,
         lovelace,
         assets,
@@ -1084,6 +1160,43 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         (format!("http://{address}"), handle)
+    }
+
+    #[tokio::test]
+    async fn input_datum_resolution_checks_its_hash() {
+        let raw = hex::decode("d87980").unwrap();
+        let mut digest = [0u8; 32];
+        let mut hasher = Blake2bVar::new(32).unwrap();
+        blake2::digest::Update::update(&mut hasher, &raw);
+        hasher.finalize_variable(&mut digest).unwrap();
+        for matches in [true, false] {
+            let hash = hex::encode(if matches { digest } else { [0; 32] });
+            let expected_path = format!("GET /datums/{hash}?inline HTTP/1.1");
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let len = stream.read(&mut request).unwrap();
+                assert!(String::from_utf8_lossy(&request[..len]).starts_with(&expected_path));
+                let body = r#"{"datum":"d87980"}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            });
+            let resolver = KupoInputResolver::new_with_security(&endpoint, None, None).unwrap();
+            let result = resolver.resolve_inline_datum(&hash).await;
+            server.join().unwrap();
+            if matches {
+                assert_eq!(result.unwrap(), raw);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("does not match"));
+            }
+        }
     }
 
     fn kupo_output(index: u64) -> serde_json::Value {
@@ -1436,6 +1549,8 @@ mod tests {
     #[test]
     fn malformed_kupo_values_are_rejected() {
         let malformed = KupoMatch {
+            datum_hash: None,
+            datum_type: None,
             transaction_id: "11".repeat(32),
             output_index: 0,
             address: format!("60{}", "aa".repeat(28)),

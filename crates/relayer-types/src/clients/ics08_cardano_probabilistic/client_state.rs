@@ -51,6 +51,7 @@ pub struct ClientState {
     pub max_clock_drift: Duration,
     pub latest_checkpoint_slot: u64,
     pub latest_checkpoint_timestamp: u64,
+    pub packet_lane_policy_id: Vec<u8>,
     pub epoch_context_challenges: Vec<raw::EpochContextChallenge>,
 }
 
@@ -118,6 +119,7 @@ impl TryFrom<RawClientState> for ClientState {
             max_clock_drift,
             latest_checkpoint_slot,
             latest_checkpoint_timestamp,
+            packet_lane_policy_id,
             epoch_context_challenges,
         } = raw;
 
@@ -171,6 +173,12 @@ impl TryFrom<RawClientState> for ClientState {
             ));
         }
 
+        if packet_lane_policy_id.len() != 28 {
+            return Err(Error::invalid_field(
+                "packet_lane_policy_id",
+                "expected 28 bytes".to_string(),
+            ));
+        }
         if host_state_nft_policy_id.is_empty() {
             return Err(Error::missing_field("host_state_nft_policy_id"));
         }
@@ -311,6 +319,7 @@ impl TryFrom<RawClientState> for ClientState {
             max_clock_drift,
             latest_checkpoint_slot,
             latest_checkpoint_timestamp,
+            packet_lane_policy_id,
             epoch_context_challenges,
         })
     }
@@ -349,6 +358,7 @@ impl From<ClientState> for RawClientState {
             max_clock_drift: Some(duration_to_proto(value.max_clock_drift)),
             latest_checkpoint_slot: value.latest_checkpoint_slot,
             latest_checkpoint_timestamp: value.latest_checkpoint_timestamp,
+            packet_lane_policy_id: value.packet_lane_policy_id,
             epoch_context_challenges: value.epoch_context_challenges,
         }
     }
@@ -473,6 +483,7 @@ mod tests {
                 nanos: 0,
             }),
             host_state_nft_policy_id: vec![1; 28],
+            packet_lane_policy_id: vec![4; 28],
             epoch_nonce: vec![2; 32],
             slots_per_kes_period: 129_600,
             current_epoch_start_slot: 1,

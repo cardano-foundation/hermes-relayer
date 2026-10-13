@@ -51,9 +51,11 @@ fi
 # Hermes config
 HERMES_CONFIG="$HOME_DIR/hermes.toml"
 HERMES_CONFIG_FORK="$HOME_DIR/hermes-fork.toml"
+HERMES_CONFIG_EVIDENCE="$HOME_DIR/hermes-evidence.toml"
 # Hermes binary
 HERMES_BIN="cargo run -q --bin hermes -- $HERMES_DEBUG --config $HERMES_CONFIG"
 HERMES_BIN_FORK="cargo run -q --bin hermes -- $HERMES_DEBUG --config $HERMES_CONFIG_FORK"
+HERMES_BIN_EVIDENCE="cargo run -q --bin hermes -- $HERMES_DEBUG --config $HERMES_CONFIG_EVIDENCE"
 
 # Validator moniker
 MONIKER="coordinator"
@@ -98,6 +100,12 @@ interchain-security-pd keys add $PROV_KEY --home ${PROV_NODE_DIR} --keyring-back
 # Add stake to user
 PROV_ACCOUNT_ADDR=$(jq -r '.address' ${PROV_NODE_DIR}/${PROV_KEY}.json)
 interchain-security-pd genesis add-genesis-account "$PROV_ACCOUNT_ADDR" $USER_COINS --home ${PROV_NODE_DIR} --keyring-backend test
+
+# The evidence monitor and background relayer submit concurrently on the provider.
+# Give evidence its own funded account so they cannot race on account sequences.
+interchain-security-pd keys add evidence --home "${PROV_NODE_DIR}" --keyring-backend test --output json > "${PROV_NODE_DIR}/evidence.json" 2>&1
+EVIDENCE_ACCOUNT_ADDR=$(jq -r '.address' "${PROV_NODE_DIR}/evidence.json")
+interchain-security-pd genesis add-genesis-account "$EVIDENCE_ACCOUNT_ADDR" 1000000000stake --home "${PROV_NODE_DIR}" --keyring-backend test
 
 # Stake 1/1000 user's coins
 interchain-security-pd genesis gentx $PROV_KEY $STAKE --chain-id provider --home ${PROV_NODE_DIR} --keyring-backend test --moniker $MONIKER
@@ -506,6 +514,8 @@ $HERMES_BIN keys delete --chain provider --all
 # Restore keys to hermes relayer
 $HERMES_BIN keys add --key-file  ${CONS_NODE_DIR}/${PROV_KEY}.json --chain consumer
 $HERMES_BIN keys add --key-file  ${PROV_NODE_DIR}/${PROV_KEY}.json --chain provider
+$HERMES_BIN keys add --key-file "${PROV_NODE_DIR}/evidence.json" --chain provider --key-name evidence
+sed '/id = "provider"/,$ s/key_name = "relayer"/key_name = "evidence"/' "$HERMES_CONFIG" > "$HERMES_CONFIG_EVIDENCE"
 
 waiting 5 "for a block"
 
@@ -656,7 +666,7 @@ waiting 10 "for Hermes relayer to start"
 diag "Running Hermes relayer evidence command"
 
 # Run hermes in evidence mode
-$HERMES_BIN evidence --chain consumer &> ${HOME_DIR}/hermes-evidence-logs.txt &
+$HERMES_BIN_EVIDENCE evidence --chain consumer &> ${HOME_DIR}/hermes-evidence-logs.txt &
 
 # If we sleep 5 here and above, we end up on the forked block later
 waiting 10 "for Hermes evidence monitor to start"
@@ -675,7 +685,7 @@ if [ "$FROZEN_HEIGHT" != "null" ]; then
     diag "Client is frozen, as expected."
 else
     diag "Client is not frozen, aborting."
-    ${HOME_DIR}/hermes-evidence-logs.txt
+    cat ${HOME_DIR}/hermes-evidence-logs.txt
     exit 1
 fi
 

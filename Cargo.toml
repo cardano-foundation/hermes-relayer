@@ -13,6 +13,17 @@ members = [
     "tools/test-framework",
 ]
 
+# The test tools enable every chain backend, and Cargo unifies features across
+# the packages being built, so keep them out of a plain `cargo build`.
+default-members = [
+    "crates/relayer",
+    "crates/relayer-types",
+    "crates/relayer-cli",
+    "crates/relayer-rest",
+    "crates/telemetry",
+    "crates/chain-registry",
+]
+
 exclude = [
     "tools/check-guide",
     "tools/query-events",
@@ -21,7 +32,7 @@ exclude = [
 [workspace.dependencies]
 # Hermes dependencies
 ibc-relayer-cli      = { version = "1.13.2",  path = "crates/relayer-cli" }
-ibc-relayer          = { version = "0.32.2", path = "crates/relayer" }
+ibc-relayer          = { version = "0.32.2", path = "crates/relayer", default-features = false }
 ibc-relayer-rest     = { version = "0.32.2", path = "crates/relayer-rest" }
 ibc-relayer-types    = { version = "0.32.2", path = "crates/relayer-types" }
 ibc-chain-registry   = { version = "0.32.2", path = "crates/chain-registry" }
