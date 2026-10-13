@@ -7506,6 +7506,70 @@ mod tests {
     }
 
     #[test]
+    fn outbound_packet_binding_still_rejects_altered_fields() {
+        let signer = format!("60{}", "99".repeat(28));
+        let message = transfer_message("lovelace".to_string(), signer.clone());
+        let intent = SigningIntent::ibc(
+            "/ibc.applications.transfer.v1.MsgTransfer",
+            &message,
+            &signer,
+            0,
+        )
+        .unwrap();
+        let transfer = intent.transfer.as_ref().unwrap();
+        let bytes = |value: &[u8]| PlutusData::BoundedBytes(value.to_vec().into());
+        let integer = |value: i64| PlutusData::BigInt(BigInt::Int(value.into()));
+        let constructor = |fields: Vec<PlutusData>| {
+            PlutusData::Constr(pallas_primitives::alonzo::Constr {
+                tag: 121,
+                any_constructor: None,
+                fields,
+            })
+        };
+        let packet_json = serde_json::json!({
+            "denom": LOVELACE_HEX, "amount": "42", "sender": "99".repeat(28),
+            "receiver": "destination", "memo": "",
+        });
+        let fields = vec![
+            integer(1),
+            bytes(b"transfer"),
+            bytes(b"channel-0"),
+            bytes(b"transfer"),
+            bytes(b"channel-1"),
+            bytes(&serde_json::to_vec(&packet_json).unwrap()),
+            constructor(vec![integer(0), integer(0)]),
+            integer(1),
+        ];
+        assert!(outbound_transfer_packet_matches(
+            &constructor(fields.clone()),
+            transfer
+        ));
+        for field in ["denom", "amount", "sender", "receiver", "memo"] {
+            let mut altered_json = packet_json.clone();
+            altered_json[field] = serde_json::Value::String("altered".to_string());
+            let mut altered = fields.clone();
+            altered[5] = bytes(&serde_json::to_vec(&altered_json).unwrap());
+            assert!(
+                !outbound_transfer_packet_matches(&constructor(altered), transfer),
+                "{field}"
+            );
+        }
+        for (index, value) in [
+            (1, bytes(b"other-port")),
+            (2, bytes(b"channel-2")),
+            (6, constructor(vec![integer(0), integer(2)])),
+            (7, integer(2)),
+        ] {
+            let mut altered = fields.clone();
+            altered[index] = value;
+            assert!(!outbound_transfer_packet_matches(
+                &constructor(altered),
+                transfer
+            ));
+        }
+    }
+
+    #[test]
     fn hashed_transfer_denom_is_resolved_only_by_matching_sha256_preimage() {
         let signer = format!("60{}", "99".repeat(28));
         let full_denom = "transfer/channel-7/uatom";
