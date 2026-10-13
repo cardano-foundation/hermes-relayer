@@ -733,6 +733,7 @@ impl ChainEndpoint for PenumbraChain {
         &mut self,
         update: &ibc_relayer_types::core::ics02_client::events::UpdateClient,
         client_state: &AnyClientState,
+        _challenge_context: Option<Vec<u8>>,
     ) -> Result<Option<crate::misbehaviour::MisbehaviourEvidence>, Error> {
         crate::time!(
             "check_misbehaviour",

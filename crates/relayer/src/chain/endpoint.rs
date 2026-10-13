@@ -185,6 +185,7 @@ pub trait ChainEndpoint: Sized {
         &mut self,
         update: &UpdateClient,
         client_state: &AnyClientState,
+        challenge_context: Option<Vec<u8>>,
     ) -> Result<Option<MisbehaviourEvidence>, Error>;
 
     // Queries
@@ -216,6 +217,17 @@ pub trait ChainEndpoint: Sized {
         &self,
         request: QueryClientStatesRequest,
     ) -> Result<Vec<IdentifiedAnyClientState>, Error>;
+
+    /// Return the production and settlement-credit hint at the trusted checkpoint.
+    fn query_cardano_challenge_context(
+        &self,
+        client_id: ClientId,
+        trusted_height: ICSHeight,
+    ) -> Result<Vec<u8>, Error> {
+        Err(Error::query(format!(
+            "Cardano challenge context is unsupported for client {client_id} at {trusted_height}"
+        )))
+    }
 
     /// Performs a query to retrieve the state of the specified light client. A
     /// proof can optionally be returned along with the result.

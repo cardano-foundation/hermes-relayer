@@ -198,6 +198,7 @@ pub enum ChainRequest {
     },
 
     BuildMisbehaviour {
+        challenge_context: Option<Vec<u8>>,
         client_state: AnyClientState,
         update_event: UpdateClient,
         reply_to: ReplyTo<Option<MisbehaviourEvidence>>,
@@ -209,6 +210,12 @@ pub enum ChainRequest {
         client_id: ClientId,
         height: Height,
         reply_to: ReplyTo<(Option<AnyClientState>, Proofs)>,
+    },
+
+    QueryCardanoChallengeContext {
+        client_id: ClientId,
+        trusted_height: Height,
+        reply_to: ReplyTo<Vec<u8>>,
     },
 
     QueryClientState {
@@ -472,6 +479,13 @@ pub trait ChainHandle: Clone + Display + Send + Sync + Debug + 'static {
         request: QueryClientStatesRequest,
     ) -> Result<Vec<IdentifiedAnyClientState>, Error>;
 
+    /// Return the production and settlement-credit hint at the trusted checkpoint.
+    fn query_cardano_challenge_context(
+        &self,
+        client_id: ClientId,
+        trusted_height: Height,
+    ) -> Result<Vec<u8>, Error>;
+
     /// Performs a query to retrieve the state of the specified light client. A
     /// proof can optionally be returned along with the result.
     fn query_client_state(
@@ -590,6 +604,7 @@ pub trait ChainHandle: Clone + Display + Send + Sync + Debug + 'static {
         &self,
         update: UpdateClient,
         client_state: AnyClientState,
+        challenge_context: Option<Vec<u8>>,
     ) -> Result<Option<MisbehaviourEvidence>, Error>;
 
     fn build_connection_proofs_and_client_state(

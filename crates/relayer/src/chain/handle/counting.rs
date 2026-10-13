@@ -201,6 +201,16 @@ impl<Handle: ChainHandle> ChainHandle for CountingChainHandle<Handle> {
         self.inner().query_clients(request)
     }
 
+    /// Return the production and settlement-credit hint at the trusted checkpoint.
+    fn query_cardano_challenge_context(
+        &self,
+        client_id: ClientId,
+        trusted_height: Height,
+    ) -> Result<Vec<u8>, Error> {
+        self.inner()
+            .query_cardano_challenge_context(client_id, trusted_height)
+    }
+
     fn query_client_state(
         &self,
         request: QueryClientStateRequest,
@@ -360,9 +370,11 @@ impl<Handle: ChainHandle> ChainHandle for CountingChainHandle<Handle> {
         &self,
         update: UpdateClient,
         client_state: AnyClientState,
+        challenge_context: Option<Vec<u8>>,
     ) -> Result<Option<MisbehaviourEvidence>, Error> {
         self.inc_metric("check_misbehaviour");
-        self.inner().check_misbehaviour(update, client_state)
+        self.inner()
+            .check_misbehaviour(update, client_state, challenge_context)
     }
 
     fn build_connection_proofs_and_client_state(

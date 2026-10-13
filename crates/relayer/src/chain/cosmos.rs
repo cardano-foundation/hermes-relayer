@@ -1055,6 +1055,7 @@ impl ChainEndpoint for CosmosSdkChain {
         &mut self,
         update: &UpdateClient,
         client_state: &AnyClientState,
+        _challenge_context: Option<Vec<u8>>,
     ) -> Result<Option<MisbehaviourEvidence>, Error> {
         crate::time!(
             "check_misbehaviour",
@@ -1261,6 +1262,44 @@ impl ChainEndpoint for CosmosSdkChain {
         clients.sort_by_cached_key(|c| client_id_suffix(&c.client_id).unwrap_or(0));
 
         Ok(clients)
+    }
+
+    fn query_cardano_challenge_context(
+        &self,
+        client_id: ClientId,
+        trusted_height: Height,
+    ) -> Result<Vec<u8>, Error> {
+        // Pin all reads to one host height so an intervening update cannot mix
+        // the latest client state with challenge metadata from a later block.
+        let host_height = self.query_application_status()?.height;
+        let (client, _) = self.query_client_state(
+            QueryClientStateRequest {
+                client_id: client_id.clone(),
+                height: QueryHeight::Specific(host_height),
+            },
+            IncludeProof::No,
+        )?;
+        let AnyClientState::Probabilistic(client) = client else {
+            return Err(Error::query(
+                "Cardano challenge requires a probabilistic client".to_owned(),
+            ));
+        };
+        crate::chain::cardano::challenge::context_from_store(client.into(), trusted_height, |key| {
+            let mut path = format!("clients/{client_id}/").into_bytes();
+            path.extend_from_slice(key);
+            let response = self
+                .block_on(self.rpc_client.abci_query(
+                    Some("/store/ibc/key".to_owned()),
+                    path,
+                    Some(host_height.into()),
+                    false,
+                ))
+                .map_err(|error| Error::rpc(self.config.rpc_addr.clone(), error))?;
+            if !response.code.is_ok() {
+                return Err(Error::abci_query(response));
+            }
+            Ok(response.value)
+        })
     }
 
     fn query_client_state(

@@ -534,6 +534,31 @@ impl GatewayClient {
             .await
     }
 
+    /// Independent evidence uses the destination's historical checkpoint hint.
+    /// Never substitute observer history or the latest post-proposal client.
+    pub async fn query_challenge_header(
+        &self,
+        trusted_height: Height,
+        height: Height,
+        probabilistic: bool,
+        context: Option<Vec<u8>>,
+    ) -> Result<AnyHeader, Error> {
+        let bytes = if probabilistic {
+            context.filter(|bytes| !bytes.is_empty()).ok_or_else(|| {
+                Error::Query("Historical Cardano challenge context is unavailable".to_owned())
+            })?
+        } else {
+            Vec::new()
+        };
+        if trusted_height >= height {
+            return Err(Error::Query(
+                "Challenge trusted height must precede target height".to_owned(),
+            ));
+        }
+        self.query_header_with_context(trusted_height, height, probabilistic, bytes)
+            .await
+    }
+
     pub async fn query_header_for_client(
         &self,
         trusted_height: Height,

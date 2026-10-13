@@ -4,6 +4,7 @@
 //! as Cosmos and Penumbra implementations in Hermes.
 
 pub mod chain_handle;
+pub(crate) mod challenge;
 pub(crate) mod checkpoint;
 pub mod config;
 pub mod endpoint;
@@ -35,3 +36,6 @@ pub use utxo_resolver::{
 pub type CardanoChain = CardanoChainEndpoint;
 
 mod intent_executor;
+
+#[cfg(test)]
+mod challenge_tests;

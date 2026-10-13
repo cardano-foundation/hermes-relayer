@@ -2081,12 +2081,33 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 )));
             }
 
+            // A probabilistic witness must use the same saved checkpoint as
+            // destination verification, including a pre-proposal rootless cursor.
+            let challenge_context = match &update_event.header {
+                Some(AnyHeader::Probabilistic(header)) => Some(
+                    self.dst_chain
+                        .query_cardano_challenge_context(self.id.clone(), header.trusted_height)
+                        .map_err(|error| {
+                            ForeignClientError::misbehaviour(
+                                format!(
+                                    "failed querying Cardano challenge checkpoint {}",
+                                    header.trusted_height
+                                ),
+                                error,
+                            )
+                        })?,
+                ),
+                _ => None,
+            };
+
             // Check for misbehaviour according to the specific source chain type.
             // In case of Tendermint client, this will also check the BFT time violation if
             // a header for the event height cannot be retrieved from the witness.
-            let result = self
-                .src_chain
-                .check_misbehaviour(update_event.clone(), client_state.clone());
+            let result = self.src_chain.check_misbehaviour(
+                update_event.clone(),
+                client_state.clone(),
+                challenge_context,
+            );
 
             let misbehavior = match result {
                 // Misbehavior check passed.
@@ -2519,6 +2540,7 @@ mod tests {
             latest_checkpoint_nonce_state: None,
             latest_checkpoint_pool_registry: None,
             latest_checkpoint_settlement_credit: None,
+            latest_checkpoint_pool_production: None,
             randomness_stabilisation_window_slots: 0,
             chain_id: source_id.clone(),
             latest_height: height(if exact_root_exists { 33 } else { 10 }),
@@ -2553,6 +2575,7 @@ mod tests {
             nonce_state: None,
             pool_registry: None,
             settlement_credit: None,
+            pool_production: None,
             root: CommitmentRoot::from_bytes(&[1; 32]),
             timestamp: 100_000_000_000,
             accepted_block_hash: "01".repeat(32),

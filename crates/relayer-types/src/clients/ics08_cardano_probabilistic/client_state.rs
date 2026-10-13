@@ -56,6 +56,7 @@ pub struct ClientState {
     pub latest_checkpoint_nonce_state: Option<raw::PraosNonceState>,
     pub latest_checkpoint_pool_registry: Option<raw::PoolRegistryState>,
     pub latest_checkpoint_settlement_credit: Option<raw::SettlementCreditState>,
+    pub latest_checkpoint_pool_production: Option<raw::PoolProductionHistory>,
     pub randomness_stabilisation_window_slots: u64,
 }
 
@@ -128,6 +129,7 @@ impl TryFrom<RawClientState> for ClientState {
             latest_checkpoint_nonce_state,
             latest_checkpoint_pool_registry,
             latest_checkpoint_settlement_credit,
+            latest_checkpoint_pool_production,
             randomness_stabilisation_window_slots,
         } = raw;
 
@@ -332,6 +334,7 @@ impl TryFrom<RawClientState> for ClientState {
             latest_checkpoint_nonce_state,
             latest_checkpoint_pool_registry,
             latest_checkpoint_settlement_credit,
+            latest_checkpoint_pool_production,
             randomness_stabilisation_window_slots,
         })
     }
@@ -375,6 +378,7 @@ impl From<ClientState> for RawClientState {
             latest_checkpoint_nonce_state: value.latest_checkpoint_nonce_state,
             latest_checkpoint_pool_registry: value.latest_checkpoint_pool_registry,
             latest_checkpoint_settlement_credit: value.latest_checkpoint_settlement_credit,
+            latest_checkpoint_pool_production: value.latest_checkpoint_pool_production,
             randomness_stabilisation_window_slots: value.randomness_stabilisation_window_slots,
         }
     }
@@ -534,6 +538,7 @@ mod tests {
         raw.randomness_stabilisation_window_slots = 172_800;
         raw.latest_checkpoint_pool_registry = Some(raw::test_pool_registry());
         raw.latest_checkpoint_settlement_credit = Some(raw::test_settlement_credit());
+        raw.latest_checkpoint_pool_production = Some(raw::test_pool_production());
         let state = ClientState::try_from(raw.clone()).unwrap();
         let any: Any = state.into();
         let decoded = ClientState::try_from(any).unwrap();
@@ -543,6 +548,10 @@ mod tests {
             raw.latest_checkpoint_nonce_state
         );
         assert_eq!(restored.randomness_stabilisation_window_slots, 172_800);
+        assert_eq!(
+            restored.latest_checkpoint_pool_production,
+            raw.latest_checkpoint_pool_production
+        );
         assert_eq!(
             restored.latest_checkpoint_settlement_credit,
             raw.latest_checkpoint_settlement_credit
