@@ -7,12 +7,11 @@ use super::error::Error;
 use super::generated::ibc::cardano::v1::{
     cardano_msg_client::CardanoMsgClient, BuildHostStateHeartbeatRequest,
     BuildHostStateHeartbeatResponse, MsgPrunePacketHistory, ObserveTxRequest, ObserveTxResponse,
-    SubmitSignedTxRequest, SubmitSignedTxResponse,
+    SubmitSignedTxRequest, SubmitSignedTxResponse, TendermintUpdateTxChain,
 };
 use super::generated::ibc::core::channel::v1::msg_client::MsgClient as GenChannelMsgClient;
 use super::generated::ibc::core::client::v1::msg_client::MsgClient as GenClientMsgClient;
 use super::generated::ibc::core::connection::v1::msg_client::MsgClient as GenConnectionMsgClient;
-use super::transfer::packet_sender_payment_key;
 use ibc_proto::google::protobuf::Any as ProtoAny;
 use ibc_proto::ibc::core::channel::v1::query_client::QueryClient as ChannelQueryClient;
 use ibc_proto::ibc::core::channel::v1::{
@@ -44,6 +43,7 @@ use ibc_relayer_types::clients::{
 };
 use ibc_relayer_types::core::ics02_client::header::AnyHeader;
 use ibc_relayer_types::Height;
+use prost::Message;
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -56,12 +56,54 @@ use tonic::{Request, Status};
 const GATEWAY_HEADER_GRPC_MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
 const CARDANO_NATIVE_ASSET_MAX_QUANTITY: u64 = u64::MAX;
 const PRUNE_PACKET_HISTORY_TYPE_URL: &str = "/ibc.cardano.v1.MsgPrunePacketHistory";
+const LEGACY_TENDERMINT_UPDATE_STEP_TYPE_URL: &str = "/ibc.cardano.v1.TendermintUpdateStep";
+pub const TENDERMINT_UPDATE_TX_CHAIN_TYPE_URL: &str = "/ibc.cardano.v1.TendermintUpdateTxChain";
+pub const TENDERMINT_UPDATE_TX_CHAIN_VERSION: u32 = 1;
+pub const MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH: usize = 100;
+
+/// An unsigned IBC transaction and its role in a possibly staged update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltIbcTxKind {
+    Singleton,
+    TendermintUpdateChain,
+    LegacyTendermintUpdateStep,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuiltIbcTx {
+    pub transactions: Vec<UnsignedTx>,
+    pub kind: BuiltIbcTxKind,
+    pub rebuild_after_submission: bool,
+}
 
 /// Unsigned transaction response from Gateway
 #[derive(Debug, Clone)]
 pub struct UnsignedTx {
     pub cbor_hex: String,
     pub description: String,
+}
+
+impl UnsignedTx {
+    pub fn from_packet_batch(
+        batch: &super::generated::ibc::cardano::v1::BuildPacketBatchResponse,
+    ) -> Result<Self, Error> {
+        let unsigned = batch
+            .unsigned_tx
+            .as_ref()
+            .ok_or_else(|| Error::Transaction("Gateway batch has no transaction".into()))?;
+        // Gateway sends UTF-8 hexadecimal text in Any.value, as it does for
+        // ordinary IBC transactions. Hex-encoding these bytes corrupts the CBOR.
+        let cbor_hex = std::str::from_utf8(&unsigned.value).map_err(|error| {
+            Error::Transaction(format!(
+                "Gateway returned invalid UTF-8 in batch transaction: {error}"
+            ))
+        })?;
+        validate_unsigned_tx_cbor(cbor_hex, 0)?;
+        Ok(Self {
+            cbor_hex: cbor_hex.to_string(),
+            description: batch.stage.clone(),
+        })
+    }
 }
 
 /// Transaction submission response from Gateway
@@ -77,6 +119,7 @@ pub struct HostStateHeartbeatBuild {
     pub heartbeat_required: bool,
     pub current_epoch: u64,
     pub host_state_epoch: u64,
+    pub next_check_delay_ms: u64,
     pub unsigned_tx: Option<UnsignedTx>,
 }
 
@@ -153,6 +196,107 @@ fn describe_update_client_message(type_url: Option<&str>) -> String {
     }
 }
 
+fn validate_unsigned_tx_cbor(cbor_hex: &str, index: usize) -> Result<(), Error> {
+    if cbor_hex.is_empty() || cbor_hex.len() % 2 != 0 || hex::decode(cbor_hex).is_err() {
+        return Err(Error::Transaction(format!(
+            "Gateway returned invalid unsigned transaction CBOR hex at chain index {index}"
+        )));
+    }
+    Ok(())
+}
+
+fn decode_update_client_transactions(
+    client_message_type_url: Option<&str>,
+    unsigned_tx: prost_types::Any,
+    description: &str,
+) -> Result<BuiltIbcTx, Error> {
+    if unsigned_tx.type_url == LEGACY_TENDERMINT_UPDATE_STEP_TYPE_URL {
+        if client_message_type_url != Some(TENDERMINT_HEADER_TYPE_URL) {
+            return Err(Error::Transaction(format!(
+                "Gateway returned the legacy Tendermint update marker for {}, but staged execution is only supported for MsgUpdateClient<TendermintHeader>",
+                describe_update_client_message(client_message_type_url)
+            )));
+        }
+        let cbor_hex = String::from_utf8(unsigned_tx.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {e}")))?;
+        validate_unsigned_tx_cbor(&cbor_hex, 0)?;
+        return Ok(BuiltIbcTx {
+            transactions: vec![UnsignedTx {
+                cbor_hex,
+                description: description.to_string(),
+            }],
+            kind: BuiltIbcTxKind::LegacyTendermintUpdateStep,
+            rebuild_after_submission: false,
+        });
+    }
+
+    if unsigned_tx.type_url != TENDERMINT_UPDATE_TX_CHAIN_TYPE_URL {
+        let cbor_hex = String::from_utf8(unsigned_tx.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {e}")))?;
+        validate_unsigned_tx_cbor(&cbor_hex, 0)?;
+        return Ok(BuiltIbcTx {
+            transactions: vec![UnsignedTx {
+                cbor_hex,
+                description: description.to_string(),
+            }],
+            kind: BuiltIbcTxKind::Singleton,
+            rebuild_after_submission: false,
+        });
+    }
+
+    if !matches!(
+        client_message_type_url,
+        Some(TENDERMINT_HEADER_TYPE_URL | TENDERMINT_MISBEHAVIOR_TYPE_URL)
+    ) {
+        return Err(Error::Transaction(format!(
+            "Gateway returned {} for {}, but transaction chaining is only supported for Tendermint headers or misbehaviour",
+            TENDERMINT_UPDATE_TX_CHAIN_TYPE_URL,
+            describe_update_client_message(client_message_type_url)
+        )));
+    }
+
+    let chain = TendermintUpdateTxChain::decode(unsigned_tx.value.as_slice()).map_err(|e| {
+        Error::Transaction(format!(
+            "Failed to decode Tendermint update transaction chain: {e}"
+        ))
+    })?;
+    if chain.version != TENDERMINT_UPDATE_TX_CHAIN_VERSION {
+        return Err(Error::Transaction(format!(
+            "Unsupported Tendermint update transaction chain version {}; expected {}",
+            chain.version, TENDERMINT_UPDATE_TX_CHAIN_VERSION
+        )));
+    }
+    if chain.unsigned_tx_cbor.is_empty()
+        || chain.unsigned_tx_cbor.len() > MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH
+    {
+        return Err(Error::Transaction(format!(
+            "Tendermint update transaction chain length must be between 1 and {} (got {})",
+            MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH,
+            chain.unsigned_tx_cbor.len()
+        )));
+    }
+
+    let total = chain.unsigned_tx_cbor.len();
+    let transactions = chain
+        .unsigned_tx_cbor
+        .into_iter()
+        .enumerate()
+        .map(|(index, cbor_hex)| {
+            validate_unsigned_tx_cbor(&cbor_hex, index)?;
+            Ok(UnsignedTx {
+                cbor_hex,
+                description: format!("{description} (chain transaction {}/{total})", index + 1),
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+
+    Ok(BuiltIbcTx {
+        transactions,
+        kind: BuiltIbcTxKind::TendermintUpdateChain,
+        rebuild_after_submission: chain.rebuild_after_submission,
+    })
+}
+
 /// Client for communicating with Cardano Gateway
 #[derive(Clone)]
 pub struct GatewayClient {
@@ -178,6 +322,27 @@ impl Interceptor for GatewayAuthInterceptor {
 }
 
 impl GatewayClient {
+    pub async fn build_packet_batch(
+        &self,
+        signer: &str,
+        port: &str,
+        channel: &str,
+        intent_hash: &str,
+    ) -> Result<super::generated::ibc::cardano::v1::BuildPacketBatchResponse, Error> {
+        let mut client = CardanoMsgClient::new(self.channel.clone());
+        Ok(client
+            .build_packet_batch(tonic::Request::new(
+                super::generated::ibc::cardano::v1::BuildPacketBatchRequest {
+                    signer: signer.to_string(),
+                    port_id: port.to_string(),
+                    channel_id: channel.to_string(),
+                    intent_tx_hash: intent_hash.to_string(),
+                },
+            ))
+            .await?
+            .into_inner())
+    }
+
     /// Create a new Gateway client and establish a gRPC connection
     pub async fn new(endpoint: String) -> Result<Self, Error> {
         Self::new_with_security(endpoint, None, None).await
@@ -597,13 +762,44 @@ impl GatewayClient {
 
     /// Query all channels
     pub async fn query_channels(&self) -> Result<Vec<u8>, Error> {
+        use ibc_proto::cosmos::base::query::v1beta1::PageRequest;
+        use ibc_proto::ibc::core::channel::v1::QueryChannelsResponse;
         let mut client = ChannelQueryClient::new(self.channel.clone());
-
-        let request = tonic::Request::new(QueryChannelsRequest { pagination: None });
-
-        let response = client.channels(request).await?.into_inner();
-
-        Ok(prost::Message::encode_to_vec(&response))
+        let mut key = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut channels = Vec::new();
+        loop {
+            let response = client
+                .channels(tonic::Request::new(QueryChannelsRequest {
+                    pagination: Some(PageRequest {
+                        key,
+                        offset: 0,
+                        limit: 100,
+                        count_total: false,
+                        reverse: false,
+                    }),
+                }))
+                .await?
+                .into_inner();
+            channels.extend(response.channels);
+            key = response
+                .pagination
+                .map(|page| page.next_key)
+                .unwrap_or_default();
+            if key.is_empty() {
+                break;
+            }
+            if !seen.insert(key.clone()) {
+                return Err(Error::GatewayClient(
+                    "repeated channel pagination cursor".into(),
+                ));
+            }
+        }
+        Ok(prost::Message::encode_to_vec(&QueryChannelsResponse {
+            channels,
+            pagination: None,
+            height: None,
+        }))
     }
 
     /// Query all clients
@@ -861,20 +1057,20 @@ impl GatewayClient {
         &self,
         type_url: &str,
         message_data: Vec<u8>,
-    ) -> Result<UnsignedTx, Error> {
+    ) -> Result<BuiltIbcTx, Error> {
         tracing::info!(
             "Building unsigned transaction for message type: {}",
             type_url
         );
 
         // Route based on type_url
-        match type_url {
+        let transaction = match type_url {
             // IBC Client messages
             "/ibc.core.client.v1.MsgCreateClient" => {
                 self.build_create_client_tx(message_data).await
             }
             "/ibc.core.client.v1.MsgUpdateClient" => {
-                self.build_update_client_tx(message_data).await
+                return self.build_update_client_tx(message_data).await;
             }
             "/ibc.core.client.v1.MsgRecoverClient" => {
                 self.build_recover_client_tx(message_data).await
@@ -938,7 +1134,13 @@ impl GatewayClient {
                     type_url
                 )))
             }
-        }
+        }?;
+
+        Ok(BuiltIbcTx {
+            transactions: vec![transaction],
+            kind: BuiltIbcTxKind::Singleton,
+            rebuild_after_submission: false,
+        })
     }
 
     //
@@ -979,7 +1181,7 @@ impl GatewayClient {
         })
     }
 
-    async fn build_update_client_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+    async fn build_update_client_tx(&self, message_data: Vec<u8>) -> Result<BuiltIbcTx, Error> {
         use super::generated::ibc::core::client::v1::MsgUpdateClient;
         use prost::Message;
 
@@ -987,11 +1189,12 @@ impl GatewayClient {
             .map_err(|e| Error::Transaction(format!("Failed to decode MsgUpdateClient: {}", e)))?;
 
         let client_id = msg.client_id.clone();
-        let message_description = describe_update_client_message(
-            msg.client_message
-                .as_ref()
-                .map(|client_message| client_message.type_url.as_str()),
-        );
+        let client_message_type_url = msg
+            .client_message
+            .as_ref()
+            .map(|client_message| client_message.type_url.clone());
+        let message_description =
+            describe_update_client_message(client_message_type_url.as_deref());
 
         let mut client = GenClientMsgClient::new(self.channel.clone());
         let request = tonic::Request::new(msg);
@@ -1002,20 +1205,18 @@ impl GatewayClient {
             Error::Transaction("No unsigned_tx in UpdateClient response".to_string())
         })?;
 
-        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
-            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
-
         tracing::info!(
-            "{}: received unsigned CBOR (length: {}), client_id: {}",
+            "{}: received unsigned transaction payload (length: {}), client_id: {}",
             message_description,
-            cbor_hex.len(),
+            unsigned_tx_any.value.len(),
             client_id
         );
 
-        Ok(UnsignedTx {
-            cbor_hex,
-            description: format!("{message_description} (client_id: {client_id})"),
-        })
+        decode_update_client_transactions(
+            client_message_type_url.as_deref(),
+            unsigned_tx_any,
+            &format!("{message_description} (client_id: {client_id})"),
+        )
     }
 
     async fn build_recover_client_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
@@ -1475,9 +1676,19 @@ impl GatewayClient {
             sequence
         );
 
+        if !unsigned_tx_any.type_url.is_empty() {
+            return Err(Error::Transaction(format!(
+                "Unsupported RecvPacket transaction profile {}: first-seen voucher receive must atomically spend the channel and mint both voucher tokens",
+                unsigned_tx_any.type_url
+            )));
+        }
         Ok(UnsignedTx {
             cbor_hex,
-            description: format!("MsgRecvPacket (sequence: {})", sequence),
+            description: if unsigned_tx_any.type_url == "/ibc.cardano.v1.InitializePacketLanes" {
+                "InitializePacketLanes".into()
+            } else {
+                format!("MsgRecvPacket (sequence: {})", sequence)
+            },
         })
     }
 
@@ -1684,8 +1895,8 @@ impl GatewayClient {
         })
     }
 
-    /// Ask the Gateway to build a HostState heartbeat only if the current
-    /// Cardano epoch does not already contain a HostState anchor.
+    /// Ask the Gateway to build a HostState heartbeat after the epoch midpoint
+    /// only if no HostState transaction has occurred in that epoch.
     pub async fn build_host_state_heartbeat(
         &self,
         signer: &str,
@@ -1721,6 +1932,7 @@ impl GatewayClient {
             heartbeat_required: response.heartbeat_required,
             current_epoch: response.current_epoch,
             host_state_epoch: response.host_state_epoch,
+            next_check_delay_ms: response.next_check_delay_ms,
             unsigned_tx,
         })
     }
@@ -1765,11 +1977,16 @@ impl GatewayClient {
 
     /// Wait for a transaction submitted through Hermes's trusted node path and
     /// finalize the matching pending Gateway state update by body hash only.
-    pub async fn observe_tx(&self, tx_hash: &str) -> Result<TxSubmitResponse, Error> {
+    pub async fn observe_tx(
+        &self,
+        tx_hash: &str,
+        allow_untracked: bool,
+    ) -> Result<TxSubmitResponse, Error> {
         let mut client = CardanoMsgClient::new(self.channel.clone());
         let response: ObserveTxResponse = client
             .observe_tx(tonic::Request::new(ObserveTxRequest {
                 tx_hash: tx_hash.to_string(),
+                allow_untracked,
             }))
             .await?
             .into_inner();
@@ -2039,7 +2256,8 @@ fn cardano_transfer_request(
         source_port: msg.source_port.clone(),
         source_channel: msg.source_channel.clone(),
         token: Some(cardano_transfer_token_from_canonical(token)?),
-        sender: packet_sender_payment_key(&msg.sender).map_err(Error::Transaction)?,
+        sender: super::signing_policy::transfer_sender_key_hash(&msg.sender)
+            .map_err(Error::Transaction)?,
         receiver: msg.receiver.clone(),
         timeout_height: msg.timeout_height.as_ref().map(|height| {
             super::generated::ibc::core::client::v1::Height {
@@ -2096,6 +2314,68 @@ mod tests {
 
     fn gateway_uri(value: &str) -> Uri {
         value.parse().expect("valid test URI")
+    }
+
+    #[test]
+    fn gateway_packet_batch_preserves_transaction_bytes_and_body_hash() {
+        use blake2::{digest::consts::U32, Blake2b};
+        use pallas_codec::minicbor;
+        use pallas_primitives::conway::MintedTx;
+
+        // Captured from PacketLaneService.batch and the real runChain/Lucid
+        // completion path, then encoded with Gateway's protobuf encoder.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/gateway-packet-batch.json")).unwrap();
+        let wire = hex::decode(fixture["response_hex"].as_str().unwrap()).unwrap();
+        let batch = super::super::generated::ibc::cardano::v1::BuildPacketBatchResponse::decode(
+            wire.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(batch.stage, "send");
+        assert!(!batch.intent_tx_hashes.is_empty());
+        let unsigned = UnsignedTx::from_packet_batch(&batch).unwrap();
+        assert_eq!(unsigned.description, batch.stage);
+        assert_eq!(
+            unsigned.cbor_hex,
+            fixture["transaction_hex"].as_str().unwrap()
+        );
+        // This is the single hex decode performed before resolving/signing.
+        let bytes = hex::decode(&unsigned.cbor_hex).unwrap();
+        assert_eq!(
+            bytes,
+            hex::decode(fixture["transaction_hex"].as_str().unwrap()).unwrap()
+        );
+        let mut decoder = minicbor::Decoder::new(&bytes);
+        let tx: MintedTx<'_> = decoder.decode().unwrap();
+        assert_eq!(decoder.position(), bytes.len());
+        let hash = Blake2b::<U32>::digest(tx.transaction_body.raw_cbor());
+        assert_eq!(hex::encode(hash), fixture["body_hash"].as_str().unwrap());
+    }
+
+    #[test]
+    fn gateway_packet_batch_rejects_invalid_transaction_encoding() {
+        use super::super::generated::ibc::cardano::v1::BuildPacketBatchResponse;
+
+        for stage in ["initialize", "send"] {
+            for value in [vec![0xff], vec![], b"abc".to_vec(), b"84xz".to_vec()] {
+                let batch = BuildPacketBatchResponse {
+                    stage: stage.to_string(),
+                    unsigned_tx: Some(prost_types::Any {
+                        type_url: String::new(),
+                        value,
+                    }),
+                    ..Default::default()
+                };
+                let error = UnsignedTx::from_packet_batch(&batch).unwrap_err();
+                assert!(matches!(error, Error::Transaction(_)));
+                assert!(error.to_string().contains("Gateway"));
+            }
+            let missing = BuildPacketBatchResponse {
+                stage: stage.to_string(),
+                ..Default::default()
+            };
+            assert!(UnsignedTx::from_packet_batch(&missing).is_err());
+        }
     }
 
     fn denom_hash(full_denom: &str) -> [u8; 32] {
@@ -2381,6 +2661,143 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    fn update_client_any(type_url: &str, value: Vec<u8>) -> prost_types::Any {
+        prost_types::Any {
+            type_url: type_url.to_string(),
+            value,
+        }
+    }
+
+    fn chain_any(
+        version: u32,
+        transactions: Vec<String>,
+        rebuild_after_submission: bool,
+    ) -> prost_types::Any {
+        update_client_any(
+            TENDERMINT_UPDATE_TX_CHAIN_TYPE_URL,
+            TendermintUpdateTxChain {
+                version,
+                unsigned_tx_cbor: transactions,
+                rebuild_after_submission,
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    #[test]
+    fn tendermint_header_chain_decodes_in_dependency_order() {
+        let built = decode_update_client_transactions(
+            Some(TENDERMINT_HEADER_TYPE_URL),
+            chain_any(1, vec!["a100".to_string(), "b200".to_string()], false),
+            "update",
+        )
+        .unwrap();
+
+        assert_eq!(built.kind, BuiltIbcTxKind::TendermintUpdateChain);
+        assert_eq!(built.transactions.len(), 2);
+        assert_eq!(built.transactions[0].cbor_hex, "a100");
+        assert_eq!(built.transactions[1].cbor_hex, "b200");
+        assert!(built.transactions[1].description.contains("2/2"));
+        assert!(!built.rebuild_after_submission);
+    }
+
+    #[test]
+    fn phase_boundary_chain_requests_rebuild_after_confirmed_submission() {
+        let built = decode_update_client_transactions(
+            Some(TENDERMINT_HEADER_TYPE_URL),
+            chain_any(1, vec!["a100".to_string()], true),
+            "phase boundary",
+        )
+        .unwrap();
+
+        assert_eq!(built.kind, BuiltIbcTxKind::TendermintUpdateChain);
+        assert!(built.rebuild_after_submission);
+    }
+
+    #[test]
+    fn tendermint_header_chain_accepts_exactly_one_hundred_transactions() {
+        let built = decode_update_client_transactions(
+            Some(TENDERMINT_HEADER_TYPE_URL),
+            chain_any(
+                1,
+                vec!["a100".to_string(); MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH],
+                false,
+            ),
+            "update",
+        )
+        .unwrap();
+
+        assert_eq!(built.transactions.len(), 100);
+    }
+
+    #[test]
+    fn tendermint_header_chain_rejects_bad_version_or_length() {
+        for any in [
+            chain_any(2, vec!["a100".to_string()], false),
+            chain_any(1, vec![], false),
+            chain_any(
+                1,
+                vec!["a100".to_string(); MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH + 1],
+                false,
+            ),
+        ] {
+            assert!(decode_update_client_transactions(
+                Some(TENDERMINT_HEADER_TYPE_URL),
+                any,
+                "update"
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn chain_is_accepted_for_tendermint_misbehaviour_only() {
+        let built = decode_update_client_transactions(
+            Some(TENDERMINT_MISBEHAVIOR_TYPE_URL),
+            chain_any(1, vec!["a100".to_string()], false),
+            "misbehaviour",
+        )
+        .unwrap();
+        assert_eq!(built.kind, BuiltIbcTxKind::TendermintUpdateChain);
+        for other_type in [
+            MITHRIL_MISBEHAVIOUR_TYPE_URL,
+            PROBABILISTIC_MISBEHAVIOUR_TYPE_URL,
+            "/unknown.Misbehaviour",
+        ] {
+            assert!(decode_update_client_transactions(
+                Some(other_type),
+                chain_any(1, vec!["a100".to_string()], false),
+                "misbehaviour"
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn ordinary_update_client_response_remains_a_singleton() {
+        let built = decode_update_client_transactions(
+            Some(TENDERMINT_MISBEHAVIOR_TYPE_URL),
+            update_client_any("", b"a100".to_vec()),
+            "misbehaviour",
+        )
+        .unwrap();
+
+        assert_eq!(built.kind, BuiltIbcTxKind::Singleton);
+        assert_eq!(built.transactions.len(), 1);
+    }
+
+    #[test]
+    fn legacy_tendermint_step_remains_supported() {
+        let built = decode_update_client_transactions(
+            Some(TENDERMINT_HEADER_TYPE_URL),
+            update_client_any(LEGACY_TENDERMINT_UPDATE_STEP_TYPE_URL, b"a100".to_vec()),
+            "update",
+        )
+        .unwrap();
+
+        assert_eq!(built.kind, BuiltIbcTxKind::LegacyTendermintUpdateStep);
     }
 
     #[test]

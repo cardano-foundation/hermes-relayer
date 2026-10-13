@@ -17,7 +17,6 @@ pub mod signer;
 pub mod signing_key_pair;
 pub mod signing_policy;
 pub mod transaction_evaluator;
-mod transfer;
 pub mod utxo_resolver;
 
 // Re-export key types for convenience
@@ -34,3 +33,5 @@ pub use utxo_resolver::{
 
 // Type alias matching Cosmos/Penumbra pattern
 pub type CardanoChain = CardanoChainEndpoint;
+
+mod intent_executor;

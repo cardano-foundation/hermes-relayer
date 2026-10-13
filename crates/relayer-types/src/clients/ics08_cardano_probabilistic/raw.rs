@@ -109,6 +109,8 @@ pub struct ClientState {
     pub latest_checkpoint_slot: u64,
     #[prost(uint64, tag = "29")]
     pub latest_checkpoint_timestamp: u64,
+    #[prost(bytes = "vec", tag = "30")]
+    pub packet_lane_policy_id: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
@@ -127,6 +129,8 @@ pub struct ConsensusState {
     pub unique_stake_bps: u64,
     #[prost(uint64, tag = "7")]
     pub security_score_bps: u64,
+    #[prost(bytes = "vec", tag = "8")]
+    pub packet_state_snapshot: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]

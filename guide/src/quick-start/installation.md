@@ -122,15 +122,18 @@ The last of these crates contains the `hermes` binary.
 cargo build --release --bin hermes
 ```
 
-<a name="telemetry-support"></a>
+<a name="chain-backends"></a>
 
-> By default, Hermes bundles a [telemetry service and server](../documentation/telemetry/index.md).
-> To build Hermes without telemetry support, and get a smaller executable,
-> supply the `--no-default-features flag` to `cargo build`:
+> By default, Hermes is built with the Cosmos SDK and Cardano chain backends.
+> The Penumbra and Namada backends pull in large SDKs, so they are opt-in.
+> To relay with Penumbra or Namada chains, enable the matching feature, or both:
 >
 > ```shell
-> cargo build --release --no-default-features --bin hermes
+> cargo build --release --bin hermes --features penumbra,namada
 > ```
+>
+> A build without one of these backends rejects configurations for that chain
+> type at startup.
 
 If the build is successful, the `hermes` executable will be located in the following location:
 

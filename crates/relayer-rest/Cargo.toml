@@ -15,7 +15,7 @@ description  = """
 
 [dependencies]
 ibc-relayer-types = { workspace = true }
-ibc-relayer       = { workspace = true }
+ibc-relayer       = { workspace = true, features = ["std"] }
 
 axum              = { workspace = true }
 crossbeam-channel = { workspace = true }

@@ -5,7 +5,9 @@ pub mod cosmos;
 pub mod counterparty;
 pub mod endpoint;
 pub mod handle;
+#[cfg(feature = "namada")]
 pub mod namada;
+#[cfg(feature = "penumbra")]
 pub mod penumbra;
 pub mod requests;
 pub mod runtime;
