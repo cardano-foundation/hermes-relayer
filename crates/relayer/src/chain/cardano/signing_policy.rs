@@ -33,14 +33,16 @@ use super::generated::ibc::core::{
         MsgChannelOpenConfirm, MsgChannelOpenInit, MsgChannelOpenTry, MsgRecvPacket, MsgTimeout,
         MsgTimeoutOnClose,
     },
-    client::v1::{MsgCreateClient, MsgRecoverClient, MsgUpdateClient},
+    client::v1::{MsgCreateClient, MsgRecoverClient, MsgUpdateClient, MsgUpgradeClient},
     connection::v1::{
         MsgConnectionOpenAck, MsgConnectionOpenConfirm, MsgConnectionOpenInit, MsgConnectionOpenTry,
     },
 };
 use super::utxo_resolver::{ResolvedInput, ResolvedTransactionInputs, TransactionOutRef};
 use ibc_relayer_types::clients::ics07_tendermint::{
-    header::TENDERMINT_HEADER_TYPE_URL, misbehaviour::TENDERMINT_MISBEHAVIOR_TYPE_URL,
+    client_state::TENDERMINT_CLIENT_STATE_TYPE_URL,
+    consensus_state::TENDERMINT_CONSENSUS_STATE_TYPE_URL, header::TENDERMINT_HEADER_TYPE_URL,
+    misbehaviour::TENDERMINT_MISBEHAVIOR_TYPE_URL,
 };
 
 const LOVELACE: &str = "lovelace";
@@ -283,6 +285,7 @@ enum ChannelRedeemerIntent<'a> {
         substitute_name: Vec<u8>,
         history_format: ConsensusHistoryFormat,
     },
+    ClientUpgrade(u64),
     Packet {
         alternative: u64,
         packet: &'a PacketIntent,
@@ -319,6 +322,11 @@ impl ChannelRedeemerIntent<'_> {
                 })
                 .and_then(|fields| fields.first())
                 .is_some_and(|token| auth_token_matches(token, substitute_policy, substitute_name)),
+            // The upgrade proofs and the proposed states travel in the
+            // verify-proof mint, which the pinned scripts bind to this spend.
+            Self::ClientUpgrade(alternative) => {
+                constructor_fields(data, *alternative).is_some_and(<[PlutusData]>::is_empty)
+            }
             Self::Packet {
                 alternative,
                 packet,
@@ -351,6 +359,14 @@ impl ChannelRedeemerIntent<'_> {
             }
         }
     }
+}
+
+/// The recovery validator branch a client transition withdraws through.
+#[derive(Clone, Copy, Debug)]
+enum ClientWithdrawal<'a> {
+    Recovery(&'a [u8]),
+    History { staged: bool },
+    Upgrade,
 }
 
 impl TransactionSigningPolicy {
@@ -653,6 +669,21 @@ impl TransactionSigningPolicy {
                     StateOutputKind::Client,
                     false,
                 ),
+                "/ibc.core.client.v1.MsgUpgradeClient" => {
+                    // The upgrade withdrawal archives the old tip in the private
+                    // consensus history, which only the proof-backed ABI has.
+                    if self.consensus_history_format != ConsensusHistoryFormat::ProofBackedV1 {
+                        return Err(
+                            "client upgrades require a proof-backed-v1 deployment".to_string()
+                        );
+                    }
+                    (
+                        vec!["spendclient", "recoverclient", "verifyproof"],
+                        vec!["verifyproof"],
+                        StateOutputKind::Client,
+                        false,
+                    )
+                }
                 "/ibc.core.connection.v1.MsgConnectionOpenInit" => (
                     vec!["mintconnectionstt"],
                     vec!["mintconnectionstt"],
@@ -1324,6 +1355,7 @@ impl TransactionSigningPolicy {
         F: Fn(String) -> Error,
     {
         let requires_withdrawal = intent.operation == "/ibc.core.client.v1.MsgRecoverClient"
+            || intent.operation == "/ibc.core.client.v1.MsgUpgradeClient"
             || (intent.operation == "/ibc.core.client.v1.MsgUpdateClient"
                 && (!intent.staged_tendermint || staged_finalization)
                 && self.consensus_history_format == ConsensusHistoryFormat::ProofBackedV1);
@@ -2268,7 +2300,9 @@ impl TransactionSigningPolicy {
         let host_alternative = match intent.operation.as_str() {
             "HostStateHeartbeat" => 10,
             "/ibc.core.client.v1.MsgCreateClient" => 0,
-            "/ibc.core.client.v1.MsgUpdateClient" | "/ibc.core.client.v1.MsgRecoverClient" => 4,
+            "/ibc.core.client.v1.MsgUpdateClient"
+            | "/ibc.core.client.v1.MsgRecoverClient"
+            | "/ibc.core.client.v1.MsgUpgradeClient" => 4,
             "/ibc.core.connection.v1.MsgConnectionOpenInit"
             | "/ibc.core.connection.v1.MsgConnectionOpenTry" => 1,
             "/ibc.core.connection.v1.MsgConnectionOpenAck"
@@ -2336,6 +2370,14 @@ impl TransactionSigningPolicy {
                     },
                 ))
             }
+            "/ibc.core.client.v1.MsgUpgradeClient" => Some((
+                &self.client_state,
+                ChannelRedeemerIntent::ClientUpgrade(if self.tendermint_session.is_some() {
+                    5
+                } else {
+                    3
+                }),
+            )),
             "/ibc.core.connection.v1.MsgConnectionOpenAck" => Some((
                 &self.connection_state,
                 ChannelRedeemerIntent::Constructor(0),
@@ -2446,8 +2488,14 @@ impl TransactionSigningPolicy {
             self.validate_client_withdrawal_redeemer(
                 redeemers,
                 &token_name,
-                Some(&substitute_name),
-                false,
+                ClientWithdrawal::Recovery(&substitute_name),
+                reject,
+            )?;
+        } else if intent.operation == "/ibc.core.client.v1.MsgUpgradeClient" {
+            self.validate_client_withdrawal_redeemer(
+                redeemers,
+                &token_name,
+                ClientWithdrawal::Upgrade,
                 reject,
             )?;
         } else if intent.operation == "/ibc.core.client.v1.MsgUpdateClient"
@@ -2456,8 +2504,9 @@ impl TransactionSigningPolicy {
             self.validate_client_withdrawal_redeemer(
                 redeemers,
                 &token_name,
-                None,
-                intent.staged_tendermint,
+                ClientWithdrawal::History {
+                    staged: intent.staged_tendermint,
+                },
                 reject,
             )?;
         }
@@ -2468,8 +2517,7 @@ impl TransactionSigningPolicy {
         &self,
         redeemers: &pallas_primitives::conway::Redeemers,
         subject_name: &[u8],
-        substitute_name: Option<&[u8]>,
-        staged: bool,
+        withdrawal: ClientWithdrawal<'_>,
         reject: &F,
     ) -> Result<(), Error>
     where
@@ -2488,15 +2536,15 @@ impl TransactionSigningPolicy {
             ));
         }
         // RecoverClientWithdrawal is constructor 0 with both requested clients;
-        // CheckClientHistory (legacy) is constructor 1; staged history is constructor 4.
-        // Both bind the requested subject.
-        // Never accept the recovery branch as authorization for an ordinary update.
-        let (alternative, arity) = if substitute_name.is_some() {
-            (0, 2)
-        } else if staged {
-            (4, 1)
-        } else {
-            (1, 1)
+        // CheckClientHistory (legacy) is constructor 1; staged history is constructor 4;
+        // UpgradeClientWithdrawal is constructor 5. All bind the requested subject.
+        // Never accept the recovery or upgrade branch as authorization for an
+        // ordinary update.
+        let (alternative, arity, substitute_name) = match withdrawal {
+            ClientWithdrawal::Recovery(substitute_name) => (0, 2, Some(substitute_name)),
+            ClientWithdrawal::History { staged: true } => (4, 1, None),
+            ClientWithdrawal::History { staged: false } => (1, 1, None),
+            ClientWithdrawal::Upgrade => (5, 1, None),
         };
         let fields = constructor_fields(&value.data, alternative)
             .filter(|fields| fields.len() == arity)
@@ -3627,6 +3675,27 @@ impl SigningIntent {
                 }
                 state_sequence = Some(subject_sequence);
                 recovery_substitute_sequence = Some(substitute_sequence);
+                msg.signer
+            }
+            "/ibc.core.client.v1.MsgUpgradeClient" => {
+                let msg = MsgUpgradeClient::decode(message).map_err(decode_error)?;
+                // Only the Cardano-hosted Tendermint client implements upgrades.
+                let type_url = |any: &Option<prost_types::Any>| {
+                    any.as_ref().map(|value| value.type_url.clone())
+                };
+                if type_url(&msg.client_state).as_deref() != Some(TENDERMINT_CLIENT_STATE_TYPE_URL)
+                    || type_url(&msg.consensus_state).as_deref()
+                        != Some(TENDERMINT_CONSENSUS_STATE_TYPE_URL)
+                {
+                    return Err(Error::Signer(
+                        "client upgrade must carry Tendermint client and consensus states"
+                            .to_string(),
+                    ));
+                }
+                state_sequence = Some(parse_identifier_sequence(
+                    &msg.client_id,
+                    Some("07-tendermint"),
+                )?);
                 msg.signer
             }
             "/ibc.core.connection.v1.MsgConnectionOpenInit" => {
@@ -5598,6 +5667,290 @@ mod tests {
         assert!(requirements.required_mint_scripts.is_empty());
     }
 
+    fn upgrade_message(
+        client_id: &str,
+        client_state: Option<&str>,
+        consensus_state: Option<&str>,
+    ) -> Vec<u8> {
+        let any = |type_url: Option<&str>| {
+            type_url.map(|type_url| prost_types::Any {
+                type_url: type_url.to_string(),
+                value: vec![1],
+            })
+        };
+        MsgUpgradeClient {
+            client_id: client_id.to_string(),
+            client_state: any(client_state),
+            consensus_state: any(consensus_state),
+            proof_upgrade_client: vec![2],
+            proof_upgrade_consensus_state: vec![3],
+            signer: recovery_signer(),
+        }
+        .encode_to_vec()
+    }
+
+    fn upgrade_intent(client_id: &str) -> Result<SigningIntent, Error> {
+        let message = upgrade_message(
+            client_id,
+            Some(TENDERMINT_CLIENT_STATE_TYPE_URL),
+            Some(TENDERMINT_CONSENSUS_STATE_TYPE_URL),
+        );
+        SigningIntent::ibc(
+            "/ibc.core.client.v1.MsgUpgradeClient",
+            &message,
+            &recovery_signer(),
+            0,
+        )
+    }
+
+    fn staged_proof_backed_policy() -> TransactionSigningPolicy {
+        let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
+        value["consensus_history_format"] = "proof-backed-v1".into();
+        value["validators"]["spend_tendermint_update_session"] = serde_json::json!({
+            "address": format!("70{}", "18".repeat(28)),
+            "script_hash": "40".repeat(28),
+            "ref_utxo": { "tx_hash": "50".repeat(32), "output_index": 0 }
+        });
+        value["validators"]["mint_tendermint_update_session"] = serde_json::json!({
+            "script_hash": "44".repeat(28),
+            "ref_utxo": { "tx_hash": "54".repeat(32), "output_index": 0 }
+        });
+        TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).unwrap()
+    }
+
+    // Gateway's upgradeClient shape: the HostState and client spends of an
+    // update, the upgrade spend and withdrawal branches, and one verify-proof
+    // marker whose redeemer carries the proofs and proposed states.
+    fn upgrade_transaction(
+        policy: &TransactionSigningPolicy,
+        spend_alternative: u64,
+    ) -> pallas_primitives::conway::Tx {
+        use pallas_primitives::conway::{ExUnits, RedeemerTag, RedeemersKey, RedeemersValue};
+        let mut tx = proof_backed_transaction(policy, false);
+        let subject = data_token(
+            &policy.client_state.policy,
+            &policy.state_token_name(StateOutputKind::Client, 7),
+        );
+        edit_redeemers(&mut tx, |redeemers| {
+            for (key, value) in redeemers.iter_mut() {
+                match (key.tag, key.index) {
+                    (RedeemerTag::Spend, 1) => {
+                        value.data = data_constructor(spend_alternative, vec![]);
+                    }
+                    (RedeemerTag::Reward, 0) => {
+                        value.data = data_constructor(5, vec![subject.clone()]);
+                    }
+                    _ => {}
+                }
+            }
+            redeemers.push((
+                RedeemersKey {
+                    tag: RedeemerTag::Mint,
+                    index: 0,
+                },
+                RedeemersValue {
+                    data: data_constructor(
+                        0,
+                        vec![data_constructor(5, vec![]), data_constructor(1, vec![])],
+                    ),
+                    ex_units: ExUnits { mem: 1, steps: 1 },
+                },
+            ));
+        });
+        let verify_proof = required_script(&policy.scripts, "verifyproof").unwrap();
+        tx.transaction_body.mint = Some(
+            vec![(
+                verify_proof.hash.as_slice().into(),
+                vec![(Vec::<u8>::new().into(), 1i64.try_into().unwrap())]
+                    .try_into()
+                    .unwrap(),
+            )]
+            .try_into()
+            .unwrap(),
+        );
+        let mut references = tx
+            .transaction_body
+            .reference_inputs
+            .clone()
+            .unwrap()
+            .to_vec();
+        references.push(pallas_primitives::conway::TransactionInput {
+            transaction_id: verify_proof.reference.0.as_slice().into(),
+            index: verify_proof.reference.1,
+        });
+        tx.transaction_body.reference_inputs = Some(references.try_into().unwrap());
+        tx
+    }
+
+    fn validate_upgrade_fixture(
+        policy: &TransactionSigningPolicy,
+        tx: &pallas_primitives::conway::Tx,
+        intent: &SigningIntent,
+    ) -> Result<(), Error> {
+        let encoded = minicbor::to_vec(tx).unwrap();
+        let transaction: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+        policy.validate(
+            &transaction,
+            encoded.len(),
+            &recovery_signer(),
+            intent,
+            &recovery_resolved_inputs(policy),
+        )
+    }
+
+    #[test]
+    fn upgrade_intent_binds_one_tendermint_client_and_requires_proof_backed_history() {
+        let intent = upgrade_intent("07-tendermint-7").unwrap();
+        assert_eq!(intent.state_sequence, Some(7));
+        assert_eq!(intent.recovery_substitute_sequence, None);
+
+        let policy = proof_backed_policy();
+        let requirements = policy.operation_requirements(&intent).unwrap();
+        assert_eq!(requirements.state_output, StateOutputKind::Client);
+        assert_eq!(
+            requirements.required_scripts,
+            vec!["spendclient", "recoverclient", "verifyproof"]
+        );
+        assert_eq!(requirements.required_mint_scripts, vec!["verifyproof"]);
+
+        let legacy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        assert!(legacy
+            .operation_requirements(&intent)
+            .err()
+            .unwrap()
+            .contains("proof-backed-v1"));
+    }
+
+    #[test]
+    fn upgrade_intent_rejects_other_clients_and_state_types() {
+        for client_id in ["08-cardano-7", "07-tendermint-07", "connection-7"] {
+            assert!(upgrade_intent(client_id).is_err(), "{client_id}");
+        }
+        for (client_state, consensus_state) in [
+            (
+                Some(TENDERMINT_CONSENSUS_STATE_TYPE_URL),
+                Some(TENDERMINT_CONSENSUS_STATE_TYPE_URL),
+            ),
+            (Some(TENDERMINT_CLIENT_STATE_TYPE_URL), None),
+            (None, Some(TENDERMINT_CONSENSUS_STATE_TYPE_URL)),
+            (
+                Some("/ibc.lightclients.cardano.v1.ClientState"),
+                Some(TENDERMINT_CONSENSUS_STATE_TYPE_URL),
+            ),
+        ] {
+            let message = upgrade_message("07-tendermint-7", client_state, consensus_state);
+            assert!(SigningIntent::ibc(
+                "/ibc.core.client.v1.MsgUpgradeClient",
+                &message,
+                &recovery_signer(),
+                0,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("Tendermint client and consensus states"));
+        }
+    }
+
+    #[test]
+    fn complete_upgrade_transaction_matches_signing_policy() {
+        let intent = upgrade_intent("07-tendermint-7").unwrap();
+        // The single-transaction client spends UpgradeClient at index 3; the
+        // staged deployment's client spends it at index 5.
+        for (policy, spend_alternative) in [
+            (proof_backed_policy(), 3),
+            (staged_proof_backed_policy(), 5),
+        ] {
+            validate_upgrade_fixture(
+                &policy,
+                &upgrade_transaction(&policy, spend_alternative),
+                &intent,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn upgrade_transaction_binds_spend_withdrawal_and_proof_mint() {
+        use pallas_primitives::conway::RedeemerTag;
+        let policy = proof_backed_policy();
+        let intent = upgrade_intent("07-tendermint-7").unwrap();
+        let subject = data_token(
+            &policy.client_state.policy,
+            &policy.state_token_name(StateOutputKind::Client, 7),
+        );
+        let other = data_token(
+            &policy.client_state.policy,
+            &policy.state_token_name(StateOutputKind::Client, 12),
+        );
+        let rejection = |tag: RedeemerTag, index: u32, data: PlutusData| {
+            let mut tx = upgrade_transaction(&policy, 3);
+            edit_redeemers(&mut tx, |values| {
+                let (_, value) = values
+                    .iter_mut()
+                    .find(|(key, _)| key.tag == tag && key.index == index)
+                    .unwrap();
+                value.data = data;
+            });
+            validate_upgrade_fixture(&policy, &tx, &intent)
+                .unwrap_err()
+                .to_string()
+        };
+
+        for data in [
+            data_constructor(5, vec![]),
+            data_constructor(3, vec![subject.clone()]),
+            data_constructor(1, vec![other.clone(), data_siblings(64, 32)]),
+        ] {
+            let error = rejection(RedeemerTag::Spend, 1, data);
+            assert!(
+                error.contains("does not match the original IBC message"),
+                "{error}"
+            );
+        }
+        let error = rejection(
+            RedeemerTag::Reward,
+            0,
+            data_constructor(5, vec![other.clone()]),
+        );
+        assert!(
+            error.contains("does not match the requested clients"),
+            "{error}"
+        );
+        for data in [
+            data_constructor(1, vec![subject.clone()]),
+            data_constructor(4, vec![subject.clone()]),
+            data_constructor(0, vec![subject.clone(), other.clone()]),
+            data_constructor(5, vec![]),
+        ] {
+            let error = rejection(RedeemerTag::Reward, 0, data);
+            assert!(
+                error.contains("withdrawal redeemer is malformed"),
+                "{error}"
+            );
+        }
+
+        let mut tx = upgrade_transaction(&policy, 3);
+        tx.transaction_body.mint = None;
+        assert!(validate_upgrade_fixture(&policy, &tx, &intent)
+            .unwrap_err()
+            .to_string()
+            .contains("omits an authorization mint"));
+        let mut tx = upgrade_transaction(&policy, 3);
+        tx.transaction_body.withdrawals = None;
+        assert!(validate_upgrade_fixture(&policy, &tx, &intent)
+            .unwrap_err()
+            .to_string()
+            .contains("withdrawal"));
+
+        // An ordinary update request never authorizes the upgrade branch.
+        assert!(validate_upgrade_fixture(
+            &policy,
+            &upgrade_transaction(&policy, 3),
+            &update_intent()
+        )
+        .is_err());
+    }
+
     #[test]
     fn actual_evaluated_proof_backed_transactions_match_signing_policy() {
         // Exported only after the matching signed transaction was evaluated and
@@ -6982,8 +7335,7 @@ mod tests {
             .validate_client_withdrawal_redeemer(
                 &redeemers,
                 &subject_name,
-                Some(&substitute_name),
-                false,
+                ClientWithdrawal::Recovery(&substitute_name),
                 &reject,
             )
             .unwrap();
@@ -6991,8 +7343,7 @@ mod tests {
             .validate_client_withdrawal_redeemer(
                 &redeemers,
                 &substitute_name,
-                Some(&subject_name),
-                false,
+                ClientWithdrawal::Recovery(&subject_name),
                 &reject,
             )
             .is_err());

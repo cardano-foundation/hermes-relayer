@@ -1142,6 +1142,9 @@ impl GatewayClient {
             "/ibc.core.client.v1.MsgRecoverClient" => {
                 self.build_recover_client_tx(message_data).await
             }
+            "/ibc.core.client.v1.MsgUpgradeClient" => {
+                self.build_upgrade_client_tx(message_data).await
+            }
 
             // IBC Connection messages
             "/ibc.core.connection.v1.MsgConnectionOpenInit" => {
@@ -1321,6 +1324,40 @@ impl GatewayClient {
             description: format!(
                 "MsgRecoverClient (subject_client_id: {subject_client_id}, substitute_client_id: {substitute_client_id})"
             ),
+        })
+    }
+
+    async fn build_upgrade_client_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+        use super::generated::ibc::core::client::v1::MsgUpgradeClient;
+        use prost::Message;
+
+        let msg = MsgUpgradeClient::decode(&message_data[..])
+            .map_err(|e| Error::Transaction(format!("Failed to decode MsgUpgradeClient: {e}")))?;
+
+        let client_id = msg.client_id.clone();
+
+        let mut client = GenClientMsgClient::new(self.channel.clone());
+        let response = client
+            .upgrade_client(tonic::Request::new(msg))
+            .await?
+            .into_inner();
+
+        let unsigned_tx_any = response.unsigned_tx.ok_or_else(|| {
+            Error::Transaction("No unsigned_tx in UpgradeClient response".to_string())
+        })?;
+
+        let cbor_hex = String::from_utf8(unsigned_tx_any.value)
+            .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {e}")))?;
+
+        tracing::info!(
+            "UpgradeClient: received unsigned CBOR (length: {}), client_id: {}",
+            cbor_hex.len(),
+            client_id
+        );
+
+        Ok(UnsignedTx {
+            cbor_hex,
+            description: format!("MsgUpgradeClient (client_id: {client_id})"),
         })
     }
 
@@ -2377,6 +2414,7 @@ mod tests {
     use super::*;
     use ibc_proto::cosmos::base::v1beta1::Coin as ProtoCoin;
     use ibc_proto::ibc::core::client::v1::MsgRecoverClient as CanonicalMsgRecoverClient;
+    use ibc_proto::ibc::core::client::v1::MsgUpgradeClient as CanonicalMsgUpgradeClient;
     use prost::Message;
 
     fn gateway_uri(value: &str) -> Uri {
@@ -2465,6 +2503,65 @@ mod tests {
         assert_eq!(decoded.subject_client_id, canonical.subject_client_id);
         assert_eq!(decoded.substitute_client_id, canonical.substitute_client_id);
         assert_eq!(decoded.signer, canonical.signer);
+    }
+
+    #[test]
+    fn gateway_upgrade_client_request_and_response_match_wire_format() {
+        let any = |type_url: &str, value: &[u8]| ibc_proto::google::protobuf::Any {
+            type_url: type_url.to_string(),
+            value: value.to_vec(),
+        };
+        let canonical = CanonicalMsgUpgradeClient {
+            client_id: "07-tendermint-3".to_string(),
+            client_state: Some(any(
+                "/ibc.lightclients.tendermint.v1.ClientState",
+                b"client",
+            )),
+            consensus_state: Some(any(
+                "/ibc.lightclients.tendermint.v1.ConsensusState",
+                b"consensus",
+            )),
+            proof_upgrade_client: b"client-proof".to_vec(),
+            proof_upgrade_consensus_state: b"consensus-proof".to_vec(),
+            signer: "addr_test1_relayer".to_string(),
+        };
+
+        let decoded = super::super::generated::ibc::core::client::v1::MsgUpgradeClient::decode(
+            canonical.encode_to_vec().as_slice(),
+        )
+        .unwrap();
+        assert_eq!(decoded.client_id, canonical.client_id);
+        assert_eq!(
+            decoded.client_state.unwrap().value,
+            canonical.client_state.unwrap().value
+        );
+        assert_eq!(
+            decoded.consensus_state.unwrap().type_url,
+            canonical.consensus_state.unwrap().type_url
+        );
+        assert_eq!(decoded.proof_upgrade_client, canonical.proof_upgrade_client);
+        assert_eq!(
+            decoded.proof_upgrade_consensus_state,
+            canonical.proof_upgrade_consensus_state
+        );
+        assert_eq!(decoded.signer, canonical.signer);
+
+        // The Gateway extends the upstream empty response with its unsigned transaction.
+        let response = super::super::generated::ibc::core::client::v1::MsgUpgradeClientResponse {
+            unsigned_tx: Some(prost_types::Any {
+                type_url: String::new(),
+                value: b"84a4".to_vec(),
+            }),
+        };
+        let wire = response.encode_to_vec();
+        assert_eq!(&wire[..2], &[0x0a, 0x06]);
+        assert_eq!(
+            super::super::generated::ibc::core::client::v1::MsgUpgradeClientResponse::decode(
+                wire.as_slice()
+            )
+            .unwrap(),
+            response
+        );
     }
 
     #[test]

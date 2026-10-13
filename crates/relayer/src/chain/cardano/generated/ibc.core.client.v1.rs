@@ -780,8 +780,11 @@ pub struct MsgUpgradeClient {
     pub signer: ::prost::alloc::string::String,
 }
 /// MsgUpgradeClientResponse defines the Msg/UpgradeClient response type.
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct MsgUpgradeClientResponse {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgUpgradeClientResponse {
+    #[prost(message, optional, tag = "1")]
+    pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
+}
 /// MsgSubmitMisbehaviour defines an sdk.Msg type that submits Evidence for
 /// light client misbehaviour.
 /// Warning: DEPRECATED
