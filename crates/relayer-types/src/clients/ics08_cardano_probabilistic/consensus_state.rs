@@ -27,6 +27,9 @@ pub struct ConsensusState {
     pub unique_stake_bps: u64,
     pub security_score_bps: u64,
     pub packet_state_snapshot: Vec<u8>,
+    pub nonce_state: Option<raw::PraosNonceState>,
+    pub pool_registry: Option<raw::PoolRegistryState>,
+    pub settlement_credit: Option<raw::SettlementCreditState>,
 }
 
 impl Ics2ConsensusState for ConsensusState {
@@ -69,6 +72,9 @@ impl TryFrom<RawConsensusState> for ConsensusState {
             unique_stake_bps: raw.unique_stake_bps,
             security_score_bps: raw.security_score_bps,
             packet_state_snapshot: raw.packet_state_snapshot,
+            nonce_state: raw.nonce_state,
+            pool_registry: raw.pool_registry,
+            settlement_credit: raw.settlement_credit,
         })
     }
 }
@@ -84,6 +90,9 @@ impl From<ConsensusState> for RawConsensusState {
             unique_stake_bps: value.unique_stake_bps,
             security_score_bps: value.security_score_bps,
             packet_state_snapshot: value.packet_state_snapshot,
+            nonce_state: value.nonce_state,
+            pool_registry: value.pool_registry,
+            settlement_credit: value.settlement_credit,
         }
     }
 }
@@ -117,5 +126,34 @@ impl From<ConsensusState> for Any {
             type_url: PROBABILISTIC_CONSENSUS_STATE_TYPE_URL.to_string(),
             value: Protobuf::<RawConsensusState>::encode_vec(value),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn historical_nonce_state_survives_protobuf_round_trip() {
+        let raw = RawConsensusState {
+            ibc_state_root: vec![1; 32],
+            pool_registry: Some(raw::test_pool_registry()),
+            settlement_credit: Some(raw::test_settlement_credit()),
+            nonce_state: Some(raw::PraosNonceState {
+                epoch_nonce: vec![2; 32],
+                evolving_nonce: vec![3; 32],
+                candidate_nonce: vec![4; 32],
+                last_applied_block_nonce: vec![5; 32],
+                last_epoch_block_nonce: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let state = ConsensusState::try_from(raw.clone()).unwrap();
+        let any: Any = state.into();
+        let decoded = ConsensusState::try_from(any).unwrap();
+        let restored: RawConsensusState = decoded.into();
+        assert_eq!(restored.nonce_state, raw.nonce_state);
+        assert_eq!(restored.pool_registry, raw.pool_registry);
+        assert_eq!(restored.settlement_credit, raw.settlement_credit);
     }
 }

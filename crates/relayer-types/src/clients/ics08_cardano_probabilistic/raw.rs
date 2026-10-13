@@ -26,18 +26,29 @@ pub struct StakeDistributionEntry {
     pub relative_stake_denominator: u64,
 }
 
+/// During updates only stake allocation supplies new trust inputs.
+/// The Cosmos verifier compares every other field with values derived from
+/// accepted state or stored network configuration. Mismatches reject updates.
+/// The starting state and network configuration require authenticated or
+/// explicitly trusted bootstrap.
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
 pub struct EpochContext {
+    /// Must equal the epoch derived from the signed header slot and stored schedule.
     #[prost(uint64, tag = "1")]
     pub epoch: u64,
+    /// Stake allocation is challenged. Identities, VRF keys and ages must match the independent registry.
     #[prost(message, repeated, tag = "2")]
     pub stake_distribution: ::prost::alloc::vec::Vec<StakeDistributionEntry>,
+    /// Must equal the locally derived nonce that the Cosmos header verifier uses.
     #[prost(bytes = "vec", tag = "3")]
     pub epoch_nonce: ::prost::alloc::vec::Vec<u8>,
+    /// Must equal the client parameter fixed at bootstrap.
     #[prost(uint64, tag = "4")]
     pub slots_per_kes_period: u64,
+    /// Must equal the start slot calculated from the stored epoch schedule.
     #[prost(uint64, tag = "5")]
     pub epoch_start_slot: u64,
+    /// Must equal the exclusive end calculated from the same stored schedule.
     #[prost(uint64, tag = "6")]
     pub epoch_end_slot_exclusive: u64,
 }
@@ -113,6 +124,87 @@ pub struct ClientState {
     pub packet_lane_policy_id: Vec<u8>,
     #[prost(message, repeated, tag = "31")]
     pub epoch_context_challenges: Vec<EpochContextChallenge>,
+    #[prost(message, optional, tag = "32")]
+    pub latest_checkpoint_nonce_state: Option<PraosNonceState>,
+    #[prost(uint64, tag = "33")]
+    pub randomness_stabilisation_window_slots: u64,
+    #[prost(message, optional, tag = "34")]
+    pub latest_checkpoint_pool_registry: Option<PoolRegistryState>,
+    #[prost(message, optional, tag = "35")]
+    pub latest_checkpoint_settlement_credit: Option<SettlementCreditState>,
+}
+
+/// Epoch reference advances from capped credit once per epoch.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct SettlementCreditState {
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+    #[prost(message, repeated, tag = "2")]
+    pub reference: Vec<PoolSettlementCredit>,
+}
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct PoolSettlementCredit {
+    #[prost(string, tag = "1")]
+    pub pool_id: String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub numerator: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub denominator: Vec<u8>,
+}
+
+/// Pool identities and keys retained separately from supplied stake amounts.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct PoolRegistrationBinding {
+    #[prost(string, tag = "1")]
+    pub pool_id: String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub vrf_key_hash: Vec<u8>,
+    #[prost(uint64, tag = "3")]
+    pub first_registration_slot: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct PoolRegistrationRecord {
+    #[prost(message, optional, tag = "1")]
+    pub registration: Option<PoolRegistrationBinding>,
+    #[prost(bool, tag = "2")]
+    pub registered: bool,
+    #[prost(bytes = "vec", tag = "3")]
+    pub pending_vrf_key_hash: Vec<u8>,
+    #[prost(uint64, tag = "4")]
+    pub pending_effective_epoch: u64,
+    #[prost(uint64, tag = "5")]
+    pub retirement_epoch: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct PoolRegistryState {
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+    #[prost(message, repeated, tag = "2")]
+    pub pools: Vec<PoolRegistrationRecord>,
+    #[prost(message, repeated, tag = "3")]
+    pub mark: Vec<PoolRegistrationBinding>,
+    #[prost(message, repeated, tag = "4")]
+    pub effective: Vec<PoolRegistrationBinding>,
+}
+
+/// Native Praos running values at an authenticated checkpoint.
+/// Empty running values encode NeutralNonce. A missing message is unavailable.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+pub struct PraosNonceState {
+    #[prost(bytes = "vec", tag = "1")]
+    pub epoch_nonce: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub evolving_nonce: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub candidate_nonce: Vec<u8>,
+    // Previous-block hash of the last applied header, not its own hash.
+    #[prost(bytes = "vec", tag = "4")]
+    pub last_applied_block_nonce: Vec<u8>,
+    #[prost(bytes = "vec", tag = "5")]
+    pub last_epoch_block_nonce: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
@@ -141,6 +233,12 @@ pub struct ConsensusState {
     pub security_score_bps: u64,
     #[prost(bytes = "vec", tag = "8")]
     pub packet_state_snapshot: Vec<u8>,
+    #[prost(message, optional, tag = "9")]
+    pub nonce_state: Option<PraosNonceState>,
+    #[prost(message, optional, tag = "10")]
+    pub pool_registry: Option<PoolRegistryState>,
+    #[prost(message, optional, tag = "11")]
+    pub settlement_credit: Option<SettlementCreditState>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
@@ -192,6 +290,39 @@ pub struct ProbabilisticHeader {
 }
 
 #[cfg(test)]
+pub(crate) fn test_pool_registry() -> PoolRegistryState {
+    let binding = PoolRegistrationBinding {
+        pool_id: "pool-a".to_string(),
+        vrf_key_hash: vec![1; 32],
+        first_registration_slot: 0,
+    };
+    PoolRegistryState {
+        epoch: 7,
+        pools: vec![PoolRegistrationRecord {
+            registration: Some(binding.clone()),
+            registered: true,
+            pending_vrf_key_hash: vec![2; 32],
+            pending_effective_epoch: 8,
+            retirement_epoch: 12,
+        }],
+        mark: vec![binding.clone()],
+        effective: vec![binding],
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_settlement_credit() -> SettlementCreditState {
+    SettlementCreditState {
+        epoch: 7,
+        reference: vec![PoolSettlementCredit {
+            pool_id: "pool-a".into(),
+            numerator: vec![1],
+            denominator: vec![200],
+        }],
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use prost::Message;
 
@@ -234,6 +365,37 @@ mod tests {
         .encode_to_vec();
 
         assert_eq!(encoded, vec![0x28, 1, 0x30, 20]);
+    }
+
+    #[test]
+    fn settlement_credit_uses_canonical_client_and_consensus_wire_tags() {
+        let credit = super::test_settlement_credit();
+        // epoch 7 and pool-a's exact 1/200 reference share.
+        let value = vec![
+            0x08, 7, 0x12, 14, 0x0a, 6, b'p', b'o', b'o', b'l', b'-', b'a', 0x12, 1, 1, 0x1a, 1,
+            200,
+        ];
+        assert_eq!(credit.encode_to_vec(), value);
+        let mut client = vec![0x9a, 0x02, value.len() as u8]; // field 35
+        client.extend(&value);
+        assert_eq!(
+            ClientState {
+                latest_checkpoint_settlement_credit: Some(credit.clone()),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            client,
+        );
+        let mut consensus = vec![0x5a, value.len() as u8]; // field 11
+        consensus.extend(&value);
+        assert_eq!(
+            super::ConsensusState {
+                settlement_credit: Some(credit),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+            consensus,
+        );
     }
 
     #[test]
