@@ -1106,8 +1106,15 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                         error,
                     )
                 })?;
-            let after_height = self.validated_client_state()?.0.latest_verified_height();
-            if after_height <= before_height {
+            let after_state = self.validated_client_state()?.0;
+            let after_height = after_state.latest_verified_height();
+            let proposed = crate::chain::cardano::checkpoint::committed_cross_epoch_proposal(
+                &state,
+                &after_state,
+                first,
+            )
+            .map_err(|error| ForeignClientError::checkpoint_update(self.dst_chain.id(), error))?;
+            if after_height <= before_height && !proposed {
                 return Err(ForeignClientError::checkpoint_update(
                     self.dst_chain.id(),
                     "epoch proposal transaction did not advance the client".to_string(),
@@ -1728,13 +1735,14 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                     ));
                 }
 
-                let before_height = self.validated_client_state()?.0.latest_verified_height();
+                let before_state = self.validated_client_state()?.0;
+                let before_height = before_state.latest_verified_height();
                 let checkpoint_message =
                     new_msgs.into_iter().next().expect("non-empty update list");
                 let events = self
                     .dst_chain()
                     .send_messages_and_wait_commit(TrackedMsgs::new_single(
-                        checkpoint_message,
+                        checkpoint_message.clone(),
                         "probabilistic checkpoint",
                     ))
                     .map_err(|error| {
@@ -1748,8 +1756,17 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 all_events.extend(events.into_iter().map(|event| event.event));
                 submitted_checkpoint = true;
 
-                let after_height = self.validated_client_state()?.0.latest_verified_height();
-                if after_height <= before_height {
+                let after_state = self.validated_client_state()?.0;
+                let after_height = after_state.latest_verified_height();
+                let proposed = crate::chain::cardano::checkpoint::committed_cross_epoch_proposal(
+                    &before_state,
+                    &after_state,
+                    &checkpoint_message,
+                )
+                .map_err(|error| {
+                    ForeignClientError::checkpoint_update(self.dst_chain.id(), error)
+                })?;
+                if after_height <= before_height && !proposed {
                     return Err(ForeignClientError::checkpoint_update(
                         self.dst_chain.id(),
                         format!(

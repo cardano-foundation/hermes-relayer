@@ -3940,7 +3940,10 @@ pub(super) fn cardano_misbehaviour_evidence(
     client_state: &AnyClientState,
 ) -> Result<Option<MisbehaviourEvidence>, Error> {
     let target_height = submitted_header.height();
-    if witness_header.height() != target_height {
+    let bounded_probabilistic = matches!((submitted_header, &witness_header),
+        (AnyHeader::Probabilistic(left), AnyHeader::Probabilistic(right))
+        if right.height <= left.height && right.trusted_height == left.trusted_height);
+    if witness_header.height() != target_height && !bounded_probabilistic {
         return Err(Error::query(format!(
             "independent Cardano header height mismatch: expected {target_height}, got {}",
             witness_header.height()
@@ -4048,72 +4051,12 @@ fn cardano_headers_conflict(
             Ok(conflicts)
         }
         (AnyHeader::Probabilistic(submitted), AnyHeader::Probabilistic(witness)) => {
-            if submitted.height != witness.height {
-                return Err(Error::query(format!(
-                    "cannot compare probabilistic headers at different heights: {} and {}",
-                    submitted.height, witness.height
-                )));
-            }
-
-            let context_conflict = match (&submitted.new_epoch_context, &witness.new_epoch_context)
-            {
-                (Some(left), Some(right)) if left.epoch == right.epoch => {
-                    !probabilistic_epoch_contexts_equal(left, right)
-                }
-                _ => false,
-            };
-            let cheap_conflict = context_conflict
-                || !submitted
-                    .anchor_block
-                    .hash
-                    .trim()
-                    .eq_ignore_ascii_case(witness.anchor_block.hash.trim())
-                || probabilistic_windows_conflict_by_block_height(submitted, witness);
-            if cheap_conflict {
-                tracing::warn!(
-                    "Probabilistic header conflict detected at {}: submitted_host_tx={}, witness_host_tx={}, submitted_anchor={}, witness_anchor={}",
-                    submitted.height,
-                    submitted.host_state_tx_hash,
-                    witness.host_state_tx_hash,
-                    submitted.anchor_block.hash,
-                    witness.anchor_block.hash,
-                );
-                return Ok(true);
-            }
-
-            // A rootless witness with identical authenticated blocks/context
-            // is not a conflict merely because it omits HostState proof fields.
-            if submitted.is_checkpoint || witness.is_checkpoint {
-                return Ok(false);
-            }
-
-            let submitted_root = extract_ibc_state_root_from_host_state_tx(
-                &AnyHeader::Probabilistic(submitted.clone()),
-                host_state_nft_policy_id,
-                host_state_nft_token_name,
-            )?;
-            let witness_root = extract_ibc_state_root_from_host_state_tx(
-                &AnyHeader::Probabilistic(witness.clone()),
-                host_state_nft_policy_id,
-                host_state_nft_token_name,
-            )?;
-
-            let conflicts = submitted_root != witness_root;
-
-            if conflicts {
-                tracing::warn!(
-                    "Probabilistic header conflict detected at {}: submitted_root={}, witness_root={}, submitted_host_tx={}, witness_host_tx={}, submitted_anchor={}, witness_anchor={}",
-                    submitted.height,
-                    hex::encode(&submitted_root),
-                    hex::encode(&witness_root),
-                    submitted.host_state_tx_hash,
-                    witness.host_state_tx_hash,
-                    submitted.anchor_block.hash,
-                    witness.anchor_block.hash,
-                );
-            }
-
-            Ok(conflicts)
+            // Cosmos verifies native signatures and body commitments. The
+            // relayer selects conflicting settled claims, never temporary tips
+            // or unsigned stake/context disagreements.
+            Ok(probabilistic_windows_conflict_by_block_height(
+                submitted, witness,
+            ))
         }
         (AnyHeader::Tendermint(_), _) => Err(Error::query(
             "Cardano misbehaviour check received a Tendermint submitted header".to_string(),
@@ -4175,42 +4118,13 @@ fn bind_probabilistic_pool_metadata(
     Ok(())
 }
 
-fn probabilistic_epoch_contexts_equal(
-    left: &ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::EpochContext,
-    right: &ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::EpochContext,
-) -> bool {
-    let normalize =
-        |context: &ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::EpochContext| {
-            let mut context = context.clone();
-            context.epoch_nonce.clear();
-            context.epoch_start_slot = 0;
-            context.epoch_end_slot_exclusive = 0;
-            context.slots_per_kes_period = 0;
-            for pool in &mut context.stake_distribution {
-                pool.pool_id = pool.pool_id.to_lowercase();
-                pool.vrf_key_hash.clear();
-                pool.first_registration_slot = 0;
-                pool.relative_stake_numerator = 0;
-                pool.relative_stake_denominator = 0;
-            }
-            context
-                .stake_distribution
-                .sort_by(|a, b| a.pool_id.cmp(&b.pool_id));
-            context
-        };
-    normalize(left) == normalize(right)
-}
-
 fn probabilistic_windows_conflict_by_block_height(
     submitted: &ibc_relayer_types::clients::ics08_cardano_probabilistic::header::Header,
     witness: &ibc_relayer_types::clients::ics08_cardano_probabilistic::header::Header,
 ) -> bool {
-    let submitted_blocks = std::iter::once(&submitted.anchor_block)
-        .chain(submitted.bridge_blocks.iter())
-        .chain(submitted.descendant_blocks.iter());
-    let witness_blocks = std::iter::once(&witness.anchor_block)
-        .chain(witness.bridge_blocks.iter())
-        .chain(witness.descendant_blocks.iter());
+    let submitted_blocks =
+        std::iter::once(&submitted.anchor_block).chain(submitted.bridge_blocks.iter());
+    let witness_blocks = std::iter::once(&witness.anchor_block).chain(witness.bridge_blocks.iter());
 
     // A shared block height with different hashes proves incompatible probabilistic windows.
     for submitted_block in submitted_blocks {
@@ -5678,10 +5592,40 @@ mod tests {
             .unwrap()
             .stake_distribution[0]
             .stake += 1;
-        assert!(conflicts(witness.clone()));
+        assert!(!conflicts(witness.clone()));
         witness.new_epoch_context = submitted.new_epoch_context.clone();
         witness.anchor_block.hash = "honest-fork".into();
         assert!(conflicts(witness));
+    }
+
+    #[test]
+    fn bounded_probabilistic_witness_compares_only_settled_prefixes() {
+        let mut submitted = probabilistic_header(12, "anchor-12");
+        let mut witness = probabilistic_header(11, "anchor-11");
+        witness.trusted_height = submitted.trusted_height;
+        submitted.bridge_blocks = vec![witness.anchor_block.clone()];
+        witness.descendant_blocks = vec![submitted.anchor_block.clone()];
+        witness.descendant_blocks[0].hash = "temporary fork at 12".into();
+        let original = AnyHeader::Probabilistic(submitted.clone());
+        let update = update_client(Some(original.clone()), height(12));
+        assert!(cardano_misbehaviour_evidence(
+            &update,
+            &original,
+            AnyHeader::Probabilistic(witness.clone()),
+            &probabilistic_client_state()
+        )
+        .unwrap()
+        .is_none());
+        submitted.bridge_blocks[0].hash = "conflicting settled block at 11".into();
+        let original = AnyHeader::Probabilistic(submitted);
+        assert!(cardano_misbehaviour_evidence(
+            &update,
+            &original,
+            AnyHeader::Probabilistic(witness),
+            &probabilistic_client_state()
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]
