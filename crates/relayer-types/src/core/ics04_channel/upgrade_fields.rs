@@ -24,6 +24,10 @@ impl UpgradeFields {
             version,
         }
     }
+
+    pub fn connection_hops(&self) -> &[ConnectionId] {
+        &self.connection_hops
+    }
 }
 
 impl Protobuf<RawUpgradeFields> for UpgradeFields {}

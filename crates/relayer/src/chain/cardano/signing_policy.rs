@@ -30,8 +30,10 @@ use super::generated::ibc::cardano::v1::MsgPrunePacketHistory;
 use super::generated::ibc::core::{
     channel::v1::{
         MsgAcknowledgement, MsgChannelCloseConfirm, MsgChannelCloseInit, MsgChannelOpenAck,
-        MsgChannelOpenConfirm, MsgChannelOpenInit, MsgChannelOpenTry, MsgRecvPacket, MsgTimeout,
-        MsgTimeoutOnClose,
+        MsgChannelOpenConfirm, MsgChannelOpenInit, MsgChannelOpenTry, MsgChannelUpgradeAck,
+        MsgChannelUpgradeCancel, MsgChannelUpgradeConfirm, MsgChannelUpgradeFlush,
+        MsgChannelUpgradeInit, MsgChannelUpgradeOpen, MsgChannelUpgradeTimeout,
+        MsgChannelUpgradeTry, MsgRecvPacket, MsgTimeout, MsgTimeoutOnClose,
     },
     client::v1::{MsgCreateClient, MsgRecoverClient, MsgUpdateClient, MsgUpgradeClient},
     connection::v1::{
@@ -139,7 +141,30 @@ pub struct SigningIntent {
     funded_intent: Option<[u8; 32]>,
     staged_tendermint: bool,
     staged_misbehaviour: bool,
+    channel_upgrade: Option<ChannelUpgradeIntent>,
 }
+
+/// A channel-upgrade step: its `ChannelUpgradeStep` constructor and whether the
+/// transaction proves the counterparty with the verify-proof mint.
+#[derive(Clone, Copy, Debug)]
+struct ChannelUpgradeIntent {
+    step: u64,
+    proven: bool,
+}
+
+impl ChannelUpgradeIntent {
+    /// INIT and FLUSH share one operation; TRY to CONFIRM and OPEN to CANCEL
+    /// have their own.
+    fn operation_script(self) -> &'static str {
+        match self.step {
+            1..=3 => "chanupgradehandshake",
+            4..=6 => "chanupgradefinish",
+            _ => "chanupgrade",
+        }
+    }
+}
+
+const CHANNEL_UPGRADE_TYPE_PREFIX: &str = "/ibc.core.channel.v1.MsgChannelUpgrade";
 
 #[derive(Clone, Debug)]
 struct ExternalOutputIntent {
@@ -293,6 +318,7 @@ enum ChannelRedeemerIntent<'a> {
     },
     OutboundTransfer(&'a TransferIntent),
     Prune(u64),
+    ChannelUpgrade(u64),
 }
 
 impl ChannelRedeemerIntent<'_> {
@@ -357,6 +383,14 @@ impl ChannelRedeemerIntent<'_> {
                     .and_then(plutus_u64)
                     == Some(*sequence)
             }
+            // ChanUpgrade(ChannelUpgradeRedeemer { step, channel_siblings,
+            // upgrade_siblings, error_receipt_siblings }). The upgrade
+            // operation checks the step's fields and the root witnesses.
+            Self::ChannelUpgrade(step) => constructor_fields(data, 11)
+                .filter(|fields| fields.len() == 1)
+                .and_then(|fields| constructor_fields(&fields[0], 0))
+                .filter(|fields| fields.len() == 4)
+                .is_some_and(|fields| constructor_fields(&fields[0], *step).is_some()),
         }
     }
 }
@@ -774,6 +808,28 @@ impl TransactionSigningPolicy {
                     StateOutputKind::Channel,
                     false,
                 ),
+                operation if operation.starts_with(CHANNEL_UPGRADE_TYPE_PREFIX) => {
+                    let upgrade = intent
+                        .channel_upgrade
+                        .ok_or_else(|| format!("{operation} has no channel-upgrade step"))?;
+                    let operation_script = upgrade.operation_script();
+                    // The steps that prove the counterparty also mint verify-proof.
+                    if upgrade.proven {
+                        (
+                            vec!["spendchannel", operation_script, "verifyproof"],
+                            vec![operation_script, "verifyproof"],
+                            StateOutputKind::Channel,
+                            false,
+                        )
+                    } else {
+                        (
+                            vec!["spendchannel", operation_script],
+                            vec![operation_script],
+                            StateOutputKind::Channel,
+                            false,
+                        )
+                    }
+                }
                 operation => return Err(format!("unsupported signing operation {operation}")),
             };
 
@@ -2319,6 +2375,8 @@ impl TransactionSigningPolicy {
             | "/ibc.core.channel.v1.MsgAcknowledgement"
             | "/ibc.applications.transfer.v1.MsgTransfer"
             | "/ibc.cardano.v1.MsgPrunePacketHistory" => 7,
+            // UpgradeChannel
+            operation if operation.starts_with(CHANNEL_UPGRADE_TYPE_PREFIX) => 14,
             operation => {
                 return Err(reject(format!(
                     "no HostState redeemer policy exists for {operation}"
@@ -2403,7 +2461,12 @@ impl TransactionSigningPolicy {
             .map(|redeemer| (&self.channel_state, redeemer)),
             "/ibc.core.channel.v1.MsgTimeout" | "/ibc.core.channel.v1.MsgTimeoutOnClose" => {
                 Some(ChannelRedeemerIntent::Packet {
-                    alternative: 3,
+                    // TimeoutPacket and TimeoutOnClose spend redeemers.
+                    alternative: if intent.operation == "/ibc.core.channel.v1.MsgTimeoutOnClose" {
+                        9
+                    } else {
+                        3
+                    },
                     packet: intent
                         .packet
                         .as_ref()
@@ -2437,6 +2500,10 @@ impl TransactionSigningPolicy {
             "/ibc.cardano.v1.MsgPrunePacketHistory" => intent
                 .prune_sequence
                 .map(ChannelRedeemerIntent::Prune)
+                .map(|redeemer| (&self.channel_state, redeemer)),
+            operation if operation.starts_with(CHANNEL_UPGRADE_TYPE_PREFIX) => intent
+                .channel_upgrade
+                .map(|upgrade| ChannelRedeemerIntent::ChannelUpgrade(upgrade.step))
                 .map(|redeemer| (&self.channel_state, redeemer)),
             _ => None,
         };
@@ -3537,6 +3604,7 @@ impl SigningIntent {
             funded_intent: None,
             staged_tendermint: false,
             staged_misbehaviour: false,
+            channel_upgrade: None,
         };
         Self::packet_batch(&original, hash, initialize)
     }
@@ -3598,6 +3666,7 @@ impl SigningIntent {
             funded_intent: None,
             staged_tendermint: false,
             staged_misbehaviour: false,
+            channel_upgrade: None,
         })
     }
 
@@ -3650,6 +3719,7 @@ impl SigningIntent {
         let mut packet_intent = None;
         let mut acknowledgement = None;
         let mut prune_sequence = None;
+        let mut channel_upgrade = None;
 
         let signer = match type_url {
             "/ibc.core.client.v1.MsgCreateClient" => {
@@ -3919,6 +3989,79 @@ impl SigningIntent {
                 });
                 msg.sender
             }
+            "/ibc.core.channel.v1.MsgChannelUpgradeInit" => {
+                let msg = MsgChannelUpgradeInit::decode(message).map_err(decode_error)?;
+                state_sequence = Some(upgrade_channel_sequence(&msg.port_id, &msg.channel_id)?);
+                channel_upgrade = Some(ChannelUpgradeIntent {
+                    step: 0,
+                    proven: false,
+                });
+                msg.signer
+            }
+            "/ibc.core.channel.v1.MsgChannelUpgradeTry" => {
+                let msg = MsgChannelUpgradeTry::decode(message).map_err(decode_error)?;
+                state_sequence = Some(upgrade_channel_sequence(&msg.port_id, &msg.channel_id)?);
+                channel_upgrade = Some(ChannelUpgradeIntent {
+                    step: 1,
+                    proven: true,
+                });
+                msg.signer
+            }
+            "/ibc.core.channel.v1.MsgChannelUpgradeAck" => {
+                let msg = MsgChannelUpgradeAck::decode(message).map_err(decode_error)?;
+                state_sequence = Some(upgrade_channel_sequence(&msg.port_id, &msg.channel_id)?);
+                channel_upgrade = Some(ChannelUpgradeIntent {
+                    step: 2,
+                    proven: true,
+                });
+                msg.signer
+            }
+            "/ibc.core.channel.v1.MsgChannelUpgradeConfirm" => {
+                let msg = MsgChannelUpgradeConfirm::decode(message).map_err(decode_error)?;
+                state_sequence = Some(upgrade_channel_sequence(&msg.port_id, &msg.channel_id)?);
+                channel_upgrade = Some(ChannelUpgradeIntent {
+                    step: 3,
+                    proven: true,
+                });
+                msg.signer
+            }
+            "/ibc.core.channel.v1.MsgChannelUpgradeOpen" => {
+                let msg = MsgChannelUpgradeOpen::decode(message).map_err(decode_error)?;
+                state_sequence = Some(upgrade_channel_sequence(&msg.port_id, &msg.channel_id)?);
+                channel_upgrade = Some(ChannelUpgradeIntent {
+                    step: 4,
+                    proven: true,
+                });
+                msg.signer
+            }
+            "/ibc.core.channel.v1.MsgChannelUpgradeTimeout" => {
+                let msg = MsgChannelUpgradeTimeout::decode(message).map_err(decode_error)?;
+                state_sequence = Some(upgrade_channel_sequence(&msg.port_id, &msg.channel_id)?);
+                channel_upgrade = Some(ChannelUpgradeIntent {
+                    step: 5,
+                    proven: true,
+                });
+                msg.signer
+            }
+            "/ibc.core.channel.v1.MsgChannelUpgradeCancel" => {
+                let msg = MsgChannelUpgradeCancel::decode(message).map_err(decode_error)?;
+                state_sequence = Some(upgrade_channel_sequence(&msg.port_id, &msg.channel_id)?);
+                // Without a proven receipt, only the deployment authority cancels.
+                channel_upgrade = Some(ChannelUpgradeIntent {
+                    step: 6,
+                    proven: !msg.proof_error_receipt.is_empty(),
+                });
+                msg.signer
+            }
+            "/ibc.core.channel.v1.MsgChannelUpgradeFlush" => {
+                let msg = MsgChannelUpgradeFlush::decode(message).map_err(decode_error)?;
+                state_sequence = Some(upgrade_channel_sequence(&msg.port_id, &msg.channel_id)?);
+                channel_upgrade = Some(ChannelUpgradeIntent {
+                    step: 7,
+                    proven: false,
+                });
+                msg.signer
+            }
             "/ibc.cardano.v1.MsgPrunePacketHistory" => {
                 let msg = MsgPrunePacketHistory::decode(message).map_err(decode_error)?;
                 module_port = Some(validate_module_port(&msg.port_id)?);
@@ -3947,6 +4090,7 @@ impl SigningIntent {
             funded_intent: None,
             staged_tendermint: false,
             staged_misbehaviour: false,
+            channel_upgrade,
         })
     }
 
@@ -4587,6 +4731,16 @@ fn module_key_for_port(port: &str) -> Result<&'static str, String> {
         "icqhost" => Ok("icq"),
         _ => Err(format!("unsupported Cardano IBC module port {port}")),
     }
+}
+
+/// Only transfer channels can upgrade on Cardano.
+fn upgrade_channel_sequence(port: &str, channel: &str) -> Result<u64, Error> {
+    if port != "transfer" {
+        return Err(Error::Signer(format!(
+            "channel upgrades are only signed for transfer channels, not port {port}"
+        )));
+    }
+    parse_identifier_sequence(channel, Some("channel"))
 }
 
 fn validate_module_port(port: &str) -> Result<String, Error> {
@@ -7691,6 +7845,7 @@ mod tests {
             funded_intent: None,
             staged_tendermint: false,
             staged_misbehaviour: false,
+            channel_upgrade: None,
         }
     }
 
@@ -7742,6 +7897,112 @@ mod tests {
             channel_try.required_mint_scripts,
             vec!["mintchannelstt", "verifyproof"]
         );
+    }
+
+    #[test]
+    fn channel_upgrade_steps_require_their_operation_and_proof() {
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let requirements = |type_url: &str, step: u64, proven: bool| {
+            let mut intent = bare_intent(type_url, None);
+            intent.channel_upgrade = Some(ChannelUpgradeIntent { step, proven });
+            policy.operation_requirements(&intent).unwrap()
+        };
+
+        let try_step = requirements("/ibc.core.channel.v1.MsgChannelUpgradeTry", 1, true);
+        assert_eq!(
+            try_step.required_scripts,
+            vec!["spendchannel", "chanupgradehandshake", "verifyproof"]
+        );
+        assert_eq!(
+            try_step.required_mint_scripts,
+            vec!["chanupgradehandshake", "verifyproof"]
+        );
+        assert_eq!(try_step.state_output, StateOutputKind::Channel);
+        // Upgrade transactions spend no IBC module.
+        assert!(try_step.module.is_none());
+
+        let open = requirements("/ibc.core.channel.v1.MsgChannelUpgradeOpen", 4, true);
+        assert_eq!(
+            open.required_mint_scripts,
+            vec!["chanupgradefinish", "verifyproof"]
+        );
+        let authority_cancel =
+            requirements("/ibc.core.channel.v1.MsgChannelUpgradeCancel", 6, false);
+        assert_eq!(
+            authority_cancel.required_mint_scripts,
+            vec!["chanupgradefinish"]
+        );
+        let flush = requirements("/ibc.core.channel.v1.MsgChannelUpgradeFlush", 7, false);
+        assert_eq!(flush.required_scripts, vec!["spendchannel", "chanupgrade"]);
+        assert_eq!(flush.required_mint_scripts, vec!["chanupgrade"]);
+
+        let undecoded = bare_intent("/ibc.core.channel.v1.MsgChannelUpgradeAck", None);
+        assert!(policy.operation_requirements(&undecoded).is_err());
+    }
+
+    #[test]
+    fn channel_upgrade_intents_record_the_step_and_its_proof() {
+        let signer = format!("60{}", "99".repeat(28));
+        let cancel = |proof: Vec<u8>| {
+            MsgChannelUpgradeCancel {
+                port_id: "transfer".to_string(),
+                channel_id: "channel-3".to_string(),
+                error_receipt: None,
+                proof_error_receipt: proof,
+                proof_height: None,
+                signer: signer.clone(),
+            }
+            .encode_to_vec()
+        };
+        let type_url = "/ibc.core.channel.v1.MsgChannelUpgradeCancel";
+
+        let proven = SigningIntent::ibc(type_url, &cancel(vec![1]), &signer, 0).unwrap();
+        assert_eq!(proven.state_sequence, Some(3));
+        assert!(matches!(
+            proven.channel_upgrade,
+            Some(ChannelUpgradeIntent {
+                step: 6,
+                proven: true
+            })
+        ));
+        let authority = SigningIntent::ibc(type_url, &cancel(vec![]), &signer, 0).unwrap();
+        assert!(matches!(
+            authority.channel_upgrade,
+            Some(ChannelUpgradeIntent {
+                step: 6,
+                proven: false
+            })
+        ));
+
+        let other_port = MsgChannelUpgradeFlush {
+            port_id: "mock".to_string(),
+            channel_id: "channel-3".to_string(),
+            signer: signer.clone(),
+        }
+        .encode_to_vec();
+        assert!(SigningIntent::ibc(
+            "/ibc.core.channel.v1.MsgChannelUpgradeFlush",
+            &other_port,
+            &signer,
+            0
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn channel_upgrade_redeemer_binds_the_gateway_step() {
+        // SpendChannelRedeemer bytes pinned in the Gateway's redeemer regression
+        // tests: ChanUpgrade with InitUpgrade and with FlushUpgrade.
+        let decode = |hex_bytes: &str| -> PlutusData {
+            minicbor::decode(&hex::decode(hex_bytes).unwrap()).unwrap()
+        };
+        let init = decode("d9050481d87984d87982d87983d87a80814c636f6e6e656374696f6e2d314769637332302d311a0036ee808141aa8080");
+        let flush = decode("d9050481d87984d905008104808080");
+
+        assert!(ChannelRedeemerIntent::ChannelUpgrade(0).matches(&init));
+        assert!(!ChannelRedeemerIntent::ChannelUpgrade(7).matches(&init));
+        assert!(ChannelRedeemerIntent::ChannelUpgrade(7).matches(&flush));
+        assert!(!ChannelRedeemerIntent::Constructor(10).matches(&flush));
     }
 
     #[test]

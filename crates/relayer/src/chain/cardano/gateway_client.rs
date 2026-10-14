@@ -20,7 +20,8 @@ use ibc_proto::ibc::core::channel::v1::{
     QueryChannelsRequest, QueryConnectionChannelsRequest, QueryNextSequenceReceiveRequest,
     QueryPacketAcknowledgementRequest, QueryPacketAcknowledgementsRequest,
     QueryPacketCommitmentRequest, QueryPacketCommitmentsRequest, QueryPacketReceiptRequest,
-    QueryUnreceivedAcksRequest, QueryUnreceivedPacketsRequest,
+    QueryUnreceivedAcksRequest, QueryUnreceivedPacketsRequest, QueryUpgradeErrorRequest,
+    QueryUpgradeErrorResponse, QueryUpgradeRequest, QueryUpgradeResponse,
 };
 use ibc_proto::ibc::core::client::v1::query_client::QueryClient as ClientQueryClient;
 use ibc_proto::ibc::core::client::v1::{
@@ -57,6 +58,46 @@ use tonic::{Request, Status};
 const GATEWAY_HEADER_GRPC_MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
 const CARDANO_NATIVE_ASSET_MAX_QUANTITY: u64 = u64::MAX;
 const PRUNE_PACKET_HISTORY_TYPE_URL: &str = "/ibc.cardano.v1.MsgPrunePacketHistory";
+
+/// Certifies drained packet lanes of a flushing Cardano transfer channel. Only
+/// the Cardano Gateway serves it, in the `ibc.core.channel.v1.Msg` service.
+pub const CHANNEL_UPGRADE_FLUSH_TYPE_URL: &str = "/ibc.core.channel.v1.MsgChannelUpgradeFlush";
+
+/// The Gateway's channel-upgrade messages carry the unsigned Cardano
+/// transaction in `unsigned_tx`, unlike their ibc-go responses.
+macro_rules! channel_upgrade_tx {
+    ($name:ident, $msg:ident, $method:ident, $label:literal) => {
+        async fn $name(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
+            use super::generated::ibc::core::channel::v1::$msg;
+            use prost::Message;
+
+            let msg = $msg::decode(&message_data[..])
+                .map_err(|e| Error::Transaction(format!("Failed to decode {}: {}", $label, e)))?;
+            let description = format!(
+                "{} (port: {}, channel: {})",
+                $label, msg.port_id, msg.channel_id
+            );
+            let response = GenChannelMsgClient::new(self.channel.clone())
+                .$method(tonic::Request::new(msg))
+                .await?
+                .into_inner();
+            let unsigned_tx = response.unsigned_tx.ok_or_else(|| {
+                Error::Transaction(format!("No unsigned_tx in {} response", $label))
+            })?;
+            let cbor_hex = String::from_utf8(unsigned_tx.value)
+                .map_err(|e| Error::Transaction(format!("Invalid UTF-8 in unsigned_tx: {}", e)))?;
+            tracing::info!(
+                "{}: received unsigned CBOR (length: {})",
+                description,
+                cbor_hex.len()
+            );
+            Ok(UnsignedTx {
+                cbor_hex,
+                description,
+            })
+        }
+    };
+}
 const LEGACY_TENDERMINT_UPDATE_STEP_TYPE_URL: &str = "/ibc.cardano.v1.TendermintUpdateStep";
 pub const TENDERMINT_UPDATE_TX_CHAIN_TYPE_URL: &str = "/ibc.cardano.v1.TendermintUpdateTxChain";
 pub const TENDERMINT_UPDATE_TX_CHAIN_VERSION: u32 = 1;
@@ -827,6 +868,46 @@ impl GatewayClient {
         Ok(prost::Message::encode_to_vec(&response))
     }
 
+    /// Query the upgrade a channel has in progress, as `ibc.core.channel.v1.Query/Upgrade`.
+    pub async fn query_upgrade(
+        &self,
+        port_id: &str,
+        channel_id: &str,
+        query_height: Option<Height>,
+    ) -> Result<QueryUpgradeResponse, Error> {
+        let request = Self::request_with_query_height(
+            QueryUpgradeRequest {
+                port_id: port_id.to_string(),
+                channel_id: channel_id.to_string(),
+            },
+            query_height,
+        )?;
+        Ok(ChannelQueryClient::new(self.channel.clone())
+            .upgrade(request)
+            .await?
+            .into_inner())
+    }
+
+    /// Query a channel's latest upgrade error receipt, as `Query/UpgradeError`.
+    pub async fn query_upgrade_error(
+        &self,
+        port_id: &str,
+        channel_id: &str,
+        query_height: Option<Height>,
+    ) -> Result<QueryUpgradeErrorResponse, Error> {
+        let request = Self::request_with_query_height(
+            QueryUpgradeErrorRequest {
+                port_id: port_id.to_string(),
+                channel_id: channel_id.to_string(),
+            },
+            query_height,
+        )?;
+        Ok(ChannelQueryClient::new(self.channel.clone())
+            .upgrade_error(request)
+            .await?
+            .into_inner())
+    }
+
     /// Query all channels
     pub async fn query_channels(&self) -> Result<Vec<u8>, Error> {
         use ibc_proto::cosmos::base::query::v1beta1::PageRequest;
@@ -1178,6 +1259,32 @@ impl GatewayClient {
             }
             "/ibc.core.channel.v1.MsgChannelCloseConfirm" => {
                 self.build_channel_close_confirm_tx(message_data).await
+            }
+
+            // IBC channel upgrade messages
+            "/ibc.core.channel.v1.MsgChannelUpgradeInit" => {
+                self.build_channel_upgrade_init_tx(message_data).await
+            }
+            "/ibc.core.channel.v1.MsgChannelUpgradeTry" => {
+                self.build_channel_upgrade_try_tx(message_data).await
+            }
+            "/ibc.core.channel.v1.MsgChannelUpgradeAck" => {
+                self.build_channel_upgrade_ack_tx(message_data).await
+            }
+            "/ibc.core.channel.v1.MsgChannelUpgradeConfirm" => {
+                self.build_channel_upgrade_confirm_tx(message_data).await
+            }
+            "/ibc.core.channel.v1.MsgChannelUpgradeOpen" => {
+                self.build_channel_upgrade_open_tx(message_data).await
+            }
+            "/ibc.core.channel.v1.MsgChannelUpgradeTimeout" => {
+                self.build_channel_upgrade_timeout_tx(message_data).await
+            }
+            "/ibc.core.channel.v1.MsgChannelUpgradeCancel" => {
+                self.build_channel_upgrade_cancel_tx(message_data).await
+            }
+            CHANNEL_UPGRADE_FLUSH_TYPE_URL => {
+                self.build_channel_upgrade_flush_tx(message_data).await
             }
 
             // IBC Packet messages
@@ -1748,6 +1855,55 @@ impl GatewayClient {
             ),
         })
     }
+
+    channel_upgrade_tx!(
+        build_channel_upgrade_init_tx,
+        MsgChannelUpgradeInit,
+        channel_upgrade_init,
+        "MsgChannelUpgradeInit"
+    );
+    channel_upgrade_tx!(
+        build_channel_upgrade_try_tx,
+        MsgChannelUpgradeTry,
+        channel_upgrade_try,
+        "MsgChannelUpgradeTry"
+    );
+    channel_upgrade_tx!(
+        build_channel_upgrade_ack_tx,
+        MsgChannelUpgradeAck,
+        channel_upgrade_ack,
+        "MsgChannelUpgradeAck"
+    );
+    channel_upgrade_tx!(
+        build_channel_upgrade_confirm_tx,
+        MsgChannelUpgradeConfirm,
+        channel_upgrade_confirm,
+        "MsgChannelUpgradeConfirm"
+    );
+    channel_upgrade_tx!(
+        build_channel_upgrade_open_tx,
+        MsgChannelUpgradeOpen,
+        channel_upgrade_open,
+        "MsgChannelUpgradeOpen"
+    );
+    channel_upgrade_tx!(
+        build_channel_upgrade_timeout_tx,
+        MsgChannelUpgradeTimeout,
+        channel_upgrade_timeout,
+        "MsgChannelUpgradeTimeout"
+    );
+    channel_upgrade_tx!(
+        build_channel_upgrade_cancel_tx,
+        MsgChannelUpgradeCancel,
+        channel_upgrade_cancel,
+        "MsgChannelUpgradeCancel"
+    );
+    channel_upgrade_tx!(
+        build_channel_upgrade_flush_tx,
+        MsgChannelUpgradeFlush,
+        channel_upgrade_flush,
+        "MsgChannelUpgradeFlush"
+    );
 
     async fn build_recv_packet_tx(&self, message_data: Vec<u8>) -> Result<UnsignedTx, Error> {
         use super::generated::ibc::core::channel::v1::MsgRecvPacket;
@@ -2503,6 +2659,35 @@ mod tests {
         assert_eq!(decoded.subject_client_id, canonical.subject_client_id);
         assert_eq!(decoded.substitute_client_id, canonical.substitute_client_id);
         assert_eq!(decoded.signer, canonical.signer);
+    }
+
+    #[test]
+    fn closing_messages_keep_the_counterparty_upgrade_sequence() {
+        use super::super::generated::ibc::core::channel::v1::{
+            MsgChannelCloseConfirm, MsgTimeoutOnClose,
+        };
+        use ibc_proto::ibc::core::channel::v1::{
+            MsgChannelCloseConfirm as CanonicalCloseConfirm,
+            MsgTimeoutOnClose as CanonicalTimeoutOnClose,
+        };
+
+        let close_confirm = CanonicalCloseConfirm {
+            port_id: "transfer".to_string(),
+            channel_id: "channel-0".to_string(),
+            counterparty_upgrade_sequence: 3,
+            ..Default::default()
+        };
+        let decoded =
+            MsgChannelCloseConfirm::decode(close_confirm.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.counterparty_upgrade_sequence, 3);
+
+        let timeout_on_close = CanonicalTimeoutOnClose {
+            counterparty_upgrade_sequence: 4,
+            ..Default::default()
+        };
+        let decoded =
+            MsgTimeoutOnClose::decode(timeout_on_close.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.counterparty_upgrade_sequence, 4);
     }
 
     #[test]

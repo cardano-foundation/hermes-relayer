@@ -4,6 +4,7 @@ use abscissa_core::{config::Override, Command, Runnable};
 use ibc_relayer::config::Config;
 
 mod channel;
+mod channel_upgrade;
 pub(crate) mod client;
 mod connection;
 mod heartbeat;
@@ -46,6 +47,15 @@ pub enum TxCmd {
 
     /// Confirm the closing of a channel (ChannelCloseConfirm)
     ChanCloseConfirm(channel::TxChanCloseConfirmCmd),
+
+    /// Propose a Cardano transfer channel's replacement connection (ChannelUpgradeInit)
+    ChanUpgradeInit(channel_upgrade::TxChanUpgradeInitCmd),
+
+    /// Certify drained packet lanes of a flushing Cardano channel (ChannelUpgradeFlush)
+    ChanUpgradeFlush(channel_upgrade::TxChanUpgradeFlushCmd),
+
+    /// Cancel a Cardano channel upgrade as the deployment authority (ChannelUpgradeCancel)
+    ChanUpgradeAuthorityCancel(channel_upgrade::TxChanUpgradeAuthorityCancelCmd),
 
     /// Relay the channel upgrade attempt (ChannelUpgradeTry)
     ChanUpgradeTry(channel::TxChanUpgradeTryCmd),
