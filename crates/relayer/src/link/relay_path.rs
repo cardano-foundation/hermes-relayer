@@ -1655,7 +1655,11 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
             )
             .map_err(|e| LinkError::packet_proofs_constructor(self.dst_chain().id(), e))?;
 
-        let counterparty_upgrade_sequence = self.src_channel(QueryHeight::Latest)?.upgrade_sequence;
+        // The proof shows the destination's closed channel, at its own upgrade
+        // sequence. It differs from the source's after a one-sided upgrade cancel.
+        let counterparty_upgrade_sequence = self
+            .dst_channel(QueryHeight::Specific(height))?
+            .upgrade_sequence;
 
         let msg = MsgTimeoutOnClose::new(
             packet.clone(),
