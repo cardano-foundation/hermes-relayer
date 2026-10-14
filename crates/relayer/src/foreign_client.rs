@@ -5,6 +5,7 @@
 //! refers to light clients running *locally* as part of the relayer.
 
 use core::{fmt, time::Duration};
+use std::collections::BTreeSet;
 use std::thread;
 use std::time::Instant;
 
@@ -2036,29 +2037,37 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 })?
         };
 
-        // Rootless epoch proposals create no consensus state. Recover the first
-        // proposal from successful transactions when a watcher starts or restarts.
+        // Proposal-only updates retain the old checkpoint epoch. Recover the
+        // stored challenge epochs first because those proposals have no new root.
         if update.is_none() {
             if let AnyClientState::Probabilistic(state) = &client_state {
-                let events = self
-                    .dst_chain
-                    .query_txs(QueryTxRequest::Client(QueryClientEventRequest {
-                        probabilistic_epoch: Some(state.current_epoch),
-                        query_height: QueryHeight::Latest,
-                        event_id: WithBlockDataType::UpdateClient,
-                        client_id: self.id.clone(),
-                        consensus_height: state.latest_verified_height(),
-                    }))
-                    .map_err(|e| {
-                        ForeignClientError::misbehaviour(
-                            "querying probabilistic epoch proposal".to_owned(),
-                            e,
-                        )
-                    })?;
-                for event in events {
-                    if let IbcEvent::UpdateClient(proposal) = event.event {
-                        if let Some(evidence) = self.detect_misbehaviour(Some(&proposal))? {
-                            return Ok(Some(evidence));
+                let epochs: BTreeSet<_> = state
+                    .epoch_context_challenges
+                    .iter()
+                    .map(|challenge| challenge.epoch)
+                    .chain(std::iter::once(state.current_epoch))
+                    .collect();
+                for epoch in epochs.into_iter().rev() {
+                    let events = self
+                        .dst_chain
+                        .query_txs(QueryTxRequest::Client(QueryClientEventRequest {
+                            probabilistic_epoch: Some(epoch),
+                            query_height: QueryHeight::Latest,
+                            event_id: WithBlockDataType::UpdateClient,
+                            client_id: self.id.clone(),
+                            consensus_height: state.latest_verified_height(),
+                        }))
+                        .map_err(|e| {
+                            ForeignClientError::misbehaviour(
+                                format!("querying probabilistic epoch {epoch} proposal"),
+                                e,
+                            )
+                        })?;
+                    for event in events {
+                        if let IbcEvent::UpdateClient(proposal) = event.event {
+                            if let Some(evidence) = self.detect_misbehaviour(Some(&proposal))? {
+                                return Ok(Some(evidence));
+                            }
                         }
                     }
                 }

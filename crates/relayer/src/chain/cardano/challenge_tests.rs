@@ -385,7 +385,6 @@ fn sdk_events_reach_independent_challenge_submission() {
                 .as_slice(),
         )
         .unwrap();
-        let latest = AnyClientState::Probabilistic(ClientState::try_from(latest_raw).unwrap());
         let mut context = raw::ClientState::decode(
             hex::decode(fixture["context"].as_str().unwrap())
                 .unwrap()
@@ -393,6 +392,7 @@ fn sdk_events_reach_independent_challenge_submission() {
         )
         .unwrap();
         context.current_epoch = context.latest_checkpoint_epoch;
+        let snapshot = context.clone();
         let context = context.encode_to_vec();
         let witness = raw::ProbabilisticHeader::decode(
             hex::decode(fixture["witness"].as_str().unwrap())
@@ -401,7 +401,20 @@ fn sdk_events_reach_independent_challenge_submission() {
         )
         .unwrap();
         let witness = AnyHeader::Probabilistic(witness.try_into().unwrap());
-        for startup in [false, true] {
+        for (startup, proposal_only) in [(false, false), (true, false), (true, true)] {
+            let mut restored = latest_raw.clone();
+            if proposal_only {
+                restored.current_epoch = snapshot.current_epoch;
+                restored.latest_checkpoint_epoch = snapshot.latest_checkpoint_epoch;
+                restored.latest_checkpoint_height = snapshot.latest_checkpoint_height.clone();
+                restored.latest_height = snapshot.latest_checkpoint_height.clone();
+                assert_eq!(restored.current_epoch, 7);
+                assert!(restored
+                    .epoch_context_challenges
+                    .iter()
+                    .any(|row| row.epoch == 8));
+            }
+            let latest = AnyClientState::Probabilistic(ClientState::try_from(restored).unwrap());
             let (source_sender, source_receiver) = crossbeam_channel::unbounded();
             let source = BaseChainHandle::new(ChainId::from_string("cardano-0"), source_sender);
             let expected_context = context.clone();
@@ -521,5 +534,68 @@ fn sdk_events_reach_independent_challenge_submission() {
             source_runtime.join().unwrap();
             assert_eq!(destination_runtime.join().unwrap(), 1);
         }
+    }
+}
+
+#[test]
+fn startup_scans_stored_challenge_epochs_once_with_the_newest_first() {
+    use crate::chain::handle::{BaseChainHandle, ChainRequest};
+    use crate::client_state::AnyClientState;
+    use crate::foreign_client::ForeignClient;
+    use ibc_relayer_types::clients::ics08_cardano_probabilistic::client_state::ClientState;
+    use ibc_relayer_types::core::ics24_host::identifier::ChainId;
+
+    for (stored, expected) in [(vec![7, 8, 8, 9], vec![9, 8, 7]), (vec![], vec![8])] {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/watcher-v8-rootless.json")).unwrap();
+        let mut latest = raw::ClientState::decode(
+            hex::decode(fixture["client"].as_str().unwrap())
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(latest.current_epoch, 8);
+        latest.epoch_context_challenges = stored
+            .into_iter()
+            .map(|epoch| raw::EpochContextChallenge {
+                epoch,
+                usable_after_unix_ns: 1,
+            })
+            .collect();
+        let latest = AnyClientState::Probabilistic(ClientState::try_from(latest).unwrap());
+        let (source_sender, _source_receiver) = crossbeam_channel::unbounded();
+        let source = BaseChainHandle::new(ChainId::from_string("cardano-0"), source_sender);
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let destination = BaseChainHandle::new(ChainId::from_string("cosmos-1"), sender);
+        let thread = std::thread::spawn(move || {
+            let mut epochs = vec![];
+            for (_, request) in receiver {
+                match request {
+                    ChainRequest::QueryClientState { reply_to, .. } => {
+                        reply_to.send(Ok((latest.clone(), None))).unwrap();
+                    }
+                    ChainRequest::QueryPacketEventDataFromTxs { request, reply_to } => {
+                        let crate::chain::requests::QueryTxRequest::Client(query) = request else {
+                            panic!("expected an epoch proposal lookup");
+                        };
+                        epochs.push(query.probabilistic_epoch.unwrap());
+                        reply_to.send(Ok(vec![])).unwrap();
+                    }
+                    ChainRequest::QueryConsensusStateHeights { reply_to, .. } => {
+                        reply_to.send(Ok(vec![])).unwrap();
+                    }
+                    other => panic!("unexpected startup request: {other:?}"),
+                }
+            }
+            epochs
+        });
+        let client = ForeignClient::restore(
+            "08-cardano-probabilistic-0".parse().unwrap(),
+            destination,
+            source,
+        );
+        assert!(client.detect_misbehaviour(None).unwrap().is_none());
+        drop(client);
+        assert_eq!(thread.join().unwrap(), expected);
     }
 }
