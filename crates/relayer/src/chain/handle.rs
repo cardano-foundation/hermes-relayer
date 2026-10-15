@@ -218,6 +218,13 @@ pub enum ChainRequest {
         reply_to: ReplyTo<Vec<u8>>,
     },
 
+    QueryProbabilisticVerification {
+        request:
+            ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,
+        height: QueryHeight,
+        reply_to: ReplyTo<Vec<u8>>,
+    },
+
     QueryClientState {
         request: QueryClientStateRequest,
         include_proof: IncludeProof,
@@ -488,6 +495,17 @@ pub trait ChainHandle: Clone + Display + Send + Sync + Debug + 'static {
 
     /// Performs a query to retrieve the state of the specified light client. A
     /// proof can optionally be returned along with the result.
+    fn query_probabilistic_verification(
+        &self,
+        request:ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,
+        height: QueryHeight,
+    ) -> Result<Vec<u8>, Error> {
+        let _ = (request, height);
+        Err(Error::query(
+            "Destination has no compact verification query".to_owned(),
+        ))
+    }
+
     fn query_client_state(
         &self,
         request: QueryClientStateRequest,

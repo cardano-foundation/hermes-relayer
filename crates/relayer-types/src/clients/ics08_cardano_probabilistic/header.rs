@@ -28,6 +28,7 @@ pub struct Header {
     pub host_state_tx_output_index: u32,
     pub new_epoch_context: Option<raw::EpochContext>,
     pub is_checkpoint: bool,
+    pub observation_chunk: Option<raw::ObservationChunk>,
 }
 
 impl crate::core::ics02_client::header::Header for Header {
@@ -50,6 +51,36 @@ impl TryFrom<RawHeader> for Header {
     type Error = Error;
 
     fn try_from(raw: RawHeader) -> Result<Self, Self::Error> {
+        if let Some(chunk) = raw.observation_chunk.clone() {
+            let trusted_height: Height = raw
+                .trusted_height
+                .clone()
+                .unwrap_or(raw::Height {
+                    revision_number: 0,
+                    revision_height: 1,
+                })
+                .try_into()?;
+            let anchor_height = if chunk.anchor_height > 0 {
+                chunk.anchor_height
+            } else {
+                trusted_height.revision_height()
+            };
+            let height = Height::new(0, anchor_height)
+                .map_err(|e| Error::invalid_field("anchor_height", e.to_string()))?;
+            return Ok(Self {
+                trusted_height,
+                height,
+                timestamp: Timestamp::none(),
+                anchor_block: raw::ProbabilisticBlock::default(),
+                bridge_blocks: vec![],
+                descendant_blocks: vec![],
+                host_state_tx_hash: String::new(),
+                host_state_tx_output_index: 0,
+                new_epoch_context: None,
+                is_checkpoint: chunk.is_checkpoint,
+                observation_chunk: Some(chunk),
+            });
+        }
         let trusted_height = raw
             .trusted_height
             .ok_or_else(|| Error::missing_field("trusted_height"))?
@@ -79,12 +110,20 @@ impl TryFrom<RawHeader> for Header {
             host_state_tx_output_index: raw.host_state_tx_output_index,
             new_epoch_context: raw.new_epoch_context,
             is_checkpoint: raw.is_checkpoint,
+            observation_chunk: raw.observation_chunk,
         })
     }
 }
 
 impl From<Header> for RawHeader {
     fn from(value: Header) -> Self {
+        if let Some(chunk) = value.observation_chunk.clone() {
+            return RawHeader {
+                trusted_height: Some(value.trusted_height.into()),
+                observation_chunk: Some(chunk),
+                ..Default::default()
+            };
+        }
         RawHeader {
             trusted_height: Some(value.trusted_height.into()),
             anchor_block: Some(value.anchor_block),
@@ -94,6 +133,7 @@ impl From<Header> for RawHeader {
             host_state_tx_output_index: value.host_state_tx_output_index,
             new_epoch_context: value.new_epoch_context,
             is_checkpoint: value.is_checkpoint,
+            observation_chunk: value.observation_chunk,
         }
     }
 }
@@ -179,6 +219,7 @@ mod tests {
             bridge_blocks,
             new_epoch_context: None,
             is_checkpoint: false,
+            observation_chunk: None,
         }
     }
 
@@ -278,6 +319,7 @@ mod tests {
             host_state_tx_output_index: u32::from(!checkpoint),
             new_epoch_context: None,
             is_checkpoint: checkpoint,
+            observation_chunk: None,
         }
     }
 

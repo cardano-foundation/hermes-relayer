@@ -209,6 +209,18 @@ impl ChainHandle for BaseChainHandle {
         })
     }
 
+    fn query_probabilistic_verification(
+        &self,
+        request:ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,
+        height: QueryHeight,
+    ) -> Result<Vec<u8>, Error> {
+        self.send(|reply_to| ChainRequest::QueryProbabilisticVerification {
+            request,
+            height,
+            reply_to,
+        })
+    }
+
     fn query_client_state(
         &self,
         request: QueryClientStateRequest,

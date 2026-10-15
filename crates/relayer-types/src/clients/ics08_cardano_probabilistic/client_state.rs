@@ -58,6 +58,12 @@ pub struct ClientState {
     pub latest_checkpoint_settlement_credit: Option<raw::SettlementCreditState>,
     pub latest_checkpoint_pool_production: Option<raw::PoolProductionHistory>,
     pub randomness_stabilisation_window_slots: u64,
+    pub storage_version: u32,
+    pub verification_generation: u64,
+    pub checkpoint_reference: Vec<u8>,
+    pub storage_namespace: Vec<u8>,
+    pub bootstrap_objects: Vec<u8>,
+    pub bootstrap_pending: bool,
 }
 
 impl ClientState {
@@ -131,6 +137,12 @@ impl TryFrom<RawClientState> for ClientState {
             latest_checkpoint_settlement_credit,
             latest_checkpoint_pool_production,
             randomness_stabilisation_window_slots,
+            storage_version,
+            verification_generation,
+            checkpoint_reference,
+            storage_namespace,
+            bootstrap_objects,
+            bootstrap_pending,
         } = raw;
 
         let chain_id = ChainId::from_string(&raw_chain_id);
@@ -336,6 +348,12 @@ impl TryFrom<RawClientState> for ClientState {
             latest_checkpoint_settlement_credit,
             latest_checkpoint_pool_production,
             randomness_stabilisation_window_slots,
+            storage_version,
+            verification_generation,
+            checkpoint_reference,
+            storage_namespace,
+            bootstrap_objects,
+            bootstrap_pending,
         })
     }
 }
@@ -380,6 +398,12 @@ impl From<ClientState> for RawClientState {
             latest_checkpoint_settlement_credit: value.latest_checkpoint_settlement_credit,
             latest_checkpoint_pool_production: value.latest_checkpoint_pool_production,
             randomness_stabilisation_window_slots: value.randomness_stabilisation_window_slots,
+            storage_version: value.storage_version,
+            verification_generation: value.verification_generation,
+            checkpoint_reference: value.checkpoint_reference,
+            storage_namespace: value.storage_namespace,
+            bootstrap_objects: value.bootstrap_objects,
+            bootstrap_pending: value.bootstrap_pending,
         }
     }
 }
