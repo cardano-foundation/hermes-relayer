@@ -1284,6 +1284,38 @@ impl ChainEndpoint for CosmosSdkChain {
                 "Cardano challenge requires a probabilistic client".to_owned(),
             ));
         };
+        if client.storage_version == 2 {
+            use prost::Message;
+            let mut path = format!("clients/{client_id}/verifiedCheckpoints/").into_bytes();
+            path.extend_from_slice(&client.verification_generation.to_be_bytes());
+            path.extend_from_slice(&trusted_height.revision_height().to_be_bytes());
+            let response = self
+                .block_on(self.rpc_client.abci_query(
+                    Some("/store/ibc/key".to_owned()),
+                    path,
+                    Some(host_height.into()),
+                    false,
+                ))
+                .map_err(|error| Error::rpc(self.config.rpc_addr.clone(), error))?;
+            if !response.code.is_ok() {
+                return Err(Error::abci_query(response));
+            }
+            if response.value.len() != 32 {
+                return Err(Error::query(
+                    "Historical compact checkpoint reference is unavailable".to_owned(),
+                ));
+            }
+            let hydrated =
+                crate::chain::cardano::staging::hydrate(client.into(), response.value, |request| {
+                    self.query_probabilistic_verification(
+                        request,
+                        QueryHeight::Specific(host_height),
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .map_err(Error::query)?;
+            return Ok(hydrated.encode_to_vec());
+        }
         crate::chain::cardano::challenge::context_from_store(client.into(), trusted_height, |key| {
             let mut path = format!("clients/{client_id}/").into_bytes();
             path.extend_from_slice(key);
@@ -1300,6 +1332,55 @@ impl ChainEndpoint for CosmosSdkChain {
             }
             Ok(response.value)
         })
+    }
+
+    fn query_client_status(
+        &self,
+        client_id: ClientId,
+        height: QueryHeight,
+    ) -> Result<Option<String>, Error> {
+        use ibc_proto::ibc::core::client::v1::{
+            query_client::QueryClient, QueryClientStatusRequest,
+        };
+        let mut client = self.block_on(create_grpc_client(&self.grpc_addr, QueryClient::new))?;
+        let mut request = tonic::Request::new(QueryClientStatusRequest {
+            client_id: client_id.to_string(),
+        });
+        request
+            .metadata_mut()
+            .insert("x-cosmos-block-height", height.try_into()?);
+        match self.block_on(client.client_status(request)) {
+            Ok(response) => Ok(Some(response.into_inner().status)),
+            Err(status) if status.code() == tonic::Code::Unimplemented => Ok(None),
+            Err(status) => Err(Error::grpc_status(status, "query_client_status".to_owned())),
+        }
+    }
+
+    fn query_probabilistic_verification(
+        &self,
+        request:ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,
+        height: QueryHeight,
+    ) -> Result<Vec<u8>, Error> {
+        use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationResponse;
+        use prost::Message;
+        let height = match height {
+            QueryHeight::Latest => None,
+            QueryHeight::Specific(height) => Some(height.into()),
+        };
+        let response = self
+            .block_on(self.rpc_client.abci_query(
+                Some("/ibc.lightclients.probabilistic.v1.Query/Verification".to_owned()),
+                request.encode_to_vec(),
+                height,
+                false,
+            ))
+            .map_err(|error| Error::rpc(self.config.rpc_addr.clone(), error))?;
+        if !response.code.is_ok() {
+            return Err(Error::abci_query(response));
+        }
+        Ok(QueryVerificationResponse::decode(response.value.as_slice())
+            .map_err(|error| Error::query(error.to_string()))?
+            .data)
     }
 
     fn query_client_state(

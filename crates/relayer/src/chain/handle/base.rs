@@ -185,6 +185,28 @@ impl ChainHandle for BaseChainHandle {
         self.send(|reply_to| ChainRequest::QueryDenomTrace { hash, reply_to })
     }
 
+    fn query_client_status(
+        &self,
+        client_id: ClientId,
+        height: QueryHeight,
+    ) -> Result<Option<String>, Error> {
+        self.send(|reply_to| ChainRequest::QueryClientStatus {
+            client_id,
+            height,
+            reply_to,
+        })
+    }
+
+    fn build_client_maintenance_header(
+        &self,
+        client_state: &AnyClientState,
+    ) -> Result<Option<AnyHeader>, Error> {
+        self.send(|reply_to| ChainRequest::BuildClientMaintenanceHeader {
+            client_state: client_state.clone(),
+            reply_to,
+        })
+    }
+
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
         self.send(|reply_to| ChainRequest::QueryApplicationStatus { reply_to })
     }
@@ -205,6 +227,18 @@ impl ChainHandle for BaseChainHandle {
         self.send(|reply_to| ChainRequest::QueryCardanoChallengeContext {
             client_id,
             trusted_height,
+            reply_to,
+        })
+    }
+
+    fn query_probabilistic_verification(
+        &self,
+        request:ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,
+        height: QueryHeight,
+    ) -> Result<Vec<u8>, Error> {
+        self.send(|reply_to| ChainRequest::QueryProbabilisticVerification {
+            request,
+            height,
             reply_to,
         })
     }

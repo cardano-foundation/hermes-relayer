@@ -14,6 +14,9 @@ use crate::keyring::Store;
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CardanoConfig {
+    /// Explicitly trusted version 2 bootstrap bundle built with compact-bootstrap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probabilistic_bootstrap_file: Option<PathBuf>,
     /// The chain's network identifier
     pub id: ChainId,
 
@@ -383,6 +386,7 @@ fn default_mithril_wait_log_interval() -> Duration {
 impl Default for CardanoConfig {
     fn default() -> Self {
         Self {
+            probabilistic_bootstrap_file: None,
             id: ChainId::from_string("cardano-test"),
             gateway_url: "http://localhost:5001".to_string(),
             gateway_tls_ca_file: None,

@@ -152,6 +152,21 @@ impl<Handle: ChainHandle> ChainHandle for CachingChainHandle<Handle> {
         self.inner().query_denom_trace(hash)
     }
 
+    fn query_client_status(
+        &self,
+        client_id: ClientId,
+        height: QueryHeight,
+    ) -> Result<Option<String>, Error> {
+        self.inner().query_client_status(client_id, height)
+    }
+
+    fn build_client_maintenance_header(
+        &self,
+        client_state: &AnyClientState,
+    ) -> Result<Option<AnyHeader>, Error> {
+        self.inner().build_client_maintenance_header(client_state)
+    }
+
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
         self.inner().query_application_status()
     }
@@ -187,6 +202,15 @@ impl<Handle: ChainHandle> ChainHandle for CachingChainHandle<Handle> {
     }
 
     // TODO: Introduce new query_client_state_latest to separate from this one.
+    fn query_probabilistic_verification(
+        &self,
+        request:ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,
+        height: QueryHeight,
+    ) -> Result<Vec<u8>, Error> {
+        self.inner()
+            .query_probabilistic_verification(request, height)
+    }
+
     fn query_client_state(
         &self,
         request: QueryClientStateRequest,

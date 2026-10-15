@@ -188,6 +188,24 @@ pub trait ChainEndpoint: Sized {
         challenge_context: Option<Vec<u8>>,
     ) -> Result<Option<MisbehaviourEvidence>, Error>;
 
+    /// Query the host's authoritative client status at a committed height.
+    /// None means the host does not implement this query. Transport errors propagate.
+    fn query_client_status(
+        &self,
+        _client_id: ClientId,
+        _height: QueryHeight,
+    ) -> Result<Option<String>, Error> {
+        Ok(None)
+    }
+
+    /// Build a rootless maintenance update without changing packet-proof height selection.
+    fn build_client_maintenance_header(
+        &mut self,
+        _client_state: &AnyClientState,
+    ) -> Result<Option<AnyHeader>, Error> {
+        Ok(None)
+    }
+
     // Queries
 
     /// Query the balance of the given account for the given denom.
@@ -231,6 +249,17 @@ pub trait ChainEndpoint: Sized {
 
     /// Performs a query to retrieve the state of the specified light client. A
     /// proof can optionally be returned along with the result.
+    fn query_probabilistic_verification(
+        &self,
+        request:ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,
+        height: QueryHeight,
+    ) -> Result<Vec<u8>, Error> {
+        let _ = (request, height);
+        Err(Error::query(
+            "Destination has no compact verification query".to_owned(),
+        ))
+    }
+
     fn query_client_state(
         &self,
         request: QueryClientStateRequest,
