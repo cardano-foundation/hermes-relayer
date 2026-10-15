@@ -401,6 +401,10 @@ fn upgrade_query_present(
                     "Gateway returned a missing or stale channel upgrade".to_string(),
                 ));
             }
+            let upgrade = response.upgrade.expect("checked above");
+            ibc_relayer_types::core::ics04_channel::upgrade::Upgrade::try_from(upgrade).map_err(
+                |error| Error::query(format!("Malformed Gateway channel upgrade: {error}")),
+            )?;
             Ok(true)
         }
         Err(super::error::Error::GatewayStatus {
@@ -4877,7 +4881,14 @@ mod tests {
         use ibc_proto::ibc::core::channel::v1::{QueryUpgradeResponse, Upgrade};
         let height = ICSHeight::new(0, 10).unwrap();
         let present = QueryUpgradeResponse {
-            upgrade: Some(Upgrade::default()),
+            upgrade: Some(Upgrade {
+                fields: Some(ibc_proto::ibc::core::channel::v1::UpgradeFields {
+                    ordering: 1,
+                    connection_hops: vec!["connection-1".into()],
+                    version: "ics20-1".into(),
+                }),
+                ..Upgrade::default()
+            }),
             proof: vec![1],
             proof_height: Some(ibc_proto::ibc::core::client::v1::Height {
                 revision_number: 0,
@@ -4891,6 +4902,11 @@ mod tests {
         let mut stale = present.clone();
         stale.proof_height.as_mut().unwrap().revision_height = 9;
         assert!(upgrade_query_present(Ok(stale), "transfer", "channel-0", Some(height)).is_err());
+        let mut malformed = present.clone();
+        malformed.upgrade = Some(Upgrade::default());
+        assert!(
+            upgrade_query_present(Ok(malformed), "transfer", "channel-0", Some(height)).is_err()
+        );
         let mut malformed = present;
         malformed.upgrade = None;
         assert!(
