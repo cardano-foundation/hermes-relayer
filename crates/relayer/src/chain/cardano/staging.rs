@@ -231,7 +231,7 @@ fn session_id(client: &raw::ClientState, chunk: &raw::ObservationChunk) -> Resul
     bytes.extend_from_slice(&chunk.original_receipt);
     extend_u64(&mut bytes, chunk.anchor_height);
     bytes.extend_from_slice(&chunk.block_count.to_be_bytes());
-    bytes.push(u8::from(chunk.is_checkpoint) | u8::from(chunk.isolated) << 1);
+    bytes.push(u8::from(chunk.is_checkpoint) | (u8::from(chunk.isolated) << 1));
     if chunk.host_state_tx_hash.is_empty() {
         bytes.extend_from_slice(&[0; 32])
     } else {
