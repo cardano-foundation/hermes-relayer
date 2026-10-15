@@ -1870,6 +1870,10 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
     ) -> Result<(), ForeignClientError> {
         use crate::chain::cardano::staging;
         use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
+        if header.new_epoch_context.is_some() {
+            // A table Mithril has certified activates without a response window.
+            self.record_mithril_stake(&AnyClientState::Probabilistic(client.clone()));
+        }
         let plan = staging::plan(&client.clone().into(), &header.into(), vec![])
             .map_err(|error| ForeignClientError::checkpoint_update(self.dst_chain.id(), error))?;
         staging::submit(
