@@ -571,6 +571,9 @@ pub struct MsgChannelUpgradeInit {
     /// out on the counterparty.
     #[prost(uint64, tag = "5")]
     pub timeout_period_ms: u64,
+    /// Cardano signing precondition captured before requesting transaction construction.
+    #[prost(uint64, optional, tag = "6")]
+    pub expected_upgrade_sequence: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MsgChannelUpgradeInitResponse {

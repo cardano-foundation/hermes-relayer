@@ -103,6 +103,7 @@ impl Runnable for TxChanUpgradeInitCmd {
             }),
             signer: signer.to_string(),
             timeout_period_ms: self.timeout_period_ms,
+            expected_upgrade_sequence: Some(channel.upgrade_sequence.into()),
         };
         info!("message ChanUpgradeInit: {:?}", msg);
         send(

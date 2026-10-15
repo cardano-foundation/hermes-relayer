@@ -146,16 +146,64 @@ pub struct SigningIntent {
 
 /// A channel-upgrade step: its `ChannelUpgradeStep` constructor and whether the
 /// transaction proves the counterparty with the verify-proof mint.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct ChannelUpgradeIntent {
     step: u64,
     proven: bool,
+    init: Option<ChannelUpgradeInitIntent>,
+}
+
+#[derive(Clone, Debug)]
+struct ChannelUpgradeInitIntent {
+    port_id: String,
+    connection_hops: Vec<String>,
+    ordering: u64,
+    version: String,
+    timeout_period_ms: u64,
+    upgrade_sequence: u64,
+}
+
+impl ChannelUpgradeInitIntent {
+    fn matches(&self, data: &PlutusData) -> bool {
+        let Some(init) = constructor_fields(data, 0).filter(|f| f.len() == 2) else {
+            return false;
+        };
+        let Some(fields) = constructor_fields(&init[0], 0).filter(|f| f.len() == 3) else {
+            return false;
+        };
+        let PlutusData::Array(hops) = &fields[1] else {
+            return false;
+        };
+        // Aiken Order constructors are None, Unordered and Ordered, matching protobuf.
+        constructor_fields(&fields[0], self.ordering).is_some_and(|f| f.is_empty())
+            && hops.len() == self.connection_hops.len()
+            && hops
+                .iter()
+                .zip(&self.connection_hops)
+                .all(|(actual, expected)| plutus_bytes(actual) == Some(expected.as_bytes()))
+            && plutus_bytes(&fields[2]) == Some(self.version.as_bytes())
+            && plutus_u64(&init[1]) == Some(self.timeout_period_ms)
+    }
+
+    fn matches_state(&self, data: &PlutusData) -> bool {
+        let Some(datum) = constructor_fields(data, 0).filter(|f| f.len() == 3) else {
+            return false;
+        };
+        let Some(state) = constructor_fields(&datum[0], 0).filter(|f| f.len() == 10) else {
+            return false;
+        };
+        let Some(channel) = constructor_fields(&state[0], 0).filter(|f| f.len() == 6) else {
+            return false;
+        };
+        plutus_bytes(&datum[1]) == Some(self.port_id.as_bytes())
+            && plutus_u64(&channel[5]) == Some(self.upgrade_sequence)
+    }
 }
 
 impl ChannelUpgradeIntent {
     /// INIT and FLUSH share one operation; TRY to CONFIRM and OPEN to CANCEL
     /// have their own.
-    fn operation_script(self) -> &'static str {
+    fn operation_script(&self) -> &'static str {
         match self.step {
             1..=3 => "chanupgradehandshake",
             4..=6 => "chanupgradefinish",
@@ -318,7 +366,7 @@ enum ChannelRedeemerIntent<'a> {
     },
     OutboundTransfer(&'a TransferIntent),
     Prune(u64),
-    ChannelUpgrade(u64),
+    ChannelUpgrade(&'a ChannelUpgradeIntent),
 }
 
 impl ChannelRedeemerIntent<'_> {
@@ -386,11 +434,17 @@ impl ChannelRedeemerIntent<'_> {
             // ChanUpgrade(ChannelUpgradeRedeemer { step, channel_siblings,
             // upgrade_siblings, error_receipt_siblings }). The upgrade
             // operation checks the step's fields and the root witnesses.
-            Self::ChannelUpgrade(step) => constructor_fields(data, 11)
+            Self::ChannelUpgrade(upgrade) => constructor_fields(data, 11)
                 .filter(|fields| fields.len() == 1)
                 .and_then(|fields| constructor_fields(&fields[0], 0))
                 .filter(|fields| fields.len() == 4)
-                .is_some_and(|fields| constructor_fields(&fields[0], *step).is_some()),
+                .is_some_and(|fields| {
+                    constructor_fields(&fields[0], upgrade.step).is_some()
+                        && upgrade
+                            .init
+                            .as_ref()
+                            .is_none_or(|init| init.matches(&fields[0]))
+                }),
         }
     }
 }
@@ -811,6 +865,7 @@ impl TransactionSigningPolicy {
                 operation if operation.starts_with(CHANNEL_UPGRADE_TYPE_PREFIX) => {
                     let upgrade = intent
                         .channel_upgrade
+                        .as_ref()
                         .ok_or_else(|| format!("{operation} has no channel-upgrade step"))?;
                     let operation_script = upgrade.operation_script();
                     // The steps that prove the counterparty also mint verify-proof.
@@ -2503,7 +2558,8 @@ impl TransactionSigningPolicy {
                 .map(|redeemer| (&self.channel_state, redeemer)),
             operation if operation.starts_with(CHANNEL_UPGRADE_TYPE_PREFIX) => intent
                 .channel_upgrade
-                .map(|upgrade| ChannelRedeemerIntent::ChannelUpgrade(upgrade.step))
+                .as_ref()
+                .map(ChannelRedeemerIntent::ChannelUpgrade)
                 .map(|redeemer| (&self.channel_state, redeemer)),
             _ => None,
         };
@@ -2538,6 +2594,21 @@ impl TransactionSigningPolicy {
             return Err(reject(
                 "multiple inputs contain the message-selected protocol state token".to_string(),
             ));
+        }
+        if let Some(init) = intent
+            .channel_upgrade
+            .as_ref()
+            .and_then(|upgrade| upgrade.init.as_ref())
+        {
+            let datum = resolved_inputs.regular[state_input]
+                .inline_datum
+                .as_ref()
+                .ok_or_else(|| reject("upgrade input has no inline channel datum".to_string()))?;
+            let datum: PlutusData = minicbor::decode(datum)
+                .map_err(|_| reject("cannot decode upgrade input channel datum".to_string()))?;
+            if !init.matches_state(&datum) {
+                return Err(reject("upgrade channel identity or proposal sequence differs from the operator request".to_string()));
+            }
         }
         let actual = spend_redeemer_for_input(body, redeemers, state_input).map_err(reject)?;
         if !expected.matches(actual) {
@@ -3995,6 +4066,30 @@ impl SigningIntent {
                 channel_upgrade = Some(ChannelUpgradeIntent {
                     step: 0,
                     proven: false,
+                    init: Some({
+                        let fields = msg.fields.as_ref().ok_or_else(|| {
+                            Error::Signer("upgrade INIT fields are missing".to_string())
+                        })?;
+                        if !(1..=2).contains(&fields.ordering) || fields.connection_hops.is_empty()
+                        {
+                            return Err(Error::Signer(
+                                "invalid upgrade INIT ordering or connection hops".to_string(),
+                            ));
+                        }
+                        ChannelUpgradeInitIntent {
+                            port_id: msg.port_id.clone(),
+                            connection_hops: fields.connection_hops.clone(),
+                            ordering: fields.ordering as u64,
+                            version: fields.version.clone(),
+                            timeout_period_ms: msg.timeout_period_ms,
+                            upgrade_sequence: msg.expected_upgrade_sequence.ok_or_else(|| {
+                                Error::Signer(
+                                    "upgrade INIT requires the expected upgrade sequence"
+                                        .to_string(),
+                                )
+                            })?,
+                        }
+                    }),
                 });
                 msg.signer
             }
@@ -4004,6 +4099,7 @@ impl SigningIntent {
                 channel_upgrade = Some(ChannelUpgradeIntent {
                     step: 1,
                     proven: true,
+                    init: None,
                 });
                 msg.signer
             }
@@ -4013,6 +4109,7 @@ impl SigningIntent {
                 channel_upgrade = Some(ChannelUpgradeIntent {
                     step: 2,
                     proven: true,
+                    init: None,
                 });
                 msg.signer
             }
@@ -4022,6 +4119,7 @@ impl SigningIntent {
                 channel_upgrade = Some(ChannelUpgradeIntent {
                     step: 3,
                     proven: true,
+                    init: None,
                 });
                 msg.signer
             }
@@ -4031,6 +4129,7 @@ impl SigningIntent {
                 channel_upgrade = Some(ChannelUpgradeIntent {
                     step: 4,
                     proven: true,
+                    init: None,
                 });
                 msg.signer
             }
@@ -4040,6 +4139,7 @@ impl SigningIntent {
                 channel_upgrade = Some(ChannelUpgradeIntent {
                     step: 5,
                     proven: true,
+                    init: None,
                 });
                 msg.signer
             }
@@ -4050,6 +4150,7 @@ impl SigningIntent {
                 channel_upgrade = Some(ChannelUpgradeIntent {
                     step: 6,
                     proven: !msg.proof_error_receipt.is_empty(),
+                    init: None,
                 });
                 msg.signer
             }
@@ -4059,6 +4160,7 @@ impl SigningIntent {
                 channel_upgrade = Some(ChannelUpgradeIntent {
                     step: 7,
                     proven: false,
+                    init: None,
                 });
                 msg.signer
             }
@@ -5590,7 +5692,11 @@ mod tests {
 
     fn data_constructor(alternative: u64, fields: Vec<PlutusData>) -> PlutusData {
         PlutusData::Constr(pallas_primitives::alonzo::Constr {
-            tag: 121 + alternative,
+            tag: if alternative < 7 {
+                121 + alternative
+            } else {
+                1280 + alternative - 7
+            },
             any_constructor: None,
             fields,
         })
@@ -7904,7 +8010,11 @@ mod tests {
         let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
         let requirements = |type_url: &str, step: u64, proven: bool| {
             let mut intent = bare_intent(type_url, None);
-            intent.channel_upgrade = Some(ChannelUpgradeIntent { step, proven });
+            intent.channel_upgrade = Some(ChannelUpgradeIntent {
+                step,
+                proven,
+                init: None,
+            });
             policy.operation_requirements(&intent).unwrap()
         };
 
@@ -7962,7 +8072,8 @@ mod tests {
             proven.channel_upgrade,
             Some(ChannelUpgradeIntent {
                 step: 6,
-                proven: true
+                proven: true,
+                ..
             })
         ));
         let authority = SigningIntent::ibc(type_url, &cancel(vec![]), &signer, 0).unwrap();
@@ -7970,7 +8081,8 @@ mod tests {
             authority.channel_upgrade,
             Some(ChannelUpgradeIntent {
                 step: 6,
-                proven: false
+                proven: false,
+                ..
             })
         ));
 
@@ -7990,6 +8102,97 @@ mod tests {
     }
 
     #[test]
+    fn channel_upgrade_init_binds_each_operator_field() {
+        let signer = format!("60{}", "99".repeat(28));
+        let message = MsgChannelUpgradeInit {
+            port_id: "transfer".into(),
+            channel_id: "channel-3".into(),
+            fields: Some(
+                super::super::generated::ibc::core::channel::v1::UpgradeFields {
+                    ordering: 1,
+                    connection_hops: vec!["connection-1".into()],
+                    version: "ics20-1".into(),
+                },
+            ),
+            timeout_period_ms: 3_600_000,
+            expected_upgrade_sequence: Some(4),
+            signer: signer.clone(),
+        };
+        let intent = SigningIntent::ibc(
+            "/ibc.core.channel.v1.MsgChannelUpgradeInit",
+            &message.encode_to_vec(),
+            &signer,
+            0,
+        )
+        .unwrap();
+        assert_eq!(intent.state_sequence, Some(3));
+        let upgrade = intent.channel_upgrade.unwrap();
+        let init = upgrade.init.as_ref().unwrap();
+        let bytes = |value: &str| PlutusData::BoundedBytes(value.as_bytes().to_vec().into());
+        let integer = |value: i64| PlutusData::BigInt(BigInt::Int(value.into()));
+        let fields = |ordering, hops: Vec<&str>, version| {
+            data_constructor(
+                0,
+                vec![
+                    data_constructor(ordering, vec![]),
+                    PlutusData::Array(hops.into_iter().map(bytes).collect()),
+                    bytes(version),
+                ],
+            )
+        };
+        let redeemer = |fields, timeout| {
+            data_constructor(
+                11,
+                vec![data_constructor(
+                    0,
+                    vec![
+                        data_constructor(0, vec![fields, integer(timeout)]),
+                        PlutusData::Array(vec![]),
+                        PlutusData::Array(vec![]),
+                        PlutusData::Array(vec![]),
+                    ],
+                )],
+            )
+        };
+        let expected = ChannelRedeemerIntent::ChannelUpgrade(&upgrade);
+        assert!(expected.matches(&redeemer(
+            fields(1, vec!["connection-1"], "ics20-1"),
+            3_600_000
+        )));
+        for changed in [
+            redeemer(fields(1, vec!["connection-2"], "ics20-1"), 3_600_000),
+            redeemer(
+                fields(1, vec!["connection-1", "connection-2"], "ics20-1"),
+                3_600_000,
+            ),
+            redeemer(fields(2, vec!["connection-1"], "ics20-1"), 3_600_000),
+            redeemer(fields(1, vec!["connection-1"], "ics20-2"), 3_600_000),
+            redeemer(fields(1, vec!["connection-1"], "ics20-1"), 3_600_001),
+        ] {
+            assert!(!expected.matches(&changed));
+        }
+        let datum = |port, sequence| {
+            let mut channel = vec![integer(0); 6];
+            channel[5] = integer(sequence);
+            let mut state = vec![integer(0); 10];
+            state[0] = data_constructor(0, channel);
+            data_constructor(0, vec![data_constructor(0, state), bytes(port), integer(0)])
+        };
+        assert!(init.matches_state(&datum("transfer", 4)));
+        assert!(!init.matches_state(&datum("mock", 4)));
+        assert!(!init.matches_state(&datum("transfer", 5)));
+        let mut missing_sequence = message;
+        missing_sequence.expected_upgrade_sequence = None;
+        assert!(SigningIntent::ibc(
+            "/ibc.core.channel.v1.MsgChannelUpgradeInit",
+            &missing_sequence.encode_to_vec(),
+            &signer,
+            0
+        )
+        .is_err());
+    }
+
+    #[test]
     fn channel_upgrade_redeemer_binds_the_gateway_step() {
         // SpendChannelRedeemer bytes pinned in the Gateway's redeemer regression
         // tests: ChanUpgrade with InitUpgrade and with FlushUpgrade.
@@ -7999,9 +8202,30 @@ mod tests {
         let init = decode("d9050481d87984d87982d87983d87a80814c636f6e6e656374696f6e2d314769637332302d311a0036ee808141aa8080");
         let flush = decode("d9050481d87984d905008104808080");
 
-        assert!(ChannelRedeemerIntent::ChannelUpgrade(0).matches(&init));
-        assert!(!ChannelRedeemerIntent::ChannelUpgrade(7).matches(&init));
-        assert!(ChannelRedeemerIntent::ChannelUpgrade(7).matches(&flush));
+        assert!(
+            ChannelRedeemerIntent::ChannelUpgrade(&ChannelUpgradeIntent {
+                step: 0,
+                proven: false,
+                init: None
+            })
+            .matches(&init)
+        );
+        assert!(
+            !ChannelRedeemerIntent::ChannelUpgrade(&ChannelUpgradeIntent {
+                step: 7,
+                proven: false,
+                init: None
+            })
+            .matches(&init)
+        );
+        assert!(
+            ChannelRedeemerIntent::ChannelUpgrade(&ChannelUpgradeIntent {
+                step: 7,
+                proven: false,
+                init: None
+            })
+            .matches(&flush)
+        );
         assert!(!ChannelRedeemerIntent::Constructor(10).matches(&flush));
     }
 
