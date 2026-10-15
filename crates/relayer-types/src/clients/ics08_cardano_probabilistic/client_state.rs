@@ -85,8 +85,8 @@ impl Ics2ClientState for ClientState {
         self.frozen_height
     }
 
-    fn expired(&self, _elapsed: Duration) -> bool {
-        false
+    fn expired(&self, elapsed: Duration) -> bool {
+        elapsed >= self.trusting_period
     }
 }
 

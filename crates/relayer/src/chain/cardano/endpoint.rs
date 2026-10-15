@@ -2005,6 +2005,23 @@ impl ChainEndpoint for CardanoChainEndpoint {
             .map_err(|e| Error::query(format!("invalid commitment prefix for Cardano: {e}")))
     }
 
+    fn build_client_maintenance_header(
+        &mut self,
+        client_state: &AnyClientState,
+    ) -> Result<Option<AnyHeader>, Error> {
+        let AnyClientState::Probabilistic(state) = client_state else {
+            return Ok(None);
+        };
+        let mut header = self
+            .rt
+            .block_on(self.gateway_client.query_maintenance_header(state))
+            .map_err(|error| {
+                Error::query(format!("Gateway checkpoint maintenance failed: {error}"))
+            })?;
+        bind_probabilistic_pool_metadata(&mut header, client_state)?;
+        Ok(Some(header))
+    }
+
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
         tracing::debug!("Querying Cardano application status via Gateway");
 

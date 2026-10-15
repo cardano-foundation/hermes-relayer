@@ -900,6 +900,10 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             ));
         }
 
+        if matches!(client_state, AnyClientState::Probabilistic(_)) {
+            return self.validated_probabilistic_client_state();
+        }
+
         match self
             .check_consensus_state_trusting_period(&client_state, &client_state.latest_height())?
         {
@@ -924,6 +928,91 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             }
             ConsensusStateTrusted::Trusted { elapsed } => Ok((client_state, Some(elapsed))),
         }
+    }
+
+    fn validated_probabilistic_client_state(
+        &self,
+    ) -> Result<(AnyClientState, Option<Duration>), ForeignClientError> {
+        let query_error = |error| {
+            ForeignClientError::client_refresh(
+                self.id.clone(),
+                "failed querying committed destination freshness".to_owned(),
+                error,
+            )
+        };
+        let committed = self
+            .dst_chain
+            .query_application_status()
+            .map_err(query_error)?;
+        let (client, _) = self
+            .dst_chain
+            .query_client_state(
+                QueryClientStateRequest {
+                    client_id: self.id.clone(),
+                    height: QueryHeight::Specific(committed.height),
+                },
+                IncludeProof::No,
+            )
+            .map_err(query_error)?;
+        let AnyClientState::Probabilistic(state) = &client else {
+            return Err(query_error(RelayerError::query(
+                "destination changed client type".to_owned(),
+            )));
+        };
+        let checkpoint_time = if state.latest_checkpoint_timestamp != 0 {
+            let derived = state
+                .latest_checkpoint_slot
+                .checked_mul(state.slot_length_ns)
+                .and_then(|offset| state.system_start_unix_ns.checked_add(offset));
+            if state.latest_checkpoint_height.is_none()
+                || derived != Some(state.latest_checkpoint_timestamp)
+            {
+                return Err(query_error(RelayerError::query(
+                    "invalid authenticated checkpoint timestamp".to_owned(),
+                )));
+            }
+            Timestamp::from_nanoseconds(state.latest_checkpoint_timestamp)
+                .map_err(|error| query_error(RelayerError::query(error.to_string())))?
+        } else {
+            if state.latest_verified_height() != state.latest_height
+                || state.latest_checkpoint_slot != 0
+            {
+                return Err(query_error(RelayerError::query(
+                    "rootless legacy checkpoint requires a timestamp migration".to_owned(),
+                )));
+            }
+            self.fetch_consensus_state(state.latest_height)?.timestamp()
+        };
+        let elapsed = committed
+            .timestamp
+            .duration_since(&checkpoint_time)
+            .unwrap_or_default();
+        let status = self
+            .dst_chain
+            .query_client_status(self.id.clone(), QueryHeight::Specific(committed.height))
+            .map_err(query_error)?;
+        let frozen = state.frozen_height.is_some() || status.as_deref() == Some("Frozen");
+        let active = match status.as_deref() {
+            Some("Active") => true,
+            None => !client.expired(elapsed),
+            Some(_) => false,
+        };
+        if frozen || !active {
+            return Err(ForeignClientError::expired_or_frozen(
+                if frozen {
+                    ExpiredOrFrozen::Frozen
+                } else {
+                    ExpiredOrFrozen::Expired
+                },
+                self.id.clone(),
+                self.dst_chain.id(),
+                format!(
+                    "destination client status {:?}, checkpoint elapsed {elapsed:?}",
+                    status
+                ),
+            ));
+        }
+        Ok((client, Some(elapsed)))
     }
 
     /// Verifies if the consensus state at given [`Height`]
@@ -1059,16 +1148,82 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         match (elapsed, refresh_period) {
             (None, _) => Ok(None),
             (Some(elapsed), refresh_period) => {
-                if elapsed > refresh_period {
+                let refresh_period = if matches!(client_state, AnyClientState::Probabilistic(_)) {
+                    // Start well before expiry to leave room for bounded history,
+                    // epoch response windows, retries and destination inclusion.
+                    refresh_period.min(client_state.trusting_period() / 3)
+                } else {
+                    refresh_period
+                };
+                if elapsed >= refresh_period {
                     info!(?elapsed, ?refresh_period, "client needs to be refreshed");
 
-                    self.build_latest_update_client_and_send()
-                        .map_or_else(Err, |ev| Ok(Some(ev)))
+                    if matches!(client_state, AnyClientState::Probabilistic(_)) {
+                        self.refresh_probabilistic_checkpoint().map(Some)
+                    } else {
+                        self.build_latest_update_client_and_send().map(Some)
+                    }
                 } else {
                     Ok(None)
                 }
             }
         }
+    }
+
+    fn refresh_probabilistic_checkpoint(&self) -> Result<Vec<IbcEvent>, ForeignClientError> {
+        let before = self.validated_client_state()?.0;
+        let header = self
+            .src_chain
+            .build_client_maintenance_header(&before)
+            .map_err(|error| {
+                ForeignClientError::checkpoint_update(self.dst_chain.id(), error.to_string())
+            })?
+            .ok_or_else(|| {
+                ForeignClientError::checkpoint_update(
+                    self.dst_chain.id(),
+                    "source does not support checkpoint maintenance".to_owned(),
+                )
+            })?;
+        let signer = self.dst_chain.get_signer().map_err(|error| {
+            ForeignClientError::checkpoint_update(self.dst_chain.id(), error.to_string())
+        })?;
+        let message = MsgUpdateClient {
+            client_id: self.id.clone(),
+            header: header.into(),
+            signer,
+        }
+        .to_any();
+        if !is_probabilistic_checkpoint_update(&message)
+            .map_err(|error| ForeignClientError::checkpoint_update(self.dst_chain.id(), error))?
+        {
+            return Err(ForeignClientError::checkpoint_update(
+                self.dst_chain.id(),
+                "maintenance must return a rootless checkpoint".to_owned(),
+            ));
+        }
+        let events = self
+            .dst_chain
+            .send_messages_and_wait_commit(TrackedMsgs::new_single(
+                message.clone(),
+                "checkpoint maintenance",
+            ))
+            .map_err(|error| {
+                ForeignClientError::checkpoint_update(self.dst_chain.id(), error.to_string())
+            })?;
+        let after = self.validated_client_state()?.0;
+        let proposed = crate::chain::cardano::checkpoint::committed_cross_epoch_proposal(
+            &before, &after, &message,
+        )
+        .map_err(|error| ForeignClientError::checkpoint_update(self.dst_chain.id(), error))?;
+        if after.latest_verified_height() <= before.latest_verified_height() && !proposed {
+            return Err(ForeignClientError::checkpoint_update(
+                self.dst_chain.id(),
+                "maintenance did not commit checkpoint progress".to_owned(),
+            ));
+        }
+        // A proposal may start a response window. It does not renew the clock,
+        // so the normal worker will retry from committed destination state.
+        Ok(events.into_iter().map(|event| event.event).collect())
     }
 
     /// Wrapper for build_update_client_with_trusted.
@@ -2611,7 +2766,7 @@ mod tests {
             slots_per_kes_period: 100,
             current_epoch_start_slot: 1,
             current_epoch_end_slot_exclusive: 1_000,
-            system_start_unix_ns: 1,
+            system_start_unix_ns: 50_000_000_000,
             slot_length_ns: 1_000_000_000,
             epoch_contexts: vec![],
             latest_checkpoint_height: Some(height(50)),
@@ -2682,6 +2837,16 @@ mod tests {
             let mut requests = ProofPreparationRequests::default();
             for (_, request) in destination_receiver {
                 match request {
+                    ChainRequest::QueryApplicationStatus { reply_to } => {
+                        requests.application_status_queries += 1;
+                        reply_to.send(Ok(ChainStatus {
+                            height: height(60),
+                            timestamp: Timestamp::from_nanoseconds(110_000_000_000).unwrap(),
+                        })).unwrap();
+                    }
+                    ChainRequest::QueryClientStatus { reply_to, .. } => {
+                        reply_to.send(Ok(Some("Active".to_owned()))).unwrap();
+                    }
                     ChainRequest::QueryConsensusState {
                         request, reply_to, ..
                     } => {
@@ -2741,9 +2906,9 @@ mod tests {
 
         assert!(result.expect("the exact proof root exists").is_empty());
         // Challenge checks also revalidate the client before and after preparing updates.
-        assert_eq!(destination.consensus_heights, vec![height(33); 4]);
-        assert_eq!(destination.client_state_queries, 2);
-        assert_eq!(source.application_status_queries, 2);
+        assert_eq!(destination.consensus_heights, vec![height(33); 2]);
+        assert_eq!(destination.client_state_queries, 4);
+        assert_eq!(source.application_status_queries, 0);
         assert_eq!(source.submissions + destination.submissions, 0);
     }
 
@@ -2760,10 +2925,10 @@ mod tests {
             .contains("a checkpoint cursor is insufficient"));
         assert_eq!(
             destination.consensus_heights,
-            vec![height(10), height(33), height(10), height(10), height(33)]
+            vec![height(33), height(33)]
         );
-        assert_eq!(destination.client_state_queries, 3);
-        assert_eq!(source.application_status_queries, 4);
+        assert_eq!(destination.client_state_queries, 6);
+        assert!(source.application_status_queries <= 1);
         assert_eq!(source.submissions + destination.submissions, 0);
     }
 
