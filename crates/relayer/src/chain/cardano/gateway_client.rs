@@ -634,7 +634,7 @@ impl GatewayClient {
     pub async fn query_maintenance_header(
         &self,
         state: &ibc_relayer_types::clients::ics08_cardano_probabilistic::client_state::ClientState,
-    ) -> Result<AnyHeader, Error> {
+    ) -> Result<Option<AnyHeader>, Error> {
         use super::generated::ibc::core::types::v1::{
             query_client::QueryClient, QueryIbcHeaderRequest,
         };
@@ -651,14 +651,15 @@ impl GatewayClient {
             })
             .await?
             .into_inner();
-        let header = response
-            .header
-            .ok_or_else(|| Error::Query("No maintenance header in response".to_owned()))?;
+        let Some(header) = response.header else {
+            return Ok(None);
+        };
         ProtoAny {
             type_url: header.type_url,
             value: header.value,
         }
         .try_into()
+        .map(Some)
         .map_err(
             |error: ibc_relayer_types::core::ics02_client::error::Error| {
                 Error::Ibc(error.to_string())

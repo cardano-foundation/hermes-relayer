@@ -12,7 +12,7 @@ use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentRoot;
 use ibc_relayer_types::signer::Signer;
 use prost::Message;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -22,6 +22,7 @@ struct Harness {
     state: Arc<Mutex<ClientState>>,
     now: Arc<AtomicU64>,
     commits: Arc<AtomicU64>,
+    source_ready: Arc<AtomicBool>,
     proof_queries: Arc<AtomicU64>,
     source_queries: Arc<AtomicU64>,
     threads: Vec<thread::JoinHandle<()>>,
@@ -45,6 +46,8 @@ impl Harness {
         ));
         let proof_time = state.lock().unwrap().latest_checkpoint_timestamp - 120_000_000_000;
         let commits = Arc::new(AtomicU64::new(0));
+        let source_ready = Arc::new(AtomicBool::new(true));
+        let available = source_ready.clone();
         let proof_queries = Arc::new(AtomicU64::new(0));
         let source_queries = Arc::new(AtomicU64::new(0));
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -64,6 +67,10 @@ impl Harness {
                         client_state,
                         reply_to,
                     } => {
+                        if !available.load(Ordering::SeqCst) {
+                            reply_to.send(Ok(None)).unwrap();
+                            continue;
+                        }
                         let AnyClientState::Probabilistic(client) = client_state else {
                             panic!("wrong client type")
                         };
@@ -208,6 +215,7 @@ impl Harness {
             state,
             now,
             commits,
+            source_ready,
             proof_queries,
             source_queries,
             threads: vec![source_thread, destination_thread],
@@ -326,5 +334,19 @@ fn refresh_worker_stops_when_the_checkpoint_expires() {
     }
     worker.join();
     assert_eq!(h.commits.load(Ordering::SeqCst), 0);
+    h.close();
+}
+
+#[test]
+fn awaiting_source_settlement_is_not_a_renewal_or_a_retry_failure() {
+    let h = Harness::new(true, true);
+    h.source_ready.store(false, Ordering::SeqCst);
+    let before = h.state.lock().unwrap().latest_checkpoint_timestamp;
+    assert_eq!(h.client().refresh().unwrap(), Some(vec![]));
+    assert_eq!(h.state.lock().unwrap().latest_checkpoint_timestamp, before);
+    assert_eq!(h.commits.load(Ordering::SeqCst), 0);
+    h.source_ready.store(true, Ordering::SeqCst);
+    h.client().refresh().unwrap();
+    assert_eq!(h.commits.load(Ordering::SeqCst), 1);
     h.close();
 }

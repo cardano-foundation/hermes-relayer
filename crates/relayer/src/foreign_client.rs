@@ -1279,13 +1279,12 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             .build_client_maintenance_header(&evidence)
             .map_err(|error| {
                 ForeignClientError::checkpoint_update(self.dst_chain.id(), error.to_string())
-            })?
-            .ok_or_else(|| {
-                ForeignClientError::checkpoint_update(
-                    self.dst_chain.id(),
-                    "source does not support checkpoint maintenance".to_owned(),
-                )
             })?;
+        let Some(header) = header else {
+            // Source settlement may not yet have produced a newer checkpoint.
+            // Keep the normal polling cadence without counting this as renewal.
+            return Ok(vec![]);
+        };
         if let (
             AnyClientState::Probabilistic(client),
             ibc_relayer_types::core::ics02_client::header::AnyHeader::Probabilistic(checkpoint),

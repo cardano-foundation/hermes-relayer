@@ -2012,12 +2012,15 @@ impl ChainEndpoint for CardanoChainEndpoint {
         let AnyClientState::Probabilistic(state) = client_state else {
             return Ok(None);
         };
-        let mut header = self
+        let header = self
             .rt
             .block_on(self.gateway_client.query_maintenance_header(state))
             .map_err(|error| {
                 Error::query(format!("Gateway checkpoint maintenance failed: {error}"))
             })?;
+        let Some(mut header) = header else {
+            return Ok(None);
+        };
         bind_probabilistic_pool_metadata(&mut header, client_state)?;
         Ok(Some(header))
     }
