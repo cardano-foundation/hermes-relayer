@@ -249,6 +249,17 @@ pub trait ChainEndpoint: Sized {
 
     /// Performs a query to retrieve the state of the specified light client. A
     /// proof can optionally be returned along with the result.
+    fn query_probabilistic_verification(
+        &self,
+        request:ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,
+        height: QueryHeight,
+    ) -> Result<Vec<u8>, Error> {
+        let _ = (request, height);
+        Err(Error::query(
+            "Destination has no compact verification query".to_owned(),
+        ))
+    }
+
     fn query_client_state(
         &self,
         request: QueryClientStateRequest,

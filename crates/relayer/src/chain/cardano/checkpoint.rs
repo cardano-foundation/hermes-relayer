@@ -1,3 +1,18 @@
+use std::time::Duration;
+
+/// Reserve the enforced maximum work at ten seconds per inclusion, source
+/// settlement lookahead and a retry allowance before the checkpoint expires.
+/// Compact activation additionally needs its full twelve-hour response window.
+/// A shorter configured lifetime makes maintenance immediately due.
+pub(crate) fn maintenance_budget(storage_version: u32) -> Duration {
+    let response = if storage_version == 2 {
+        12 * 60 * 60
+    } else {
+        180
+    };
+    Duration::from_secs(4096 * 10 + 128 * 20 + 30 * 60 + response + 10)
+}
+
 use ibc_proto::google::protobuf::Any;
 use ibc_proto::ibc::core::client::v1::MsgUpdateClient as RawMsgUpdateClient;
 use ibc_relayer_types::clients::ics08_cardano_probabilistic::header::PROBABILISTIC_HEADER_TYPE_URL;

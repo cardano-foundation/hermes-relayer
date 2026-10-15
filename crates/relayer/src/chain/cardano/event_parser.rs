@@ -917,6 +917,7 @@ mod tests {
             bridge_blocks: vec![],
             new_epoch_context: None,
             is_checkpoint: false,
+            observation_chunk: None,
         }
     }
 

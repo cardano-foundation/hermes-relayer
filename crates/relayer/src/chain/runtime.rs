@@ -259,6 +259,10 @@ where
                             reply_to.send(result).map_err(Error::send)?;
                         },
 
+                        ChainRequest::QueryProbabilisticVerification{request,height,reply_to}=>{
+                            let result=self.chain.query_probabilistic_verification(request,height);
+                            reply_to.send(result).map_err(Error::send)?;
+                        },
                         ChainRequest::QueryClientState { request, include_proof, reply_to } => {
                             self.query_client_state(request, include_proof, reply_to)?
                         },

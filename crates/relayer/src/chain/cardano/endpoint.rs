@@ -3984,6 +3984,8 @@ pub(super) fn cardano_misbehaviour_evidence(
                 client_id: update.client_id().clone(),
                 header1,
                 header2,
+                verified_observation_1:vec![],
+                verified_observation_2:vec![],
             })
         }
         (AnyHeader::Tendermint(_), _) => {
@@ -5260,6 +5262,12 @@ mod tests {
             latest_checkpoint_settlement_credit: None,
             latest_checkpoint_pool_production: None,
             randomness_stabilisation_window_slots: 0,
+            storage_version: 0,
+            verification_generation: 0,
+            checkpoint_reference: vec![],
+            storage_namespace: vec![],
+            bootstrap_objects: vec![],
+            bootstrap_pending: false,
         })
     }
 
@@ -5294,6 +5302,7 @@ mod tests {
             host_state_tx_output_index: 0,
             new_epoch_context: None,
             is_checkpoint: false,
+            observation_chunk: None,
         }
     }
 

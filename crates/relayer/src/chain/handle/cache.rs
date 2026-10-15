@@ -202,6 +202,15 @@ impl<Handle: ChainHandle> ChainHandle for CachingChainHandle<Handle> {
     }
 
     // TODO: Introduce new query_client_state_latest to separate from this one.
+    fn query_probabilistic_verification(
+        &self,
+        request:ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,
+        height: QueryHeight,
+    ) -> Result<Vec<u8>, Error> {
+        self.inner()
+            .query_probabilistic_verification(request, height)
+    }
+
     fn query_client_state(
         &self,
         request: QueryClientStateRequest,
