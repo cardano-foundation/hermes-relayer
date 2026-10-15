@@ -1,5 +1,6 @@
 use core::fmt::{Display, Error as FmtError, Formatter};
 use core::time::Duration;
+use ibc_relayer_types::core::ics02_client::client_state::ClientState as _;
 
 use ibc_proto::google::protobuf::Any;
 use serde::Serialize;
@@ -36,8 +37,9 @@ use crate::chain::cardano::generated::ibc::core::channel::v1::MsgChannelUpgradeF
 use crate::chain::counterparty::{channel_connection_client, channel_state_on_destination};
 use crate::chain::handle::ChainHandle;
 use crate::chain::requests::{
-    IncludeProof, PageRequest, QueryChannelRequest, QueryConnectionChannelsRequest,
-    QueryConnectionRequest, QueryHeight,
+    IncludeProof, PageRequest, QueryChannelRequest, QueryClientStateRequest,
+    QueryConnectionChannelsRequest, QueryConnectionRequest, QueryConsensusStateRequest,
+    QueryHeight,
 };
 use crate::chain::tracking::TrackedMsgs;
 use crate::config::ChainConfig;
@@ -1628,6 +1630,47 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Channel<ChainA, ChainB> {
         }
     }
 
+    fn require_replacement_clients_ready(
+        &self,
+        src_hop: &ConnectionId,
+        dst_hop: &ConnectionId,
+    ) -> Result<(), ChannelError> {
+        let (src, _) = self
+            .src_chain()
+            .query_connection(
+                QueryConnectionRequest {
+                    connection_id: src_hop.clone(),
+                    height: QueryHeight::Latest,
+                },
+                IncludeProof::No,
+            )
+            .map_err(|e| ChannelError::query(self.src_chain().id(), e))?;
+        let (dst, _) = self
+            .dst_chain()
+            .query_connection(
+                QueryConnectionRequest {
+                    connection_id: dst_hop.clone(),
+                    height: QueryHeight::Latest,
+                },
+                IncludeProof::No,
+            )
+            .map_err(|e| ChannelError::query(self.dst_chain().id(), e))?;
+        use ibc_relayer_types::core::ics03_connection::connection::State as ConnectionState;
+        if src.state() != &ConnectionState::Open
+            || dst.state() != &ConnectionState::Open
+            || src.counterparty().connection_id() != Some(dst_hop)
+            || dst.counterparty().connection_id() != Some(src_hop)
+            || src.counterparty().client_id() != dst.client_id()
+            || dst.counterparty().client_id() != src.client_id()
+        {
+            return Err(ChannelError::tx_response(
+                "replacement connections are not an open reciprocal pair".into(),
+            ));
+        }
+        require_upgrade_client_ready(self.src_chain(), self.dst_chain(), src.client_id())?;
+        require_upgrade_client_ready(self.dst_chain(), self.src_chain(), dst.client_id())
+    }
+
     pub fn build_chan_upgrade_try(&self) -> Result<Vec<Any>, ChannelError> {
         let src_channel_id = self
             .src_channel_id()
@@ -1706,6 +1749,11 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Channel<ChainA, ChainB> {
             .connection_id()
             .cloned()
             .ok_or_else(ChannelError::missing_counterparty_connection)?];
+
+        self.require_replacement_clients_ready(
+            src_upgrade_connection,
+            &proposed_upgrade_connection_hops[0],
+        )?;
 
         if !matches!(channel_end.state, State::Open(_)) {
             return Err(ChannelError::invalid_channel_upgrade_state(
@@ -2048,6 +2096,49 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Channel<ChainA, ChainB> {
             )
             .map_err(|e| ChannelError::query(self.src_chain().id(), e))?;
 
+        // Before the first side opens, both replacement clients must still
+        // be usable. Once one side opened, finish the handover and retain its
+        // proposal even if a replacement subsequently expires or freezes.
+        if !src_channel_end.is_open() {
+            let dst_height = self
+                .dst_chain()
+                .query_latest_height()
+                .map_err(|e| ChannelError::query(self.dst_chain().id(), e))?;
+            let (src_upgrade, _) = self
+                .src_chain()
+                .query_upgrade(
+                    QueryUpgradeRequest {
+                        port_id: src_port_id.to_string(),
+                        channel_id: src_channel_id.to_string(),
+                    },
+                    src_latest_height,
+                    IncludeProof::No,
+                )
+                .map_err(|e| ChannelError::query(self.src_chain().id(), e))?;
+            let (dst_upgrade, _) = self
+                .dst_chain()
+                .query_upgrade(
+                    QueryUpgradeRequest {
+                        port_id: dst_port_id.to_string(),
+                        channel_id: dst_channel_id.to_string(),
+                    },
+                    dst_height,
+                    IncludeProof::No,
+                )
+                .map_err(|e| ChannelError::query(self.dst_chain().id(), e))?;
+            let src_hop = src_upgrade
+                .fields
+                .connection_hops()
+                .first()
+                .ok_or_else(ChannelError::missing_counterparty_connection)?;
+            let dst_hop = dst_upgrade
+                .fields
+                .connection_hops()
+                .first()
+                .ok_or_else(ChannelError::missing_counterparty_connection)?;
+            self.require_replacement_clients_ready(src_hop, dst_hop)?;
+        }
+
         let counterparty_upgrade_sequence = src_channel_end.upgrade_sequence;
 
         // Building the channel proof at the queried height
@@ -2356,6 +2447,46 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Channel<ChainA, ChainB> {
             Ok(Some(self.build_chan_upgrade_open_and_send()?))
         }
     }
+}
+
+fn require_upgrade_client_ready<Host: ChainHandle, CounterpartyChain: ChainHandle>(
+    host: &Host,
+    counterparty: &CounterpartyChain,
+    client_id: &ClientId,
+) -> Result<(), ChannelError> {
+    let status = host
+        .query_application_status()
+        .map_err(|e| ChannelError::query(host.id(), e))?;
+    let (client, _) = host
+        .query_client_state(
+            QueryClientStateRequest {
+                client_id: client_id.clone(),
+                height: QueryHeight::Specific(status.height),
+            },
+            IncludeProof::No,
+        )
+        .map_err(|e| ChannelError::query(host.id(), e))?;
+    let (consensus, _) = host
+        .query_consensus_state(
+            QueryConsensusStateRequest {
+                client_id: client_id.clone(),
+                consensus_height: client.latest_height(),
+                query_height: QueryHeight::Specific(status.height),
+            },
+            IncludeProof::No,
+        )
+        .map_err(|e| ChannelError::query(host.id(), e))?;
+    let elapsed = status
+        .timestamp
+        .duration_since(&consensus.timestamp())
+        .unwrap_or_default();
+    if client.chain_id() != counterparty.id() || client.is_frozen() || client.expired(elapsed) {
+        return Err(ChannelError::tx_response(format!(
+            "replacement client {client_id} on {} is frozen, expired or tracks a different chain",
+            host.id()
+        )));
+    }
+    Ok(())
 }
 
 pub fn extract_channel_id(event: &IbcEvent) -> Result<&ChannelId, ChannelError> {
