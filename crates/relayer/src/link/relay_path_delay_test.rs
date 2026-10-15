@@ -49,7 +49,7 @@ fn cardano_client() -> AnyClientState {
         slots_per_kes_period: 100,
         current_epoch_start_slot: 1,
         current_epoch_end_slot_exclusive: 1_000,
-        system_start_unix_ns: 1,
+        system_start_unix_ns: 50_000_000_000,
         slot_length_ns: 1_000_000_000,
         epoch_contexts: vec![],
         latest_checkpoint_height: Some(height(50)),
@@ -81,6 +81,9 @@ fn runtime(config: ChainConfig) -> (BaseChainHandle, thread::JoinHandle<Vec<Heig
                             timestamp: Timestamp::from_nanoseconds(110_000_000_000).unwrap(),
                         }))
                         .unwrap();
+                }
+                ChainRequest::QueryClientStatus { reply_to, .. } => {
+                    reply_to.send(Ok(None)).unwrap();
                 }
                 ChainRequest::QueryClientState { reply_to, .. } => {
                     reply_to.send(Ok((cardano_client(), None))).unwrap();

@@ -1334,6 +1334,28 @@ impl ChainEndpoint for CosmosSdkChain {
         })
     }
 
+    fn query_client_status(
+        &self,
+        client_id: ClientId,
+        height: QueryHeight,
+    ) -> Result<Option<String>, Error> {
+        use ibc_proto::ibc::core::client::v1::{
+            query_client::QueryClient, QueryClientStatusRequest,
+        };
+        let mut client = self.block_on(create_grpc_client(&self.grpc_addr, QueryClient::new))?;
+        let mut request = tonic::Request::new(QueryClientStatusRequest {
+            client_id: client_id.to_string(),
+        });
+        request
+            .metadata_mut()
+            .insert("x-cosmos-block-height", height.try_into()?);
+        match self.block_on(client.client_status(request)) {
+            Ok(response) => Ok(Some(response.into_inner().status)),
+            Err(status) if status.code() == tonic::Code::Unimplemented => Ok(None),
+            Err(status) => Err(Error::grpc_status(status, "query_client_status".to_owned())),
+        }
+    }
+
     fn query_probabilistic_verification(
         &self,
         request:ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,

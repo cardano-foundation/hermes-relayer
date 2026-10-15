@@ -168,6 +168,17 @@ pub enum ChainRequest {
         reply_to: ReplyTo<DenomTrace>,
     },
 
+    QueryClientStatus {
+        client_id: ClientId,
+        height: QueryHeight,
+        reply_to: ReplyTo<Option<String>>,
+    },
+
+    BuildClientMaintenanceHeader {
+        client_state: AnyClientState,
+        reply_to: ReplyTo<Option<AnyHeader>>,
+    },
+
     QueryApplicationStatus {
         reply_to: ReplyTo<ChainStatus>,
     },
@@ -472,6 +483,24 @@ pub trait ChainHandle: Clone + Display + Send + Sync + Debug + 'static {
 
     /// Query the denomination trace given a trace hash.
     fn query_denom_trace(&self, hash: String) -> Result<DenomTrace, Error>;
+
+    /// Query the host's authoritative client status at a committed height.
+    /// None means the host does not implement this query. Transport errors propagate.
+    fn query_client_status(
+        &self,
+        _client_id: ClientId,
+        _height: QueryHeight,
+    ) -> Result<Option<String>, Error> {
+        Ok(None)
+    }
+
+    /// Build a rootless maintenance update without changing packet-proof height selection.
+    fn build_client_maintenance_header(
+        &self,
+        _client_state: &AnyClientState,
+    ) -> Result<Option<AnyHeader>, Error> {
+        Ok(None)
+    }
 
     /// Query the latest height and timestamp the application is at
     fn query_application_status(&self) -> Result<ChainStatus, Error>;

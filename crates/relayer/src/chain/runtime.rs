@@ -234,6 +234,14 @@ where
                             self.query_denom_trace(hash, reply_to)?
                         },
 
+                        ChainRequest::QueryClientStatus { client_id, height, reply_to } => {
+                            let result = self.chain.query_client_status(client_id, height);
+                            reply_to.send(result).map_err(Error::send)?;
+                        },
+                        ChainRequest::BuildClientMaintenanceHeader { client_state, reply_to } => {
+                            let result = self.chain.build_client_maintenance_header(&client_state);
+                            reply_to.send(result).map_err(Error::send)?;
+                        },
                         ChainRequest::QueryApplicationStatus { reply_to } => {
                             self.query_application_status(reply_to)?
                         },

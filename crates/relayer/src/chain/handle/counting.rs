@@ -183,6 +183,21 @@ impl<Handle: ChainHandle> ChainHandle for CountingChainHandle<Handle> {
         self.inner().query_denom_trace(hash)
     }
 
+    fn query_client_status(
+        &self,
+        client_id: ClientId,
+        height: QueryHeight,
+    ) -> Result<Option<String>, Error> {
+        self.inner().query_client_status(client_id, height)
+    }
+
+    fn build_client_maintenance_header(
+        &self,
+        client_state: &AnyClientState,
+    ) -> Result<Option<AnyHeader>, Error> {
+        self.inner().build_client_maintenance_header(client_state)
+    }
+
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
         self.inc_metric("query_application_status");
         self.inner().query_application_status()
