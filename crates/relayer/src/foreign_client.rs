@@ -2881,10 +2881,7 @@ fn should_skip_client_update(
 }
 
 fn is_cardano_client_type(client_type: ClientType) -> bool {
-    matches!(
-        client_type,
-        ClientType::CardanoMithril | ClientType::CardanoProbabilistic
-    )
+    matches!(client_type, ClientType::CardanoProbabilistic)
 }
 
 pub fn fetch_ccv_consumer_id(
@@ -2937,9 +2934,6 @@ mod tests {
     #[test]
     fn cardano_clients_may_skip_misbehaviour_without_update_header() {
         assert!(client_type_allows_missing_update_header(
-            ClientType::CardanoMithril
-        ));
-        assert!(client_type_allows_missing_update_header(
             ClientType::CardanoProbabilistic
         ));
         assert!(!client_type_allows_missing_update_header(
@@ -2968,7 +2962,7 @@ mod tests {
     #[test]
     fn cardano_clients_skip_updates_at_or_below_the_latest_height() {
         assert!(should_skip_client_update(
-            ClientType::CardanoMithril,
+            ClientType::CardanoProbabilistic,
             height(33),
             height(4),
         ));
@@ -2982,7 +2976,7 @@ mod tests {
     #[test]
     fn cardano_clients_still_update_to_newer_heights() {
         assert!(!should_skip_client_update(
-            ClientType::CardanoMithril,
+            ClientType::CardanoProbabilistic,
             height(4),
             height(33),
         ));

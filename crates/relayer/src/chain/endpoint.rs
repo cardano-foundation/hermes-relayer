@@ -548,7 +548,7 @@ pub trait ChainEndpoint: Sized {
         // Proof height semantics are chain-specific.
         //
         // Hermes historically uses `query_height + 1` as `proof_height` for Tendermint/Cosmos SDK
-        // chains. For Cardano (Mithril snapshot heights), the consensus state at height H commits to
+        // chains. For Cardano (accepted block heights), the consensus state at height H commits to
         // the IBC root at height H directly, so the proof height must be exactly `query_height`.
         let proof_height = if matches!(self.config(), ChainConfig::Cardano(_)) {
             height
