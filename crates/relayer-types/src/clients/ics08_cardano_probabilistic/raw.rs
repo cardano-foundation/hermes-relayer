@@ -3,6 +3,7 @@
 use serde_derive::{Deserialize, Serialize};
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Height {
     #[prost(uint64, tag = "1")]
     pub revision_number: u64,
@@ -11,6 +12,7 @@ pub struct Height {
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StakeDistributionEntry {
     #[prost(string, tag = "1")]
     pub pool_id: ::prost::alloc::string::String,
@@ -32,6 +34,7 @@ pub struct StakeDistributionEntry {
 /// The starting state and network configuration require authenticated or
 /// explicitly trusted bootstrap.
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EpochContext {
     /// Must equal the epoch derived from the signed header slot and stored schedule.
     #[prost(uint64, tag = "1")]
@@ -54,6 +57,7 @@ pub struct EpochContext {
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OperationalCertificateCounter {
     #[prost(bytes = "vec", tag = "1")]
     pub pool_id: ::prost::alloc::vec::Vec<u8>,
@@ -62,6 +66,7 @@ pub struct OperationalCertificateCounter {
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ClientState {
     #[prost(string, tag = "1")]
     pub chain_id: ::prost::alloc::string::String,
@@ -134,10 +139,23 @@ pub struct ClientState {
     pub latest_checkpoint_settlement_credit: Option<SettlementCreditState>,
     #[prost(message, optional, tag = "36")]
     pub latest_checkpoint_pool_production: Option<PoolProductionHistory>,
+    #[prost(uint32, tag = "37")]
+    pub storage_version: u32,
+    #[prost(uint64, tag = "38")]
+    pub verification_generation: u64,
+    #[prost(bytes = "vec", tag = "39")]
+    pub checkpoint_reference: Vec<u8>,
+    #[prost(bytes = "vec", tag = "40")]
+    pub storage_namespace: Vec<u8>,
+    #[prost(bytes = "vec", tag = "41")]
+    pub bootstrap_objects: Vec<u8>,
+    #[prost(bool, tag = "42")]
+    pub bootstrap_pending: bool,
 }
 
 /// Bit 0 is epoch-1 and bit 4 is epoch-5. Current observations never qualify that epoch.
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PoolProductionHistory {
     #[prost(uint64, tag = "1")]
     pub epoch: u64,
@@ -146,6 +164,7 @@ pub struct PoolProductionHistory {
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PoolProductionRecord {
     #[prost(string, tag = "1")]
     pub pool_id: String,
@@ -157,6 +176,7 @@ pub struct PoolProductionRecord {
 
 /// Epoch reference advances from capped credit once per epoch.
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SettlementCreditState {
     #[prost(uint64, tag = "1")]
     pub epoch: u64,
@@ -165,6 +185,7 @@ pub struct SettlementCreditState {
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PoolSettlementCredit {
     #[prost(string, tag = "1")]
     pub pool_id: String,
@@ -176,6 +197,7 @@ pub struct PoolSettlementCredit {
 
 /// Pool identities and keys retained separately from supplied stake amounts.
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PoolRegistrationBinding {
     #[prost(string, tag = "1")]
     pub pool_id: String,
@@ -186,6 +208,7 @@ pub struct PoolRegistrationBinding {
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PoolRegistrationRecord {
     #[prost(message, optional, tag = "1")]
     pub registration: Option<PoolRegistrationBinding>,
@@ -200,6 +223,7 @@ pub struct PoolRegistrationRecord {
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PoolRegistryState {
     #[prost(uint64, tag = "1")]
     pub epoch: u64,
@@ -214,6 +238,7 @@ pub struct PoolRegistryState {
 /// Native Praos running values at an authenticated checkpoint.
 /// Empty running values encode NeutralNonce. A missing message is unavailable.
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PraosNonceState {
     #[prost(bytes = "vec", tag = "1")]
     pub epoch_nonce: Vec<u8>,
@@ -229,6 +254,7 @@ pub struct PraosNonceState {
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EpochContextChallenge {
     #[prost(uint64, tag = "1")]
     pub epoch: u64,
@@ -237,6 +263,7 @@ pub struct EpochContextChallenge {
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ConsensusState {
     #[prost(uint64, tag = "1")]
     pub timestamp: u64,
@@ -262,9 +289,16 @@ pub struct ConsensusState {
     pub settlement_credit: Option<SettlementCreditState>,
     #[prost(message, optional, tag = "12")]
     pub pool_production: Option<PoolProductionHistory>,
+    #[prost(uint64, tag = "13")]
+    pub verification_generation: u64,
+    #[prost(bytes = "vec", tag = "14")]
+    pub checkpoint_reference: Vec<u8>,
+    #[prost(bytes = "vec", tag = "15")]
+    pub packet_state_reference: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Misbehaviour {
     #[prost(string, tag = "1")]
     pub client_id: ::prost::alloc::string::String,
@@ -272,9 +306,14 @@ pub struct Misbehaviour {
     pub probabilistic_header_1: ::core::option::Option<ProbabilisticHeader>,
     #[prost(message, optional, tag = "3")]
     pub probabilistic_header_2: ::core::option::Option<ProbabilisticHeader>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub verified_observation_1: Vec<u8>,
+    #[prost(bytes = "vec", tag = "5")]
+    pub verified_observation_2: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProbabilisticBlock {
     #[prost(message, optional, tag = "1")]
     pub height: ::core::option::Option<Height>,
@@ -293,6 +332,7 @@ pub struct ProbabilisticBlock {
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProbabilisticHeader {
     #[prost(message, optional, tag = "1")]
     pub trusted_height: ::core::option::Option<Height>,
@@ -310,6 +350,8 @@ pub struct ProbabilisticHeader {
     pub new_epoch_context: ::core::option::Option<EpochContext>,
     #[prost(bool, tag = "12")]
     pub is_checkpoint: bool,
+    #[prost(message, optional, tag = "13")]
+    pub observation_chunk: Option<ObservationChunk>,
 }
 
 #[cfg(test)]
@@ -486,3 +528,89 @@ mod tests {
         );
     }
 }
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ObservationChunk {
+    #[prost(uint32, tag = "1")]
+    pub operation: u32,
+    #[prost(bytes = "vec", tag = "2")]
+    pub session_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub base_checkpoint_reference: Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub original_receipt: Vec<u8>,
+    #[prost(uint64, tag = "5")]
+    pub anchor_height: u64,
+    #[prost(uint32, tag = "6")]
+    pub block_count: u32,
+    #[prost(message, optional, tag = "7")]
+    pub table_context: Option<EpochContext>,
+    #[prost(bytes = "vec", tag = "8")]
+    pub stake_rows: Vec<u8>,
+    #[prost(message, repeated, tag = "9")]
+    pub blocks: Vec<ProbabilisticBlock>,
+    #[prost(bytes = "vec", tag = "10")]
+    pub objects: Vec<u8>,
+    #[prost(bytes = "vec", tag = "11")]
+    pub other_receipt: Vec<u8>,
+    #[prost(bool, tag = "12")]
+    pub is_checkpoint: bool,
+    #[prost(string, tag = "13")]
+    pub host_state_tx_hash: String,
+    #[prost(uint32, tag = "14")]
+    pub table_rows: u32,
+    #[prost(uint64, tag = "15")]
+    pub table_total: u64,
+    #[prost(bytes = "vec", tag = "16")]
+    pub evidence_digest: Vec<u8>,
+    #[prost(bytes = "vec", tag = "17")]
+    pub table_digest: Vec<u8>,
+    #[prost(uint32, tag = "18")]
+    pub sequence: u32,
+    #[prost(bool, tag = "19")]
+    pub isolated: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueryVerificationRequest {
+    #[prost(bytes = "vec", tag = "1")]
+    pub namespace: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub generation: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub checkpoint_reference: Vec<u8>,
+    #[prost(uint32, tag = "4")]
+    pub kind: u32,
+    #[prost(bytes = "vec", tag = "5")]
+    pub after: Vec<u8>,
+    #[prost(uint32, tag = "6")]
+    pub limit: u32,
+    #[prost(bytes = "vec", tag = "7")]
+    pub session_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "8")]
+    pub receipt_id: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueryVerificationResponse {
+    #[prost(bytes = "vec", tag = "1")]
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MsgContinueClient {
+    #[prost(string, tag = "1")]
+    pub signer: String,
+    #[prost(string, tag = "2")]
+    pub client_id: String,
+    #[prost(uint32, tag = "3")]
+    pub operation: u32,
+}
+
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MsgContinueClientResponse {}

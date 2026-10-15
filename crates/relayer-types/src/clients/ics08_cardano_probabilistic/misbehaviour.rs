@@ -18,6 +18,8 @@ pub struct Misbehaviour {
     pub client_id: ClientId,
     pub header1: Header,
     pub header2: Header,
+    pub verified_observation_1: Vec<u8>,
+    pub verified_observation_2: Vec<u8>,
 }
 
 impl crate::core::ics02_client::misbehaviour::Misbehaviour for Misbehaviour {
@@ -49,7 +51,38 @@ impl TryFrom<RawMisbehaviour> for Misbehaviour {
     type Error = Error;
 
     fn try_from(raw: RawMisbehaviour) -> Result<Self, Self::Error> {
+        if !raw.verified_observation_1.is_empty() || !raw.verified_observation_2.is_empty() {
+            if raw.verified_observation_1.len() != 32
+                || raw.verified_observation_2.len() != 32
+                || raw.probabilistic_header_1.is_some()
+                || raw.probabilistic_header_2.is_some()
+            {
+                return Err(Error::invalid_field(
+                    "receipt",
+                    "Compact conflict requires two verified receipt references".into(),
+                ));
+            }
+            let placeholder = Header::try_from(raw::ProbabilisticHeader {
+                observation_chunk: Some(raw::ObservationChunk {
+                    anchor_height: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })?;
+            return Ok(Self {
+                client_id: raw
+                    .client_id
+                    .parse::<ClientId>()
+                    .map_err(|e| Error::invalid_field("client_id", e.to_string()))?,
+                header1: placeholder.clone(),
+                header2: placeholder,
+                verified_observation_1: raw.verified_observation_1,
+                verified_observation_2: raw.verified_observation_2,
+            });
+        }
         Ok(Self {
+            verified_observation_1: vec![],
+            verified_observation_2: vec![],
             client_id: raw
                 .client_id
                 .parse::<ClientId>()
@@ -68,10 +101,20 @@ impl TryFrom<RawMisbehaviour> for Misbehaviour {
 
 impl From<Misbehaviour> for RawMisbehaviour {
     fn from(value: Misbehaviour) -> Self {
+        if !value.verified_observation_1.is_empty() {
+            return RawMisbehaviour {
+                client_id: value.client_id.to_string(),
+                verified_observation_1: value.verified_observation_1,
+                verified_observation_2: value.verified_observation_2,
+                ..Default::default()
+            };
+        }
         RawMisbehaviour {
             client_id: value.client_id.to_string(),
             probabilistic_header_1: Some(value.header1.into()),
             probabilistic_header_2: Some(value.header2.into()),
+            verified_observation_1: vec![],
+            verified_observation_2: vec![],
         }
     }
 }

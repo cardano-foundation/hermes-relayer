@@ -23,6 +23,12 @@ fn height(n: u64) -> Height {
 
 fn cardano_client() -> AnyClientState {
     AnyClientState::Probabilistic(ProbabilisticClientState {
+        storage_version: 0,
+        verification_generation: 0,
+        checkpoint_reference: vec![],
+        storage_namespace: vec![],
+        bootstrap_objects: vec![],
+        bootstrap_pending: false,
         packet_lane_policy_id: vec![0x55; 28],
         epoch_context_challenges: vec![],
         latest_checkpoint_nonce_state: None,
@@ -43,7 +49,7 @@ fn cardano_client() -> AnyClientState {
         slots_per_kes_period: 100,
         current_epoch_start_slot: 1,
         current_epoch_end_slot_exclusive: 1_000,
-        system_start_unix_ns: 1,
+        system_start_unix_ns: 50_000_000_000,
         slot_length_ns: 1_000_000_000,
         epoch_contexts: vec![],
         latest_checkpoint_height: Some(height(50)),
@@ -76,6 +82,9 @@ fn runtime(config: ChainConfig) -> (BaseChainHandle, thread::JoinHandle<Vec<Heig
                         }))
                         .unwrap();
                 }
+                ChainRequest::QueryClientStatus { reply_to, .. } => {
+                    reply_to.send(Ok(None)).unwrap();
+                }
                 ChainRequest::QueryClientState { reply_to, .. } => {
                     reply_to.send(Ok((cardano_client(), None))).unwrap();
                 }
@@ -86,6 +95,9 @@ fn runtime(config: ChainConfig) -> (BaseChainHandle, thread::JoinHandle<Vec<Heig
                     let answer = if request.consensus_height == height(33) {
                         Ok((
                             AnyConsensusState::Probabilistic(ProbabilisticConsensusState {
+                                verification_generation: 0,
+                                checkpoint_reference: vec![],
+                                packet_state_reference: vec![],
                                 packet_state_snapshot: vec![],
                                 nonce_state: None,
                                 pool_registry: None,

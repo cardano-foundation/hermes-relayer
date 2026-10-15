@@ -670,6 +670,44 @@ impl GatewayClient {
             })
     }
 
+    /// A zero target with checkpoint_only requests maintenance from the indexed tip.
+    /// Ordinary latest-height and consensus queries retain their proof-height meaning.
+    pub async fn query_maintenance_header(
+        &self,
+        state: &ibc_relayer_types::clients::ics08_cardano_probabilistic::client_state::ClientState,
+    ) -> Result<Option<AnyHeader>, Error> {
+        use super::generated::ibc::core::types::v1::{
+            query_client::QueryClient, QueryIbcHeaderRequest,
+        };
+        use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
+        use prost::Message;
+        let mut client = QueryClient::new(self.channel.clone())
+            .max_decoding_message_size(GATEWAY_HEADER_GRPC_MESSAGE_LIMIT);
+        let response = client
+            .ibc_header(QueryIbcHeaderRequest {
+                trusted_height: state.latest_verified_height().revision_height(),
+                height: 0,
+                checkpoint_only: true,
+                probabilistic_client_state: raw::ClientState::from(state.clone()).encode_to_vec(),
+            })
+            .await?
+            .into_inner();
+        let Some(header) = response.header else {
+            return Ok(None);
+        };
+        ProtoAny {
+            type_url: header.type_url,
+            value: header.value,
+        }
+        .try_into()
+        .map(Some)
+        .map_err(
+            |error: ibc_relayer_types::core::ics02_client::error::Error| {
+                Error::Ibc(error.to_string())
+            },
+        )
+    }
+
     /// Query block results at a specific height.
     pub async fn query_block_results(
         &self,

@@ -17,6 +17,7 @@ pub mod keyring;
 pub mod signer;
 pub mod signing_key_pair;
 pub mod signing_policy;
+pub(crate) mod staging;
 pub mod transaction_evaluator;
 pub mod utxo_resolver;
 

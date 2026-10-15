@@ -31,6 +31,9 @@ pub struct ConsensusState {
     pub pool_registry: Option<raw::PoolRegistryState>,
     pub settlement_credit: Option<raw::SettlementCreditState>,
     pub pool_production: Option<raw::PoolProductionHistory>,
+    pub verification_generation: u64,
+    pub checkpoint_reference: Vec<u8>,
+    pub packet_state_reference: Vec<u8>,
 }
 
 impl Ics2ConsensusState for ConsensusState {
@@ -77,6 +80,9 @@ impl TryFrom<RawConsensusState> for ConsensusState {
             pool_registry: raw.pool_registry,
             settlement_credit: raw.settlement_credit,
             pool_production: raw.pool_production,
+            verification_generation: raw.verification_generation,
+            checkpoint_reference: raw.checkpoint_reference,
+            packet_state_reference: raw.packet_state_reference,
         })
     }
 }
@@ -96,6 +102,9 @@ impl From<ConsensusState> for RawConsensusState {
             pool_registry: value.pool_registry,
             settlement_credit: value.settlement_credit,
             pool_production: value.pool_production,
+            verification_generation: value.verification_generation,
+            checkpoint_reference: value.checkpoint_reference,
+            packet_state_reference: value.packet_state_reference,
         }
     }
 }

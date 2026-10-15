@@ -2,7 +2,7 @@ use core::convert::Infallible;
 use core::time::Duration;
 use crossbeam_channel::Receiver;
 use retry::delay::Fibonacci;
-use retry::retry_with_index;
+use retry::{retry_with_index, OperationResult};
 use tracing::{debug, debug_span, error_span, trace, warn};
 
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
@@ -12,7 +12,7 @@ use crate::util::retry::clamp_total;
 use crate::util::task::{spawn_background_task, Next, TaskError, TaskHandle};
 use crate::{
     chain::handle::ChainHandle,
-    foreign_client::{ForeignClient, MisbehaviourResults},
+    foreign_client::{ForeignClient, HasExpiredOrFrozenError, MisbehaviourResults},
 };
 
 use super::WorkerCmd;
@@ -45,7 +45,11 @@ pub fn spawn_refresh_client<ChainA: ChainHandle, ChainB: ChainHandle>(
         move || {
             // Try to refresh the client, but only if the refresh window has expired.
             // If the refresh fails, retry according to the given strategy.
-            let res = retry_with_index(refresh_strategy(), |_| client.refresh());
+            let res = retry_with_index(refresh_strategy(), |_| match client.refresh() {
+                Ok(events) => OperationResult::Ok(events),
+                Err(error) if error.is_expired_or_frozen_error() => OperationResult::Err(error),
+                Err(error) => OperationResult::Retry(error),
+            });
 
             match res {
                 // If `client.refresh()` was successful, continue
