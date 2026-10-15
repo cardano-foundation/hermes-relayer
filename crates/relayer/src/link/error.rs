@@ -117,6 +117,10 @@ define_error! {
                     e.channel_id, e.chain_id)
             },
 
+        ChannelRoute
+            { detail: String }
+            |e| { format!("packet route is unavailable: {}", e.detail) },
+
         ChannelNotOpened
             {
                 channel_id: ChannelId,

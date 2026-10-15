@@ -20,6 +20,10 @@ pub struct Channel {
     /// opaque channel version, which is agreed upon during the handshake
     #[prost(string, tag = "5")]
     pub version: ::prost::alloc::string::String,
+    /// upgrade sequence indicates the latest upgrade attempt performed by this channel
+    /// the value of 0 indicates the channel has never been upgraded
+    #[prost(uint64, tag = "6")]
+    pub upgrade_sequence: u64,
 }
 /// IdentifiedChannel defines a channel with additional port and channel
 /// identifier fields.
@@ -47,6 +51,10 @@ pub struct IdentifiedChannel {
     /// channel identifier
     #[prost(string, tag = "7")]
     pub channel_id: ::prost::alloc::string::String,
+    /// upgrade sequence indicates the latest upgrade attempt performed by this channel
+    /// the value of 0 indicates the channel has never been upgraded
+    #[prost(uint64, tag = "8")]
+    pub upgrade_sequence: u64,
 }
 /// Counterparty defines a channel end counterparty
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -153,6 +161,18 @@ pub struct Coin {
     #[prost(uint64, tag = "2")]
     pub amount: u64,
 }
+/// Timeout defines an execution deadline structure for 04-channel handlers.
+/// This includes packet lifecycle handlers as well as the upgrade handshake handlers.
+/// A valid Timeout contains either one or both of a timestamp and block height (sequence).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct Timeout {
+    /// block height after which the packet or upgrade times out
+    #[prost(message, optional, tag = "1")]
+    pub height: ::core::option::Option<super::super::client::v1::Height>,
+    /// block timestamp (in nanoseconds) after which the packet or upgrade times out
+    #[prost(uint64, tag = "2")]
+    pub timestamp: u64,
+}
 /// State defines if a channel is in one of the following states:
 /// CLOSED, INIT, TRYOPEN, OPEN or UNINITIALIZED.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -170,6 +190,10 @@ pub enum State {
     /// A channel has been closed and can no longer be used to send or receive
     /// packets.
     Closed = 4,
+    /// A channel has just accepted the upgrade handshake attempt and is flushing in-flight packets.
+    Flushing = 5,
+    /// A channel has just completed flushing any in-flight packets.
+    Flushcomplete = 6,
 }
 impl State {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -183,6 +207,8 @@ impl State {
             Self::Tryopen => "STATE_TRYOPEN",
             Self::Open => "STATE_OPEN",
             Self::Closed => "STATE_CLOSED",
+            Self::Flushing => "STATE_FLUSHING",
+            Self::Flushcomplete => "STATE_FLUSHCOMPLETE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -193,6 +219,8 @@ impl State {
             "STATE_TRYOPEN" => Some(Self::Tryopen),
             "STATE_OPEN" => Some(Self::Open),
             "STATE_CLOSED" => Some(Self::Closed),
+            "STATE_FLUSHING" => Some(Self::Flushing),
+            "STATE_FLUSHCOMPLETE" => Some(Self::Flushcomplete),
             _ => None,
         }
     }
@@ -230,6 +258,43 @@ impl Order {
             _ => None,
         }
     }
+}
+/// Upgrade is a verifiable type which contains the relevant information
+/// for an attempted upgrade. It provides the proposed changes to the channel
+/// end, the timeout for this upgrade attempt and the next packet sequence
+/// which allows the counterparty to efficiently know the highest sequence it has received.
+/// The next sequence send is used for pruning and upgrading from unordered to ordered channels.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Upgrade {
+    #[prost(message, optional, tag = "1")]
+    pub fields: ::core::option::Option<UpgradeFields>,
+    #[prost(message, optional, tag = "2")]
+    pub timeout: ::core::option::Option<Timeout>,
+    #[prost(uint64, tag = "3")]
+    pub next_sequence_send: u64,
+}
+/// UpgradeFields are the fields in a channel end which may be changed
+/// during a channel upgrade.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpgradeFields {
+    #[prost(enumeration = "Order", tag = "1")]
+    pub ordering: i32,
+    #[prost(string, repeated, tag = "2")]
+    pub connection_hops: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "3")]
+    pub version: ::prost::alloc::string::String,
+}
+/// ErrorReceipt defines a type which encapsulates the upgrade sequence and error associated with the
+/// upgrade handshake failure. When a channel upgrade handshake is aborted both chains are expected to increment to the
+/// next sequence.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ErrorReceipt {
+    /// the channel upgrade sequence
+    #[prost(uint64, tag = "1")]
+    pub sequence: u64,
+    /// the error message detailing the cause of failure
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
 }
 /// MsgChannelOpenInit defines an sdk.Msg to initialize a channel handshake. It
 /// is called by a relayer on Chain A.
@@ -361,6 +426,8 @@ pub struct MsgChannelCloseConfirm {
     pub proof_height: ::core::option::Option<super::super::client::v1::Height>,
     #[prost(string, tag = "5")]
     pub signer: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "6")]
+    pub counterparty_upgrade_sequence: u64,
 }
 /// MsgChannelCloseConfirmResponse defines the Msg/ChannelCloseConfirm response
 /// type.
@@ -426,6 +493,8 @@ pub struct MsgTimeoutOnClose {
     pub next_sequence_recv: u64,
     #[prost(string, tag = "6")]
     pub signer: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "7")]
+    pub counterparty_upgrade_sequence: u64,
 }
 /// MsgTimeoutOnCloseResponse defines the Msg/TimeoutOnClose response type.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -487,20 +556,202 @@ pub struct MsgTransferResponse {
     #[prost(message, optional, tag = "2")]
     pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
 }
-/// MsgChannelOpenConfirm defines a msg sent by a Relayer to Chain B to
-/// acknowledge the change of channel state to OPEN on Chain A.
+/// MsgChannelUpgradeInit is the deployment authority's proposal to upgrade a channel.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct MsgTimeoutRefresh {
+pub struct MsgChannelUpgradeInit {
     #[prost(string, tag = "1")]
-    pub channel_id: ::prost::alloc::string::String,
+    pub port_id: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
+    pub channel_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub fields: ::core::option::Option<UpgradeFields>,
+    #[prost(string, tag = "4")]
+    pub signer: ::prost::alloc::string::String,
+    /// Cardano: milliseconds from the start of flushing until the upgrade times
+    /// out on the counterparty.
+    #[prost(uint64, tag = "5")]
+    pub timeout_period_ms: u64,
+    /// Cardano signing precondition captured before requesting transaction construction.
+    #[prost(uint64, optional, tag = "6")]
+    pub expected_upgrade_sequence: ::core::option::Option<u64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgChannelUpgradeInitResponse {
+    #[prost(message, optional, tag = "1")]
+    pub upgrade: ::core::option::Option<Upgrade>,
+    #[prost(uint64, tag = "2")]
+    pub upgrade_sequence: u64,
+    #[prost(message, optional, tag = "3")]
+    pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgChannelUpgradeTry {
+    #[prost(string, tag = "1")]
+    pub port_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub channel_id: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "3")]
+    pub proposed_upgrade_connection_hops: ::prost::alloc::vec::Vec<
+        ::prost::alloc::string::String,
+    >,
+    #[prost(message, optional, tag = "4")]
+    pub counterparty_upgrade_fields: ::core::option::Option<UpgradeFields>,
+    #[prost(uint64, tag = "5")]
+    pub counterparty_upgrade_sequence: u64,
+    #[prost(bytes = "vec", tag = "6")]
+    pub proof_channel: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "7")]
+    pub proof_upgrade: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "8")]
+    pub proof_height: ::core::option::Option<super::super::client::v1::Height>,
+    #[prost(string, tag = "9")]
     pub signer: ::prost::alloc::string::String,
 }
-/// MsgChannelOpenConfirmResponse defines the Msg/ChannelOpenConfirm response
-/// type.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct MsgTimeoutRefreshResponse {
+pub struct MsgChannelUpgradeTryResponse {
     #[prost(message, optional, tag = "1")]
+    pub upgrade: ::core::option::Option<Upgrade>,
+    #[prost(uint64, tag = "2")]
+    pub upgrade_sequence: u64,
+    #[prost(enumeration = "ResponseResultType", tag = "3")]
+    pub result: i32,
+    #[prost(message, optional, tag = "4")]
+    pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgChannelUpgradeAck {
+    #[prost(string, tag = "1")]
+    pub port_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub channel_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub counterparty_upgrade: ::core::option::Option<Upgrade>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub proof_channel: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "5")]
+    pub proof_upgrade: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "6")]
+    pub proof_height: ::core::option::Option<super::super::client::v1::Height>,
+    #[prost(string, tag = "7")]
+    pub signer: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgChannelUpgradeAckResponse {
+    #[prost(enumeration = "ResponseResultType", tag = "1")]
+    pub result: i32,
+    #[prost(message, optional, tag = "2")]
+    pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgChannelUpgradeConfirm {
+    #[prost(string, tag = "1")]
+    pub port_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub channel_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "State", tag = "3")]
+    pub counterparty_channel_state: i32,
+    #[prost(message, optional, tag = "4")]
+    pub counterparty_upgrade: ::core::option::Option<Upgrade>,
+    #[prost(bytes = "vec", tag = "5")]
+    pub proof_channel: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "6")]
+    pub proof_upgrade: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "7")]
+    pub proof_height: ::core::option::Option<super::super::client::v1::Height>,
+    #[prost(string, tag = "8")]
+    pub signer: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgChannelUpgradeConfirmResponse {
+    #[prost(enumeration = "ResponseResultType", tag = "1")]
+    pub result: i32,
+    #[prost(message, optional, tag = "2")]
+    pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgChannelUpgradeOpen {
+    #[prost(string, tag = "1")]
+    pub port_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub channel_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "State", tag = "3")]
+    pub counterparty_channel_state: i32,
+    #[prost(uint64, tag = "4")]
+    pub counterparty_upgrade_sequence: u64,
+    #[prost(bytes = "vec", tag = "5")]
+    pub proof_channel: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "6")]
+    pub proof_height: ::core::option::Option<super::super::client::v1::Height>,
+    #[prost(string, tag = "7")]
+    pub signer: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgChannelUpgradeOpenResponse {
+    #[prost(message, optional, tag = "1")]
+    pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgChannelUpgradeTimeout {
+    #[prost(string, tag = "1")]
+    pub port_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub channel_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub counterparty_channel: ::core::option::Option<Channel>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub proof_channel: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "5")]
+    pub proof_height: ::core::option::Option<super::super::client::v1::Height>,
+    #[prost(string, tag = "6")]
+    pub signer: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgChannelUpgradeTimeoutResponse {
+    #[prost(message, optional, tag = "1")]
+    pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgChannelUpgradeCancel {
+    #[prost(string, tag = "1")]
+    pub port_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub channel_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub error_receipt: ::core::option::Option<ErrorReceipt>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub proof_error_receipt: ::prost::alloc::vec::Vec<u8>,
+    #[prost(message, optional, tag = "5")]
+    pub proof_height: ::core::option::Option<super::super::client::v1::Height>,
+    #[prost(string, tag = "6")]
+    pub signer: ::prost::alloc::string::String,
+    /// Cardano authority cancellation must name the operator's observed attempt.
+    #[prost(uint64, optional, tag = "7")]
+    pub expected_upgrade_sequence: ::core::option::Option<u64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgChannelUpgradeCancelResponse {
+    #[prost(message, optional, tag = "1")]
+    pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
+}
+/// MsgChannelUpgradeFlush certifies the drained packet lanes of a flushing
+/// Cardano channel.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgChannelUpgradeFlush {
+    #[prost(string, tag = "1")]
+    pub port_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub channel_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub signer: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MsgChannelUpgradeFlushResponse {
+    /// Packet lanes certified so far, out of the deployment's lane count.
+    #[prost(uint64, tag = "1")]
+    pub flushed_lanes: u64,
+    #[prost(uint64, tag = "2")]
+    pub lane_count: u64,
+    #[prost(message, optional, tag = "3")]
     pub unsigned_tx: ::core::option::Option<::prost_types::Any>,
 }
 /// ResponseResultType defines the possible outcomes of the execution of a message
@@ -513,6 +764,8 @@ pub enum ResponseResultType {
     Noop = 1,
     /// The message was executed successfully
     Success = 2,
+    /// The message was executed unsuccessfully
+    Failure = 3,
 }
 impl ResponseResultType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -524,6 +777,7 @@ impl ResponseResultType {
             Self::Unspecified => "RESPONSE_RESULT_TYPE_UNSPECIFIED",
             Self::Noop => "RESPONSE_RESULT_TYPE_NOOP",
             Self::Success => "RESPONSE_RESULT_TYPE_SUCCESS",
+            Self::Failure => "RESPONSE_RESULT_TYPE_FAILURE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -532,6 +786,7 @@ impl ResponseResultType {
             "RESPONSE_RESULT_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
             "RESPONSE_RESULT_TYPE_NOOP" => Some(Self::Noop),
             "RESPONSE_RESULT_TYPE_SUCCESS" => Some(Self::Success),
+            "RESPONSE_RESULT_TYPE_FAILURE" => Some(Self::Failure),
             _ => None,
         }
     }
@@ -908,12 +1163,12 @@ pub mod msg_client {
                 .insert(GrpcMethod::new("ibc.core.channel.v1.Msg", "Transfer"));
             self.inner.unary(req, path, codec).await
         }
-        /// TimeoutRefresh defines a rpc handler method for MsgTimeoutRefresh.
-        pub async fn timeout_refresh(
+        /// ChannelUpgradeInit defines a rpc handler method for MsgChannelUpgradeInit.
+        pub async fn channel_upgrade_init(
             &mut self,
-            request: impl tonic::IntoRequest<super::MsgTimeoutRefresh>,
+            request: impl tonic::IntoRequest<super::MsgChannelUpgradeInit>,
         ) -> std::result::Result<
-            tonic::Response<super::MsgTimeoutRefreshResponse>,
+            tonic::Response<super::MsgChannelUpgradeInitResponse>,
             tonic::Status,
         > {
             self.inner
@@ -926,11 +1181,199 @@ pub mod msg_client {
                 })?;
             let codec = tonic::codec::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
-                "/ibc.core.channel.v1.Msg/TimeoutRefresh",
+                "/ibc.core.channel.v1.Msg/ChannelUpgradeInit",
             );
             let mut req = request.into_request();
             req.extensions_mut()
-                .insert(GrpcMethod::new("ibc.core.channel.v1.Msg", "TimeoutRefresh"));
+                .insert(
+                    GrpcMethod::new("ibc.core.channel.v1.Msg", "ChannelUpgradeInit"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// ChannelUpgradeTry defines a rpc handler method for MsgChannelUpgradeTry.
+        pub async fn channel_upgrade_try(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MsgChannelUpgradeTry>,
+        ) -> std::result::Result<
+            tonic::Response<super::MsgChannelUpgradeTryResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ibc.core.channel.v1.Msg/ChannelUpgradeTry",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("ibc.core.channel.v1.Msg", "ChannelUpgradeTry"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// ChannelUpgradeAck defines a rpc handler method for MsgChannelUpgradeAck.
+        pub async fn channel_upgrade_ack(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MsgChannelUpgradeAck>,
+        ) -> std::result::Result<
+            tonic::Response<super::MsgChannelUpgradeAckResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ibc.core.channel.v1.Msg/ChannelUpgradeAck",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("ibc.core.channel.v1.Msg", "ChannelUpgradeAck"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// ChannelUpgradeConfirm defines a rpc handler method for MsgChannelUpgradeConfirm.
+        pub async fn channel_upgrade_confirm(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MsgChannelUpgradeConfirm>,
+        ) -> std::result::Result<
+            tonic::Response<super::MsgChannelUpgradeConfirmResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ibc.core.channel.v1.Msg/ChannelUpgradeConfirm",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("ibc.core.channel.v1.Msg", "ChannelUpgradeConfirm"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// ChannelUpgradeOpen defines a rpc handler method for MsgChannelUpgradeOpen.
+        pub async fn channel_upgrade_open(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MsgChannelUpgradeOpen>,
+        ) -> std::result::Result<
+            tonic::Response<super::MsgChannelUpgradeOpenResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ibc.core.channel.v1.Msg/ChannelUpgradeOpen",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("ibc.core.channel.v1.Msg", "ChannelUpgradeOpen"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// ChannelUpgradeTimeout defines a rpc handler method for MsgChannelUpgradeTimeout.
+        pub async fn channel_upgrade_timeout(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MsgChannelUpgradeTimeout>,
+        ) -> std::result::Result<
+            tonic::Response<super::MsgChannelUpgradeTimeoutResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ibc.core.channel.v1.Msg/ChannelUpgradeTimeout",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("ibc.core.channel.v1.Msg", "ChannelUpgradeTimeout"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// ChannelUpgradeCancel defines a rpc handler method for MsgChannelUpgradeCancel.
+        pub async fn channel_upgrade_cancel(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MsgChannelUpgradeCancel>,
+        ) -> std::result::Result<
+            tonic::Response<super::MsgChannelUpgradeCancelResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ibc.core.channel.v1.Msg/ChannelUpgradeCancel",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("ibc.core.channel.v1.Msg", "ChannelUpgradeCancel"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// ChannelUpgradeFlush records drained Cardano packet lanes of a flushing
+        /// channel. It has no ibc-go counterpart.
+        pub async fn channel_upgrade_flush(
+            &mut self,
+            request: impl tonic::IntoRequest<super::MsgChannelUpgradeFlush>,
+        ) -> std::result::Result<
+            tonic::Response<super::MsgChannelUpgradeFlushResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ibc.core.channel.v1.Msg/ChannelUpgradeFlush",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("ibc.core.channel.v1.Msg", "ChannelUpgradeFlush"),
+                );
             self.inner.unary(req, path, codec).await
         }
     }

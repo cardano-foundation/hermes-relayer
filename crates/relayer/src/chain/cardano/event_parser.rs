@@ -26,7 +26,11 @@ use ibc_relayer_types::{
             height::{Height, HeightErrorDetail},
         },
         ics03_connection::events as ConnectionEvents,
-        ics04_channel::{events as ChannelEvents, packet::Packet, timeout::TimeoutHeight},
+        ics04_channel::{
+            events as ChannelEvents,
+            packet::{Packet, Sequence},
+            timeout::TimeoutHeight,
+        },
         ics24_host::identifier::{ChannelId, ClientId, ConnectionId, PortId},
     },
     events::IbcEvent,
@@ -154,6 +158,49 @@ pub fn parse_events(gateway_events: Vec<Event>, _height: Height) -> Result<Vec<I
                 attrs,
                 parse_channel_close_confirm_event,
             )?,
+
+            // Channel upgrade events
+            "channel_upgrade_init" => {
+                parse_event_with_context("channel_upgrade_init", &attributes, attrs, |attrs| {
+                    parse_channel_upgrade_event(attrs, IbcEvent::UpgradeInitChannel)
+                })?
+            }
+            "channel_upgrade_try" => {
+                parse_event_with_context("channel_upgrade_try", &attributes, attrs, |attrs| {
+                    parse_channel_upgrade_event(attrs, IbcEvent::UpgradeTryChannel)
+                })?
+            }
+            "channel_upgrade_ack" => {
+                parse_event_with_context("channel_upgrade_ack", &attributes, attrs, |attrs| {
+                    parse_channel_upgrade_event(attrs, IbcEvent::UpgradeAckChannel)
+                })?
+            }
+            "channel_upgrade_confirm" => {
+                parse_event_with_context("channel_upgrade_confirm", &attributes, attrs, |attrs| {
+                    parse_channel_upgrade_event(attrs, IbcEvent::UpgradeConfirmChannel)
+                })?
+            }
+            "channel_upgrade_open" => {
+                parse_event_with_context("channel_upgrade_open", &attributes, attrs, |attrs| {
+                    parse_channel_upgrade_event(attrs, IbcEvent::UpgradeOpenChannel)
+                })?
+            }
+            "channel_upgrade_timeout" => {
+                parse_event_with_context("channel_upgrade_timeout", &attributes, attrs, |attrs| {
+                    parse_channel_upgrade_event(attrs, IbcEvent::UpgradeTimeoutChannel)
+                })?
+            }
+            "channel_upgrade_cancelled" => parse_event_with_context(
+                "channel_upgrade_cancelled",
+                &attributes,
+                attrs,
+                |attrs| parse_channel_upgrade_event(attrs, IbcEvent::UpgradeCancelChannel),
+            )?,
+            "channel_upgrade_error" => {
+                parse_event_with_context("channel_upgrade_error", &attributes, attrs, |attrs| {
+                    parse_channel_upgrade_event(attrs, IbcEvent::UpgradeErrorChannel)
+                })?
+            }
 
             // Packet events
             "send_packet" => parse_event_with_context(
@@ -565,6 +612,41 @@ fn parse_channel_close_confirm_event(attrs: HashMap<String, String>) -> Result<I
         counterparty_port_id,
         counterparty_channel_id,
     }))
+}
+
+//
+// Channel upgrade event parsers
+//
+
+/// ibc-go v8 channel-upgrade event attributes. The Gateway reports no upgrade
+/// timeout, which Hermes only displays.
+fn parse_channel_upgrade_attributes(
+    attrs: &HashMap<String, String>,
+) -> Result<ChannelEvents::UpgradeAttributes, Error> {
+    Ok(ChannelEvents::UpgradeAttributes {
+        port_id: parse_port_id(attrs, "port_id")?,
+        channel_id: parse_channel_id(attrs, "channel_id")?,
+        counterparty_port_id: parse_port_id(attrs, "counterparty_port_id")?,
+        counterparty_channel_id: parse_optional_channel_id(attrs, "counterparty_channel_id"),
+        upgrade_sequence: Sequence::from(parse_u64(attrs, "upgrade_sequence")?),
+        upgrade_timeout_height: None,
+        upgrade_timeout_timestamp: None,
+        error_receipt: attrs.get("error_receipt").cloned(),
+    })
+}
+
+fn parse_channel_upgrade_event<T>(
+    attrs: HashMap<String, String>,
+    variant: impl FnOnce(T) -> IbcEvent,
+) -> Result<IbcEvent, Error>
+where
+    T: TryFrom<ChannelEvents::UpgradeAttributes>,
+    T::Error: std::fmt::Display,
+{
+    let attributes = parse_channel_upgrade_attributes(&attrs)?;
+    let event = T::try_from(attributes)
+        .map_err(|e| Error::EventAttribute(format!("Invalid channel upgrade event: {e}")))?;
+    Ok(variant(event))
 }
 
 //
@@ -1062,6 +1144,59 @@ mod tests {
         let events = parse_events(vec![gateway_event], Height::new(0, 1).unwrap()).unwrap();
 
         assert!(matches!(&events[0], RelayerIbcEvent::ClientMisbehaviour(_)));
+    }
+
+    #[test]
+    fn parse_channel_upgrade_events_ok() {
+        let common = [
+            ("port_id", "transfer"),
+            ("channel_id", "channel-0"),
+            ("counterparty_port_id", "transfer"),
+            ("counterparty_channel_id", "channel-7"),
+            ("upgrade_sequence", "2"),
+        ];
+        let init = Event {
+            r#type: "channel_upgrade_init".to_string(),
+            attributes: attrs(
+                &[
+                    common.as_slice(),
+                    &[("upgrade_connection_hops", "connection-1")],
+                ]
+                .concat(),
+            ),
+        };
+        let error = Event {
+            r#type: "channel_upgrade_error".to_string(),
+            attributes: attrs(
+                &[
+                    common.as_slice(),
+                    &[(
+                        "error_receipt",
+                        "ABCI code: 34: restored channel to pre-upgrade state",
+                    )],
+                ]
+                .concat(),
+            ),
+        };
+
+        let events = parse_events(vec![init, error], Height::new(0, 1).unwrap()).unwrap();
+
+        match &events[..] {
+            [RelayerIbcEvent::UpgradeInitChannel(init), RelayerIbcEvent::UpgradeErrorChannel(error)] =>
+            {
+                assert_eq!(init.channel_id.as_str(), "channel-0");
+                assert_eq!(
+                    init.counterparty_channel_id.as_ref().unwrap().as_str(),
+                    "channel-7"
+                );
+                assert_eq!(init.upgrade_sequence, 2.into());
+                assert_eq!(
+                    error.error_receipt,
+                    "ABCI code: 34: restored channel to pre-upgrade state"
+                );
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
     }
 
     #[test]

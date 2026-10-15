@@ -57,8 +57,11 @@ use ibc_relayer_types::core::ics02_client::header::{AnyHeader, Header as IbcHead
 use ibc_relayer_types::core::ics03_connection::connection::{
     ConnectionEnd, IdentifiedConnectionEnd,
 };
-use ibc_relayer_types::core::ics04_channel::channel::{ChannelEnd, IdentifiedChannelEnd};
+use ibc_relayer_types::core::ics04_channel::channel::{
+    ChannelEnd, IdentifiedChannelEnd, State as ChannelState, UpgradeState,
+};
 use ibc_relayer_types::core::ics04_channel::packet::{PacketMsgType, Sequence};
+use ibc_relayer_types::core::ics04_channel::upgrade::{ErrorReceipt, Upgrade};
 use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentRoot;
 use ibc_relayer_types::core::ics23_commitment::commitment::{
     CommitmentPrefix, CommitmentProofBytes,
@@ -364,7 +367,86 @@ fn validate_trace_registry_prelude(
     Ok(())
 }
 
+fn expected_upgrade_absence(
+    message: &str,
+    port_id: &str,
+    channel_id: &str,
+    height: Option<ICSHeight>,
+) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(message) else {
+        return false;
+    };
+    let error = &value["error"];
+    error["code"] == "CHANNEL_UPGRADE_NOT_FOUND"
+        && error["details"]["port_id"] == port_id
+        && error["details"]["channel_id"] == channel_id
+        && height.is_some_and(|height| {
+            height.revision_number() == 0
+                && error["details"]["proof_height"].as_str()
+                    == Some(height.revision_height().to_string().as_str())
+        })
+}
+
+fn upgrade_query_present(
+    response: Result<ibc_proto::ibc::core::channel::v1::QueryUpgradeResponse, super::error::Error>,
+    port_id: &str,
+    channel_id: &str,
+    height: Option<ICSHeight>,
+) -> Result<bool, Error> {
+    match response {
+        Ok(response) => {
+            assert_gateway_proof_height("query_upgrade", response.proof_height, height)?;
+            if response.upgrade.is_none() || response.proof.is_empty() {
+                return Err(Error::query(
+                    "Gateway returned a missing or stale channel upgrade".to_string(),
+                ));
+            }
+            let upgrade = response.upgrade.expect("checked above");
+            ibc_relayer_types::core::ics04_channel::upgrade::Upgrade::try_from(upgrade).map_err(
+                |error| Error::query(format!("Malformed Gateway channel upgrade: {error}")),
+            )?;
+            Ok(true)
+        }
+        Err(super::error::Error::GatewayStatus {
+            code: tonic::Code::NotFound,
+            message,
+        }) if expected_upgrade_absence(&message, port_id, channel_id, height) => Ok(false),
+        Err(error) => Err(Error::query(format!(
+            "Cannot determine channel upgrade state: {error}"
+        ))),
+    }
+}
+
 impl CardanoChainEndpoint {
+    /// The Gateway reports a channel with an upgrade in progress as OPEN, like
+    /// ibc-go. As for Cosmos chains, Hermes treats it as upgrading when an
+    /// upgrade exists. Only transfer channels can upgrade on Cardano.
+    async fn mark_upgrading(
+        &self,
+        port_id: &str,
+        channel_id: &str,
+        height: Option<ICSHeight>,
+        channel: &mut ChannelEnd,
+    ) -> Result<(), Error> {
+        if port_id != "transfer" || !channel.is_open() {
+            return Ok(());
+        }
+        if height.is_none() {
+            return Err(Error::query(
+                "Cannot discover channel upgrade state without a channel snapshot height"
+                    .to_string(),
+            ));
+        }
+        let response = self
+            .gateway_client
+            .query_upgrade(port_id, channel_id, height)
+            .await;
+        if upgrade_query_present(response, port_id, channel_id, height)? {
+            channel.state = ChannelState::Open(UpgradeState::Upgrading);
+        }
+        Ok(())
+    }
+
     async fn resolve_signing_intent_denom(&self, intent: &mut SigningIntent) -> Result<(), Error> {
         let Some(hash) = intent.unresolved_ibc_denom_hash().map(str::to_owned) else {
             return Ok(());
@@ -2484,6 +2566,14 @@ impl ChainEndpoint for CardanoChainEndpoint {
                     ))
                 })?;
 
+            let channel_height = response
+                .height
+                .and_then(|height| ICSHeight::try_from(height).ok());
+            if channel_height.is_none() {
+                return Err(Error::query(
+                    "Gateway channel listing has no valid snapshot height".to_string(),
+                ));
+            }
             // Convert proto channels to domain types, filtering out parsing errors
             let channels: Vec<IdentifiedChannelEnd> = response
                 .channels
@@ -2501,6 +2591,16 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         .ok()
                 })
                 .collect();
+            let mut channels = channels;
+            for channel in channels.iter_mut() {
+                self.mark_upgrading(
+                    channel.port_id.as_ref(),
+                    channel.channel_id.as_ref(),
+                    channel_height,
+                    &mut channel.channel_end,
+                )
+                .await?;
+            }
 
             Ok(channels)
         })
@@ -2528,6 +2628,14 @@ impl ChainEndpoint for CardanoChainEndpoint {
             let response = QueryChannelsResponse::decode(&response_bytes[..])
                 .map_err(|e| Error::query(format!("Failed to decode channels response: {}", e)))?;
 
+            let channel_height = response
+                .height
+                .and_then(|height| ICSHeight::try_from(height).ok());
+            if channel_height.is_none() {
+                return Err(Error::query(
+                    "Gateway channel listing has no valid snapshot height".to_string(),
+                ));
+            }
             // Convert proto channels to domain types, filtering out parsing errors
             let channels: Vec<IdentifiedChannelEnd> = response
                 .channels
@@ -2545,6 +2653,16 @@ impl ChainEndpoint for CardanoChainEndpoint {
                         .ok()
                 })
                 .collect();
+            let mut channels = channels;
+            for channel in channels.iter_mut() {
+                self.mark_upgrading(
+                    channel.port_id.as_ref(),
+                    channel.channel_id.as_ref(),
+                    channel_height,
+                    &mut channel.channel_end,
+                )
+                .await?;
+            }
 
             Ok(channels)
         })
@@ -2583,13 +2701,23 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 .map_err(|e| Error::query(format!("Failed to decode channel response: {}", e)))?;
             assert_gateway_proof_height("query_channel", response.proof_height, gateway_height)?;
 
+            let channel_height = response
+                .proof_height
+                .and_then(|height| ICSHeight::try_from(height).ok());
             let channel_proto = response
                 .channel
                 .ok_or_else(|| Error::query("No channel in response".to_string()))?;
 
             // Convert proto Channel to domain ChannelEnd
-            let channel = ChannelEnd::try_from(channel_proto)
+            let mut channel = ChannelEnd::try_from(channel_proto)
                 .map_err(|e| Error::query(format!("Failed to parse ChannelEnd: {}", e)))?;
+            self.mark_upgrading(
+                request.port_id.as_ref(),
+                request.channel_id.as_ref(),
+                channel_height,
+                &mut channel,
+            )
+            .await?;
 
             // Parse proof if requested
             let proof = if matches!(include_proof, IncludeProof::Yes) {
@@ -3770,36 +3898,60 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn query_upgrade(
         &self,
-        _request: ibc_proto::ibc::core::channel::v1::QueryUpgradeRequest,
-        _height: ibc_relayer_types::Height,
-        _include_proof: IncludeProof,
-    ) -> Result<
-        (
-            ibc_relayer_types::core::ics04_channel::upgrade::Upgrade,
-            Option<MerkleProof>,
-        ),
-        Error,
-    > {
-        Err(Error::query(
-            "IBC channel upgrades are not implemented for Cardano".to_string(),
-        ))
+        request: ibc_proto::ibc::core::channel::v1::QueryUpgradeRequest,
+        height: ibc_relayer_types::Height,
+        include_proof: IncludeProof,
+    ) -> Result<(Upgrade, Option<MerkleProof>), Error> {
+        self.rt.block_on(async {
+            let response = self
+                .gateway_client
+                .query_upgrade(&request.port_id, &request.channel_id, Some(height))
+                .await
+                .map_err(|e| Error::query(format!("Failed to query channel upgrade: {e}")))?;
+            // The upgrade proof must share the channel proof's root.
+            proof_height_from_response(response.proof_height, height, "channel upgrade")?;
+            let upgrade = Upgrade::try_from(
+                response
+                    .upgrade
+                    .ok_or_else(|| Error::query("No upgrade in Gateway response".to_string()))?,
+            )
+            .map_err(|e| Error::query(format!("Failed to parse channel upgrade: {e}")))?;
+            let proof = match include_proof {
+                IncludeProof::Yes => {
+                    decode_optional_merkle_proof(&response.proof, "channel upgrade")?
+                }
+                IncludeProof::No => None,
+            };
+            Ok((upgrade, proof))
+        })
     }
 
     fn query_upgrade_error(
         &self,
-        _request: ibc_proto::ibc::core::channel::v1::QueryUpgradeErrorRequest,
-        _height: ibc_relayer_types::Height,
-        _include_proof: IncludeProof,
-    ) -> Result<
-        (
-            ibc_relayer_types::core::ics04_channel::upgrade::ErrorReceipt,
-            Option<MerkleProof>,
-        ),
-        Error,
-    > {
-        Err(Error::query(
-            "IBC channel upgrades are not implemented for Cardano".to_string(),
-        ))
+        request: ibc_proto::ibc::core::channel::v1::QueryUpgradeErrorRequest,
+        height: ibc_relayer_types::Height,
+        include_proof: IncludeProof,
+    ) -> Result<(ErrorReceipt, Option<MerkleProof>), Error> {
+        self.rt.block_on(async {
+            let response = self
+                .gateway_client
+                .query_upgrade_error(&request.port_id, &request.channel_id, Some(height))
+                .await
+                .map_err(|e| Error::query(format!("Failed to query upgrade error: {e}")))?;
+            proof_height_from_response(response.proof_height, height, "upgrade error")?;
+            let receipt =
+                ErrorReceipt::try_from(response.error_receipt.ok_or_else(|| {
+                    Error::query("No error receipt in Gateway response".to_string())
+                })?)
+                .map_err(|e| Error::query(format!("Failed to parse upgrade error receipt: {e}")))?;
+            let proof = match include_proof {
+                IncludeProof::Yes => {
+                    decode_optional_merkle_proof(&response.proof, "upgrade error")?
+                }
+                IncludeProof::No => None,
+            };
+            Ok((receipt, proof))
+        })
     }
 
     fn query_ccv_consumer_id(
@@ -4744,6 +4896,72 @@ fn cardano_latest_height_unhealthy_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upgrade_discovery_propagates_unknown_and_stale_state() {
+        use super::super::error::Error as GatewayError;
+        use ibc_proto::ibc::core::channel::v1::{QueryUpgradeResponse, Upgrade};
+        let height = ICSHeight::new(0, 10).unwrap();
+        let present = QueryUpgradeResponse {
+            upgrade: Some(Upgrade {
+                fields: Some(ibc_proto::ibc::core::channel::v1::UpgradeFields {
+                    ordering: 1,
+                    connection_hops: vec!["connection-1".into()],
+                    version: "ics20-1".into(),
+                }),
+                ..Upgrade::default()
+            }),
+            proof: vec![1],
+            proof_height: Some(ibc_proto::ibc::core::client::v1::Height {
+                revision_number: 0,
+                revision_height: 10,
+            }),
+        };
+        assert!(
+            upgrade_query_present(Ok(present.clone()), "transfer", "channel-0", Some(height))
+                .unwrap()
+        );
+        let mut stale = present.clone();
+        stale.proof_height.as_mut().unwrap().revision_height = 9;
+        assert!(upgrade_query_present(Ok(stale), "transfer", "channel-0", Some(height)).is_err());
+        let mut malformed = present.clone();
+        malformed.upgrade = Some(Upgrade::default());
+        assert!(
+            upgrade_query_present(Ok(malformed), "transfer", "channel-0", Some(height)).is_err()
+        );
+        let mut malformed = present;
+        malformed.upgrade = None;
+        assert!(
+            upgrade_query_present(Ok(malformed), "transfer", "channel-0", Some(height)).is_err()
+        );
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Internal,
+            tonic::Code::NotFound,
+        ] {
+            assert!(upgrade_query_present(
+                Err(GatewayError::GatewayStatus {
+                    code,
+                    message: "endpoint failed".into()
+                }),
+                "transfer",
+                "channel-0",
+                Some(height)
+            )
+            .is_err());
+        }
+        assert!(!upgrade_query_present(
+            Err(GatewayError::GatewayStatus {
+                code: tonic::Code::NotFound,
+                message: serde_json::json!({ "error": { "code": "CHANNEL_UPGRADE_NOT_FOUND", "details": { "port_id": "transfer", "channel_id": "channel-0", "proof_height": "10" } } }).to_string(),
+            }),
+            "transfer",
+            "channel-0",
+            Some(height)
+        )
+        .unwrap());
+    }
 
     #[test]
     fn trace_registry_prelude_is_rejected_even_for_a_single_valid_receive() {

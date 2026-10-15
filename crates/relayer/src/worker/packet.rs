@@ -105,8 +105,16 @@ pub fn spawn_packet_cmd_worker<ChainA: ChainHandle, ChainB: ChainHandle>(
 
     let mut idle_worker_timer = 0;
 
+    let mut route_retry = None;
     spawn_background_task(span, Some(Duration::from_millis(200)), move || {
-        if let Ok(cmd) = cmd_rx.try_recv() {
+        if let Some(cmd) = route_retry.take().or_else(|| cmd_rx.try_recv().ok()) {
+            let refreshed = link.lock().unwrap().a_to_b.refresh_channel_route();
+            if let Err(error) = refreshed {
+                // Keep the command while route discovery is unavailable or
+                // only one endpoint has opened on its replacement connection.
+                route_retry = Some(cmd);
+                return Err(TaskError::Ignore(RunError::link(error).into()));
+            }
             let is_new_batch = cmd.is_ibc_events();
 
             // Try to clear pending packets. At different levels down in `handle_packet_cmd` there
@@ -169,8 +177,16 @@ pub fn spawn_incentivized_packet_cmd_worker<ChainA: ChainHandle, ChainB: ChainHa
             .build(),
     );
 
+    let mut route_retry = None;
     spawn_background_task(span, Some(Duration::from_millis(200)), move || {
-        if let Ok(cmd) = cmd_rx.try_recv() {
+        if let Some(cmd) = route_retry.take().or_else(|| cmd_rx.try_recv().ok()) {
+            let refreshed = link.lock().unwrap().a_to_b.refresh_channel_route();
+            if let Err(error) = refreshed {
+                // Keep the command while route discovery is unavailable or
+                // only one endpoint has opened on its replacement connection.
+                route_retry = Some(cmd);
+                return Err(TaskError::Ignore(RunError::link(error).into()));
+            }
             handle_incentivized_packet_cmd(
                 &mut link.lock().unwrap(),
                 &path,
@@ -212,8 +228,16 @@ pub fn spawn_clear_cmd_worker<ChainA: ChainHandle, ChainB: ChainHandle>(
 
     let mut idle_worker_timer = 0;
 
+    let mut route_retry = None;
     spawn_background_task(span, Some(Duration::from_millis(200)), move || {
-        if let Ok(cmd) = cmd_rx.try_recv() {
+        if let Some(cmd) = route_retry.take().or_else(|| cmd_rx.try_recv().ok()) {
+            let refreshed = link.lock().unwrap().a_to_b.refresh_channel_route();
+            if let Err(error) = refreshed {
+                // Keep the command while route discovery is unavailable or
+                // only one endpoint has opened on its replacement connection.
+                route_retry = Some(cmd);
+                return Err(TaskError::Ignore(RunError::link(error).into()));
+            }
             match clear_cmd_tx.send(cmd.clone()) {
                 Ok(_) => trace!("Successfully sent cmd to packet worker"),
                 Err(e) => {
@@ -524,6 +548,10 @@ fn handle_execute_schedule<ChainA: ChainHandle, ChainB: ChainHandle>(
     _path: &Packet,
     resubmit: Resubmit,
 ) -> Result<(), TaskError<RunError>> {
+    link.a_to_b
+        .refresh_channel_route()
+        .map_err(|error| TaskError::Ignore(RunError::link(error).into()))?;
+
     link.a_to_b
         .refresh_schedule()
         .map_err(handle_link_error_in_task)?;
