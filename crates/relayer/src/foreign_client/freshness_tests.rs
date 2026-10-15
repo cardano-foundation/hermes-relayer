@@ -350,3 +350,18 @@ fn awaiting_source_settlement_is_not_a_renewal_or_a_retry_failure() {
     assert_eq!(h.commits.load(Ordering::SeqCst), 1);
     h.close();
 }
+
+#[test]
+fn compact_clients_cannot_use_the_legacy_timestamp_fallback() {
+    let h = Harness::new(false, true);
+    {
+        let mut state = h.state.lock().unwrap();
+        state.storage_version = 2;
+        state.latest_checkpoint_timestamp = 0;
+        state.latest_checkpoint_slot = 0;
+        state.latest_checkpoint_height = Some(state.latest_height);
+    }
+    assert!(h.client().validated_client_state().is_err());
+    assert_eq!(h.proof_queries.load(Ordering::SeqCst), 0);
+    h.close();
+}

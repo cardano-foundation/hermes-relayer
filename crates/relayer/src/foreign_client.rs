@@ -1022,7 +1022,8 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             Timestamp::from_nanoseconds(state.latest_checkpoint_timestamp)
                 .map_err(|error| query_error(RelayerError::query(error.to_string())))?
         } else {
-            if state.latest_verified_height() != state.latest_height
+            if state.storage_version != 0
+                || state.latest_verified_height() != state.latest_height
                 || state.latest_checkpoint_slot != 0
             {
                 return Err(query_error(RelayerError::query(
