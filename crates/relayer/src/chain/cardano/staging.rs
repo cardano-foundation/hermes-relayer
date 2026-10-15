@@ -218,6 +218,8 @@ pub(crate) struct ObservationPlan {
     pub begin: raw::ObservationChunk,
     pub rows: Vec<u8>,
     pub blocks: Vec<raw::ProbabilisticBlock>,
+    row_suffixes: Vec<Vec<u8>>,
+    block_suffixes: Vec<Vec<u8>>,
 }
 fn extend_u64(raw: &mut Vec<u8>, value: u64) {
     raw.extend_from_slice(&value.to_be_bytes())
@@ -281,13 +283,6 @@ pub(crate) fn plan(
         host_state_tx_hash: header.host_state_tx_hash.clone(),
         ..Default::default()
     };
-    let mut digest = hash(
-        &[
-            b"cardano-ibc.observation/v2\0".as_slice(),
-            &client.checkpoint_reference,
-        ]
-        .concat(),
-    );
     let mut table_digest = hash(b"cardano-ibc.stake-table/v2\0");
     let mut rows = vec![];
     if let Some(context) = header
@@ -322,7 +317,6 @@ pub(crate) fn plan(
                 .checked_add(amount)
                 .ok_or("Stake total overflow")?;
             rows.extend_from_slice(&row);
-            digest = hash(&[digest, row.clone()].concat());
             table_digest = hash(&[table_digest, row].concat());
         }
         let mut table = context.clone();
@@ -334,6 +328,7 @@ pub(crate) fn plan(
     let mut blocks = header.bridge_blocks.clone();
     blocks.push(anchor.clone());
     blocks.extend(header.descendant_blocks.clone());
+    let mut records = vec![];
     for block in &blocks {
         let height = block.height.as_ref().ok_or("Missing evidence height")?;
         if height.revision_number != 0 {
@@ -363,15 +358,34 @@ pub(crate) fn plan(
         };
         record.extend_from_slice(&(witness.len() as u32).to_be_bytes());
         record.extend_from_slice(witness);
-        digest = Sha256::digest([digest, record].concat()).to_vec();
+        records.push(record);
     }
-    begin.evidence_digest = digest;
+    let mut block_suffixes = vec![vec![]; blocks.len() + 1];
+    block_suffixes[blocks.len()] = hash(
+        &[
+            b"cardano-ibc.observation-segments/v2\0".as_slice(),
+            &client.checkpoint_reference,
+        ]
+        .concat(),
+    );
+    for i in (0..blocks.len()).rev() {
+        block_suffixes[i] = hash(&[&block_suffixes[i + 1][..], &records[i]].concat());
+    }
+    let mut row_suffixes = vec![vec![]; rows.len() / 36 + 1];
+    let last = row_suffixes.len() - 1;
+    row_suffixes[last] = block_suffixes[0].clone();
+    for i in (0..last).rev() {
+        row_suffixes[i] = hash(&[&row_suffixes[i + 1][..], &rows[i * 36..(i + 1) * 36]].concat());
+    }
+    begin.evidence_digest = row_suffixes[0].clone();
     let id = session_id(client, &begin)?;
     Ok(ObservationPlan {
         id,
         begin,
         rows,
         blocks,
+        row_suffixes,
+        block_suffixes,
     })
 }
 
@@ -399,7 +413,8 @@ pub(crate) fn submit(
         if rows < (plan.rows.len() / 36) {
             chunk.operation = 2;
             chunk.stake_rows =
-                plan.rows[rows * 36..std::cmp::min((rows + 128) * 36, plan.rows.len())].to_vec()
+                plan.rows[rows * 36..std::cmp::min((rows + 128) * 36, plan.rows.len())].to_vec();
+            chunk.evidence_digest = plan.row_suffixes[rows + chunk.stake_rows.len() / 36].clone();
         } else if session.get("CreditReady").and_then(Value::as_bool) != Some(true) {
             chunk.operation = 3
         } else if !session.get("PendingBlock").is_none_or(Value::is_null) {
@@ -414,7 +429,8 @@ pub(crate) fn submit(
                 };
                 chunk.operation = 4;
                 chunk.blocks =
-                    plan.blocks[count..std::cmp::min(count + size, plan.blocks.len())].to_vec()
+                    plan.blocks[count..std::cmp::min(count + size, plan.blocks.len())].to_vec();
+                chunk.evidence_digest = plan.block_suffixes[count + chunk.blocks.len()].clone();
             } else {
                 chunk.operation = 6
             }
@@ -434,8 +450,82 @@ pub(crate) fn integer(value: &Value, name: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bech32::ToBase32;
     use serde_json::json;
     use std::cell::RefCell;
+
+    #[test]
+    fn segment_commitments_match_go() {
+        let client = raw::ClientState {
+            storage_version: 2,
+            current_epoch: 7,
+            checkpoint_reference: vec![2; 32],
+            storage_namespace: vec![1; 32],
+            verification_generation: 7,
+            ..Default::default()
+        };
+        let header = raw::ProbabilisticHeader {
+            anchor_block: Some(raw::ProbabilisticBlock {
+                height: Some(raw::Height {
+                    revision_number: 0,
+                    revision_height: 42,
+                }),
+                slot: 100,
+                epoch: 8,
+                timestamp: 1234,
+                hash: hex::encode([3; 32]),
+                header_cbor: vec![4, 5],
+                ..Default::default()
+            }),
+            descendant_blocks: vec![raw::ProbabilisticBlock {
+                height: Some(raw::Height {
+                    revision_number: 0,
+                    revision_height: 43,
+                }),
+                slot: 101,
+                epoch: 8,
+                timestamp: 1235,
+                hash: hex::encode([6; 32]),
+                header_cbor: vec![7, 8],
+                ..Default::default()
+            }],
+            new_epoch_context: Some(raw::EpochContext {
+                epoch: 8,
+                stake_distribution: [1u8, 2]
+                    .into_iter()
+                    .map(|key| raw::StakeDistributionEntry {
+                        pool_id: bech32::encode(
+                            "pool",
+                            vec![key; 28].to_base32(),
+                            bech32::Variant::Bech32,
+                        )
+                        .unwrap(),
+                        stake: u64::from(key) * 10,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plan = plan(&client, &header, vec![]).unwrap();
+        assert_eq!(
+            hex::encode(&plan.begin.evidence_digest),
+            "47f9a8871da8cf81d8345564d023a95888035fbb34189d7d183d5c69383caa0a"
+        );
+        assert_eq!(
+            hex::encode(&plan.row_suffixes[1]),
+            "879a70ff65d65797e73dcfa01a48711491871537323a01ca562f983fbf086381"
+        );
+        assert_eq!(
+            hex::encode(&plan.block_suffixes[0]),
+            "10495c5e7616f6bdc85b7cfee7b46e71f0f66ae54f369cdc28877190a216fdb9"
+        );
+        assert_eq!(
+            hex::encode(&plan.block_suffixes[2]),
+            "2e8bcd5d17896af3c4db1ecc52f6d6827ff840aa12a64bc3927f480c0a765845"
+        );
+    }
 
     #[test]
     fn session_encoding_matches_go() {
@@ -489,6 +579,8 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            row_suffixes: vec![vec![1; 32]; 130],
+            block_suffixes: vec![vec![2; 32]; 3],
         };
         let state = RefCell::new(
             json!({"Sequence":4,"RowsRead":128,"CreditReady":false,"PendingBlock":null,"ProcessedBlocks":0,"Complete":false}),
@@ -511,10 +603,12 @@ mod tests {
                 match chunk.operation {
                     2 => {
                         assert_eq!(chunk.stake_rows.len(), 36);
+                        assert_eq!(chunk.evidence_digest, vec![1; 32]);
                         state["RowsRead"] = json!(129)
                     }
                     3 => state["CreditReady"] = json!(true),
                     4 => {
+                        assert_eq!(chunk.evidence_digest, vec![2; 32]);
                         if state["ProcessedBlocks"] == json!(0) {
                             state["PendingBlock"] = json!({"height":1})
                         } else {
