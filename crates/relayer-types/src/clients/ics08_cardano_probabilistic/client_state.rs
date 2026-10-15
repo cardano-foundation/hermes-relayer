@@ -102,6 +102,22 @@ impl TryFrom<RawClientState> for ClientState {
     type Error = Error;
 
     fn try_from(raw: RawClientState) -> Result<Self, Self::Error> {
+        if raw.storage_version != 2 {
+            return Err(Error::invalid_field(
+                "storage_version",
+                "only snapshot storage version 2 is supported".to_owned(),
+            ));
+        }
+        if raw.verification_generation == 0
+            || raw.checkpoint_reference.len() != 32
+            || raw.storage_namespace.len() != 32
+        {
+            return Err(Error::invalid_field(
+                "checkpoint_reference",
+                "client requires a generation, namespace and checkpoint reference".to_owned(),
+            ));
+        }
+
         let RawClientState {
             chain_id: raw_chain_id,
             latest_height,
@@ -517,6 +533,10 @@ mod tests {
 
     fn raw_client_state() -> RawClientState {
         RawClientState {
+            storage_version: 2,
+            verification_generation: 1,
+            checkpoint_reference: vec![1; 32],
+            storage_namespace: vec![2; 32],
             chain_id: "cardano-preprod".to_string(),
             latest_height: Some(RawHeight {
                 revision_number: 0,
@@ -547,6 +567,18 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn rejects_unsupported_storage_formats() {
+        for version in [0, 1, 3] {
+            let mut raw = raw_client_state();
+            raw.storage_version = version;
+            assert!(ClientState::try_from(raw).is_err());
+        }
+        let mut raw = raw_client_state();
+        raw.verification_generation = 0;
+        assert!(ClientState::try_from(raw).is_err());
     }
 
     #[test]

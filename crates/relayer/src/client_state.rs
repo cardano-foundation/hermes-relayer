@@ -253,6 +253,10 @@ mod tests {
             relative_stake_denominator: 5,
         };
         let raw_state = raw::ClientState {
+            storage_version: 2,
+            verification_generation: 1,
+            checkpoint_reference: vec![1; 32],
+            storage_namespace: vec![2; 32],
             chain_id: "cardano-preprod".to_string(),
             latest_height: Some(raw::Height {
                 revision_number: 0,

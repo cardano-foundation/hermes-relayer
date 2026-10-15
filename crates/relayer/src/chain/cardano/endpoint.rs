@@ -3683,31 +3683,10 @@ impl ChainEndpoint for CardanoChainEndpoint {
             Error::query("missing Cardano header while building consensus state".to_string())
         })?;
 
-        if let AnyHeader::Probabilistic(expected) = &header {
-            let response = self
-                .rt
-                .block_on(self.gateway_client.query_new_client(header_height))
-                .map_err(|error| Error::query(error.to_string()))?;
-            let raw = response
-                .consensus_state
-                .ok_or_else(|| Error::query("missing packet consensus snapshot".to_string()))?;
-            let state = AnyConsensusState::try_from(ibc_proto::google::protobuf::Any {
-                type_url: raw.type_url,
-                value: raw.value,
-            })
-            .map_err(|error| Error::query(error.to_string()))?;
-            if let AnyConsensusState::Probabilistic(consensus) = &state {
-                if consensus.accepted_block_hash != expected.anchor_block.hash {
-                    return Err(Error::query(
-                        "packet consensus snapshot is on a different block".to_string(),
-                    ));
-                }
-            } else {
-                return Err(Error::query(
-                    "unexpected consensus snapshot type".to_string(),
-                ));
-            }
-            return Ok(state);
+        if matches!(&header, AnyHeader::Probabilistic(_)) {
+            return Err(Error::query(
+                "Probabilistic client creation requires probabilistic_bootstrap_file".to_owned(),
+            ));
         }
 
         let ibc_state_root = extract_ibc_state_root_from_host_state_tx(
@@ -5483,7 +5462,7 @@ mod tests {
             latest_checkpoint_settlement_credit: None,
             latest_checkpoint_pool_production: None,
             randomness_stabilisation_window_slots: 0,
-            storage_version: 0,
+            storage_version: 2,
             verification_generation: 0,
             checkpoint_reference: vec![],
             storage_namespace: vec![],
