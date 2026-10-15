@@ -38,7 +38,6 @@ use ibc_relayer_types::clients::{
     ics07_tendermint::{
         header::TENDERMINT_HEADER_TYPE_URL, misbehaviour::TENDERMINT_MISBEHAVIOR_TYPE_URL,
     },
-    ics08_cardano::{header::MITHRIL_HEADER_TYPE_URL, misbehaviour::MITHRIL_MISBEHAVIOUR_TYPE_URL},
     ics08_cardano_probabilistic::{
         header::PROBABILISTIC_HEADER_TYPE_URL, misbehaviour::PROBABILISTIC_MISBEHAVIOUR_TYPE_URL,
     },
@@ -227,8 +226,6 @@ fn describe_update_client_message(type_url: Option<&str>) -> String {
         Some(TENDERMINT_MISBEHAVIOR_TYPE_URL) => {
             "MsgUpdateClient<TendermintMisbehaviour>".to_string()
         }
-        Some(MITHRIL_HEADER_TYPE_URL) => "MsgUpdateClient<CardanoHeader>".to_string(),
-        Some(MITHRIL_MISBEHAVIOUR_TYPE_URL) => "MsgUpdateClient<CardanoMisbehaviour>".to_string(),
         Some(PROBABILISTIC_HEADER_TYPE_URL) => "MsgUpdateClient<ProbabilisticHeader>".to_string(),
         Some(PROBABILISTIC_MISBEHAVIOUR_TYPE_URL) => {
             "MsgUpdateClient<ProbabilisticMisbehaviour>".to_string()
@@ -475,13 +472,17 @@ impl GatewayClient {
     pub async fn query_new_client(
         &self,
         height: u64,
+        initialization_sequence: u32,
     ) -> Result<super::generated::ibc::core::client::v1::QueryNewClientResponse, Error> {
         use super::generated::ibc::core::client::v1::{
             query_client::QueryClient, QueryNewClientRequest,
         };
 
         let mut client = QueryClient::new(self.channel.clone());
-        let request = tonic::Request::new(QueryNewClientRequest { height });
+        let request = tonic::Request::new(QueryNewClientRequest {
+            height,
+            initialization_sequence,
+        });
         let response = client.new_client(request).await?.into_inner();
 
         Ok(response)
@@ -2315,33 +2316,6 @@ impl GatewayClient {
         &self.endpoint
     }
 
-    /// Fetch a Mithril certificate for a specific chain point
-    ///
-    /// This should query the Gateway's Mithril aggregator endpoint to get:
-    /// 1. The latest Mithril certificate covering the requested slot/epoch
-    /// 2. The certificate chain back to genesis (if needed)
-    /// 3. The multi-signature proof
-    ///
-    /// The certificate is used by the light client to verify Cardano block headers
-    /// without needing to sync the full chain.
-    ///
-    /// TODO: Add custom proto for Mithril certificate query
-    /// TODO: Implement certificate chain verification
-    /// TODO: Cache certificates to avoid redundant queries
-    pub async fn fetch_mithril_certificate(&self, slot: u64, epoch: u64) -> Result<Vec<u8>, Error> {
-        tracing::info!(
-            "Fetching Mithril certificate for slot={}, epoch={}",
-            slot,
-            epoch
-        );
-
-        // Stub implementation - requires custom Mithril proto
-        tracing::warn!(
-            "fetch_mithril_certificate: requires custom proto for Mithril aggregator endpoint"
-        );
-        Ok(vec![])
-    }
-
     /// Query block header at a specific height
     pub async fn query_block_header(&self, _height: Height) -> Result<Vec<u8>, Error> {
         // TODO: Implement block header query
@@ -3148,11 +3122,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(built.kind, BuiltIbcTxKind::TendermintUpdateChain);
-        for other_type in [
-            MITHRIL_MISBEHAVIOUR_TYPE_URL,
-            PROBABILISTIC_MISBEHAVIOUR_TYPE_URL,
-            "/unknown.Misbehaviour",
-        ] {
+        for other_type in [PROBABILISTIC_MISBEHAVIOUR_TYPE_URL, "/unknown.Misbehaviour"] {
             assert!(decode_update_client_transactions(
                 Some(other_type),
                 chain_any(1, vec!["a100".to_string()], false),

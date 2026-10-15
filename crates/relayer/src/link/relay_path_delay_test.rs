@@ -23,7 +23,7 @@ fn height(n: u64) -> Height {
 
 fn cardano_client() -> AnyClientState {
     AnyClientState::Probabilistic(ProbabilisticClientState {
-        storage_version: 0,
+        storage_version: 2,
         verification_generation: 0,
         checkpoint_reference: vec![],
         storage_namespace: vec![],
@@ -98,11 +98,7 @@ fn runtime(config: ChainConfig) -> (BaseChainHandle, thread::JoinHandle<Vec<Heig
                                 verification_generation: 0,
                                 checkpoint_reference: vec![],
                                 packet_state_reference: vec![],
-                                packet_state_snapshot: vec![],
-                                nonce_state: None,
-                                pool_registry: None,
-                                settlement_credit: None,
-                                pool_production: None,
+
                                 root: CommitmentRoot::from_bytes(&[1; 32]),
                                 timestamp: 100_000_000_000,
                                 accepted_block_hash: "01".repeat(32),

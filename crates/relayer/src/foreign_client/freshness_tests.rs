@@ -37,6 +37,10 @@ impl Harness {
         else {
             unreachable!()
         };
+        client.storage_version = 2;
+        client.verification_generation = 1;
+        client.checkpoint_reference = vec![1; 32];
+        client.storage_namespace = vec![2; 32];
         client.system_start_unix_ns = 950_000_000_000;
         client.latest_checkpoint_timestamp = 1_000_000_000_000;
         client.trusting_period = Duration::from_secs(60);
@@ -79,6 +83,10 @@ impl Harness {
                             panic!("wrong client type")
                         };
                         let timestamp = clock.load(Ordering::SeqCst);
+                        if timestamp <= client.latest_checkpoint_timestamp {
+                            reply_to.send(Ok(None)).unwrap();
+                            continue;
+                        }
                         let height = client.latest_verified_height().increment();
                         let raw = raw::ProbabilisticHeader {
                             trusted_height: Some(client.latest_verified_height().into()),
@@ -121,8 +129,22 @@ impl Harness {
         );
         let (reject, attempts) = (reject_submission.clone(), submissions.clone());
         let destination_thread = thread::spawn(move || {
+            let mut session = serde_json::json!({"Sequence":0,"RowsRead":0,"CreditReady":true,"ProcessedBlocks":0,"Complete":false,"Receipt":vec![3u8;32]});
+            let mut staged_anchor: Option<raw::ProbabilisticBlock> = None;
             for (_, request) in rx {
                 match request {
+                    ChainRequest::QueryCardanoChallengeContext { reply_to, .. } => {
+                        let raw: raw::ClientState = current.lock().unwrap().clone().into();
+                        reply_to.send(Ok(raw.encode_to_vec())).unwrap();
+                    }
+                    ChainRequest::QueryProbabilisticVerification {
+                        request, reply_to, ..
+                    } => {
+                        assert_eq!(request.kind, 8);
+                        reply_to
+                            .send(Ok(serde_json::to_vec(&session).unwrap()))
+                            .unwrap();
+                    }
                     ChainRequest::QueryClientState { reply_to, .. } => {
                         reply_to
                             .send(Ok((
@@ -181,16 +203,32 @@ impl Harness {
                             update.client_message.unwrap().value.as_slice(),
                         )
                         .unwrap();
-                        assert!(header.is_checkpoint);
-                        if commit_progress {
-                            let anchor = header.anchor_block.unwrap();
-                            let mut client = current.lock().unwrap();
-                            client.latest_checkpoint_height =
-                                Some(anchor.height.unwrap().try_into().unwrap());
-                            client.latest_checkpoint_timestamp = anchor.timestamp;
-                            client.latest_checkpoint_slot = anchor.slot;
-                            client.latest_checkpoint_block_hash = anchor.hash;
-                            committed.fetch_add(1, Ordering::SeqCst);
+                        let chunk = header
+                            .observation_chunk
+                            .expect("maintenance must use bounded operations");
+                        session["Sequence"] = chunk.sequence.into();
+                        match chunk.operation {
+                            1 => {
+                                session["ProcessedBlocks"] = 0.into();
+                                session["Complete"] = false.into();
+                            }
+                            4 => {
+                                staged_anchor = chunk.blocks.first().cloned();
+                                session["ProcessedBlocks"] = chunk.blocks.len().into();
+                            }
+                            6 => session["Complete"] = true.into(),
+                            7 if commit_progress => {
+                                let anchor = staged_anchor.take().unwrap();
+                                let mut client = current.lock().unwrap();
+                                client.latest_checkpoint_height =
+                                    Some(anchor.height.unwrap().try_into().unwrap());
+                                client.latest_checkpoint_timestamp = anchor.timestamp;
+                                client.latest_checkpoint_slot = anchor.slot;
+                                client.latest_checkpoint_block_hash = anchor.hash;
+                                committed.fetch_add(1, Ordering::SeqCst);
+                            }
+                            7 => {}
+                            _ => panic!("unexpected maintenance operation"),
                         }
                         reply_to.send(Ok(vec![])).unwrap();
                     }
@@ -204,14 +242,9 @@ impl Harness {
                             unique_pools_count: 5,
                             unique_stake_bps: 1000,
                             security_score_bps: 1000,
-                            packet_state_snapshot: vec![],
-                            nonce_state: None,
-                            pool_registry: None,
-                            settlement_credit: None,
-                            pool_production: None,
-                            verification_generation: 0,
-                            checkpoint_reference: vec![],
-                            packet_state_reference: vec![],
+                            verification_generation: 1,
+                            checkpoint_reference: vec![1; 32],
+                            packet_state_reference: vec![2; 32],
                         };
                         reply_to
                             .send(Ok((AnyConsensusState::Probabilistic(consensus), None)))
@@ -252,7 +285,7 @@ impl Harness {
 }
 
 #[test]
-fn checkpoint_freshness_uses_destination_time_and_the_supported_legacy_fallback() {
+fn checkpoint_freshness_uses_destination_time_without_a_timestamp_fallback() {
     for authoritative in [false, true] {
         let h = Harness::new(authoritative, true);
         let client = h.client();
@@ -269,7 +302,7 @@ fn checkpoint_freshness_uses_destination_time_and_the_supported_legacy_fallback(
             .unwrap_err()
             .is_expired_error());
         assert!(client.clone().refresh().unwrap_err().is_expired_error());
-        // Only a root-bearing legacy cursor may recover time from its consensus state.
+        // Even a root-bearing cursor must carry its authenticated timestamp.
         {
             let mut state = h.state.lock().unwrap();
             state.latest_checkpoint_height = Some(state.latest_height);
@@ -280,13 +313,14 @@ fn checkpoint_freshness_uses_destination_time_and_the_supported_legacy_fallback(
             timestamp - 120_000_000_000 + 59_000_000_000,
             Ordering::SeqCst,
         );
-        assert!(client.validated_client_state().is_ok());
+        assert!(client.validated_client_state().is_err());
+        assert_eq!(h.proof_queries.load(Ordering::SeqCst), 0);
         h.state.lock().unwrap().latest_checkpoint_height = Some(Height::new(0, 10000).unwrap());
         assert!(client
             .validated_client_state()
             .unwrap_err()
             .to_string()
-            .contains("timestamp migration"));
+            .contains("invalid authenticated checkpoint"));
         drop(client);
         h.close();
     }
@@ -301,7 +335,7 @@ fn a_transaction_without_committed_checkpoint_progress_does_not_renew_trust() {
         .refresh()
         .unwrap_err()
         .to_string()
-        .contains("did not commit checkpoint progress"));
+        .contains("no checkpoint or proposal"));
     assert_eq!(before, h.state.lock().unwrap().latest_checkpoint_timestamp);
     h.close();
 }
@@ -366,7 +400,7 @@ fn awaiting_source_settlement_is_not_a_renewal_or_a_retry_failure() {
 }
 
 #[test]
-fn compact_clients_cannot_use_the_legacy_timestamp_fallback() {
+fn missing_checkpoint_timestamps_fail_without_querying_proof_state() {
     let h = Harness::new(false, true);
     {
         let mut state = h.state.lock().unwrap();

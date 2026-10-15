@@ -1,5 +1,5 @@
 //! Destination snapshot queries and resumable bounded observations. Public client
-//! records stay compact, expansion happens only in this off-chain evidence builder.
+//! records stay bounded, expansion happens only in this off-chain evidence builder.
 use bech32::FromBase32;
 use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
 use serde::de::DeserializeOwned;
@@ -112,7 +112,7 @@ pub(crate) fn hydrate(
     mut query: impl FnMut(raw::QueryVerificationRequest) -> Result<Vec<u8>, String>,
 ) -> Result<raw::ClientState, String> {
     if client.storage_version != 2 {
-        return Ok(client);
+        return Err("Unsupported probabilistic client storage format".into());
     }
     let raw = query(raw::QueryVerificationRequest {
         namespace: client.storage_namespace.clone(),
@@ -631,28 +631,5 @@ mod tests {
         .unwrap();
         assert_eq!(receipt, vec![7; 32]);
         assert_eq!(*operations.borrow(), vec![1, 2, 3, 4, 5, 4, 6]);
-    }
-}
-
-#[derive(serde::Deserialize)]
-pub(crate) struct BootstrapBundle {
-    pub client_state: String,
-    pub consensus_state: String,
-    pub imports: Vec<String>,
-}
-impl BootstrapBundle {
-    pub(crate) fn load(path: &std::path::Path) -> Result<Self, String> {
-        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        if file.metadata().map_err(|e| e.to_string())?.len() > 20 * 1024 * 1024 {
-            return Err("Trusted bootstrap bundle exceeds its import allowance".into());
-        }
-        let bundle: Self = serde_json::from_reader(file).map_err(|e| e.to_string())?;
-        if bundle.imports.is_empty() || bundle.imports.len() > 4096 {
-            return Err("Invalid trusted bootstrap import count".into());
-        }
-        Ok(bundle)
-    }
-    pub(crate) fn bytes(encoded: &str) -> Result<Vec<u8>, String> {
-        subtle_encoding::base64::decode(encoded.as_bytes()).map_err(|e| e.to_string())
     }
 }

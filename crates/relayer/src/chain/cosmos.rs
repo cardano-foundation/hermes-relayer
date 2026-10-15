@@ -1284,54 +1284,34 @@ impl ChainEndpoint for CosmosSdkChain {
                 "Cardano challenge requires a probabilistic client".to_owned(),
             ));
         };
-        if client.storage_version == 2 {
-            use prost::Message;
-            let mut path = format!("clients/{client_id}/verifiedCheckpoints/").into_bytes();
-            path.extend_from_slice(&client.verification_generation.to_be_bytes());
-            path.extend_from_slice(&trusted_height.revision_height().to_be_bytes());
-            let response = self
-                .block_on(self.rpc_client.abci_query(
-                    Some("/store/ibc/key".to_owned()),
-                    path,
-                    Some(host_height.into()),
-                    false,
-                ))
-                .map_err(|error| Error::rpc(self.config.rpc_addr.clone(), error))?;
-            if !response.code.is_ok() {
-                return Err(Error::abci_query(response));
-            }
-            if response.value.len() != 32 {
-                return Err(Error::query(
-                    "Historical compact checkpoint reference is unavailable".to_owned(),
-                ));
-            }
-            let hydrated =
-                crate::chain::cardano::staging::hydrate(client.into(), response.value, |request| {
-                    self.query_probabilistic_verification(
-                        request,
-                        QueryHeight::Specific(host_height),
-                    )
-                    .map_err(|error| error.to_string())
-                })
-                .map_err(Error::query)?;
-            return Ok(hydrated.encode_to_vec());
+
+        use prost::Message;
+        let mut path = format!("clients/{client_id}/verifiedCheckpoints/").into_bytes();
+        path.extend_from_slice(&client.verification_generation.to_be_bytes());
+        path.extend_from_slice(&trusted_height.revision_height().to_be_bytes());
+        let response = self
+            .block_on(self.rpc_client.abci_query(
+                Some("/store/ibc/key".to_owned()),
+                path,
+                Some(host_height.into()),
+                false,
+            ))
+            .map_err(|error| Error::rpc(self.config.rpc_addr.clone(), error))?;
+        if !response.code.is_ok() {
+            return Err(Error::abci_query(response));
         }
-        crate::chain::cardano::challenge::context_from_store(client.into(), trusted_height, |key| {
-            let mut path = format!("clients/{client_id}/").into_bytes();
-            path.extend_from_slice(key);
-            let response = self
-                .block_on(self.rpc_client.abci_query(
-                    Some("/store/ibc/key".to_owned()),
-                    path,
-                    Some(host_height.into()),
-                    false,
-                ))
-                .map_err(|error| Error::rpc(self.config.rpc_addr.clone(), error))?;
-            if !response.code.is_ok() {
-                return Err(Error::abci_query(response));
-            }
-            Ok(response.value)
-        })
+        if response.value.len() != 32 {
+            return Err(Error::query(
+                "Historical snapshot checkpoint reference is unavailable".to_owned(),
+            ));
+        }
+        let hydrated =
+            crate::chain::cardano::staging::hydrate(client.into(), response.value, |request| {
+                self.query_probabilistic_verification(request, QueryHeight::Specific(host_height))
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(Error::query)?;
+        Ok(hydrated.encode_to_vec())
     }
 
     fn query_client_status(
@@ -1507,8 +1487,8 @@ impl ChainEndpoint for CosmosSdkChain {
         let consensus_state = AnyConsensusState::decode_vec(&res.value).map_err(Error::decode)?;
 
         // Note: Upstream Hermes assumed Cosmos chains only ever store Tendermint consensus states.
-        // In this repo we also support non-Tendermint clients on Cosmos chains (e.g. the Mithril
-        // client used to track Cardano). Therefore we must accept whatever consensus state type is
+        // In this repo we also support non-Tendermint clients on Cosmos chains (e.g. the
+        // probabilistic client that tracks Cardano). Therefore we must accept whatever consensus state type is
         // actually stored under the requested client ID and height.
 
         match include_proof {

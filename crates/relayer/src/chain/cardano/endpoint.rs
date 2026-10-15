@@ -17,8 +17,6 @@ use super::utxo_resolver::{
     transaction_consumes_output_from, KupoInputResolver, TrustedUtxoOverlay,
 };
 
-use ibc_relayer_types::clients::ics08_cardano::consensus_state::ConsensusState as MithrilConsensusState;
-use ibc_relayer_types::clients::ics08_cardano::misbehaviour::Misbehaviour as MithrilMisbehaviour;
 use ibc_relayer_types::clients::ics08_cardano_probabilistic::misbehaviour::Misbehaviour as ProbabilisticMisbehaviour;
 
 use crate::account::Balance;
@@ -62,7 +60,6 @@ use ibc_relayer_types::core::ics04_channel::channel::{
 };
 use ibc_relayer_types::core::ics04_channel::packet::{PacketMsgType, Sequence};
 use ibc_relayer_types::core::ics04_channel::upgrade::{ErrorReceipt, Upgrade};
-use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentRoot;
 use ibc_relayer_types::core::ics23_commitment::commitment::{
     CommitmentPrefix, CommitmentProofBytes,
 };
@@ -1203,10 +1200,8 @@ impl CardanoChainEndpoint {
     /// Why this exists:
     /// - After trusted Ogmios submission, the Gateway reports the transaction
     ///   inclusion height from `db-sync`'s `block_no`.
-    /// - Separately, for Cardano↔Cosmos IBC, the Cosmos-side light client only accepts heights
-    ///   that satisfy the active Gateway light-client mode. In Mithril mode this is a certified
-    ///   transaction snapshot block number; in probabilistic mode it is a heuristically accepted
-    ///   Cardano block number.
+    /// - Separately, for Cardano↔Cosmos IBC, the Cosmos-side light client only accepts
+    ///   heuristically accepted Cardano block numbers.
     ///
     /// If Hermes proceeds immediately after inclusion, it may query proofs at a height that the
     /// Cosmos-side client has not yet been updated to, or worse: it may receive proofs that are
@@ -1214,14 +1209,14 @@ impl CardanoChainEndpoint {
     /// root. That shows up as "proof does not match ibc_state_root".
     ///
     /// To avoid this class of race, we treat "commit" for Cardano transactions as "included AND
-    /// accepted by the Gateway's current light-client mode".
+    /// accepted by the Gateway".
     async fn wait_for_gateway_accepted_height(
         &self,
         included_height: ICSHeight,
     ) -> Result<ICSHeight, Error> {
-        let poll_interval = self.config.mithril_poll_interval;
-        let timeout = self.config.mithril_certification_timeout;
-        let log_interval = self.config.mithril_wait_log_interval;
+        let poll_interval = self.config.accepted_height_poll_interval;
+        let timeout = self.config.accepted_height_timeout;
+        let log_interval = self.config.accepted_height_wait_log_interval;
         let start = tokio::time::Instant::now();
         let mut last_logged_elapsed = std::time::Duration::from_secs(0);
         let mut last_latest_height: Option<u64> = None;
@@ -1274,7 +1269,7 @@ impl CardanoChainEndpoint {
             if elapsed >= timeout {
                 return Err(Error::send_tx(format!(
                     "timed out waiting for Gateway-accepted height >= {} (latest={}). \
-                     Note: for Cardano, Height.revision_height is a block-number based height in both Mithril and probabilistic modes.",
+                     Note: for Cardano, Height.revision_height is a block number, not a slot.",
                     included_height, latest,
                 )));
             }
@@ -1930,7 +1925,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         // For Cardano, we rely on on-chain verification in the Cosmos-side Cardano light client
         // implementation (the chain rejects invalid headers and proofs for the active client type).
         //
-        // To keep Hermes functional without coupling it to the full Mithril verification stack
+        // To keep Hermes functional without coupling it to the full verification stack
         // (which is already implemented in the on-chain client), we treat this as a best-effort
         // fetch + structural validation step:
         // - fetch the Cardano header for `target` from the Gateway
@@ -1945,10 +1940,6 @@ impl ChainEndpoint for CardanoChainEndpoint {
             .contains_key(&target.revision_height())
         {
             let (host_state_nft_policy_id, host_state_nft_token_name) = match client_state {
-                AnyClientState::Mithril(state) => (
-                    state.host_state_nft_policy_id.clone(),
-                    state.host_state_nft_token_name.clone(),
-                ),
                 AnyClientState::Probabilistic(state) => (
                     state.host_state_nft_policy_id.clone(),
                     state.host_state_nft_token_name.clone(),
@@ -1989,10 +1980,6 @@ impl ChainEndpoint for CardanoChainEndpoint {
         bind_probabilistic_pool_metadata(&mut header, client_state)?;
 
         let (host_state_nft_policy_id, host_state_nft_token_name) = match client_state {
-            AnyClientState::Mithril(state) => (
-                state.host_state_nft_policy_id.clone(),
-                state.host_state_nft_token_name.clone(),
-            ),
             AnyClientState::Probabilistic(state) => (
                 state.host_state_nft_policy_id.clone(),
                 state.host_state_nft_token_name.clone(),
@@ -3493,6 +3480,38 @@ impl ChainEndpoint for CardanoChainEndpoint {
         ))
     }
 
+    fn query_client_initialization(
+        &self,
+        height: u64,
+        sequence: u32,
+    ) -> Result<crate::chain::endpoint::ClientInitialization, Error> {
+        let response = self
+            .rt
+            .block_on(self.gateway_client.query_new_client(height, sequence))
+            .map_err(|e| Error::query(format!("Gateway client initialization failed: {e}")))?;
+        let convert = |value: prost_types::Any| ibc_proto::google::protobuf::Any {
+            type_url: value.type_url,
+            value: value.value,
+        };
+        let client_state = response
+            .client_state
+            .ok_or_else(|| Error::query("Initial client state is missing".into()))?;
+        let consensus_state = response
+            .consensus_state
+            .ok_or_else(|| Error::query("Initial consensus state is missing".into()))?;
+        Ok(crate::chain::endpoint::ClientInitialization {
+            client_state: AnyClientState::try_from(convert(client_state))
+                .map_err(|e| Error::query(e.to_string()))?,
+            consensus_state: AnyConsensusState::try_from(convert(consensus_state))
+                .map_err(|e| Error::query(e.to_string()))?,
+            message: response
+                .initialization_message
+                .map(|raw| AnyHeader::try_from(convert(raw)))
+                .transpose()
+                .map_err(|e| Error::query(e.to_string()))?,
+        })
+    }
+
     fn build_client_state(
         &self,
         height: ICSHeight,
@@ -3504,7 +3523,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             .rt
             .block_on(
                 self.gateway_client
-                    .query_new_client(height.revision_height()),
+                    .query_new_client(height.revision_height(), 0),
             )
             .map_err(|e| Error::query(format!("Gateway query_new_client failed: {e}")))?;
 
@@ -3683,47 +3702,10 @@ impl ChainEndpoint for CardanoChainEndpoint {
             Error::query("missing Cardano header while building consensus state".to_string())
         })?;
 
-        if let AnyHeader::Probabilistic(expected) = &header {
-            let response = self
-                .rt
-                .block_on(self.gateway_client.query_new_client(header_height))
-                .map_err(|error| Error::query(error.to_string()))?;
-            let raw = response
-                .consensus_state
-                .ok_or_else(|| Error::query("missing packet consensus snapshot".to_string()))?;
-            let state = AnyConsensusState::try_from(ibc_proto::google::protobuf::Any {
-                type_url: raw.type_url,
-                value: raw.value,
-            })
-            .map_err(|error| Error::query(error.to_string()))?;
-            if let AnyConsensusState::Probabilistic(consensus) = &state {
-                if consensus.accepted_block_hash != expected.anchor_block.hash {
-                    return Err(Error::query(
-                        "packet consensus snapshot is on a different block".to_string(),
-                    ));
-                }
-            } else {
-                return Err(Error::query(
-                    "unexpected consensus snapshot type".to_string(),
-                ));
-            }
-            return Ok(state);
-        }
-
-        let ibc_state_root = extract_ibc_state_root_from_host_state_tx(
-            &header,
-            &light_block.host_state_nft_policy_id,
-            &light_block.host_state_nft_token_name,
-        )?;
-
         match header {
-            AnyHeader::Mithril(header) => Ok(AnyConsensusState::from(MithrilConsensusState::new(
-                CommitmentRoot::from_bytes(&ibc_state_root),
-                header.timestamp.nanoseconds(),
-                header.mithril_stake_distribution_certificate,
-                header.transaction_snapshot_certificate.hash,
-            ))),
-            AnyHeader::Probabilistic(_) => unreachable!("handled packet snapshot above"),
+            AnyHeader::Probabilistic(_) => Err(Error::query(
+                "Probabilistic creation requires the source initialization query".to_owned(),
+            )),
             AnyHeader::Tendermint(_) => Err(Error::query(
                 "Cardano build_consensus_state received a Tendermint header".to_string(),
             )),
@@ -3736,22 +3718,6 @@ impl ChainEndpoint for CardanoChainEndpoint {
         target_height: ICSHeight,
         client_state: &AnyClientState,
     ) -> Result<(Self::Header, Vec<Self::Header>), Error> {
-        // NOTE: Hermes core logic often requests a client update at `proofs_height + 1`.
-        //
-        // On Tendermint chains this is fine because heights are contiguous and the Tendermint
-        // header builder can return intermediate "support" headers (including the proof height).
-        //
-        // For Cardano/Mithril, however, headers only exist at Mithril-certified transaction snapshot
-        // heights (e.g. every ~15 blocks in our devnet setup). That means a height like `H + 1`
-        // may not exist at all even if the chain has advanced well beyond it.
-        //
-        // If the exact `target_height` is not available, we still want to:
-        // - install a consensus state at `target_height - 1` (the proof height), so proofs verify, and
-        // - also advance the client to the latest available snapshot height.
-        //
-        // We do this by returning:
-        // - `support` header at `target_height - 1`, and
-        // - a final header at the latest snapshot height.
         let effective_trusted_height =
             normalize_header_query_trusted_height(trusted_height, target_height)?;
         tracing::info!(
@@ -3771,88 +3737,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 bind_probabilistic_pool_metadata(&mut header, client_state)?;
                 Ok((header, vec![]))
             }
-            Err(e) => {
-                if matches!(client_state, AnyClientState::Probabilistic(_))
-                    || !is_recoverable_gateway_header_height_error(&e)
-                {
-                    return Err(Error::query(format!("Gateway query_header failed: {e}")));
-                }
-
-                let proof_height = target_height
-                    .decrement()
-                    .map_err(|_| Error::query(format!("invalid target height {target_height}")))?;
-                let effective_proof_trusted_height =
-                    normalize_header_query_trusted_height(trusted_height, proof_height)?;
-
-                let proof_header = self
-                    .rt
-                    .block_on(
-                        self.gateway_client
-                            .query_header(effective_proof_trusted_height, proof_height),
-                    )
-                    .map_err(|e| {
-                        Error::query(format!(
-                            "Gateway query_header failed at proof height {proof_height}: {e}"
-                        ))
-                    })?;
-
-                let latest_height = self
-                    .rt
-                    .block_on(self.gateway_client.query_latest_height())
-                    .map_err(|e| {
-                        Error::query(format!("Gateway query_latest_height failed: {e}"))
-                    })?;
-
-                let mut selected_header = None;
-                let mut candidate_height = target_height.revision_height();
-                let latest_revision_height = latest_height.revision_height();
-
-                while candidate_height <= latest_revision_height {
-                    let candidate_ics_height =
-                        ICSHeight::new(target_height.revision_number(), candidate_height)
-                            .map_err(|_| {
-                                Error::query(format!(
-                                    "invalid candidate height while searching Cardano header: {candidate_height}"
-                                ))
-                            })?;
-
-                    match self.rt.block_on(
-                        self.gateway_client
-                            .query_header(proof_height, candidate_ics_height),
-                    ) {
-                        Ok(header) => {
-                            selected_header = Some(header);
-                            break;
-                        }
-                        Err(search_error) => {
-                            if !is_recoverable_gateway_header_height_error(&search_error) {
-                                return Err(Error::query(format!(
-                                    "Gateway query_header failed while searching for a certified height at/after {target_height} (candidate {candidate_ics_height}): {search_error}"
-                                )));
-                            }
-                        }
-                    }
-
-                    candidate_height = candidate_height.saturating_add(1);
-                }
-
-                let selected_header = if let Some(header) = selected_header {
-                    header
-                } else {
-                    self.rt
-                        .block_on(
-                            self.gateway_client
-                                .query_header(proof_height, latest_height),
-                        )
-                        .map_err(|e| {
-                            Error::query(format!(
-                                "Gateway query_header failed at latest height {latest_height}: {e}"
-                            ))
-                        })?
-                };
-
-                Ok((selected_header, vec![proof_header]))
-            }
+            Err(e) => Err(Error::query(format!("Gateway query_header failed: {e}"))),
         }
     }
 
@@ -4028,10 +3913,6 @@ fn filter_packet_events_from_block_results(
     Ok(filtered)
 }
 
-// Mithril header is decoded from the Gateway as `google.protobuf.Any`.
-// See `ibc-relayer-types/src/clients/ics08_cardano/header.rs` and
-// `ibc-relayer-types/src/core/ics02_client/header.rs`.
-
 // Shared by the endpoint and the wire regression so challenge requests always
 // carry the destination-owned context with the exact submitted trusted height.
 pub(crate) async fn query_cardano_witness_header(
@@ -4058,12 +3939,6 @@ pub(crate) async fn query_cardano_witness_header(
 
 fn independent_header_trusted_height(header: &AnyHeader) -> Result<ICSHeight, Error> {
     match header {
-        AnyHeader::Mithril(header) => header.height.decrement().map_err(|_| {
-            Error::query(format!(
-                "cannot independently query Mithril header at {} without a prior trusted height",
-                header.height
-            ))
-        }),
         AnyHeader::Probabilistic(header) => Ok(header.trusted_height),
         AnyHeader::Tendermint(_) => Err(Error::query(
             "Cardano misbehaviour check received a Tendermint header".to_string(),
@@ -4127,13 +4002,6 @@ pub(super) fn cardano_misbehaviour_evidence(
     }
 
     let misbehaviour = match (submitted_header.clone(), witness_header) {
-        (AnyHeader::Mithril(header1), AnyHeader::Mithril(header2)) => {
-            AnyMisbehaviour::Mithril(MithrilMisbehaviour {
-                client_id: update.client_id().clone(),
-                header1,
-                header2,
-            })
-        }
         (AnyHeader::Probabilistic(header1), AnyHeader::Probabilistic(header2)) => {
             AnyMisbehaviour::Probabilistic(ProbabilisticMisbehaviour {
                 client_id: update.client_id().clone(),
@@ -4168,62 +4036,13 @@ fn cardano_headers_conflict(
     witness: &AnyHeader,
     client_state: &AnyClientState,
 ) -> Result<bool, Error> {
-    let (host_state_nft_policy_id, host_state_nft_token_name) =
-        cardano_host_state_nft(client_state)?;
+    if !matches!(client_state, AnyClientState::Probabilistic(_)) {
+        return Err(Error::query(
+            "Cardano misbehaviour check requires a Cardano client state".to_string(),
+        ));
+    }
 
     match (submitted, witness) {
-        (AnyHeader::Mithril(submitted), AnyHeader::Mithril(witness)) => {
-            if submitted.height != witness.height {
-                return Err(Error::query(format!(
-                    "cannot compare Mithril headers at different heights: {} and {}",
-                    submitted.height, witness.height
-                )));
-            }
-
-            let submitted_root = extract_ibc_state_root_from_host_state_tx(
-                &AnyHeader::Mithril(submitted.clone()),
-                host_state_nft_policy_id,
-                host_state_nft_token_name,
-            )?;
-            let witness_root = extract_ibc_state_root_from_host_state_tx(
-                &AnyHeader::Mithril(witness.clone()),
-                host_state_nft_policy_id,
-                host_state_nft_token_name,
-            )?;
-
-            let conflicts = submitted_root != witness_root
-                || !submitted
-                    .host_state_tx_hash
-                    .trim()
-                    .eq_ignore_ascii_case(witness.host_state_tx_hash.trim())
-                || !submitted
-                    .mithril_stake_distribution_certificate
-                    .hash
-                    .trim()
-                    .eq_ignore_ascii_case(
-                        witness.mithril_stake_distribution_certificate.hash.trim(),
-                    )
-                || !submitted
-                    .transaction_snapshot_certificate
-                    .hash
-                    .trim()
-                    .eq_ignore_ascii_case(witness.transaction_snapshot_certificate.hash.trim());
-
-            if conflicts {
-                tracing::warn!(
-                    "Mithril header conflict detected at {}: submitted_root={}, witness_root={}, submitted_host_tx={}, witness_host_tx={}, submitted_tx_cert={}, witness_tx_cert={}",
-                    submitted.height,
-                    hex::encode(&submitted_root),
-                    hex::encode(&witness_root),
-                    submitted.host_state_tx_hash,
-                    witness.host_state_tx_hash,
-                    submitted.transaction_snapshot_certificate.hash,
-                    witness.transaction_snapshot_certificate.hash,
-                );
-            }
-
-            Ok(conflicts)
-        }
         (AnyHeader::Probabilistic(submitted), AnyHeader::Probabilistic(witness)) => {
             // Cosmos verifies native signatures and body commitments. The
             // relayer selects conflicting settled claims, never temporary tips
@@ -4238,11 +4057,6 @@ fn cardano_headers_conflict(
         (_, AnyHeader::Tendermint(_)) => Err(Error::query(
             "Cardano misbehaviour check independently fetched a Tendermint header".to_string(),
         )),
-        (submitted, witness) => Err(Error::query(format!(
-            "cannot compare different Cardano header types: submitted={:?}, witness={:?}",
-            submitted.client_type(),
-            witness.client_type()
-        ))),
     }
 }
 
@@ -4327,471 +4141,6 @@ fn probabilistic_block_revision_height(
     block.height.as_ref().map(|height| height.revision_height)
 }
 
-fn cardano_host_state_nft(client_state: &AnyClientState) -> Result<(&[u8], &[u8]), Error> {
-    match client_state {
-        AnyClientState::Mithril(state) => Ok((
-            state.host_state_nft_policy_id.as_slice(),
-            state.host_state_nft_token_name.as_slice(),
-        )),
-        AnyClientState::Probabilistic(state) => Ok((
-            state.host_state_nft_policy_id.as_slice(),
-            state.host_state_nft_token_name.as_slice(),
-        )),
-        _ => Err(Error::query(
-            "Cardano misbehaviour check requires a Cardano client state".to_string(),
-        )),
-    }
-}
-
-fn extract_ibc_state_root_from_host_state_tx(
-    header: &AnyHeader,
-    host_state_nft_policy_id: &[u8],
-    host_state_nft_token_name: &[u8],
-) -> Result<Vec<u8>, Error> {
-    match header {
-        AnyHeader::Mithril(header) => extract_ibc_state_root_from_host_state_tx_body(
-            "Mithril",
-            header.host_state_tx_hash.trim(),
-            header.host_state_tx_body_cbor.as_slice(),
-            header.host_state_tx_output_index,
-            host_state_nft_policy_id,
-            host_state_nft_token_name,
-        ),
-        AnyHeader::Probabilistic(header) => extract_ibc_state_root_from_probabilistic_anchor_block(
-            header.host_state_tx_hash.trim(),
-            header.anchor_block.block_cbor.as_slice(),
-            header.host_state_tx_output_index,
-            host_state_nft_policy_id,
-            host_state_nft_token_name,
-        ),
-        AnyHeader::Tendermint(_) => Err(Error::query(
-            "unexpected Tendermint header in Cardano host state extraction".to_string(),
-        )),
-    }
-}
-
-fn extract_ibc_state_root_from_host_state_tx_body(
-    header_kind: &str,
-    tx_hash: &str,
-    tx_body_cbor: &[u8],
-    output_index: u32,
-    host_state_nft_policy_id: &[u8],
-    host_state_nft_token_name: &[u8],
-) -> Result<Vec<u8>, Error> {
-    if tx_hash.is_empty() {
-        return Err(Error::query(format!(
-            "missing host_state_tx_hash in {header_kind} header"
-        )));
-    }
-
-    if host_state_nft_policy_id.len() != 28 {
-        return Err(Error::query(format!(
-            "invalid host_state_nft_policy_id length: expected 28 bytes, got {}",
-            host_state_nft_policy_id.len()
-        )));
-    }
-
-    if tx_body_cbor.is_empty() {
-        return Err(Error::query(format!(
-            "missing host_state_tx_body_cbor in {header_kind} header"
-        )));
-    }
-
-    let computed = blake2b_256(tx_body_cbor);
-    let computed_hex = hex::encode(computed);
-    if !computed_hex.eq_ignore_ascii_case(tx_hash) {
-        return Err(Error::query(format!(
-            "HostState tx body hash mismatch: expected {tx_hash}, got {computed_hex}"
-        )));
-    }
-
-    use pallas_codec::minicbor;
-    use pallas_codec::utils::KeepRaw;
-    use pallas_primitives::{babbage, conway};
-
-    let conway_body: Result<KeepRaw<'_, conway::MintedTransactionBody<'_>>, _> =
-        minicbor::decode(tx_body_cbor);
-    if let Ok(body) = conway_body {
-        return extract_root_from_conway_tx_body(
-            &body,
-            output_index,
-            host_state_nft_policy_id,
-            host_state_nft_token_name,
-        );
-    }
-
-    let babbage_body: Result<KeepRaw<'_, babbage::MintedTransactionBody<'_>>, _> =
-        minicbor::decode(tx_body_cbor);
-    if let Ok(body) = babbage_body {
-        return extract_root_from_babbage_tx_body(
-            &body,
-            output_index,
-            host_state_nft_policy_id,
-            host_state_nft_token_name,
-        );
-    }
-
-    Err(Error::query(
-        "unsupported HostState transaction body CBOR".to_string(),
-    ))
-}
-
-fn extract_ibc_state_root_from_probabilistic_anchor_block(
-    tx_hash: &str,
-    anchor_block_cbor: &[u8],
-    output_index: u32,
-    host_state_nft_policy_id: &[u8],
-    host_state_nft_token_name: &[u8],
-) -> Result<Vec<u8>, Error> {
-    use pallas_codec::minicbor;
-    use pallas_codec::utils::KeepRaw;
-    use pallas_primitives::{babbage, conway};
-
-    if tx_hash.is_empty() {
-        return Err(Error::query(
-            "missing host_state_tx_hash in probabilistic header".to_string(),
-        ));
-    }
-
-    if host_state_nft_policy_id.len() != 28 {
-        return Err(Error::query(format!(
-            "invalid host_state_nft_policy_id length: expected 28 bytes, got {}",
-            host_state_nft_policy_id.len()
-        )));
-    }
-
-    if anchor_block_cbor.is_empty() {
-        return Err(Error::query(
-            "missing anchor block_cbor in probabilistic header".to_string(),
-        ));
-    }
-
-    let conway_block: Result<KeepRaw<'_, conway::MintedBlock<'_>>, _> =
-        minicbor::decode(anchor_block_cbor);
-    if let Ok(block) = conway_block {
-        return extract_root_from_conway_block(
-            &block,
-            tx_hash,
-            output_index,
-            host_state_nft_policy_id,
-            host_state_nft_token_name,
-        );
-    }
-
-    let babbage_block: Result<KeepRaw<'_, babbage::MintedBlock<'_>>, _> =
-        minicbor::decode(anchor_block_cbor);
-    if let Ok(block) = babbage_block {
-        return extract_root_from_babbage_block(
-            &block,
-            tx_hash,
-            output_index,
-            host_state_nft_policy_id,
-            host_state_nft_token_name,
-        );
-    }
-
-    Err(Error::query(
-        "unsupported probabilistic anchor block CBOR".to_string(),
-    ))
-}
-
-fn blake2b_256(data: &[u8]) -> [u8; 32] {
-    use blake2::digest::consts::U32;
-    use blake2::{Blake2b, Digest};
-
-    let mut hasher = Blake2b::<U32>::new();
-    hasher.update(data);
-    let digest = hasher.finalize();
-
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
-}
-
-fn extract_root_from_conway_block<'a>(
-    block: &pallas_codec::utils::KeepRaw<'a, pallas_primitives::conway::MintedBlock<'a>>,
-    tx_hash: &str,
-    output_index: u32,
-    host_state_nft_policy_id: &[u8],
-    host_state_nft_token_name: &[u8],
-) -> Result<Vec<u8>, Error> {
-    for tx_body in block.transaction_bodies.iter() {
-        let computed_hex = hex::encode(blake2b_256(tx_body.raw_cbor()));
-        if computed_hex.eq_ignore_ascii_case(tx_hash) {
-            return extract_root_from_conway_tx_body(
-                tx_body,
-                output_index,
-                host_state_nft_policy_id,
-                host_state_nft_token_name,
-            );
-        }
-    }
-
-    Err(Error::query(format!(
-        "HostState tx {tx_hash} not found in probabilistic anchor block"
-    )))
-}
-
-fn extract_root_from_babbage_block<'a>(
-    block: &pallas_codec::utils::KeepRaw<'a, pallas_primitives::babbage::MintedBlock<'a>>,
-    tx_hash: &str,
-    output_index: u32,
-    host_state_nft_policy_id: &[u8],
-    host_state_nft_token_name: &[u8],
-) -> Result<Vec<u8>, Error> {
-    for tx_body in block.transaction_bodies.iter() {
-        let computed_hex = hex::encode(blake2b_256(tx_body.raw_cbor()));
-        if computed_hex.eq_ignore_ascii_case(tx_hash) {
-            return extract_root_from_babbage_tx_body(
-                tx_body,
-                output_index,
-                host_state_nft_policy_id,
-                host_state_nft_token_name,
-            );
-        }
-    }
-
-    Err(Error::query(format!(
-        "HostState tx {tx_hash} not found in probabilistic anchor block"
-    )))
-}
-
-fn extract_root_from_conway_tx_body<'a>(
-    body: &pallas_codec::utils::KeepRaw<'a, pallas_primitives::conway::MintedTransactionBody<'a>>,
-    output_index: u32,
-    host_state_nft_policy_id: &[u8],
-    host_state_nft_token_name: &[u8],
-) -> Result<Vec<u8>, Error> {
-    use pallas_primitives::conway::{MintedTransactionOutput, PseudoTransactionOutput};
-
-    let idx: usize = output_index
-        .try_into()
-        .map_err(|_| Error::query("host_state_tx_output_index out of range".to_string()))?;
-
-    let output: &MintedTransactionOutput<'a> = body
-        .outputs
-        .get(idx)
-        .ok_or_else(|| Error::query("host_state_tx_output_index out of range".to_string()))?;
-
-    let out = match output {
-        PseudoTransactionOutput::PostAlonzo(out) => out,
-        _ => {
-            return Err(Error::query(
-                "HostState output is not a post-Alonzo output".to_string(),
-            ))
-        }
-    };
-
-    ensure_value_contains_host_state_nft_conway(
-        &out.value,
-        host_state_nft_policy_id,
-        host_state_nft_token_name,
-    )?;
-
-    let datum_option = out.datum_option.as_ref().ok_or_else(|| {
-        Error::query("HostState output has no datum option (expected inline datum)".to_string())
-    })?;
-
-    let plutus_data = match datum_option {
-        pallas_primitives::babbage::PseudoDatumOption::Data(cbor_wrap) => {
-            std::ops::Deref::deref(std::ops::Deref::deref(cbor_wrap))
-        }
-        _ => {
-            return Err(Error::query(
-                "HostState output does not contain an inline datum".to_string(),
-            ))
-        }
-    };
-
-    extract_ibc_state_root_from_host_state_datum(plutus_data, host_state_nft_policy_id)
-}
-
-fn extract_root_from_babbage_tx_body<'a>(
-    body: &pallas_codec::utils::KeepRaw<'a, pallas_primitives::babbage::MintedTransactionBody<'a>>,
-    output_index: u32,
-    host_state_nft_policy_id: &[u8],
-    host_state_nft_token_name: &[u8],
-) -> Result<Vec<u8>, Error> {
-    use pallas_primitives::babbage::{MintedTransactionOutput, PseudoTransactionOutput};
-
-    let idx: usize = output_index
-        .try_into()
-        .map_err(|_| Error::query("host_state_tx_output_index out of range".to_string()))?;
-
-    let output: &MintedTransactionOutput<'a> = body
-        .outputs
-        .get(idx)
-        .ok_or_else(|| Error::query("host_state_tx_output_index out of range".to_string()))?;
-
-    let out = match output {
-        PseudoTransactionOutput::PostAlonzo(out) => out,
-        _ => {
-            return Err(Error::query(
-                "HostState output is not a post-Alonzo output".to_string(),
-            ))
-        }
-    };
-
-    ensure_value_contains_host_state_nft_alonzo(
-        &out.value,
-        host_state_nft_policy_id,
-        host_state_nft_token_name,
-    )?;
-
-    let datum_option = out.datum_option.as_ref().ok_or_else(|| {
-        Error::query("HostState output has no datum option (expected inline datum)".to_string())
-    })?;
-
-    let plutus_data = match datum_option {
-        pallas_primitives::babbage::PseudoDatumOption::Data(cbor_wrap) => {
-            std::ops::Deref::deref(std::ops::Deref::deref(cbor_wrap))
-        }
-        _ => {
-            return Err(Error::query(
-                "HostState output does not contain an inline datum".to_string(),
-            ))
-        }
-    };
-
-    extract_ibc_state_root_from_host_state_datum(plutus_data, host_state_nft_policy_id)
-}
-
-fn ensure_value_contains_host_state_nft_conway(
-    value: &pallas_primitives::conway::Value,
-    host_state_nft_policy_id: &[u8],
-    host_state_nft_token_name: &[u8],
-) -> Result<(), Error> {
-    match value {
-        pallas_primitives::conway::Value::Multiasset(_, multiasset) => {
-            for (policy, assets) in multiasset.iter() {
-                if policy.as_ref() != host_state_nft_policy_id {
-                    continue;
-                }
-
-                for (asset, amount) in assets.iter() {
-                    if asset.as_slice() == host_state_nft_token_name {
-                        let amount_u64: u64 = amount.into();
-                        if amount_u64 == 1 {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-
-            Err(Error::query(
-                "HostState output does not contain the expected HostState NFT".to_string(),
-            ))
-        }
-        _ => Err(Error::query(
-            "HostState output has no multi-assets (expected HostState NFT)".to_string(),
-        )),
-    }
-}
-
-fn ensure_value_contains_host_state_nft_alonzo(
-    value: &pallas_primitives::alonzo::Value,
-    host_state_nft_policy_id: &[u8],
-    host_state_nft_token_name: &[u8],
-) -> Result<(), Error> {
-    match value {
-        pallas_primitives::alonzo::Value::Multiasset(_, multiasset) => {
-            for (policy, assets) in multiasset.iter() {
-                if policy.as_ref() != host_state_nft_policy_id {
-                    continue;
-                }
-
-                for (asset, amount) in assets.iter() {
-                    if asset.as_slice() == host_state_nft_token_name && *amount == 1 {
-                        return Ok(());
-                    }
-                }
-            }
-
-            Err(Error::query(
-                "HostState output does not contain the expected HostState NFT".to_string(),
-            ))
-        }
-        _ => Err(Error::query(
-            "HostState output has no multi-assets (expected HostState NFT)".to_string(),
-        )),
-    }
-}
-
-fn extract_ibc_state_root_from_host_state_datum(
-    datum: &pallas_primitives::alonzo::PlutusData,
-    expected_nft_policy_id: &[u8],
-) -> Result<Vec<u8>, Error> {
-    use pallas_primitives::alonzo::PlutusData;
-
-    let outer = match datum {
-        PlutusData::Constr(c) => c,
-        _ => {
-            return Err(Error::query(
-                "HostState datum is not a constructor PlutusData".to_string(),
-            ))
-        }
-    };
-
-    if plutus_constructor_index(outer) != Some(0) || outer.fields.len() < 2 {
-        return Err(Error::query(
-            "HostState datum does not match expected constructor shape".to_string(),
-        ));
-    }
-
-    let state = &outer.fields[0];
-    let nft_policy = &outer.fields[1];
-
-    if !expected_nft_policy_id.is_empty() {
-        let nft_policy_bytes: &[u8] = match nft_policy {
-            PlutusData::BoundedBytes(bytes) => bytes.as_slice(),
-            _ => {
-                return Err(Error::query(
-                    "HostState datum nft_policy is not a byte string".to_string(),
-                ))
-            }
-        };
-
-        if nft_policy_bytes != expected_nft_policy_id {
-            return Err(Error::query(
-                "unexpected HostState nft_policy in datum".to_string(),
-            ));
-        }
-    }
-
-    let state = match state {
-        PlutusData::Constr(c) => c,
-        _ => {
-            return Err(Error::query(
-                "HostState state is not a constructor".to_string(),
-            ))
-        }
-    };
-
-    if plutus_constructor_index(state) != Some(0) || state.fields.len() < 2 {
-        return Err(Error::query(
-            "HostState state does not match expected constructor shape".to_string(),
-        ));
-    }
-
-    let root: &[u8] = match &state.fields[1] {
-        PlutusData::BoundedBytes(bytes) => bytes.as_slice(),
-        _ => {
-            return Err(Error::query(
-                "ibc_state_root is not a byte string".to_string(),
-            ))
-        }
-    };
-
-    if root.len() != 32 {
-        return Err(Error::query(format!(
-            "invalid ibc_state_root length: expected 32 bytes, got {}",
-            root.len()
-        )));
-    }
-
-    Ok(root.to_vec())
-}
-
 fn normalize_header_query_trusted_height(
     trusted_height: ICSHeight,
     target_height: ICSHeight,
@@ -4805,25 +4154,6 @@ fn normalize_header_query_trusted_height(
             "invalid Cardano header query heights: trusted height {trusted_height} must be less than target height {target_height}"
         ))
     })
-}
-
-fn is_recoverable_gateway_header_height_error(error: &super::error::Error) -> bool {
-    match error {
-        super::error::Error::GatewayStatus { code, message } => {
-            matches!(
-                (*code, message.as_str()),
-                (tonic::Code::NotFound, msg) if msg.contains("HEIGHT_NOT_FOUND")
-            ) || matches!(
-                (*code, message.as_str()),
-                (tonic::Code::FailedPrecondition, msg) if msg.contains("HEIGHT_NOT_ACCEPTED")
-            ) || is_legacy_gateway_header_height_not_found(message)
-        }
-        _ => is_legacy_gateway_header_height_not_found(&error.to_string()),
-    }
-}
-
-fn is_legacy_gateway_header_height_not_found(message: &str) -> bool {
-    message.contains("Not found") && message.contains("height")
 }
 
 fn decode_optional_merkle_proof(proof: &[u8], context: &str) -> Result<Option<MerkleProof>, Error> {
@@ -4866,17 +4196,6 @@ fn proof_height_from_response(
     }
 
     Ok(proof_height)
-}
-
-fn plutus_constructor_index(
-    constr: &pallas_primitives::alonzo::Constr<pallas_primitives::alonzo::PlutusData>,
-) -> Option<u64> {
-    match constr.tag {
-        102 => constr.any_constructor,
-        121..=127 => Some(constr.tag - 121),
-        1280..=1400 => Some(constr.tag - 1280 + 7),
-        _ => None,
-    }
 }
 
 fn cardano_latest_height_unhealthy_error(
@@ -4997,10 +4316,6 @@ mod tests {
     use crate::client_state::AnyClientState;
     use ibc_proto::ibc::core::client::v1::Height as RawHeight;
     use ibc_proto::Protobuf;
-    use ibc_relayer_types::clients::ics08_cardano::{
-        client_state::ClientState as MithrilClientState, header::Header as MithrilHeader,
-        raw as mithril_raw,
-    };
     use ibc_relayer_types::clients::ics08_cardano_probabilistic::{
         client_state::ClientState as ProbabilisticClientState,
         header::Header as ProbabilisticHeader, raw as probabilistic_raw,
@@ -5019,7 +4334,9 @@ mod tests {
     }
 
     fn client_id() -> ClientId {
-        "08-cardano-mithril-0".parse().expect("valid client id")
+        "08-cardano-probabilistic-0"
+            .parse()
+            .expect("valid client id")
     }
 
     fn staged_action(
@@ -5310,143 +4627,6 @@ mod tests {
         ensure_completed_tendermint_chain_has_update_event(false, &empty).unwrap();
     }
 
-    fn host_state_tx_body_cbor(root: [u8; 32]) -> Vec<u8> {
-        fn encode_host_state_output(
-            e: &mut pallas_codec::minicbor::Encoder<&mut Vec<u8>>,
-            root: [u8; 32],
-        ) {
-            use pallas_codec::minicbor::data::Tag;
-
-            // Minimal post-Alonzo output map containing only the fields the
-            // HostState root extractor reads: address, multiasset value, datum.
-            e.map(3).unwrap();
-            e.u8(0).unwrap();
-            e.bytes(&[0]).unwrap();
-
-            // Value with exactly one HostState NFT under the configured policy.
-            // The extractor rejects outputs that do not carry this NFT.
-            e.u8(1).unwrap();
-            e.array(2).unwrap();
-            e.u8(0).unwrap();
-            e.map(1).unwrap();
-            e.bytes(&HOST_STATE_NFT_POLICY_ID).unwrap();
-            e.map(1).unwrap();
-            e.bytes(HOST_STATE_NFT_TOKEN_NAME).unwrap();
-            e.u8(1).unwrap();
-
-            e.u8(2).unwrap();
-            e.array(2).unwrap();
-            e.u8(1).unwrap();
-
-            // Inline datum shape expected by `extract_ibc_state_root_from_host_state_datum`:
-            // HostState(state, nft_policy), where state contains the 32-byte IBC root.
-            let mut datum = Vec::new();
-            let mut datum_encoder = pallas_codec::minicbor::Encoder::new(&mut datum);
-            datum_encoder.tag(Tag::Unassigned(121)).unwrap();
-            datum_encoder.array(2).unwrap();
-            datum_encoder.tag(Tag::Unassigned(121)).unwrap();
-            datum_encoder.array(2).unwrap();
-            datum_encoder.bytes(&[]).unwrap();
-            datum_encoder.bytes(&root).unwrap();
-            datum_encoder.bytes(&HOST_STATE_NFT_POLICY_ID).unwrap();
-
-            e.tag(Tag::Cbor).unwrap();
-            e.bytes(&datum).unwrap();
-        }
-
-        let mut tx_body = Vec::new();
-        let mut encoder = pallas_codec::minicbor::Encoder::new(&mut tx_body);
-        // Minimal transaction body: no inputs, one HostState output, zero fee.
-        // This keeps the fixture small while still exercising real CBOR decoding.
-        encoder.map(3).unwrap();
-        encoder.u8(0).unwrap();
-        encoder.array(0).unwrap();
-        encoder.u8(1).unwrap();
-        encoder.array(1).unwrap();
-        encode_host_state_output(&mut encoder, root);
-        encoder.u8(2).unwrap();
-        encoder.u8(0).unwrap();
-        tx_body
-    }
-
-    fn raw_protocol_parameters() -> mithril_raw::MithrilProtocolParameters {
-        mithril_raw::MithrilProtocolParameters {
-            k: 1,
-            m: 2,
-            phi_f: None,
-        }
-    }
-
-    fn raw_certificate(hash: &str) -> mithril_raw::MithrilCertificate {
-        mithril_raw::MithrilCertificate {
-            hash: hash.to_string(),
-            previous_hash: String::new(),
-            epoch: 0,
-            signed_entity_type: None,
-            metadata: Some(mithril_raw::CertificateMetadata {
-                network: "testnet".to_string(),
-                protocol_version: "v1".to_string(),
-                protocol_parameters: Some(raw_protocol_parameters()),
-                initiated_at: "2024-01-01T00:00:00Z".to_string(),
-                sealed_at: "2024-01-01T00:00:01Z".to_string(),
-                signers: vec![],
-            }),
-            protocol_message: None,
-            signed_message: String::new(),
-            aggregate_verification_key: String::new(),
-            multi_signature: String::new(),
-            genesis_signature: String::new(),
-        }
-    }
-
-    fn mithril_header(revision_height: u64, root: [u8; 32]) -> MithrilHeader {
-        let tx_body = host_state_tx_body_cbor(root);
-
-        MithrilHeader {
-            height: height(revision_height),
-            timestamp: Timestamp::from_nanoseconds(1).expect("valid timestamp"),
-            mithril_stake_distribution: mithril_raw::MithrilStakeDistribution {
-                epoch: 0,
-                signers_with_stake: vec![],
-                hash: "stake_distribution".to_string(),
-                certificate_hash: "stake_distribution_cert".to_string(),
-                created_at: 1,
-                protocol_parameter: Some(raw_protocol_parameters()),
-            },
-            mithril_stake_distribution_certificate: raw_certificate("stake_distribution_cert"),
-            transaction_snapshot: mithril_raw::CardanoTransactionSnapshot {
-                merkle_root: "snapshot_root".to_string(),
-                epoch: 0,
-                block_number: revision_height,
-                hash: "snapshot".to_string(),
-                certificate_hash: "tx_snapshot_cert".to_string(),
-                created_at: "2024-01-01T00:00:01Z".to_string(),
-            },
-            transaction_snapshot_certificate: raw_certificate("tx_snapshot_cert"),
-            previous_mithril_stake_distribution_certificates: vec![],
-            // Match the fixture body hash so conflicts come from the requested
-            // root/certificate fields, not from malformed fixture data.
-            host_state_tx_hash: hex::encode(blake2b_256(&tx_body)),
-            host_state_tx_body_cbor: tx_body,
-            host_state_tx_output_index: 0,
-            host_state_tx_proof: vec![1],
-        }
-    }
-
-    fn mithril_client_state() -> AnyClientState {
-        AnyClientState::Mithril(MithrilClientState {
-            chain_id: ChainId::from_string("cardano-1"),
-            latest_height: height(10),
-            frozen_height: None,
-            current_epoch: 0,
-            trusting_period: Duration::from_secs(60),
-            protocol_parameters: raw_protocol_parameters(),
-            upgrade_path: vec![],
-            host_state_nft_policy_id: HOST_STATE_NFT_POLICY_ID.to_vec(),
-            host_state_nft_token_name: HOST_STATE_NFT_TOKEN_NAME.to_vec(),
-        })
-    }
-
     fn probabilistic_client_state() -> AnyClientState {
         AnyClientState::Probabilistic(ProbabilisticClientState {
             chain_id: ChainId::from_string("cardano-1"),
@@ -5483,7 +4663,7 @@ mod tests {
             latest_checkpoint_settlement_credit: None,
             latest_checkpoint_pool_production: None,
             randomness_stabilisation_window_slots: 0,
-            storage_version: 0,
+            storage_version: 2,
             verification_generation: 0,
             checkpoint_reference: vec![],
             storage_namespace: vec![],
@@ -5531,7 +4711,7 @@ mod tests {
         UpdateClient {
             common: Attributes {
                 client_id: client_id(),
-                client_type: ClientType::CardanoMithril,
+                client_type: ClientType::CardanoProbabilistic,
                 consensus_height,
             },
             header,
@@ -5562,47 +4742,6 @@ mod tests {
         assert!(message.contains("latest-height probe is required"));
         assert!(message.contains("client-states probe also failed"));
         assert!(message.contains("client states unavailable"));
-    }
-
-    #[test]
-    fn header_height_errors_accept_typed_recoverable_statuses() {
-        let height_not_found = CardanoError::from(tonic::Status::not_found(
-            "HEIGHT_NOT_FOUND: no header at height 10",
-        ));
-        let height_not_accepted = CardanoError::from(tonic::Status::failed_precondition(
-            "HEIGHT_NOT_ACCEPTED: height 10 is not an accepted Cardano header height",
-        ));
-
-        assert!(is_recoverable_gateway_header_height_error(
-            &height_not_found
-        ));
-        assert!(is_recoverable_gateway_header_height_error(
-            &height_not_accepted
-        ));
-    }
-
-    #[test]
-    fn header_height_errors_reject_typed_fatal_statuses() {
-        let history_not_ready = CardanoError::from(tonic::Status::unavailable(
-            "HISTORY_NOT_READY: Gateway has not indexed the requested range",
-        ));
-        let invalid_trusted_height = CardanoError::from(tonic::Status::invalid_argument(
-            "INVALID_TRUSTED_HEIGHT: trusted height must be lower than target height",
-        ));
-
-        assert!(!is_recoverable_gateway_header_height_error(
-            &history_not_ready
-        ));
-        assert!(!is_recoverable_gateway_header_height_error(
-            &invalid_trusted_height
-        ));
-    }
-
-    #[test]
-    fn header_height_errors_keep_legacy_text_fallback() {
-        let legacy = CardanoError::GatewayClient("Not found: height 10".to_string());
-
-        assert!(is_recoverable_gateway_header_height_error(&legacy));
     }
 
     #[test]
@@ -5685,33 +4824,21 @@ mod tests {
 
     #[test]
     fn misbehaviour_no_conflict_returns_no_evidence() {
-        let submitted = AnyHeader::Mithril(mithril_header(10, [1; 32]));
+        let submitted = AnyHeader::Probabilistic(probabilistic_header(10, "anchor_a"));
         let witness = submitted.clone();
         let update = update_client(Some(submitted.clone()), height(10));
 
         // Identical submitted and witness headers should be treated as a valid
         // client update, not as misbehaviour evidence.
-        let evidence =
-            cardano_misbehaviour_evidence(&update, &submitted, witness, &mithril_client_state())
-                .expect("misbehaviour check succeeds");
+        let evidence = cardano_misbehaviour_evidence(
+            &update,
+            &submitted,
+            witness,
+            &probabilistic_client_state(),
+        )
+        .expect("misbehaviour check succeeds");
 
         assert!(evidence.is_none());
-    }
-
-    #[test]
-    fn misbehaviour_root_conflict_returns_evidence() {
-        let submitted = AnyHeader::Mithril(mithril_header(10, [1; 32]));
-        let witness = AnyHeader::Mithril(mithril_header(10, [2; 32]));
-        let update = update_client(Some(submitted.clone()), height(10));
-
-        // Same height plus different extracted HostState root is the core
-        // fork/conflict signal for Mithril-backed Cardano headers.
-        let evidence =
-            cardano_misbehaviour_evidence(&update, &submitted, witness, &mithril_client_state())
-                .expect("misbehaviour check succeeds")
-                .expect("conflicting roots produce evidence");
-
-        assert!(matches!(evidence.misbehaviour, AnyMisbehaviour::Mithril(_)));
     }
 
     #[test]
@@ -5877,15 +5004,20 @@ mod tests {
 
     #[test]
     fn misbehaviour_witness_wrong_height_errors() {
-        let submitted = AnyHeader::Mithril(mithril_header(10, [1; 32]));
-        let witness = AnyHeader::Mithril(mithril_header(11, [1; 32]));
+        let submitted = AnyHeader::Probabilistic(probabilistic_header(10, "anchor_a"));
+        let witness = AnyHeader::Probabilistic(probabilistic_header(11, "anchor_a"));
         let update = update_client(Some(submitted.clone()), height(10));
 
-        // Evidence requires two headers at the same client height. A mismatched
-        // witness height means the independent query is unusable, not conflicting.
-        let error =
-            cardano_misbehaviour_evidence(&update, &submitted, witness, &mithril_client_state())
-                .expect_err("wrong witness height must fail");
+        // Evidence requires a witness within the submitted window. A witness
+        // above the submitted height means the independent query is unusable,
+        // not conflicting.
+        let error = cardano_misbehaviour_evidence(
+            &update,
+            &submitted,
+            witness,
+            &probabilistic_client_state(),
+        )
+        .expect_err("wrong witness height must fail");
 
         assert!(error
             .to_string()
@@ -5893,13 +5025,13 @@ mod tests {
     }
 
     #[test]
-    fn mithril_evidence_is_encoded_as_msg_update_client_misbehaviour() {
-        let submitted = mithril_header(10, [1; 32]);
-        let witness = mithril_header(10, [2; 32]);
-        let misbehaviour = AnyMisbehaviour::Mithril(MithrilMisbehaviour {
+    fn probabilistic_evidence_is_encoded_as_msg_update_client_misbehaviour() {
+        let misbehaviour = AnyMisbehaviour::Probabilistic(ProbabilisticMisbehaviour {
             client_id: client_id(),
-            header1: submitted,
-            header2: witness,
+            header1: probabilistic_header(10, "anchor_a"),
+            header2: probabilistic_header(10, "anchor_b"),
+            verified_observation_1: vec![],
+            verified_observation_2: vec![],
         });
 
         // Hermes submits Cardano evidence through MsgUpdateClient with the
@@ -5914,8 +5046,8 @@ mod tests {
 
         assert_eq!(
             header.type_url,
-            ibc_relayer_types::clients::ics08_cardano::misbehaviour::MITHRIL_MISBEHAVIOUR_TYPE_URL
+            ibc_relayer_types::clients::ics08_cardano_probabilistic::misbehaviour::PROBABILISTIC_MISBEHAVIOUR_TYPE_URL
         );
-        assert!(MithrilMisbehaviour::decode_vec(&header.value).is_ok());
+        assert!(ProbabilisticMisbehaviour::decode_vec(&header.value).is_ok());
     }
 }

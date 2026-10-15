@@ -231,6 +231,18 @@ impl ChainHandle for BaseChainHandle {
         })
     }
 
+    fn query_client_initialization(
+        &self,
+        height: u64,
+        sequence: u32,
+    ) -> Result<crate::chain::endpoint::ClientInitialization, Error> {
+        self.send(|reply_to| ChainRequest::QueryClientInitialization {
+            height,
+            sequence,
+            reply_to,
+        })
+    }
+
     fn query_probabilistic_verification(
         &self,
         request:ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,

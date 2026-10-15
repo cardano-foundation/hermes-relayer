@@ -229,6 +229,12 @@ pub enum ChainRequest {
         reply_to: ReplyTo<Vec<u8>>,
     },
 
+    QueryClientInitialization {
+        height: u64,
+        sequence: u32,
+        reply_to: ReplyTo<crate::chain::endpoint::ClientInitialization>,
+    },
+
     QueryProbabilisticVerification {
         request:
             ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,
@@ -524,6 +530,18 @@ pub trait ChainHandle: Clone + Display + Send + Sync + Debug + 'static {
 
     /// Performs a query to retrieve the state of the specified light client. A
     /// proof can optionally be returned along with the result.
+    /// Prepare creation records or the next bounded initialization message.
+    fn query_client_initialization(
+        &self,
+        height: u64,
+        sequence: u32,
+    ) -> Result<crate::chain::endpoint::ClientInitialization, Error> {
+        let _ = (height, sequence);
+        Err(Error::query(
+            "Source does not provide client initialization".to_owned(),
+        ))
+    }
+
     fn query_probabilistic_verification(
         &self,
         request:ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,

@@ -26,11 +26,6 @@ pub struct ConsensusState {
     pub unique_pools_count: u64,
     pub unique_stake_bps: u64,
     pub security_score_bps: u64,
-    pub packet_state_snapshot: Vec<u8>,
-    pub nonce_state: Option<raw::PraosNonceState>,
-    pub pool_registry: Option<raw::PoolRegistryState>,
-    pub settlement_credit: Option<raw::SettlementCreditState>,
-    pub pool_production: Option<raw::PoolProductionHistory>,
     pub verification_generation: u64,
     pub checkpoint_reference: Vec<u8>,
     pub packet_state_reference: Vec<u8>,
@@ -56,6 +51,28 @@ impl TryFrom<RawConsensusState> for ConsensusState {
     type Error = Error;
 
     fn try_from(raw: RawConsensusState) -> Result<Self, Self::Error> {
+        if raw.verification_generation == 0
+            || raw.checkpoint_reference.len() != 32
+            || raw.packet_state_reference.len() != 32
+            || raw.timestamp == 0
+        {
+            return Err(Error::invalid_field(
+                "checkpoint_reference",
+                "consensus requires authenticated snapshot references".to_owned(),
+            ));
+        }
+        if !raw.packet_state_snapshot.is_empty()
+            || raw.nonce_state.is_some()
+            || raw.pool_registry.is_some()
+            || raw.settlement_credit.is_some()
+            || raw.pool_production.is_some()
+        {
+            return Err(Error::invalid_field(
+                "checkpoint_reference",
+                "consensus cannot embed verification collections".to_owned(),
+            ));
+        }
+
         if raw.ibc_state_root.is_empty() {
             return Err(Error::missing_field("ibc_state_root"));
         }
@@ -75,11 +92,6 @@ impl TryFrom<RawConsensusState> for ConsensusState {
             unique_pools_count: raw.unique_pools_count,
             unique_stake_bps: raw.unique_stake_bps,
             security_score_bps: raw.security_score_bps,
-            packet_state_snapshot: raw.packet_state_snapshot,
-            nonce_state: raw.nonce_state,
-            pool_registry: raw.pool_registry,
-            settlement_credit: raw.settlement_credit,
-            pool_production: raw.pool_production,
             verification_generation: raw.verification_generation,
             checkpoint_reference: raw.checkpoint_reference,
             packet_state_reference: raw.packet_state_reference,
@@ -97,14 +109,10 @@ impl From<ConsensusState> for RawConsensusState {
             unique_pools_count: value.unique_pools_count,
             unique_stake_bps: value.unique_stake_bps,
             security_score_bps: value.security_score_bps,
-            packet_state_snapshot: value.packet_state_snapshot,
-            nonce_state: value.nonce_state,
-            pool_registry: value.pool_registry,
-            settlement_credit: value.settlement_credit,
-            pool_production: value.pool_production,
             verification_generation: value.verification_generation,
             checkpoint_reference: value.checkpoint_reference,
             packet_state_reference: value.packet_state_reference,
+            ..Default::default()
         }
     }
 }
@@ -144,30 +152,25 @@ impl From<ConsensusState> for Any {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn historical_nonce_state_survives_protobuf_round_trip() {
+    fn only_snapshot_consensus_round_trips() {
         let raw = RawConsensusState {
+            timestamp: 1,
             ibc_state_root: vec![1; 32],
-            pool_registry: Some(raw::test_pool_registry()),
-            settlement_credit: Some(raw::test_settlement_credit()),
-            pool_production: Some(raw::test_pool_production()),
-            nonce_state: Some(raw::PraosNonceState {
-                epoch_nonce: vec![2; 32],
-                evolving_nonce: vec![3; 32],
-                candidate_nonce: vec![4; 32],
-                last_applied_block_nonce: vec![5; 32],
-                last_epoch_block_nonce: Vec::new(),
-            }),
+            verification_generation: 1,
+            checkpoint_reference: vec![2; 32],
+            packet_state_reference: vec![3; 32],
             ..Default::default()
         };
         let state = ConsensusState::try_from(raw.clone()).unwrap();
         let any: Any = state.into();
-        let decoded = ConsensusState::try_from(any).unwrap();
-        let restored: RawConsensusState = decoded.into();
-        assert_eq!(restored.nonce_state, raw.nonce_state);
-        assert_eq!(restored.pool_registry, raw.pool_registry);
-        assert_eq!(restored.settlement_credit, raw.settlement_credit);
-        assert_eq!(restored.pool_production, raw.pool_production);
+        let restored: RawConsensusState = ConsensusState::try_from(any).unwrap().into();
+        assert_eq!(restored, raw);
+        let mut invalid = raw.clone();
+        invalid.verification_generation = 0;
+        assert!(ConsensusState::try_from(invalid).is_err());
+        let mut invalid = raw;
+        invalid.pool_registry = Some(raw::test_pool_registry());
+        assert!(ConsensusState::try_from(invalid).is_err());
     }
 }
