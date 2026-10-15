@@ -151,6 +151,24 @@ pub struct ClientState {
     pub bootstrap_objects: Vec<u8>,
     #[prost(bool, tag = "42")]
     pub bootstrap_pending: bool,
+    /// Trusted Mithril signing state for certificates of `mithril_epoch`, set at
+    /// bootstrap like the checkpoint. A Mithril-certified stake distribution
+    /// outranks a supplied epoch stake table.
+    #[prost(uint64, tag = "43")]
+    pub mithril_epoch: u64,
+    #[prost(string, tag = "44")]
+    pub mithril_aggregate_verification_key: String,
+    #[prost(string, tag = "45")]
+    pub mithril_protocol_parameters_hash: String,
+}
+
+/// Mithril aggregator certificates in JSON from consecutive epochs, starting at
+/// the client's `mithril_epoch`.
+#[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MithrilStakeCertificates {
+    #[prost(string, repeated, tag = "1")]
+    pub certificates: Vec<String>,
 }
 
 /// Bit 0 is epoch-1 and bit 4 is epoch-5. Current observations never qualify that epoch.

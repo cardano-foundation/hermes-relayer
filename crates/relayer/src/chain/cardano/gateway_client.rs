@@ -709,6 +709,27 @@ impl GatewayClient {
         )
     }
 
+    /// Mithril certificates that extend a client's anchor at `mithril_epoch`,
+    /// as a `MithrilStakeCertificates` client message.
+    pub async fn query_mithril_stake_certificates(
+        &self,
+        mithril_epoch: u64,
+    ) -> Result<Option<ProtoAny>, Error> {
+        use super::generated::ibc::core::types::v1::{
+            query_client::QueryClient, QueryMithrilStakeCertificatesRequest,
+        };
+        let mut client = QueryClient::new(self.channel.clone())
+            .max_decoding_message_size(GATEWAY_HEADER_GRPC_MESSAGE_LIMIT);
+        let response = client
+            .mithril_stake_certificates(QueryMithrilStakeCertificatesRequest { mithril_epoch })
+            .await?
+            .into_inner();
+        Ok(response.client_message.map(|message| ProtoAny {
+            type_url: message.type_url,
+            value: message.value,
+        }))
+    }
+
     /// Query block results at a specific height.
     pub async fn query_block_results(
         &self,

@@ -106,16 +106,36 @@ pub struct QueryIbcHeaderRequest {
     pub trusted_height: u64,
     #[prost(uint64, tag = "2")]
     pub height: u64,
+    /// Rootless probabilistic evidence. With a nonzero height, return exact
+    /// historical evidence for independent misbehaviour checks. With height zero,
+    /// select a newer settled checkpoint for client maintenance. This does not
+    /// change the packet-proof height returned by QueryLatestHeight. Maintenance
+    /// returns an empty header when no newer settled checkpoint is available.
     #[prost(bool, tag = "3")]
     pub checkpoint_only: bool,
-    /// Destination client query hint. Cosmos uses its own saved credit reference.
+    /// Destination client state for capped settlement credit and descendant selection.
+    /// This is a query hint. The light client derives credit from its own saved state.
     #[prost(bytes = "vec", tag = "4")]
-    pub probabilistic_client_state: Vec<u8>,
+    pub probabilistic_client_state: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct QueryIbcHeaderResponse {
     #[prost(message, optional, tag = "1")]
     pub header: ::core::option::Option<::prost_types::Any>,
+}
+/// Mithril certificates that extend a probabilistic client's Mithril anchor.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct QueryMithrilStakeCertificatesRequest {
+    /// The destination client's mithril_epoch.
+    #[prost(uint64, tag = "1")]
+    pub mithril_epoch: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QueryMithrilStakeCertificatesResponse {
+    /// A MithrilStakeCertificates client message. Empty until Mithril certifies a
+    /// Cardano stake distribution in mithril_epoch.
+    #[prost(message, optional, tag = "1")]
+    pub client_message: ::core::option::Option<::prost_types::Any>,
 }
 /// Generated client implementations.
 pub mod query_client {
@@ -303,6 +323,35 @@ pub mod query_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("ibc.core.types.v1.Query", "IBCHeader"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn mithril_stake_certificates(
+            &mut self,
+            request: impl tonic::IntoRequest<super::QueryMithrilStakeCertificatesRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::QueryMithrilStakeCertificatesResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ibc.core.types.v1.Query/MithrilStakeCertificates",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "ibc.core.types.v1.Query",
+                        "MithrilStakeCertificates",
+                    ),
+                );
             self.inner.unary(req, path, codec).await
         }
     }

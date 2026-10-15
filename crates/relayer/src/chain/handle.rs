@@ -179,6 +179,11 @@ pub enum ChainRequest {
         reply_to: ReplyTo<Option<AnyHeader>>,
     },
 
+    QueryMithrilStakeCertificates {
+        mithril_epoch: u64,
+        reply_to: ReplyTo<Option<ibc_proto::google::protobuf::Any>>,
+    },
+
     QueryApplicationStatus {
         reply_to: ReplyTo<ChainStatus>,
     },
@@ -505,6 +510,15 @@ pub trait ChainHandle: Clone + Display + Send + Sync + Debug + 'static {
         &self,
         _client_state: &AnyClientState,
     ) -> Result<Option<AnyHeader>, Error> {
+        Ok(None)
+    }
+
+    /// Mithril certificates that extend a probabilistic client's anchor at
+    /// `mithril_epoch`, as a client message. None while there are none to add.
+    fn query_mithril_stake_certificates(
+        &self,
+        _mithril_epoch: u64,
+    ) -> Result<Option<ibc_proto::google::protobuf::Any>, Error> {
         Ok(None)
     }
 

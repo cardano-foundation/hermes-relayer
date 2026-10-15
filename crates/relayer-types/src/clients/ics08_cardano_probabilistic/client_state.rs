@@ -64,6 +64,9 @@ pub struct ClientState {
     pub storage_namespace: Vec<u8>,
     pub bootstrap_objects: Vec<u8>,
     pub bootstrap_pending: bool,
+    pub mithril_epoch: u64,
+    pub mithril_aggregate_verification_key: String,
+    pub mithril_protocol_parameters_hash: String,
 }
 
 impl ClientState {
@@ -159,6 +162,9 @@ impl TryFrom<RawClientState> for ClientState {
             storage_namespace,
             bootstrap_objects,
             bootstrap_pending,
+            mithril_epoch,
+            mithril_aggregate_verification_key,
+            mithril_protocol_parameters_hash,
         } = raw;
 
         let chain_id = ChainId::from_string(&raw_chain_id);
@@ -356,6 +362,9 @@ impl TryFrom<RawClientState> for ClientState {
             storage_namespace,
             bootstrap_objects,
             bootstrap_pending,
+            mithril_epoch,
+            mithril_aggregate_verification_key,
+            mithril_protocol_parameters_hash,
         })
     }
 }
@@ -406,6 +415,9 @@ impl From<ClientState> for RawClientState {
             storage_namespace: value.storage_namespace,
             bootstrap_objects: value.bootstrap_objects,
             bootstrap_pending: value.bootstrap_pending,
+            mithril_epoch: value.mithril_epoch,
+            mithril_aggregate_verification_key: value.mithril_aggregate_verification_key,
+            mithril_protocol_parameters_hash: value.mithril_protocol_parameters_hash,
         }
     }
 }
@@ -655,6 +667,9 @@ mod tests {
             epoch: 7,
             usable_after_unix_ns: 1_700_000_180_000_000_000,
         }];
+        raw.mithril_epoch = 7;
+        raw.mithril_aggregate_verification_key = "7b7d".to_string();
+        raw.mithril_protocol_parameters_hash = "ab".repeat(32);
 
         let any = Any {
             type_url: PROBABILISTIC_CLIENT_STATE_TYPE_URL.to_string(),
@@ -667,6 +682,7 @@ mod tests {
         assert_eq!(decoded.max_clock_drift, Duration::from_secs(10));
         assert_eq!(decoded.latest_checkpoint_slot, 10);
         assert_eq!(decoded.latest_checkpoint_timestamp, 11);
+        assert_eq!(decoded.mithril_epoch, 7);
         assert_eq!(
             decoded.epoch_context_challenges,
             raw.epoch_context_challenges

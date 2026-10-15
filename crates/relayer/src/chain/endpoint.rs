@@ -214,6 +214,15 @@ pub trait ChainEndpoint: Sized {
         Ok(None)
     }
 
+    /// Mithril certificates that extend a probabilistic client's anchor at
+    /// `mithril_epoch`, as a client message. None while there are none to add.
+    fn query_mithril_stake_certificates(
+        &mut self,
+        _mithril_epoch: u64,
+    ) -> Result<Option<ibc_proto::google::protobuf::Any>, Error> {
+        Ok(None)
+    }
+
     // Queries
 
     /// Query the balance of the given account for the given denom.

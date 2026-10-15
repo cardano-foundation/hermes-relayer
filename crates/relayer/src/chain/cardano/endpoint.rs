@@ -112,6 +112,7 @@ pub struct CardanoChainEndpoint {
     event_source_cmd: Option<crate::event::source::TxEventSourceCmd>,
     stop_intent_executor: Arc<AtomicBool>,
     pending_new_client_consensus_states: Mutex<HashMap<u64, AnyConsensusState>>,
+    mithril_stake_polls: super::mithril_stake::MithrilStakePolls,
 }
 
 impl Drop for CardanoChainEndpoint {
@@ -1466,6 +1467,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             stop_intent_executor: Arc::new(AtomicBool::new(false)),
             event_source_cmd: None, // Initialized lazily on first subscribe() call
             pending_new_client_consensus_states: Mutex::new(HashMap::new()),
+            mithril_stake_polls: Default::default(),
         };
 
         tracing::info!("Cardano chain endpoint bootstrap complete");
@@ -2092,6 +2094,35 @@ impl ChainEndpoint for CardanoChainEndpoint {
         };
         bind_probabilistic_pool_metadata(&mut header, client_state)?;
         Ok(Some(header))
+    }
+
+    fn query_mithril_stake_certificates(
+        &mut self,
+        mithril_epoch: u64,
+    ) -> Result<Option<ibc_proto::google::protobuf::Any>, Error> {
+        let now = std::time::Instant::now();
+        if !self.mithril_stake_polls.due(mithril_epoch, now) {
+            return Ok(None);
+        }
+        let message = self
+            .rt
+            .block_on(
+                self.gateway_client
+                    .query_mithril_stake_certificates(mithril_epoch),
+            )
+            .map_err(|error| {
+                Error::query(format!(
+                    "Gateway Mithril stake certificates failed: {error}"
+                ))
+            })?;
+        self.mithril_stake_polls
+            .record(mithril_epoch, now, message.is_some());
+        let Some(message) = message else {
+            return Ok(None);
+        };
+        super::mithril_stake::validate_client_message(message)
+            .map(Some)
+            .map_err(|error| Error::query(format!("Gateway Mithril stake certificates: {error}")))
     }
 
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
@@ -4669,6 +4700,9 @@ mod tests {
             storage_namespace: vec![],
             bootstrap_objects: vec![],
             bootstrap_pending: false,
+            mithril_epoch: 0,
+            mithril_aggregate_verification_key: String::new(),
+            mithril_protocol_parameters_hash: String::new(),
         })
     }
 

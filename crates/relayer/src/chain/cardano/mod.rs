@@ -13,6 +13,7 @@ pub mod event_source;
 pub mod gateway_client;
 pub mod generated;
 pub mod keyring;
+pub(crate) mod mithril_stake;
 pub mod signer;
 pub mod signing_key_pair;
 pub mod signing_policy;
