@@ -178,37 +178,48 @@ pub struct CardanoConfig {
     pub host_state_heartbeat_interval: Option<Duration>,
 
     /// Maximum amount of time Hermes will wait after a Cardano transaction is included
-    /// until it is also "Mithril-certified".
+    /// until the Gateway accepts its height.
     ///
     /// Important nuance about "height":
     /// In this Cardano↔Cosmos integration, `Height.revision_height` is treated as a Cardano
-    /// *block number* (as surfaced by `db-sync` and by Mithril's `cardano-transactions`
-    /// snapshots). It is not a Cardano *slot number*.
+    /// *block number*. It is not a Cardano *slot number*.
     ///
     /// When Hermes submits a transaction on Cardano, the Gateway returns the inclusion
-    /// block number. Hermes then waits until the Gateway reports a Mithril snapshot
-    /// whose `block_number` is >= that inclusion block number, before proceeding to the
-    /// next IBC step. Without this, Hermes can race ahead and build proofs at a height
-    /// that the Cosmos-side Mithril light client cannot yet verify.
+    /// block number. Hermes then waits until the Gateway's accepted height is >= that
+    /// inclusion block number, before proceeding to the next IBC step. Without this,
+    /// Hermes can race ahead and build proofs at a height that the Cosmos-side light
+    /// client cannot yet verify.
+    ///
+    /// `mithril_certification_timeout` is accepted as an alias for older configurations.
     #[serde(
-        default = "default_mithril_certification_timeout",
+        default = "default_accepted_height_timeout",
+        alias = "mithril_certification_timeout",
         with = "humantime_serde"
     )]
-    pub mithril_certification_timeout: Duration,
+    pub accepted_height_timeout: Duration,
 
-    /// Polling interval while waiting for Mithril snapshots to catch up.
-    #[serde(default = "default_mithril_poll_interval", with = "humantime_serde")]
-    pub mithril_poll_interval: Duration,
+    /// Polling interval while waiting for the accepted height to catch up.
+    ///
+    /// `mithril_poll_interval` is accepted as an alias for older configurations.
+    #[serde(
+        default = "default_accepted_height_poll_interval",
+        alias = "mithril_poll_interval",
+        with = "humantime_serde"
+    )]
+    pub accepted_height_poll_interval: Duration,
 
-    /// How often to log progress while waiting for Mithril snapshot catch-up.
+    /// How often to log progress while waiting for the accepted height to catch up.
     ///
     /// This is intentionally an `INFO`-level log, because in many environments the default
     /// log level is `info` (so `debug` would be invisible and the process would look hung).
+    ///
+    /// `mithril_wait_log_interval` is accepted as an alias for older configurations.
     #[serde(
-        default = "default_mithril_wait_log_interval",
+        default = "default_accepted_height_wait_log_interval",
+        alias = "mithril_wait_log_interval",
         with = "humantime_serde"
     )]
-    pub mithril_wait_log_interval: Duration,
+    pub accepted_height_wait_log_interval: Duration,
 }
 
 const REDACTED_ENDPOINT: &str = "<redacted>";
@@ -309,12 +320,15 @@ impl fmt::Debug for CardanoConfig {
                 "host_state_heartbeat_interval",
                 &self.host_state_heartbeat_interval,
             )
+            .field("accepted_height_timeout", &self.accepted_height_timeout)
             .field(
-                "mithril_certification_timeout",
-                &self.mithril_certification_timeout,
+                "accepted_height_poll_interval",
+                &self.accepted_height_poll_interval,
             )
-            .field("mithril_poll_interval", &self.mithril_poll_interval)
-            .field("mithril_wait_log_interval", &self.mithril_wait_log_interval)
+            .field(
+                "accepted_height_wait_log_interval",
+                &self.accepted_height_wait_log_interval,
+            )
             .finish()
     }
 }
@@ -371,15 +385,15 @@ fn default_event_replay_window() -> u64 {
     100
 }
 
-fn default_mithril_certification_timeout() -> Duration {
+fn default_accepted_height_timeout() -> Duration {
     Duration::from_secs(10 * 60)
 }
 
-fn default_mithril_poll_interval() -> Duration {
+fn default_accepted_height_poll_interval() -> Duration {
     Duration::from_secs(5)
 }
 
-fn default_mithril_wait_log_interval() -> Duration {
+fn default_accepted_height_wait_log_interval() -> Duration {
     Duration::from_secs(30)
 }
 
@@ -425,9 +439,9 @@ impl Default for CardanoConfig {
             event_replay_window: default_event_replay_window(),
             packet_executor_concurrency: default_packet_executor_concurrency(),
             host_state_heartbeat_interval: None,
-            mithril_certification_timeout: default_mithril_certification_timeout(),
-            mithril_poll_interval: default_mithril_poll_interval(),
-            mithril_wait_log_interval: default_mithril_wait_log_interval(),
+            accepted_height_timeout: default_accepted_height_timeout(),
+            accepted_height_poll_interval: default_accepted_height_poll_interval(),
+            accepted_height_wait_log_interval: default_accepted_height_wait_log_interval(),
         }
     }
 }
@@ -463,6 +477,39 @@ mod tests {
             "packet_executor_concurrency = 0"
         ))
         .is_err());
+    }
+
+    #[test]
+    fn accepted_height_wait_accepts_the_former_mithril_names() {
+        let encoded = toml::to_string(&CardanoConfig::default()).unwrap();
+        assert!(encoded.contains("accepted_height_timeout = \"10m\""));
+        let legacy = encoded
+            .replace(
+                "accepted_height_timeout = \"10m\"",
+                "mithril_certification_timeout = \"30m\"",
+            )
+            .replace(
+                "accepted_height_poll_interval = \"5s\"",
+                "mithril_poll_interval = \"2s\"",
+            )
+            .replace(
+                "accepted_height_wait_log_interval = \"30s\"",
+                "mithril_wait_log_interval = \"1m\"",
+            );
+        assert!(!legacy.contains("accepted_height"));
+        let decoded: CardanoConfig = toml::from_str(&legacy).unwrap();
+        assert_eq!(
+            decoded.accepted_height_timeout,
+            Duration::from_secs(30 * 60)
+        );
+        assert_eq!(
+            decoded.accepted_height_poll_interval,
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            decoded.accepted_height_wait_log_interval,
+            Duration::from_secs(60)
+        );
     }
 
     #[test]

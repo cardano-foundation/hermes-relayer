@@ -210,11 +210,7 @@ impl FilterPolicy {
             }
             // Cardano light clients do not expose a Tendermint trust threshold; their
             // security parameters are validated by the client implementation itself.
-            None if matches!(
-                state.client_type(),
-                ClientType::CardanoMithril | ClientType::CardanoProbabilistic
-            ) =>
-            {
+            None if matches!(state.client_type(), ClientType::CardanoProbabilistic) => {
                 Permission::Allow
             }
             None => {

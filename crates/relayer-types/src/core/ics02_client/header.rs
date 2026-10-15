@@ -9,7 +9,6 @@ use prost::Message;
 use crate::clients::ics07_tendermint::header::{
     decode_header as tm_decode_header, Header as TendermintHeader, TENDERMINT_HEADER_TYPE_URL,
 };
-use crate::clients::ics08_cardano::header::{Header as MithrilHeader, MITHRIL_HEADER_TYPE_URL};
 use crate::clients::ics08_cardano_probabilistic::header::{
     Header as ProbabilisticHeader, PROBABILISTIC_HEADER_TYPE_URL,
 };
@@ -41,7 +40,6 @@ pub fn decode_header(header_bytes: &[u8]) -> Result<AnyHeader, Error> {
 #[allow(clippy::large_enum_variant)]
 pub enum AnyHeader {
     Tendermint(TendermintHeader),
-    Mithril(MithrilHeader),
     Probabilistic(ProbabilisticHeader),
 }
 
@@ -49,7 +47,6 @@ impl Header for AnyHeader {
     fn client_type(&self) -> ClientType {
         match self {
             Self::Tendermint(header) => header.client_type(),
-            Self::Mithril(header) => header.client_type(),
             Self::Probabilistic(header) => header.client_type(),
         }
     }
@@ -57,7 +54,6 @@ impl Header for AnyHeader {
     fn height(&self) -> Height {
         match self {
             Self::Tendermint(header) => header.height(),
-            Self::Mithril(header) => header.height(),
             Self::Probabilistic(header) => header.height(),
         }
     }
@@ -65,7 +61,6 @@ impl Header for AnyHeader {
     fn timestamp(&self) -> Timestamp {
         match self {
             Self::Tendermint(header) => header.timestamp(),
-            Self::Mithril(header) => header.timestamp(),
             Self::Probabilistic(header) => header.timestamp(),
         }
     }
@@ -81,10 +76,6 @@ impl TryFrom<Any> for AnyHeader {
             TENDERMINT_HEADER_TYPE_URL => {
                 let val = tm_decode_header(raw.value.as_slice())?;
                 Ok(AnyHeader::Tendermint(val))
-            }
-            MITHRIL_HEADER_TYPE_URL => {
-                let val: MithrilHeader = raw.try_into()?;
-                Ok(AnyHeader::Mithril(val))
             }
             PROBABILISTIC_HEADER_TYPE_URL => {
                 let val: ProbabilisticHeader = raw.try_into()?;
@@ -105,7 +96,6 @@ impl From<AnyHeader> for Any {
                 type_url: TENDERMINT_HEADER_TYPE_URL.to_string(),
                 value: Protobuf::<RawHeader>::encode_vec(header),
             },
-            AnyHeader::Mithril(header) => header.into(),
             AnyHeader::Probabilistic(header) => header.into(),
         }
     }
@@ -114,12 +104,6 @@ impl From<AnyHeader> for Any {
 impl From<TendermintHeader> for AnyHeader {
     fn from(header: TendermintHeader) -> Self {
         Self::Tendermint(header)
-    }
-}
-
-impl From<MithrilHeader> for AnyHeader {
-    fn from(header: MithrilHeader) -> Self {
-        Self::Mithril(header)
     }
 }
 

@@ -4,10 +4,6 @@ use ibc_proto::google::protobuf::Any;
 use ibc_relayer_types::clients::ics07_tendermint::misbehaviour::{
     Misbehaviour as TmMisbehaviour, TENDERMINT_MISBEHAVIOR_TYPE_URL,
 };
-use ibc_relayer_types::clients::ics08_cardano::misbehaviour::{
-    Misbehaviour as MithrilMisbehaviour, MITHRIL_MISBEHAVIOUR_TYPE_URL,
-};
-use ibc_relayer_types::clients::ics08_cardano::raw as mithril_raw;
 use ibc_relayer_types::clients::ics08_cardano_probabilistic::misbehaviour::{
     Misbehaviour as ProbabilisticMisbehaviour, PROBABILISTIC_MISBEHAVIOUR_TYPE_URL,
 };
@@ -30,7 +26,6 @@ pub struct MisbehaviourEvidence {
 #[allow(clippy::large_enum_variant)]
 pub enum AnyMisbehaviour {
     Tendermint(TmMisbehaviour),
-    Mithril(MithrilMisbehaviour),
     Probabilistic(ProbabilisticMisbehaviour),
 }
 
@@ -38,7 +33,6 @@ impl Misbehaviour for AnyMisbehaviour {
     fn client_id(&self) -> &ClientId {
         match self {
             Self::Tendermint(misbehaviour) => misbehaviour.client_id(),
-            Self::Mithril(misbehaviour) => misbehaviour.client_id(),
             Self::Probabilistic(misbehaviour) => misbehaviour.client_id(),
         }
     }
@@ -46,7 +40,6 @@ impl Misbehaviour for AnyMisbehaviour {
     fn height(&self) -> Height {
         match self {
             Self::Tendermint(misbehaviour) => misbehaviour.height(),
-            Self::Mithril(misbehaviour) => misbehaviour.height(),
             Self::Probabilistic(misbehaviour) => misbehaviour.height(),
         }
     }
@@ -62,11 +55,6 @@ impl TryFrom<Any> for AnyMisbehaviour {
             TENDERMINT_MISBEHAVIOR_TYPE_URL => Ok(AnyMisbehaviour::Tendermint(
                 TmMisbehaviour::decode_vec(&raw.value).map_err(Error::decode_raw_misbehaviour)?,
             )),
-            MITHRIL_MISBEHAVIOUR_TYPE_URL => {
-                let value = mithril_raw::Misbehaviour::decode(raw.value.as_slice())
-                    .map_err(Error::decode)?;
-                Ok(AnyMisbehaviour::Mithril(value.try_into()?))
-            }
             PROBABILISTIC_MISBEHAVIOUR_TYPE_URL => {
                 let value = probabilistic_raw::Misbehaviour::decode(raw.value.as_slice())
                     .map_err(Error::decode)?;
@@ -85,13 +73,6 @@ impl From<AnyMisbehaviour> for Any {
                 type_url: TENDERMINT_MISBEHAVIOR_TYPE_URL.to_string(),
                 value: misbehaviour.encode_vec(),
             },
-            AnyMisbehaviour::Mithril(misbehaviour) => {
-                let raw: mithril_raw::Misbehaviour = misbehaviour.into();
-                Any {
-                    type_url: MITHRIL_MISBEHAVIOUR_TYPE_URL.to_string(),
-                    value: raw.encode_to_vec(),
-                }
-            }
             AnyMisbehaviour::Probabilistic(misbehaviour) => {
                 let raw: probabilistic_raw::Misbehaviour = misbehaviour.into();
                 Any {
@@ -107,7 +88,6 @@ impl core::fmt::Display for AnyMisbehaviour {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
         match self {
             AnyMisbehaviour::Tendermint(tm) => write!(f, "{tm}"),
-            AnyMisbehaviour::Mithril(mithril) => write!(f, "{mithril}"),
             AnyMisbehaviour::Probabilistic(probabilistic) => write!(f, "{probabilistic}"),
         }
     }
@@ -116,12 +96,6 @@ impl core::fmt::Display for AnyMisbehaviour {
 impl From<TmMisbehaviour> for AnyMisbehaviour {
     fn from(misbehaviour: TmMisbehaviour) -> Self {
         Self::Tendermint(misbehaviour)
-    }
-}
-
-impl From<MithrilMisbehaviour> for AnyMisbehaviour {
-    fn from(misbehaviour: MithrilMisbehaviour) -> Self {
-        Self::Mithril(misbehaviour)
     }
 }
 

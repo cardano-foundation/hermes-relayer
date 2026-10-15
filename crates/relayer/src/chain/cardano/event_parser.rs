@@ -1,7 +1,7 @@
 //! Event parsing for Cardano Gateway events -> Hermes `IbcEvent` conversion.
 //!
 //! The Gateway returns events in the format:
-//! `Event { type: "create_client", attributes: [{ key: "client_id", value: "08-cardano-mithril-0" }, ...] }`
+//! `Event { type: "create_client", attributes: [{ key: "client_id", value: "08-cardano-probabilistic-0" }, ...] }`
 //!
 //! This module converts them into Hermes' `IbcEvent` enum variants.
 
@@ -10,9 +10,6 @@ use ibc_relayer_types::{
     clients::{
         ics07_tendermint::{
             header::TENDERMINT_HEADER_TYPE_URL, misbehaviour::TENDERMINT_MISBEHAVIOR_TYPE_URL,
-        },
-        ics08_cardano::{
-            header::MITHRIL_HEADER_TYPE_URL, misbehaviour::MITHRIL_MISBEHAVIOUR_TYPE_URL,
         },
         ics08_cardano_probabilistic::{
             header::PROBABILISTIC_HEADER_TYPE_URL,
@@ -388,14 +385,12 @@ fn parse_optional_client_message_header(
     })?;
 
     match client_message.type_url.as_str() {
-        TENDERMINT_HEADER_TYPE_URL | MITHRIL_HEADER_TYPE_URL | PROBABILISTIC_HEADER_TYPE_URL => {
+        TENDERMINT_HEADER_TYPE_URL | PROBABILISTIC_HEADER_TYPE_URL => {
             AnyHeader::try_from(client_message)
                 .map(Some)
                 .map_err(|e| Error::EventAttribute(format!("Invalid update-client header: {e}")))
         }
-        TENDERMINT_MISBEHAVIOR_TYPE_URL
-        | MITHRIL_MISBEHAVIOUR_TYPE_URL
-        | PROBABILISTIC_MISBEHAVIOUR_TYPE_URL => Ok(None),
+        TENDERMINT_MISBEHAVIOR_TYPE_URL | PROBABILISTIC_MISBEHAVIOUR_TYPE_URL => Ok(None),
         other => Err(Error::EventAttribute(format!(
             "Unknown update-client client message type_url: {other}"
         ))),
@@ -716,9 +711,6 @@ fn parse_client_type(
         .ok_or_else(|| Error::EventAttribute(format!("Missing attribute: {}", key)))?;
 
     match value.as_str() {
-        "cardano-mithril" | "08-cardano-mithril" => {
-            Ok(ibc_relayer_types::core::ics02_client::client_type::ClientType::CardanoMithril)
-        }
         "cardano-probabilistic" | "08-cardano-probabilistic" => Ok(
             ibc_relayer_types::core::ics02_client::client_type::ClientType::CardanoProbabilistic,
         ),
@@ -881,9 +873,7 @@ fn parse_packet(attrs: &HashMap<String, String>) -> Result<Packet, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ibc_relayer_types::clients::{
-        ics08_cardano::raw as mithril_raw, ics08_cardano_probabilistic::raw as probabilistic_raw,
-    };
+    use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw as probabilistic_raw;
     use ibc_relayer_types::core::ics02_client::client_type::ClientType;
     use ibc_relayer_types::core::ics02_client::height::Height;
     use ibc_relayer_types::core::ics04_channel::timeout::TimeoutHeight;
@@ -906,66 +896,6 @@ mod tests {
             }
             .encode_to_vec(),
         )
-    }
-
-    fn raw_mithril_certificate(sealed_at: &str) -> mithril_raw::MithrilCertificate {
-        mithril_raw::MithrilCertificate {
-            hash: "cert_hash".to_string(),
-            previous_hash: String::new(),
-            epoch: 0,
-            signed_entity_type: None,
-            metadata: Some(mithril_raw::CertificateMetadata {
-                network: "testnet".to_string(),
-                protocol_version: "v1".to_string(),
-                protocol_parameters: Some(mithril_raw::MithrilProtocolParameters {
-                    k: 1,
-                    m: 2,
-                    phi_f: None,
-                }),
-                initiated_at: "2024-01-01T00:00:00Z".to_string(),
-                sealed_at: sealed_at.to_string(),
-                signers: vec![],
-            }),
-            protocol_message: None,
-            signed_message: String::new(),
-            aggregate_verification_key: String::new(),
-            multi_signature: String::new(),
-            genesis_signature: String::new(),
-        }
-    }
-
-    fn raw_mithril_header(block_number: u64) -> mithril_raw::MithrilHeader {
-        mithril_raw::MithrilHeader {
-            mithril_stake_distribution: Some(mithril_raw::MithrilStakeDistribution {
-                epoch: 0,
-                signers_with_stake: vec![],
-                hash: "stake_dist_hash".to_string(),
-                certificate_hash: "stake_dist_cert_hash".to_string(),
-                created_at: 0,
-                protocol_parameter: Some(mithril_raw::MithrilProtocolParameters {
-                    k: 1,
-                    m: 2,
-                    phi_f: None,
-                }),
-            }),
-            mithril_stake_distribution_certificate: Some(raw_mithril_certificate(
-                "2024-01-01T00:00:00Z",
-            )),
-            transaction_snapshot: Some(mithril_raw::CardanoTransactionSnapshot {
-                merkle_root: "merkle_root".to_string(),
-                epoch: 0,
-                block_number,
-                hash: "tx_snapshot_hash".to_string(),
-                certificate_hash: "tx_snapshot_cert_hash".to_string(),
-                created_at: "2024-01-01T00:00:00Z".to_string(),
-            }),
-            transaction_snapshot_certificate: Some(raw_mithril_certificate("2024-01-01T00:00:00Z")),
-            previous_mithril_stake_distribution_certificates: vec![],
-            host_state_tx_hash: "host_state_tx_hash".to_string(),
-            host_state_tx_body_cbor: vec![0x01],
-            host_state_tx_output_index: 0,
-            host_state_tx_proof: vec![0x02],
-        }
     }
 
     fn raw_probabilistic_block(
@@ -1017,32 +947,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_update_client_event_with_mithril_header_any() {
-        let header_hex = any_hex(
-            MITHRIL_HEADER_TYPE_URL,
-            raw_mithril_header(10).encode_to_vec(),
-        );
-        let gateway_event = Event {
-            r#type: "update_client".to_string(),
-            attributes: attrs(&[
-                ("client_id", "08-cardano-mithril-0"),
-                ("client_type", "08-cardano-mithril"),
-                ("consensus_height", "0-10"),
-                (ATTR_CLIENT_MESSAGE_ANY_HEX, &header_hex),
-            ]),
-        };
-
-        let events = parse_events(vec![gateway_event], Height::new(0, 10).unwrap()).unwrap();
-
-        match &events[0] {
-            RelayerIbcEvent::UpdateClient(ev) => {
-                assert!(matches!(ev.header, Some(AnyHeader::Mithril(_))));
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
-
-    #[test]
     fn parse_update_client_event_with_probabilistic_header_any() {
         let header_hex = any_hex(
             PROBABILISTIC_HEADER_TYPE_URL,
@@ -1089,12 +993,12 @@ mod tests {
 
     #[test]
     fn parse_update_client_event_with_misbehaviour_any_keeps_header_empty() {
-        let misbehaviour_hex = any_hex(MITHRIL_MISBEHAVIOUR_TYPE_URL, vec![0x01, 0x02]);
+        let misbehaviour_hex = any_hex(PROBABILISTIC_MISBEHAVIOUR_TYPE_URL, vec![0x01, 0x02]);
         let gateway_event = Event {
             r#type: "update_client".to_string(),
             attributes: attrs(&[
-                ("client_id", "08-cardano-mithril-0"),
-                ("client_type", "08-cardano-mithril"),
+                ("client_id", "08-cardano-probabilistic-0"),
+                ("client_type", "08-cardano-probabilistic"),
                 ("consensus_height", "0-10"),
                 (ATTR_CLIENT_MESSAGE_ANY_HEX, &misbehaviour_hex),
             ]),
@@ -1113,8 +1017,8 @@ mod tests {
         let gateway_event = Event {
             r#type: "update_client".to_string(),
             attributes: attrs(&[
-                ("client_id", "08-cardano-mithril-0"),
-                ("client_type", "08-cardano-mithril"),
+                ("client_id", "08-cardano-probabilistic-0"),
+                ("client_type", "08-cardano-probabilistic"),
                 ("consensus_height", "0-10"),
                 (ATTR_CLIENT_MESSAGE_ANY_HEX, "not-hex"),
             ]),

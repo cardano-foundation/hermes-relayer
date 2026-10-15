@@ -1487,8 +1487,8 @@ impl ChainEndpoint for CosmosSdkChain {
         let consensus_state = AnyConsensusState::decode_vec(&res.value).map_err(Error::decode)?;
 
         // Note: Upstream Hermes assumed Cosmos chains only ever store Tendermint consensus states.
-        // In this repo we also support non-Tendermint clients on Cosmos chains (e.g. the Mithril
-        // client used to track Cardano). Therefore we must accept whatever consensus state type is
+        // In this repo we also support non-Tendermint clients on Cosmos chains (e.g. the
+        // probabilistic client that tracks Cardano). Therefore we must accept whatever consensus state type is
         // actually stored under the requested client ID and height.
 
         match include_proof {

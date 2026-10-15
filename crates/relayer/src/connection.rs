@@ -945,9 +945,9 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
             ChainConfig::Cardano(_)
         );
 
-        // Cardano query_latest_height is Mithril-certified snapshot height, not raw tip.
+        // Cardano query_latest_height is the latest accepted height, not raw tip.
         // A strict pre-wait on this value can deadlock the handshake before we submit the tx
-        // that would advance certified state.
+        // that would advance accepted state.
         if dst_chain_is_cardano {
             debug!(
                 "skipping destination-height pre-wait for Cardano (required consensus proof height: {})",
