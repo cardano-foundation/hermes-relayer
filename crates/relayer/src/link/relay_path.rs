@@ -11,6 +11,7 @@ use tracing::{debug, error, info, span, trace, warn, Level};
 
 use ibc_relayer_types::core::ics02_client::client_type::ClientType;
 use ibc_relayer_types::core::ics02_client::events::ClientMisbehaviour as ClientMisbehaviourEvent;
+use ibc_relayer_types::core::ics03_connection::connection::State as ConnectionState;
 use ibc_relayer_types::core::ics04_channel::channel::{
     ChannelEnd, Ordering, State as ChannelState,
 };
@@ -36,6 +37,7 @@ use crate::chain::requests::Paginate;
 use crate::chain::requests::QueryChannelRequest;
 use crate::chain::requests::QueryClientEventRequest;
 use crate::chain::requests::QueryClientStateRequest;
+use crate::chain::requests::QueryConnectionRequest;
 use crate::chain::requests::QueryHeight;
 use crate::chain::requests::QueryHostConsensusStateRequest;
 use crate::chain::requests::QueryNextSequenceReceiveRequest;
@@ -47,7 +49,7 @@ use crate::chain::requests::{IncludeProof, Qualified};
 use crate::chain::tracking::TrackedMsgs;
 use crate::chain::tracking::TrackingId;
 use crate::channel::error::ChannelError;
-use crate::channel::Channel;
+use crate::channel::{Channel, ChannelSide};
 use crate::config::types::ics20_field_size_limit::Ics20FieldSizeLimit;
 use crate::config::types::ics20_field_size_limit::ValidationResult;
 use crate::config::ChainConfig;
@@ -98,6 +100,8 @@ impl Resubmit {
 
 pub struct RelayPath<ChainA: ChainHandle, ChainB: ChainHandle> {
     channel: Channel<ChainA, ChainB>,
+    refresh_cardano_route: bool,
+    route_heights: Option<(Height, Height)>,
 
     pub(crate) path_id: PathIdentifiers,
 
@@ -156,9 +160,18 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
             counterparty_port_id: src_port_id.clone(),
             counterparty_channel_id: src_channel_id.clone(),
         };
+        let refresh_cardano_route = matches!(
+            src_chain.config().map_err(LinkError::relayer)?,
+            ChainConfig::Cardano(_)
+        ) || matches!(
+            dst_chain.config().map_err(LinkError::relayer)?,
+            ChainConfig::Cardano(_)
+        );
 
         Ok(Self {
             channel,
+            refresh_cardano_route,
+            route_heights: None,
 
             path_id: path,
 
@@ -218,6 +231,134 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
 
     pub fn channel(&self) -> &Channel<ChainA, ChainB> {
         &self.channel
+    }
+
+    /// Refresh both ends at explicit heights, bypassing the open-channel cache.
+    /// A half-completed cutover waits without changing the route or queued work.
+    pub fn refresh_channel_route(&mut self) -> Result<(), LinkError> {
+        if !self.refresh_cardano_route {
+            return Ok(());
+        }
+        let heights = (self.src_latest_height()?, self.dst_latest_height()?);
+        if self.route_heights == Some(heights) {
+            return Ok(());
+        }
+        let source = self.src_channel(QueryHeight::Specific(heights.0))?;
+        let destination = self.dst_channel(QueryHeight::Specific(heights.1))?;
+        let unavailable = |detail: &str| LinkError::channel_route(detail.to_string());
+        if source.counterparty().port_id() != self.dst_port_id()
+            || source.counterparty().channel_id() != Some(self.dst_channel_id())
+            || destination.counterparty().port_id() != self.src_port_id()
+            || destination.counterparty().channel_id() != Some(self.src_channel_id())
+            || source.ordering != self.channel.ordering
+            || destination.ordering != self.channel.ordering
+            || source.version != destination.version
+        {
+            return Err(unavailable("channel identity, ordering or version changed"));
+        }
+        let ([source_hop], [destination_hop]) = (
+            source.connection_hops().as_slice(),
+            destination.connection_hops().as_slice(),
+        ) else {
+            return Err(unavailable("one connection hop is required on both ends"));
+        };
+        if source_hop == self.src_connection_id() && destination_hop == self.dst_connection_id() {
+            self.route_heights = Some(heights);
+            return Ok(());
+        }
+        let (source_connection, _) = self
+            .src_chain()
+            .query_connection(
+                QueryConnectionRequest {
+                    connection_id: source_hop.clone(),
+                    height: QueryHeight::Specific(heights.0),
+                },
+                IncludeProof::No,
+            )
+            .map_err(LinkError::relayer)?;
+        let (destination_connection, _) = self
+            .dst_chain()
+            .query_connection(
+                QueryConnectionRequest {
+                    connection_id: destination_hop.clone(),
+                    height: QueryHeight::Specific(heights.1),
+                },
+                IncludeProof::No,
+            )
+            .map_err(LinkError::relayer)?;
+        if !source_connection.state_matches(&ConnectionState::Open)
+            || !destination_connection.state_matches(&ConnectionState::Open)
+            || source_connection.counterparty().connection_id() != Some(destination_hop)
+            || destination_connection.counterparty().connection_id() != Some(source_hop)
+            || source_connection.counterparty().client_id() != destination_connection.client_id()
+            || destination_connection.counterparty().client_id() != source_connection.client_id()
+            || source_connection.delay_period() != destination_connection.delay_period()
+        {
+            return Err(unavailable(
+                "waiting for both channel ends to use the replacement connection",
+            ));
+        }
+
+        let previous = self.channel.clone();
+        self.channel = Channel {
+            ordering: source.ordering,
+            a_side: ChannelSide::new(
+                previous.src_chain().clone(),
+                source_connection.client_id().clone(),
+                source_hop.clone(),
+                self.src_port_id().clone(),
+                Some(self.src_channel_id().clone()),
+                Some(source.version.clone()),
+            ),
+            b_side: ChannelSide::new(
+                previous.dst_chain().clone(),
+                destination_connection.client_id().clone(),
+                destination_hop.clone(),
+                self.dst_port_id().clone(),
+                Some(self.dst_channel_id().clone()),
+                Some(destination.version.clone()),
+            ),
+            connection_delay: source_connection.delay_period(),
+        };
+        // Rebuild from retained events, including the new connection delay.
+        // Queries or client updates may fail. Publish the replacement queues
+        // only after all their messages have been prepared successfully.
+        let rebuilt = (|| {
+            let mut source_queue = VecDeque::new();
+            let mut destination_queue = VecDeque::new();
+            for old in self
+                .src_operational_data
+                .clone_vec()
+                .into_iter()
+                .chain(self.dst_operational_data.clone_vec())
+            {
+                let (source, destination) = self.generate_operational_data(old.into_events())?;
+                for data in [source, destination].into_iter().flatten() {
+                    if data.batch.is_empty() {
+                        continue;
+                    }
+                    let data = self.prepare_operational_data(data)?;
+                    match data.target {
+                        OperationalDataTarget::Source => source_queue.push_back(data),
+                        OperationalDataTarget::Destination => destination_queue.push_back(data),
+                    }
+                }
+            }
+            Ok::<_, LinkError>((source_queue, destination_queue))
+        })();
+        let (source_queue, destination_queue) = match rebuilt {
+            Ok(queues) => queues,
+            Err(error) => {
+                self.channel = previous;
+                return Err(error);
+            }
+        };
+        self.src_operational_data.replace(source_queue);
+        self.dst_operational_data.replace(destination_queue);
+        self.route_heights = Some(heights);
+        info!(source_connection = %source_hop, destination_connection = %destination_hop,
+            "packet worker adopted the channel replacement connection");
+        Ok(())
     }
 
     fn src_channel(&self, height_query: QueryHeight) -> Result<ChannelEnd, LinkError> {
@@ -2003,7 +2144,7 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
     /// Adds a new operational data item for this relaying path to process later.
     /// If the relaying path has non-zero packet delays, this method also updates the client on the
     /// target chain with the appropriate headers.
-    fn schedule_operational_data(&self, mut od: OperationalData) -> Result<(), LinkError> {
+    fn schedule_operational_data(&self, od: OperationalData) -> Result<(), LinkError> {
         let _span = span!(Level::INFO, "schedule", odata = %od.info()).entered();
 
         if od.batch.is_empty() {
@@ -2014,6 +2155,20 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
             return Ok(());
         }
 
+        let od = self.prepare_operational_data(od)?;
+
+        match od.target {
+            OperationalDataTarget::Source => self.src_operational_data.push_back(od),
+            OperationalDataTarget::Destination => self.dst_operational_data.push_back(od),
+        };
+
+        Ok(())
+    }
+
+    fn prepare_operational_data(
+        &self,
+        mut od: OperationalData,
+    ) -> Result<OperationalData, LinkError> {
         // Update clients ahead of scheduling the operational data, if the delays are non-zero.
         // If the connection-delay must be taken into account, set the `scheduled_time` to an
         // instant in the past, i.e. when this client update was first processed (`processed_time`)
@@ -2039,12 +2194,7 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
 
         od.set_scheduled_time(scheduled_time);
 
-        match od.target {
-            OperationalDataTarget::Source => self.src_operational_data.push_back(od),
-            OperationalDataTarget::Destination => self.dst_operational_data.push_back(od),
-        };
-
-        Ok(())
+        Ok(od)
     }
 
     /// Pulls out the operational elements with elapsed delay period and that can
@@ -2261,6 +2411,10 @@ fn check_ics20_fields_size(
 #[cfg(test)]
 #[path = "relay_path_delay_test.rs"]
 mod delayed_height_tests;
+
+#[cfg(test)]
+#[path = "relay_path_route_test.rs"]
+mod route_tests;
 
 #[cfg(test)]
 mod tests {
