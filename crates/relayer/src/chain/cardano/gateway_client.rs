@@ -45,7 +45,6 @@ use ibc_relayer_types::core::ics02_client::header::AnyHeader;
 use ibc_relayer_types::Height;
 use prost::Message;
 use sha2::{Digest, Sha256};
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::InterceptedService;
@@ -315,6 +314,11 @@ impl GatewayClient {
         let channel_endpoint = Channel::from_shared(endpoint.clone())
             .map_err(|e| Error::GatewayClient(format!("invalid Gateway endpoint: {e}")))?;
         let use_tls = validate_gateway_endpoint(channel_endpoint.uri())?;
+        if !use_tls && auth_token_file.is_some() {
+            return Err(Error::GatewayClient(
+                "gateway_auth_token_file requires an https:// Gateway endpoint".to_string(),
+            ));
+        }
 
         let channel_endpoint = if use_tls {
             let mut tls_config = ClientTlsConfig::new().with_native_roots();
@@ -332,7 +336,7 @@ impl GatewayClient {
                 ));
             }
             tracing::warn!(
-                "Using plaintext gRPC for loopback Cardano Gateway endpoint {}; do not expose this connection to an untrusted network",
+                "Using plaintext gRPC for Cardano Gateway endpoint {}; only use this on a trusted network",
                 endpoint
             );
             channel_endpoint
@@ -2132,38 +2136,18 @@ fn validate_gateway_endpoint(uri: &Uri) -> Result<bool, Error> {
     match uri.scheme_str() {
         Some("https") => Ok(true),
         Some("http") => {
-            let host = uri.host().ok_or_else(|| {
+            uri.host().ok_or_else(|| {
                 Error::GatewayClient("Gateway endpoint must include a host".to_string())
             })?;
-
-            if is_loopback_host(host) {
-                Ok(false)
-            } else {
-                Err(Error::GatewayClient(format!(
-                    "refusing plaintext gRPC connection to non-loopback Gateway host '{host}'; use an https:// endpoint"
-                )))
-            }
+            Ok(false)
         }
         Some(scheme) => Err(Error::GatewayClient(format!(
-            "unsupported Gateway endpoint scheme '{scheme}'; use https://, or http:// for loopback only"
+            "unsupported Gateway endpoint scheme '{scheme}'; use https:// or http://"
         ))),
         None => Err(Error::GatewayClient(
-            "Gateway endpoint must include an https:// scheme, or http:// for loopback only"
-                .to_string(),
+            "Gateway endpoint must include an https:// or http:// scheme".to_string(),
         )),
     }
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let host = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .trim_end_matches('.');
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-
-    matches!(host.parse::<IpAddr>(), Ok(address) if address.is_loopback())
 }
 
 fn parse_submit_signed_tx_height(raw_height: &str) -> Result<Option<Height>, Error> {
@@ -2314,46 +2298,35 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_gateway_is_limited_to_loopback_hosts() {
+    fn plaintext_gateway_accepts_cluster_and_loopback_hosts() {
         for endpoint in [
             "http://localhost:5001",
-            "http://LOCALHOST.:5001",
             "http://127.0.0.1:5001",
-            "http://127.42.0.9:5001",
             "http://[::1]:5001",
+            "http://cf-cardano-ibc-gateway:5001",
+            "http://10.0.0.2:5001",
         ] {
             assert!(
                 !validate_gateway_endpoint(&gateway_uri(endpoint)).unwrap(),
-                "{endpoint} should be accepted as loopback plaintext"
-            );
-        }
-    }
-
-    #[test]
-    fn plaintext_gateway_rejects_non_loopback_hosts() {
-        for endpoint in [
-            "http://gateway:5001",
-            "http://0.0.0.0:5001",
-            "http://192.168.1.2:5001",
-            "http://10.0.0.2:5001",
-            "http://localhost.example:5001",
-        ] {
-            let error = validate_gateway_endpoint(&gateway_uri(endpoint)).unwrap_err();
-            assert!(
-                error.to_string().contains("refusing plaintext"),
-                "unexpected error for {endpoint}: {error}"
+                "{endpoint} should be accepted as plaintext"
             );
         }
     }
 
     #[tokio::test]
-    async fn gateway_client_rejects_remote_plaintext_before_connecting() {
-        let error = GatewayClient::new("http://gateway.example:5001".to_string())
-            .await
-            .err()
-            .expect("remote plaintext must fail");
+    async fn gateway_client_rejects_auth_token_over_plaintext() {
+        let error = GatewayClient::new_with_security(
+            "http://cf-cardano-ibc-gateway:5001".to_string(),
+            None,
+            Some(PathBuf::from("/does/not/need/to/exist.token")),
+        )
+        .await
+        .err()
+        .expect("bearer token must not be sent over plaintext");
 
-        assert!(error.to_string().contains("refusing plaintext"));
+        assert!(error
+            .to_string()
+            .contains("gateway_auth_token_file requires an https://"));
     }
 
     #[tokio::test]
