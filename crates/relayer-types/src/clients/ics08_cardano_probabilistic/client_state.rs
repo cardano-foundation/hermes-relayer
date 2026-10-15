@@ -315,20 +315,6 @@ impl TryFrom<RawClientState> for ClientState {
             "latest_checkpoint_operational_certificate_counters",
         )?;
 
-        let history_start_height = operational_certificate_counter_history_start_height
-            .ok_or_else(|| {
-                Error::missing_field("operational_certificate_counter_history_start_height")
-            })?;
-        let latest_counter_height = latest_checkpoint_height.unwrap_or(latest_height);
-        if history_start_height > latest_counter_height {
-            return Err(Error::invalid_field(
-                "operational_certificate_counter_history_start_height",
-                format!(
-                    "must not be newer than the latest counter height ({latest_counter_height}), got {history_start_height}"
-                ),
-            ));
-        }
-
         Ok(Self {
             chain_id,
             latest_height,
@@ -796,16 +782,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_state_without_usable_history_start() {
+    fn snapshot_clients_do_not_require_inline_counter_rollback_metadata() {
         let mut missing = raw_client_state();
         missing.operational_certificate_counter_history_start_height = None;
-        assert!(ClientState::try_from(missing).is_err());
+        assert!(ClientState::try_from(missing).is_ok());
 
         let mut newer_than_latest = raw_client_state();
         newer_than_latest.operational_certificate_counter_history_start_height = Some(RawHeight {
             revision_number: 0,
             revision_height: 11,
         });
-        assert!(ClientState::try_from(newer_than_latest).is_err());
+        assert!(ClientState::try_from(newer_than_latest).is_ok());
     }
 }
