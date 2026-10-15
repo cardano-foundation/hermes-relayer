@@ -662,11 +662,27 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                         })?,
                     })
                 };
+                let encoded_client = decode(
+                    &bundle.client_state,
+                    "/ibc.lightclients.probabilistic.v1.ClientState",
+                )?;
+                let decoded =
+                    AnyClientState::try_from(encoded_client.clone()).map_err(|error| {
+                        ForeignClientError::checkpoint_update(
+                            self.dst_chain.id(),
+                            error.to_string(),
+                        )
+                    })?;
+                if let AnyClientState::Probabilistic(client) = decoded {
+                    if client.storage_version == 2
+                        && client.trusting_period
+                            <= crate::chain::cardano::checkpoint::maintenance_budget(2)
+                    {
+                        return Err(ForeignClientError::checkpoint_update(self.dst_chain.id(), "compact trusting period must exceed the bounded maintenance and response-window budget, use at least 48 hours".to_owned()));
+                    }
+                }
                 return MsgCreateClient::new(
-                    decode(
-                        &bundle.client_state,
-                        "/ibc.lightclients.probabilistic.v1.ClientState",
-                    )?,
+                    encoded_client,
                     decode(
                         &bundle.consensus_state,
                         "/ibc.lightclients.probabilistic.v1.ConsensusState",
@@ -1068,9 +1084,12 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
 
         let consensus_state_timestamp = self.fetch_consensus_state(*height)?.timestamp();
 
-        let current_src_network_time = self
-            .src_chain
-            .query_application_status()
+        let network_status = if matches!(client_state, AnyClientState::Probabilistic(_)) {
+            self.dst_chain.query_application_status()
+        } else {
+            self.src_chain.query_application_status()
+        };
+        let current_src_network_time = network_status
             .map_err(|e| {
                 ForeignClientError::client_refresh(
                     self.id().clone(),
@@ -3249,20 +3268,9 @@ mod tests {
         submissions: usize,
     }
 
-    // Exercise the real helper through the runtime request/reply boundary. The
-    // cursor at 50 authenticates headers, while only the listed heights have
-    // roots that can verify a handshake proof.
-    fn prepare_proof_with_checkpoint_cursor(
-        exact_root_exists: bool,
-        packet_path: bool,
-    ) -> (
-        Result<Vec<Any>, ForeignClientError>,
-        ProofPreparationRequests,
-        ProofPreparationRequests,
-    ) {
+    pub(super) fn checkpoint_test_client_state(exact_root_exists: bool) -> AnyClientState {
         let source_id = ChainId::from_string("cardano-0");
-        let client_id: ClientId = "08-cardano-probabilistic-0".parse().unwrap();
-        let client_state = AnyClientState::Probabilistic(ProbabilisticClientState {
+        AnyClientState::Probabilistic(ProbabilisticClientState {
             storage_version: 0,
             verification_generation: 0,
             checkpoint_reference: vec![],
@@ -3303,7 +3311,23 @@ mod tests {
             max_clock_drift: Duration::from_secs(10),
             latest_checkpoint_slot: 50,
             latest_checkpoint_timestamp: 100_000_000_000,
-        });
+        })
+    }
+
+    // Exercise the real helper through the runtime request/reply boundary. The
+    // cursor at 50 authenticates headers, while only the listed heights have
+    // roots that can verify a handshake proof.
+    fn prepare_proof_with_checkpoint_cursor(
+        exact_root_exists: bool,
+        packet_path: bool,
+    ) -> (
+        Result<Vec<Any>, ForeignClientError>,
+        ProofPreparationRequests,
+        ProofPreparationRequests,
+    ) {
+        let source_id = ChainId::from_string("cardano-0");
+        let client_id: ClientId = "08-cardano-probabilistic-0".parse().unwrap();
+        let client_state = checkpoint_test_client_state(exact_root_exists);
         let consensus_state = AnyConsensusState::Probabilistic(ProbabilisticConsensusState {
             verification_generation: 0,
             checkpoint_reference: vec![],
@@ -3637,3 +3661,7 @@ mod tests {
         assert_eq!(destination_runtime.join().unwrap(), vec![10, 9, 12, 0]);
     }
 }
+
+#[cfg(test)]
+#[path = "foreign_client/freshness_tests.rs"]
+mod freshness_tests;
