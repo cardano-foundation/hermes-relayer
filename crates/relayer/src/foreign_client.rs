@@ -1206,7 +1206,8 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         let AnyClientState::Probabilistic(client) = state else {
             return;
         };
-        if client.mithril_epoch == 0 || client.frozen_height.is_some() {
+        // A pending bootstrap's own certificate moves its anchor first.
+        if client.mithril_epoch == 0 || client.frozen_height.is_some() || client.bootstrap_pending {
             return;
         }
         let message = match self
