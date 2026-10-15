@@ -427,6 +427,12 @@ impl CardanoChainEndpoint {
         if port_id != "transfer" || !channel.is_open() {
             return Ok(());
         }
+        if height.is_none() {
+            return Err(Error::query(
+                "Cannot discover channel upgrade state without a channel snapshot height"
+                    .to_string(),
+            ));
+        }
         let response = self
             .gateway_client
             .query_upgrade(port_id, channel_id, height)
