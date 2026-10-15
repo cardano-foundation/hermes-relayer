@@ -3480,6 +3480,38 @@ impl ChainEndpoint for CardanoChainEndpoint {
         ))
     }
 
+    fn query_client_initialization(
+        &self,
+        height: u64,
+        sequence: u32,
+    ) -> Result<crate::chain::endpoint::ClientInitialization, Error> {
+        let response = self
+            .rt
+            .block_on(self.gateway_client.query_new_client(height, sequence))
+            .map_err(|e| Error::query(format!("Gateway client initialization failed: {e}")))?;
+        let convert = |value: prost_types::Any| ibc_proto::google::protobuf::Any {
+            type_url: value.type_url,
+            value: value.value,
+        };
+        let client_state = response
+            .client_state
+            .ok_or_else(|| Error::query("Initial client state is missing".into()))?;
+        let consensus_state = response
+            .consensus_state
+            .ok_or_else(|| Error::query("Initial consensus state is missing".into()))?;
+        Ok(crate::chain::endpoint::ClientInitialization {
+            client_state: AnyClientState::try_from(convert(client_state))
+                .map_err(|e| Error::query(e.to_string()))?,
+            consensus_state: AnyConsensusState::try_from(convert(consensus_state))
+                .map_err(|e| Error::query(e.to_string()))?,
+            message: response
+                .initialization_message
+                .map(|raw| AnyHeader::try_from(convert(raw)))
+                .transpose()
+                .map_err(|e| Error::query(e.to_string()))?,
+        })
+    }
+
     fn build_client_state(
         &self,
         height: ICSHeight,
@@ -3491,7 +3523,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             .rt
             .block_on(
                 self.gateway_client
-                    .query_new_client(height.revision_height()),
+                    .query_new_client(height.revision_height(), 0),
             )
             .map_err(|e| Error::query(format!("Gateway query_new_client failed: {e}")))?;
 
@@ -3672,7 +3704,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
         match header {
             AnyHeader::Probabilistic(_) => Err(Error::query(
-                "Probabilistic client creation requires probabilistic_bootstrap_file".to_owned(),
+                "Probabilistic creation requires the source initialization query".to_owned(),
             )),
             AnyHeader::Tendermint(_) => Err(Error::query(
                 "Cardano build_consensus_state received a Tendermint header".to_string(),

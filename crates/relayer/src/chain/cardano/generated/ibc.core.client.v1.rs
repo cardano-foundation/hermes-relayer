@@ -289,9 +289,12 @@ pub struct QueryUpgradedConsensusStateResponse {
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct QueryNewClientRequest {
-    /// Block number to query
+    /// Initial height. Zero selects the current point after HostState creation.
     #[prost(uint64, tag = "1")]
     pub height: u64,
+    /// Zero requests creation records. Positive values request one bounded import.
+    #[prost(uint32, tag = "2")]
+    pub initialization_sequence: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct QueryNewClientResponse {
@@ -301,6 +304,9 @@ pub struct QueryNewClientResponse {
     /// consensus state associated with the request identifier
     #[prost(message, optional, tag = "2")]
     pub consensus_state: ::core::option::Option<::prost_types::Any>,
+    /// One bounded import for the same initial checkpoint.
+    #[prost(message, optional, tag = "3")]
+    pub initialization_message: ::core::option::Option<::prost_types::Any>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct QueryBlockDataRequest {

@@ -2,7 +2,6 @@
 //! records stay bounded, expansion happens only in this off-chain evidence builder.
 use bech32::FromBase32;
 use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
-use prost::Message;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -632,105 +631,5 @@ mod tests {
         .unwrap();
         assert_eq!(receipt, vec![7; 32]);
         assert_eq!(*operations.borrow(), vec![1, 2, 3, 4, 5, 4, 6]);
-    }
-}
-
-#[derive(serde::Deserialize)]
-pub(crate) struct BootstrapBundle {
-    pub client_state: String,
-    pub consensus_state: String,
-    pub imports: Vec<String>,
-}
-impl BootstrapBundle {
-    pub(crate) fn load(path: &std::path::Path) -> Result<Self, String> {
-        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        if file.metadata().map_err(|e| e.to_string())?.len() > 20 * 1024 * 1024 {
-            return Err("Trusted bootstrap bundle exceeds its import allowance".into());
-        }
-        let bundle: Self = serde_json::from_reader(file).map_err(|e| e.to_string())?;
-        if bundle.imports.is_empty() || bundle.imports.len() > 4096 {
-            return Err("Invalid trusted bootstrap import count".into());
-        }
-        let client = raw::ClientState::decode(Self::bytes(&bundle.client_state)?.as_slice())
-            .map_err(|e| e.to_string())?;
-        let consensus =
-            raw::ConsensusState::decode(Self::bytes(&bundle.consensus_state)?.as_slice())
-                .map_err(|e| e.to_string())?;
-        if client.storage_version != 2
-            || client.verification_generation != 1
-            || !client.bootstrap_pending
-            || client.checkpoint_reference.len() != 32
-            || client.storage_namespace.len() != 32
-            || !client.epoch_stake_distribution.is_empty()
-            || !client.epoch_contexts.is_empty()
-            || client.latest_checkpoint_pool_registry.is_some()
-            || client.latest_checkpoint_settlement_credit.is_some()
-            || client.latest_checkpoint_pool_production.is_some()
-            || !client
-                .latest_checkpoint_operational_certificate_counters
-                .is_empty()
-        {
-            return Err("Trusted bootstrap bundle must contain a pending snapshot client".into());
-        }
-        if consensus.verification_generation != client.verification_generation
-            || consensus.checkpoint_reference != client.checkpoint_reference
-            || consensus.packet_state_reference.len() != 32
-            || !consensus.packet_state_snapshot.is_empty()
-            || consensus.pool_registry.is_some()
-            || consensus.settlement_credit.is_some()
-            || consensus.pool_production.is_some()
-            || consensus.nonce_state.is_some()
-        {
-            return Err(
-                "Trusted bootstrap bundle must contain matching snapshot consensus references"
-                    .into(),
-            );
-        }
-        Ok(bundle)
-    }
-    pub(crate) fn bytes(encoded: &str) -> Result<Vec<u8>, String> {
-        subtle_encoding::base64::decode(encoded.as_bytes()).map_err(|e| e.to_string())
-    }
-}
-
-#[cfg(test)]
-mod bootstrap_tests {
-    use super::*;
-    #[test]
-    fn bundle_requires_the_only_supported_storage_format() {
-        let path = std::env::temp_dir().join(format!(
-            "probabilistic-bootstrap-{}.json",
-            std::process::id()
-        ));
-        let mut client = raw::ClientState {
-            storage_version: 2,
-            verification_generation: 1,
-            checkpoint_reference: vec![1; 32],
-            storage_namespace: vec![2; 32],
-            bootstrap_pending: true,
-            ..Default::default()
-        };
-        let consensus = raw::ConsensusState {
-            verification_generation: 1,
-            checkpoint_reference: vec![1; 32],
-            packet_state_reference: vec![3; 32],
-            ..Default::default()
-        };
-        let write = |client: &raw::ClientState| {
-            let bytes = serde_json::to_vec(&serde_json::json!({"client_state":String::from_utf8(subtle_encoding::base64::encode(client.encode_to_vec())).unwrap(),"consensus_state":String::from_utf8(subtle_encoding::base64::encode(consensus.encode_to_vec())).unwrap(),"imports":["AA=="]})).unwrap();
-            std::fs::write(&path, bytes).unwrap();
-        };
-        write(&client);
-        assert!(BootstrapBundle::load(&path).is_ok());
-        client.storage_version = 0;
-        write(&client);
-        assert!(BootstrapBundle::load(&path).is_err());
-        client.storage_version = 2;
-        client
-            .epoch_stake_distribution
-            .push(raw::StakeDistributionEntry::default());
-        write(&client);
-        assert!(BootstrapBundle::load(&path).is_err());
-        std::fs::remove_file(path).unwrap();
     }
 }

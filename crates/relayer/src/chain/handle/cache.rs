@@ -202,6 +202,14 @@ impl<Handle: ChainHandle> ChainHandle for CachingChainHandle<Handle> {
     }
 
     // TODO: Introduce new query_client_state_latest to separate from this one.
+    fn query_client_initialization(
+        &self,
+        height: u64,
+        sequence: u32,
+    ) -> Result<crate::chain::endpoint::ClientInitialization, Error> {
+        self.inner().query_client_initialization(height, sequence)
+    }
+
     fn query_probabilistic_verification(
         &self,
         request:ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,

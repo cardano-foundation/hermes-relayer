@@ -84,6 +84,14 @@ pub enum HostStateHeartbeatOutcome {
     },
 }
 
+/// A source-provided initial checkpoint and an optional bounded import.
+#[derive(Clone, Debug)]
+pub struct ClientInitialization {
+    pub client_state: AnyClientState,
+    pub consensus_state: AnyConsensusState,
+    pub message: Option<AnyHeader>,
+}
+
 /// Defines a blockchain as understood by the relayer
 pub trait ChainEndpoint: Sized {
     /// Type of light blocks for this chain
@@ -249,6 +257,18 @@ pub trait ChainEndpoint: Sized {
 
     /// Performs a query to retrieve the state of the specified light client. A
     /// proof can optionally be returned along with the result.
+    /// Prepare creation records or the next bounded initialization message.
+    fn query_client_initialization(
+        &self,
+        height: u64,
+        sequence: u32,
+    ) -> Result<crate::chain::endpoint::ClientInitialization, Error> {
+        let _ = (height, sequence);
+        Err(Error::query(
+            "Source does not provide client initialization".to_owned(),
+        ))
+    }
+
     fn query_probabilistic_verification(
         &self,
         request:ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::QueryVerificationRequest,

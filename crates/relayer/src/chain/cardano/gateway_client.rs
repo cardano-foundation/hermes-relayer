@@ -472,13 +472,14 @@ impl GatewayClient {
     pub async fn query_new_client(
         &self,
         height: u64,
+        initialization_sequence: u32,
     ) -> Result<super::generated::ibc::core::client::v1::QueryNewClientResponse, Error> {
         use super::generated::ibc::core::client::v1::{
             query_client::QueryClient, QueryNewClientRequest,
         };
 
         let mut client = QueryClient::new(self.channel.clone());
-        let request = tonic::Request::new(QueryNewClientRequest { height });
+        let request = tonic::Request::new(QueryNewClientRequest { height, initialization_sequence });
         let response = client.new_client(request).await?.into_inner();
 
         Ok(response)

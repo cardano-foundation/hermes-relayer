@@ -628,17 +628,6 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             )
         })?;
 
-        // Build client create message with the data from source chain at latest height.
-        let latest_height = self.src_chain.query_latest_height().map_err(|e| {
-            ForeignClientError::client_create(
-                self.src_chain.id(),
-                "failed while querying src chain for latest height".to_string(),
-                e,
-            )
-        })?;
-
-        // Calculate client state settings from the chain configurations and
-        // optional user overrides.
         let src_config = self.src_chain.config().map_err(|e| {
             ForeignClientError::client_create(
                 self.src_chain.id(),
@@ -647,48 +636,34 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             )
         })?;
 
-        if let crate::config::ChainConfig::Cardano(config) = &src_config {
-            if let Some(path) = &config.probabilistic_bootstrap_file {
-                use crate::chain::cardano::staging::BootstrapBundle;
-                let bundle = BootstrapBundle::load(path)
-                    .map_err(|e| ForeignClientError::checkpoint_update(self.dst_chain.id(), e))?;
-                let decode = |value: &str, url: &str| -> Result<Any, ForeignClientError> {
-                    Ok(Any {
-                        type_url: url.into(),
-                        value: BootstrapBundle::bytes(value).map_err(|e| {
-                            ForeignClientError::checkpoint_update(self.dst_chain.id(), e)
-                        })?,
-                    })
-                };
-                let encoded_client = decode(
-                    &bundle.client_state,
-                    "/ibc.lightclients.probabilistic.v1.ClientState",
-                )?;
-                let decoded =
-                    AnyClientState::try_from(encoded_client.clone()).map_err(|error| {
-                        ForeignClientError::checkpoint_update(
-                            self.dst_chain.id(),
-                            error.to_string(),
-                        )
-                    })?;
-                if let AnyClientState::Probabilistic(client) = decoded {
-                    if client.trusting_period
-                        <= crate::chain::cardano::checkpoint::maintenance_budget()
-                    {
-                        return Err(ForeignClientError::checkpoint_update(self.dst_chain.id(), "probabilistic trusting period must exceed the bounded maintenance and response-window budget, use at least 48 hours".to_owned()));
-                    }
+        if matches!(src_config, crate::config::ChainConfig::Cardano(_)) {
+            let initial = self
+                .src_chain
+                .query_client_initialization(0, 0)
+                .map_err(|e| {
+                    ForeignClientError::checkpoint_update(self.dst_chain.id(), e.to_string())
+                })?;
+            if let AnyClientState::Probabilistic(client) = &initial.client_state {
+                if client.trusting_period <= crate::chain::cardano::checkpoint::maintenance_budget()
+                {
+                    return Err(ForeignClientError::checkpoint_update(self.dst_chain.id(), "probabilistic trusting period must exceed the bounded maintenance and response-window budget, use at least 48 hours".to_owned()));
                 }
-                return MsgCreateClient::new(
-                    encoded_client,
-                    decode(
-                        &bundle.consensus_state,
-                        "/ibc.lightclients.probabilistic.v1.ConsensusState",
-                    )?,
-                    signer,
-                )
-                .map_err(ForeignClientError::client);
             }
+            return MsgCreateClient::new(
+                initial.client_state.into(),
+                initial.consensus_state.into(),
+                signer,
+            )
+            .map_err(ForeignClientError::client);
         }
+
+        let latest_height = self.src_chain.query_latest_height().map_err(|e| {
+            ForeignClientError::client_create(
+                self.src_chain.id(),
+                "failed while querying src chain for latest height".to_string(),
+                e,
+            )
+        })?;
 
         let dst_config = self.dst_chain.config().map_err(|e| {
             ForeignClientError::client_create(
@@ -1162,6 +1137,10 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
 
     fn try_refresh(&mut self) -> Result<Option<Vec<IbcEvent>>, ForeignClientError> {
         let (client_state, elapsed) = self.validated_client_state()?;
+        if matches!(&client_state, AnyClientState::Probabilistic(client) if client.bootstrap_pending) {
+            self.complete_bootstrap()?;
+            return Ok(Some(vec![]));
+        }
 
         let src_config = self.src_chain.config().map_err(|e| {
             ForeignClientError::client_create(
@@ -1688,69 +1667,67 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
     }
 
     fn complete_bootstrap(&self) -> Result<(), ForeignClientError> {
-        use crate::chain::cardano::staging::{self, BootstrapBundle};
-        use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
-        use prost::Message;
-        let fail = |e: String| ForeignClientError::checkpoint_update(self.dst_chain.id(), e);
-        let (state, _) = self
-            .dst_chain
-            .query_client_state(
-                QueryClientStateRequest {
-                    client_id: self.id.clone(),
-                    height: QueryHeight::Latest,
-                },
-                IncludeProof::No,
-            )
-            .map_err(|e| fail(e.to_string()))?;
-        let AnyClientState::Probabilistic(client) = state else {
-            return Ok(());
-        };
-        if !client.bootstrap_pending {
-            return Ok(());
-        }
-        let config = self.src_chain.config().map_err(|e| fail(e.to_string()))?;
-        let crate::config::ChainConfig::Cardano(config) = config else {
-            return Err(fail("Compact bootstrap requires a Cardano source".into()));
-        };
-        let path = config.probabilistic_bootstrap_file.ok_or_else(|| {
-            fail("Pending bootstrap requires the explicitly trusted local bundle".into())
-        })?;
-        let bundle = BootstrapBundle::load(&path).map_err(fail)?;
-        let initial = raw::ClientState::decode(
-            BootstrapBundle::bytes(&bundle.client_state)
-                .map_err(fail)?
-                .as_slice(),
-        )
-        .map_err(|e| fail(e.to_string()))?;
-        if initial.checkpoint_reference != client.checkpoint_reference
-            || initial.chain_id != client.chain_id.to_string()
-        {
-            return Err(fail(
-                "Trusted bundle belongs to a different starting checkpoint".into(),
-            ));
-        }
-        let progress = self
-            .verification_query(&client, 11, vec![], vec![])
-            .map_err(fail)?;
-        let sequence = staging::integer(&progress, "Sequence").map_err(fail)?;
-        for encoded in bundle.imports {
-            let header = raw::ProbabilisticHeader::decode(
-                BootstrapBundle::bytes(&encoded).map_err(fail)?.as_slice(),
-            )
-            .map_err(|e| fail(e.to_string()))?;
-            let chunk = header
-                .observation_chunk
-                .ok_or_else(|| fail("Missing bootstrap import operation".into()))?;
-            if chunk.operation != 10 && chunk.operation != 11 {
+        use crate::chain::cardano::staging;
+        let fail =
+            |error: String| ForeignClientError::checkpoint_update(self.dst_chain.id(), error);
+        // Re-read committed progress so another uploader or an interrupted
+        // process never makes us silently skip unfinished imports.
+        for _ in 0..=4096 {
+            let (state, _) = self
+                .dst_chain
+                .query_client_state(
+                    QueryClientStateRequest {
+                        client_id: self.id.clone(),
+                        height: QueryHeight::Latest,
+                    },
+                    IncludeProof::No,
+                )
+                .map_err(|e| fail(e.to_string()))?;
+            let AnyClientState::Probabilistic(client) = state else {
+                return Ok(());
+            };
+            if !client.bootstrap_pending {
+                return Ok(());
+            }
+            let progress = self
+                .verification_query(&client, 11, vec![], vec![])
+                .map_err(fail)?;
+            let sequence = u32::try_from(staging::integer(&progress, "Sequence").map_err(fail)?)
+                .map_err(|e| fail(e.to_string()))?
+                .checked_add(1)
+                .ok_or_else(|| fail("Initialization sequence overflow".into()))?;
+            let initial = self
+                .src_chain
+                .query_client_initialization(client.latest_height.revision_height(), sequence)
+                .map_err(|e| fail(e.to_string()))?;
+            let AnyClientState::Probabilistic(prepared) = initial.client_state else {
+                return Err(fail("Initial client has the wrong type".into()));
+            };
+            if prepared.checkpoint_reference != client.checkpoint_reference
+                || prepared.chain_id != client.chain_id
+            {
                 return Err(fail(
-                    "Trusted bundle contains a non-bootstrap operation".into(),
+                    "Initialization data belongs to a different starting checkpoint".into(),
                 ));
             }
-            if u64::from(chunk.sequence) > sequence {
-                self.send_observation_step(chunk).map_err(fail)?;
+            let Some(AnyHeader::Probabilistic(header)) = initial.message else {
+                return Err(fail(
+                    "Missing probabilistic client initialization import".into(),
+                ));
+            };
+            let chunk = header
+                .observation_chunk
+                .ok_or_else(|| fail("Missing client initialization operation".into()))?;
+            if ![10, 11].contains(&chunk.operation) || chunk.sequence != sequence {
+                return Err(fail(
+                    "Invalid client initialization operation or sequence".into(),
+                ));
             }
+            self.send_observation_step(chunk).map_err(fail)?;
         }
-        Ok(())
+        Err(fail(
+            "Client initialization exceeds its import allowance".into(),
+        ))
     }
 
     fn verification_query(
@@ -3383,3 +3360,7 @@ mod tests {
 #[cfg(test)]
 #[path = "foreign_client/freshness_tests.rs"]
 mod freshness_tests;
+
+#[cfg(test)]
+#[path = "foreign_client/initialization_tests.rs"]
+mod initialization_tests;
