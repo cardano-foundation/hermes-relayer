@@ -724,6 +724,9 @@ pub struct MsgChannelUpgradeCancel {
     pub proof_height: ::core::option::Option<super::super::client::v1::Height>,
     #[prost(string, tag = "6")]
     pub signer: ::prost::alloc::string::String,
+    /// Cardano authority cancellation must name the operator's observed attempt.
+    #[prost(uint64, optional, tag = "7")]
+    pub expected_upgrade_sequence: ::core::option::Option<u64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MsgChannelUpgradeCancelResponse {

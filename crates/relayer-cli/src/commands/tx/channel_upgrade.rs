@@ -204,6 +204,17 @@ pub struct TxChanUpgradeAuthorityCancelCmd {
 impl Runnable for TxChanUpgradeAuthorityCancelCmd {
     fn run(&self) {
         let chain = cardano_chain(&self.chain_id);
+        let (channel, _) = match chain.query_channel(
+            QueryChannelRequest {
+                port_id: self.port_id.clone(),
+                channel_id: self.channel_id.clone(),
+                height: QueryHeight::Latest,
+            },
+            IncludeProof::No,
+        ) {
+            Ok(channel) => channel,
+            Err(e) => Output::error(e).exit(),
+        };
         let signer = match chain.get_signer() {
             Ok(signer) => signer,
             Err(e) => Output::error(e).exit(),
@@ -215,6 +226,7 @@ impl Runnable for TxChanUpgradeAuthorityCancelCmd {
             proof_error_receipt: vec![],
             proof_height: None,
             signer: signer.to_string(),
+            expected_upgrade_sequence: Some(channel.upgrade_sequence.into()),
         };
         send(
             chain,

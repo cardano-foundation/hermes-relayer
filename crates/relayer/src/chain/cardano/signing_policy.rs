@@ -151,6 +151,19 @@ struct ChannelUpgradeIntent {
     step: u64,
     proven: bool,
     init: Option<ChannelUpgradeInitIntent>,
+    authority_cancel: Option<ChannelUpgradeCancelIntent>,
+}
+
+#[derive(Clone, Debug)]
+struct ChannelUpgradeCancelIntent {
+    port_id: String,
+    upgrade_sequence: u64,
+}
+
+impl ChannelUpgradeCancelIntent {
+    fn matches_state(&self, data: &PlutusData) -> bool {
+        channel_upgrade_state_matches(data, &self.port_id, self.upgrade_sequence, true)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -186,18 +199,33 @@ impl ChannelUpgradeInitIntent {
     }
 
     fn matches_state(&self, data: &PlutusData) -> bool {
-        let Some(datum) = constructor_fields(data, 0).filter(|f| f.len() == 3) else {
-            return false;
-        };
-        let Some(state) = constructor_fields(&datum[0], 0).filter(|f| f.len() == 10) else {
-            return false;
-        };
-        let Some(channel) = constructor_fields(&state[0], 0).filter(|f| f.len() == 6) else {
-            return false;
-        };
-        plutus_bytes(&datum[1]) == Some(self.port_id.as_bytes())
-            && plutus_u64(&channel[5]) == Some(self.upgrade_sequence)
+        channel_upgrade_state_matches(data, &self.port_id, self.upgrade_sequence, false)
     }
+}
+
+fn channel_upgrade_state_matches(
+    data: &PlutusData,
+    port_id: &str,
+    sequence: u64,
+    require_pending: bool,
+) -> bool {
+    let Some(datum) = constructor_fields(data, 0).filter(|f| f.len() == 3) else {
+        return false;
+    };
+    let Some(state) = constructor_fields(&datum[0], 0).filter(|f| f.len() == 10) else {
+        return false;
+    };
+    let Some(channel) = constructor_fields(&state[0], 0).filter(|f| f.len() == 6) else {
+        return false;
+    };
+    plutus_bytes(&datum[1]) == Some(port_id.as_bytes())
+        && plutus_u64(&channel[5]) == Some(sequence)
+        && (!require_pending
+            || constructor_fields(&state[9], 0)
+                .filter(|fields| fields.len() == 3)
+                .is_some_and(|fields| {
+                    constructor_fields(&fields[0], 0).is_some_and(|pending| pending.len() == 1)
+                }))
 }
 
 impl ChannelUpgradeIntent {
@@ -2595,10 +2623,10 @@ impl TransactionSigningPolicy {
                 "multiple inputs contain the message-selected protocol state token".to_string(),
             ));
         }
-        if let Some(init) = intent
+        if let Some(upgrade) = intent
             .channel_upgrade
             .as_ref()
-            .and_then(|upgrade| upgrade.init.as_ref())
+            .filter(|upgrade| upgrade.init.is_some() || upgrade.authority_cancel.is_some())
         {
             let datum = resolved_inputs.regular[state_input]
                 .inline_datum
@@ -2606,7 +2634,15 @@ impl TransactionSigningPolicy {
                 .ok_or_else(|| reject("upgrade input has no inline channel datum".to_string()))?;
             let datum: PlutusData = minicbor::decode(datum)
                 .map_err(|_| reject("cannot decode upgrade input channel datum".to_string()))?;
-            if !init.matches_state(&datum) {
+            if !upgrade
+                .init
+                .as_ref()
+                .is_none_or(|init| init.matches_state(&datum))
+                || !upgrade
+                    .authority_cancel
+                    .as_ref()
+                    .is_none_or(|cancel| cancel.matches_state(&datum))
+            {
                 return Err(reject("upgrade channel identity or proposal sequence differs from the operator request".to_string()));
             }
         }
@@ -4066,6 +4102,7 @@ impl SigningIntent {
                 channel_upgrade = Some(ChannelUpgradeIntent {
                     step: 0,
                     proven: false,
+                    authority_cancel: None,
                     init: Some({
                         let fields = msg.fields.as_ref().ok_or_else(|| {
                             Error::Signer("upgrade INIT fields are missing".to_string())
@@ -4100,6 +4137,7 @@ impl SigningIntent {
                     step: 1,
                     proven: true,
                     init: None,
+                    authority_cancel: None,
                 });
                 msg.signer
             }
@@ -4110,6 +4148,7 @@ impl SigningIntent {
                     step: 2,
                     proven: true,
                     init: None,
+                    authority_cancel: None,
                 });
                 msg.signer
             }
@@ -4120,6 +4159,7 @@ impl SigningIntent {
                     step: 3,
                     proven: true,
                     init: None,
+                    authority_cancel: None,
                 });
                 msg.signer
             }
@@ -4130,6 +4170,7 @@ impl SigningIntent {
                     step: 4,
                     proven: true,
                     init: None,
+                    authority_cancel: None,
                 });
                 msg.signer
             }
@@ -4140,6 +4181,7 @@ impl SigningIntent {
                     step: 5,
                     proven: true,
                     init: None,
+                    authority_cancel: None,
                 });
                 msg.signer
             }
@@ -4151,6 +4193,19 @@ impl SigningIntent {
                     step: 6,
                     proven: !msg.proof_error_receipt.is_empty(),
                     init: None,
+                    authority_cancel: if msg.proof_error_receipt.is_empty() {
+                        Some(ChannelUpgradeCancelIntent {
+                            port_id: msg.port_id.clone(),
+                            upgrade_sequence: msg.expected_upgrade_sequence.ok_or_else(|| {
+                                Error::Signer(
+                                    "authority CANCEL requires the expected upgrade sequence"
+                                        .to_string(),
+                                )
+                            })?,
+                        })
+                    } else {
+                        None
+                    },
                 });
                 msg.signer
             }
@@ -4161,6 +4216,7 @@ impl SigningIntent {
                     step: 7,
                     proven: false,
                     init: None,
+                    authority_cancel: None,
                 });
                 msg.signer
             }
@@ -8014,6 +8070,7 @@ mod tests {
                 step,
                 proven,
                 init: None,
+                authority_cancel: None,
             });
             policy.operation_requirements(&intent).unwrap()
         };
@@ -8061,6 +8118,7 @@ mod tests {
                 proof_error_receipt: proof,
                 proof_height: None,
                 signer: signer.clone(),
+                expected_upgrade_sequence: Some(4),
             }
             .encode_to_vec()
         };
@@ -8099,6 +8157,129 @@ mod tests {
             0
         )
         .is_err());
+    }
+
+    #[test]
+    fn authority_cancel_rejects_a_replaced_proposal_in_the_resolved_input() {
+        use pallas_primitives::conway::RedeemerTag;
+        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let signer = recovery_signer();
+        let mut message = MsgChannelUpgradeCancel {
+            port_id: "transfer".into(),
+            channel_id: "channel-3".into(),
+            error_receipt: None,
+            proof_error_receipt: vec![],
+            proof_height: None,
+            signer: signer.clone(),
+            expected_upgrade_sequence: Some(4),
+        };
+        let type_url = "/ibc.core.channel.v1.MsgChannelUpgradeCancel";
+        let intent = SigningIntent::ibc(type_url, &message.encode_to_vec(), &signer, 0).unwrap();
+        let requirements = policy.operation_requirements(&intent).unwrap();
+        let mut tx = proof_backed_transaction(&policy, false);
+        edit_redeemers(&mut tx, |redeemers| {
+            for (key, value) in redeemers {
+                if key.tag == RedeemerTag::Spend {
+                    value.data = if key.index == 0 {
+                        data_constructor(14, vec![])
+                    } else {
+                        data_constructor(
+                            11,
+                            vec![data_constructor(
+                                0,
+                                vec![
+                                    data_constructor(
+                                        6,
+                                        vec![
+                                            data_constructor(1, vec![]),
+                                            data_constructor(0, vec![]),
+                                            data_constructor(0, vec![]),
+                                        ],
+                                    ),
+                                    PlutusData::Array(vec![]),
+                                    PlutusData::Array(vec![]),
+                                    PlutusData::Array(vec![]),
+                                ],
+                            )],
+                        )
+                    };
+                }
+            }
+        });
+        let encoded = minicbor::to_vec(&tx).unwrap();
+        let transaction: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+        let check = |sequence: i64, port: &str, pending: bool| {
+            let integer = |value: i64| PlutusData::BigInt(BigInt::Int(value.into()));
+            let mut channel = vec![integer(0); 6];
+            channel[5] = integer(sequence);
+            let mut state = vec![integer(0); 10];
+            state[0] = data_constructor(0, channel);
+            state[9] = data_constructor(
+                0,
+                vec![
+                    if pending {
+                        data_constructor(0, vec![integer(0)])
+                    } else {
+                        data_constructor(1, vec![])
+                    },
+                    data_constructor(1, vec![]),
+                    integer(0),
+                ],
+            );
+            let datum = data_constructor(
+                0,
+                vec![
+                    data_constructor(0, state),
+                    PlutusData::BoundedBytes(port.as_bytes().to_vec().into()),
+                    integer(0),
+                ],
+            );
+            let mut resolved = recovery_resolved_inputs(&policy);
+            let input = resolved
+                .regular
+                .get_mut(&TransactionOutRef {
+                    transaction_id: RECOVERY_SUBJECT_INPUT_ID,
+                    output_index: 0,
+                })
+                .unwrap();
+            input.address = policy.channel_state.address.clone();
+            input.assets = vec![ResolvedAsset {
+                policy_id: policy.channel_state.policy.clone().try_into().unwrap(),
+                asset_name: policy.state_token_name(StateOutputKind::Channel, 3),
+                quantity: 1,
+            }];
+            input.inline_datum = Some(minicbor::to_vec(datum).unwrap());
+            policy.validate_message_binding(
+                &transaction.transaction_body,
+                transaction.transaction_witness_set.redeemer.as_deref(),
+                &[],
+                &intent,
+                &requirements,
+                &resolved,
+                &Error::Signer,
+            )
+        };
+        assert!(check(4, "transfer", true).is_ok());
+        for changed in [
+            check(5, "transfer", true),
+            check(4, "other", true),
+            check(4, "transfer", false),
+        ] {
+            assert!(changed
+                .unwrap_err()
+                .to_string()
+                .contains("proposal sequence differs"));
+        }
+        message.expected_upgrade_sequence = None;
+        assert!(SigningIntent::ibc(type_url, &message.encode_to_vec(), &signer, 0).is_err());
+        message.proof_error_receipt = vec![1];
+        let receipt_intent =
+            SigningIntent::ibc(type_url, &message.encode_to_vec(), &signer, 0).unwrap();
+        assert!(receipt_intent
+            .channel_upgrade
+            .unwrap()
+            .authority_cancel
+            .is_none());
     }
 
     #[test]
@@ -8206,7 +8387,8 @@ mod tests {
             ChannelRedeemerIntent::ChannelUpgrade(&ChannelUpgradeIntent {
                 step: 0,
                 proven: false,
-                init: None
+                init: None,
+                authority_cancel: None,
             })
             .matches(&init)
         );
@@ -8214,7 +8396,8 @@ mod tests {
             !ChannelRedeemerIntent::ChannelUpgrade(&ChannelUpgradeIntent {
                 step: 7,
                 proven: false,
-                init: None
+                init: None,
+                authority_cancel: None,
             })
             .matches(&init)
         );
@@ -8222,7 +8405,8 @@ mod tests {
             ChannelRedeemerIntent::ChannelUpgrade(&ChannelUpgradeIntent {
                 step: 7,
                 proven: false,
-                init: None
+                init: None,
+                authority_cancel: None,
             })
             .matches(&flush)
         );
