@@ -1137,7 +1137,8 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
 
     fn try_refresh(&mut self) -> Result<Option<Vec<IbcEvent>>, ForeignClientError> {
         let (client_state, elapsed) = self.validated_client_state()?;
-        if matches!(&client_state, AnyClientState::Probabilistic(client) if client.bootstrap_pending) {
+        if matches!(&client_state, AnyClientState::Probabilistic(client) if client.bootstrap_pending)
+        {
             self.complete_bootstrap()?;
             return Ok(Some(vec![]));
         }

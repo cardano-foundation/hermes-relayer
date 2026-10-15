@@ -479,7 +479,10 @@ impl GatewayClient {
         };
 
         let mut client = QueryClient::new(self.channel.clone());
-        let request = tonic::Request::new(QueryNewClientRequest { height, initialization_sequence });
+        let request = tonic::Request::new(QueryNewClientRequest {
+            height,
+            initialization_sequence,
+        });
         let response = client.new_client(request).await?.into_inner();
 
         Ok(response)
