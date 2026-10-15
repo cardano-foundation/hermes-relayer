@@ -5,7 +5,9 @@ use retry::delay::Fibonacci;
 use retry::{retry_with_index, OperationResult};
 use tracing::{debug, debug_span, error_span, trace, warn};
 
+use ibc_relayer_types::core::ics02_client::client_type::ClientType;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
+use ibc_relayer_types::core::ics24_host::identifier::ClientId;
 use ibc_relayer_types::events::IbcEvent;
 
 use crate::util::retry::clamp_total;
@@ -34,6 +36,11 @@ pub fn spawn_refresh_client<ChainA: ChainHandle, ChainB: ChainHandle>(
         return None;
     }
 
+    let checkpoint_maintenance = client.id().as_str().starts_with(&format!(
+        "{}-",
+        ClientId::prefix(ClientType::CardanoProbabilistic)
+    ));
+
     Some(spawn_background_task(
         error_span!(
             "worker.client.refresh",
@@ -45,7 +52,14 @@ pub fn spawn_refresh_client<ChainA: ChainHandle, ChainB: ChainHandle>(
         move || {
             // Try to refresh the client, but only if the refresh window has expired.
             // If the refresh fails, retry according to the given strategy.
-            let res = retry_with_index(refresh_strategy(), |_| match client.refresh() {
+            // Checkpoint maintenance must return between attempts so shutdown
+            // and committed freshness are checked on every normal poll.
+            let delays = refresh_strategy().take(if checkpoint_maintenance {
+                0
+            } else {
+                usize::MAX
+            });
+            let res = retry_with_index(delays, |_| match client.refresh() {
                 Ok(events) => OperationResult::Ok(events),
                 Err(error) if error.is_expired_or_frozen_error() => OperationResult::Err(error),
                 Err(error) => OperationResult::Retry(error),
@@ -54,6 +68,10 @@ pub fn spawn_refresh_client<ChainA: ChainHandle, ChainB: ChainHandle>(
             match res {
                 // If `client.refresh()` was successful, continue
                 Ok(_) => Ok(Next::Continue),
+
+                Err(e) if checkpoint_maintenance && !e.error.is_expired_or_frozen_error() => {
+                    Err(TaskError::Ignore(Box::new(e)))
+                }
 
                 // If `client.refresh()` failed and the retry mechanism
                 // exceeded the maximum delay, return a fatal error.

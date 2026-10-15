@@ -23,6 +23,8 @@ struct Harness {
     now: Arc<AtomicU64>,
     commits: Arc<AtomicU64>,
     source_ready: Arc<AtomicBool>,
+    reject_submission: Arc<AtomicBool>,
+    submissions: Arc<AtomicU64>,
     proof_queries: Arc<AtomicU64>,
     source_queries: Arc<AtomicU64>,
     threads: Vec<thread::JoinHandle<()>>,
@@ -47,6 +49,8 @@ impl Harness {
         let proof_time = state.lock().unwrap().latest_checkpoint_timestamp - 120_000_000_000;
         let commits = Arc::new(AtomicU64::new(0));
         let source_ready = Arc::new(AtomicBool::new(true));
+        let reject_submission = Arc::new(AtomicBool::new(false));
+        let submissions = Arc::new(AtomicU64::new(0));
         let available = source_ready.clone();
         let proof_queries = Arc::new(AtomicU64::new(0));
         let source_queries = Arc::new(AtomicU64::new(0));
@@ -115,6 +119,7 @@ impl Harness {
             commits.clone(),
             proof_queries.clone(),
         );
+        let (reject, attempts) = (reject_submission.clone(), submissions.clone());
         let destination_thread = thread::spawn(move || {
             for (_, request) in rx {
                 match request {
@@ -160,6 +165,13 @@ impl Harness {
                         tracked_msgs,
                         reply_to,
                     } => {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        if reject.load(Ordering::SeqCst) {
+                            reply_to
+                                .send(Err(RelayerError::query("host proofs pending".to_owned())))
+                                .unwrap();
+                            continue;
+                        }
                         assert_eq!(tracked_msgs.msgs.len(), 1);
                         let update = ibc_proto::ibc::core::client::v1::MsgUpdateClient::decode(
                             tracked_msgs.msgs[0].value.as_slice(),
@@ -216,6 +228,8 @@ impl Harness {
             now,
             commits,
             source_ready,
+            reject_submission,
+            submissions,
             proof_queries,
             source_queries,
             threads: vec![source_thread, destination_thread],
@@ -363,5 +377,43 @@ fn compact_clients_cannot_use_the_legacy_timestamp_fallback() {
     }
     assert!(h.client().validated_client_state().is_err());
     assert_eq!(h.proof_queries.load(Ordering::SeqCst), 0);
+    h.close();
+}
+
+#[test]
+fn failed_maintenance_does_not_block_shutdown_or_count_as_renewal() {
+    let h = Harness::new(true, true);
+    let initial = h.state.lock().unwrap().latest_checkpoint_timestamp;
+    h.reject_submission.store(true, Ordering::SeqCst);
+    let worker = crate::worker::client::spawn_refresh_client(h.client()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(25);
+    while h.submissions.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    let attempts = h.submissions.load(Ordering::SeqCst);
+    assert_eq!(h.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(h.state.lock().unwrap().latest_checkpoint_timestamp, initial);
+    worker.shutdown();
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while !worker.is_stopped() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    let stopped = worker.is_stopped();
+    // Let a regressed worker leave its inner retry loop before the assertion.
+    h.reject_submission.store(false, Ordering::SeqCst);
+    worker.shutdown_and_wait();
+    assert!(attempts >= 3, "maintenance did not retry on normal polls");
+    assert!(
+        stopped,
+        "maintenance shutdown waited for the inner retry loop"
+    );
+    let worker = crate::worker::client::spawn_refresh_client(h.client()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while h.commits.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    worker.shutdown_and_wait();
+    assert_eq!(h.commits.load(Ordering::SeqCst), 1);
+    assert!(h.state.lock().unwrap().latest_checkpoint_timestamp > initial);
     h.close();
 }
