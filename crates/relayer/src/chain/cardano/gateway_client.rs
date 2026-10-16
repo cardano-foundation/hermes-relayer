@@ -1010,7 +1010,7 @@ impl GatewayClient {
             .height
             .as_ref()
             .ok_or_else(|| Error::GatewayClient("channel page has no snapshot height".into()))?;
-        Height::try_from(height.clone()).map_err(|error| {
+        Height::try_from(*height).map_err(|error| {
             Error::GatewayClient(format!("invalid channel page snapshot height: {error}"))
         })?;
         if channels
