@@ -140,6 +140,23 @@ impl Harness {
                     ChainRequest::QueryProbabilisticVerification {
                         request, reply_to, ..
                     } => {
+                        if request.kind
+                            == crate::chain::cardano::epoch_usability::QUERY_EPOCH_USABILITY
+                        {
+                            let client = current.lock().unwrap();
+                            let now = clock.load(Ordering::SeqCst);
+                            let status =
+                                if now >= client.latest_checkpoint_timestamp + 60_000_000_000 {
+                                    "expired"
+                                } else {
+                                    "usable"
+                                };
+                            let response = serde_json::json!({"status":status,"epoch":request.epoch,"generation":client.verification_generation,"revision":0,"height":100,"timestamp":now});
+                            reply_to
+                                .send(Ok(serde_json::to_vec(&response).unwrap()))
+                                .unwrap();
+                            continue;
+                        }
                         assert_eq!(request.kind, 8);
                         reply_to
                             .send(Ok(serde_json::to_vec(&session).unwrap()))

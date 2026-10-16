@@ -609,6 +609,10 @@ pub struct QueryVerificationRequest {
     pub session_id: Vec<u8>,
     #[prost(bytes = "vec", tag = "8")]
     pub receipt_id: Vec<u8>,
+    #[prost(uint64, tag = "9")]
+    pub epoch: u64,
+    #[prost(string, tag = "10")]
+    pub client_id: String,
 }
 
 #[derive(Clone, PartialEq, Eq, ::prost::Message, Serialize, Deserialize)]

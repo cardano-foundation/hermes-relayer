@@ -105,6 +105,19 @@ fn runtime(config: ChainConfig) -> (BaseChainHandle, thread::JoinHandle<Vec<Heig
                 ChainRequest::QueryClientStatus { reply_to, .. } => {
                     reply_to.send(Ok(None)).unwrap();
                 }
+                ChainRequest::QueryProbabilisticVerification {
+                    request, reply_to, ..
+                } => {
+                    assert_eq!(
+                        request.kind,
+                        crate::chain::cardano::epoch_usability::QUERY_EPOCH_USABILITY
+                    );
+                    assert_eq!(request.epoch, 7, "only the packet root's epoch matters");
+                    let response = serde_json::json!({"status":"usable","epoch":request.epoch,"generation":request.generation,"revision":0,"height":60,"timestamp":110_000_000_000u64});
+                    reply_to
+                        .send(Ok(serde_json::to_vec(&response).unwrap()))
+                        .unwrap();
+                }
                 ChainRequest::QueryClientState { reply_to, .. } => {
                     reply_to.send(Ok((cardano_client(), None))).unwrap();
                 }
