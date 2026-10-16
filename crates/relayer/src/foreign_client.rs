@@ -1611,15 +1611,18 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             };
         }
         let retries = scan.retry.len().min(8);
-        let retrying: Vec<_> = scan.retry.drain(..retries).collect();
         let mut incomplete = None;
         let mut checked = std::collections::BTreeSet::new();
+        let mut failed = std::collections::BTreeSet::new();
         let mut check =
             |id: Vec<u8>,
              receipt: serde_json::Value,
              incomplete: &mut Option<ForeignClientError>,
              retry: &mut VecDeque<(Vec<u8>, serde_json::Value)>| {
                 if !checked.insert(id.clone()) {
+                    if failed.contains(&id) && !retry.iter().any(|(other, _)| other == &id) {
+                        retry.push_back((id, receipt));
+                    }
                     return None;
                 }
                 match self.check_probabilistic_receipt(client, id.clone(), receipt.clone()) {
@@ -1627,6 +1630,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                     Err(error) => {
                         warn!(receipt_id = %hex::encode(&id), %error, "observation check incomplete, will retry");
                         *incomplete = Some(error);
+                        failed.insert(id.clone());
                         if !retry.iter().any(|(other, _)| other == &id) {
                             retry.push_back((id, receipt));
                         }
@@ -1689,7 +1693,8 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 }
             }
         }
-        for (id, receipt) in retrying {
+        for _ in 0..retries {
+            let (id, receipt) = scan.retry.pop_front().expect("queued historical check");
             if let Some(evidence) = check(id, receipt, &mut incomplete, &mut scan.retry) {
                 return Ok(Some(evidence));
             }
