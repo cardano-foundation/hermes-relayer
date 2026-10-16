@@ -118,6 +118,7 @@ pallas-primitives                = "0.30"
 pallas-codec                     = "0.30"
 
 [dev-dependencies]
+tungstenite       = "0.21"
 ibc-relayer-types = { workspace = true }
 serial_test       = { workspace = true }
 env_logger        = { workspace = true }

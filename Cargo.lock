@@ -4644,6 +4644,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber 0.3.19",
+ "tungstenite 0.21.0",
  "uuid 1.17.0",
  "zeroize",
 ]

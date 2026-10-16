@@ -496,3 +496,6 @@ pub enum Next {
     Continue,
     Reconnect,
 }
+
+#[cfg(test)]
+mod tests;
