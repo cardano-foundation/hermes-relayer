@@ -1,5 +1,5 @@
 use super::*;
-use crate::event::tx::operation_fixtures::{records, Record};
+use crate::event::tx::operation_fixtures::{records, v10_records, Record};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::TcpListener;
@@ -133,7 +133,11 @@ fn serve(
 
 #[test]
 fn committed_operations_survive_production_push_collection_and_reconnect() {
-    let records = records();
+    check_push_collection_and_reconnect(records());
+    check_push_collection_and_reconnect(v10_records());
+}
+
+fn check_push_collection_and_reconnect(records: Vec<Record>) {
     let expected: Vec<_> = records
         .iter()
         .flat_map(|r| r.consensus_heights.clone().unwrap_or_default())
