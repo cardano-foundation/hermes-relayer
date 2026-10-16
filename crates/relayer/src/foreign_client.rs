@@ -1308,16 +1308,6 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
     fn refresh_probabilistic_checkpoint(&self) -> Result<Vec<IbcEvent>, ForeignClientError> {
         let before = self.validated_client_state()?.0;
         let evidence = self.maintenance_evidence_client(&before)?;
-        let committed = self.dst_chain.query_application_status().map_err(|error| {
-            ForeignClientError::checkpoint_update(self.dst_chain.id(), error.to_string())
-        })?;
-        if let AnyClientState::Probabilistic(state) = &before {
-            if state.epoch_context_challenges.iter().any(|challenge| {
-                challenge.usable_after_unix_ns >= committed.timestamp.nanoseconds()
-            }) {
-                return Ok(vec![]);
-            }
-        }
         let header = self
             .src_chain
             .build_client_maintenance_header(&evidence)
@@ -1343,6 +1333,21 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 "maintenance requires a rootless checkpoint".to_owned(),
             ));
         }
+        // Refresh runs in a polling worker. Leave a dependent proposal for the
+        // next poll instead of blocking shutdown inside its response window.
+        let epochs = Self::probabilistic_observation_epochs(client, &checkpoint);
+        let committed = self.dst_chain.query_application_status().map_err(|error| {
+            ForeignClientError::checkpoint_update(self.dst_chain.id(), error.to_string())
+        })?;
+        if client.epoch_context_challenges.iter().any(|challenge| {
+            epochs.contains(&challenge.epoch)
+                && challenge
+                    .usable_after_unix_ns
+                    .saturating_add(10_000_000_000)
+                    >= committed.timestamp.nanoseconds()
+        }) {
+            return Ok(vec![]);
+        }
         self.stage_forward_observation(client, checkpoint)?;
         let after = self.validated_client_state()?.0;
         if after.latest_verified_height() <= before.latest_verified_height() {
@@ -1365,7 +1370,6 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         target_height: Height,
     ) -> Result<Vec<Any>, ForeignClientError> {
         for _ in 0..MAX_PROBABILISTIC_CHECKPOINT_UPDATES {
-            self.wait_for_probabilistic_epoch_challenge()?;
             let messages = self.wait_and_build_update_client_with_trusted(target_height, None)?;
             let (state, _) = self.validated_client_state()?;
             if matches!(&state, AnyClientState::Probabilistic(state) if state.latest_verified_height() < target_height)
@@ -2002,6 +2006,21 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         }
         Ok(())
     }
+    fn probabilistic_observation_epochs(
+        client: &ibc_relayer_types::clients::ics08_cardano_probabilistic::client_state::ClientState,
+        header: &ibc_relayer_types::clients::ics08_cardano_probabilistic::header::Header,
+    ) -> Vec<u64> {
+        let mut epochs = vec![client.current_epoch];
+        if let Some(context) = header
+            .new_epoch_context
+            .as_ref()
+            .filter(|context| context.epoch > client.current_epoch)
+        {
+            epochs.push(context.epoch);
+        }
+        epochs
+    }
+
     fn stage_forward_observation(
         &self,
         client: &ibc_relayer_types::clients::ics08_cardano_probabilistic::client_state::ClientState,
@@ -2013,8 +2032,13 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             // A table Mithril has certified activates without a response window.
             self.record_mithril_stake(&AnyClientState::Probabilistic(client.clone()));
         }
+        let epochs = Self::probabilistic_observation_epochs(client, &header);
         let plan = staging::plan(&client.clone().into(), &header.into(), vec![])
             .map_err(|error| ForeignClientError::checkpoint_update(self.dst_chain.id(), error))?;
+        // Activation checks the live base epoch and any table used by settlement
+        // descendants. A new table gets its deadline when first proposed, so it
+        // must be submitted once before there is a deadline to wait for.
+        self.wait_for_probabilistic_epoch_challenge(&epochs)?;
         staging::submit(
             &plan,
             |id| self.verification_query(client, 8, id.to_vec(), vec![]),
@@ -2043,7 +2067,10 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         .map_err(|error| ForeignClientError::checkpoint_update(self.dst_chain.id(), error))
     }
 
-    fn wait_for_probabilistic_epoch_challenge(&self) -> Result<(), ForeignClientError> {
+    fn wait_for_probabilistic_epoch_challenge(
+        &self,
+        epochs: &[u64],
+    ) -> Result<(), ForeignClientError> {
         loop {
             let (state, _) = self.validated_client_state()?;
             let AnyClientState::Probabilistic(state) = state else {
@@ -2052,6 +2079,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             let deadline = state
                 .epoch_context_challenges
                 .iter()
+                .filter(|challenge| epochs.contains(&challenge.epoch))
                 .map(|challenge| challenge.usable_after_unix_ns)
                 .max()
                 .unwrap_or(0);
@@ -2071,7 +2099,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             if status.timestamp.nanoseconds() > deadline.saturating_add(10_000_000_000) {
                 return Ok(());
             }
-            debug!(client_id = %self.id, deadline, "waiting for epoch context challenge window");
+            debug!(client_id = %self.id, ?epochs, deadline, "waiting for epoch context challenge window");
             thread::sleep(Duration::from_secs(1));
         }
     }
@@ -2111,6 +2139,12 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         );
 
         if let Ok((consensus_state, _)) = consensus_state {
+            // A retained root only depends on its own epoch. Later proposals
+            // cannot delay it. The keeper still enforces generation, host
+            // continuity and connection delays when verifying the proof.
+            if let AnyConsensusState::Probabilistic(state) = &consensus_state {
+                self.wait_for_probabilistic_epoch_challenge(&[state.accepted_epoch])?;
+            }
             debug!("consensus state already exists at height {target_height}, skipping update");
             trace!(?consensus_state, "consensus state");
 
@@ -2440,7 +2474,6 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
 
         let mut next_trusted_height = trusted_height;
         for _ in 0..MAX_PROBABILISTIC_CHECKPOINT_UPDATES {
-            self.wait_for_probabilistic_epoch_challenge()?;
             let messages =
                 self.wait_and_build_update_client_with_trusted(target_height, next_trusted_height)?;
             if messages.is_empty() {
@@ -3391,7 +3424,7 @@ mod tests {
             .to_string()
             .contains("a checkpoint cursor is insufficient"));
         assert_eq!(destination.consensus_heights, vec![height(33), height(33)]);
-        assert!(destination.client_state_queries >= 6);
+        assert!(destination.client_state_queries >= 4);
         assert!(source.application_status_queries <= 1);
         assert_eq!(source.submissions + destination.submissions, 0);
     }
@@ -3675,3 +3708,7 @@ mod initialization_tests;
 #[cfg(test)]
 #[path = "foreign_client/mithril_stake_tests.rs"]
 mod mithril_stake_tests;
+
+#[cfg(test)]
+#[path = "foreign_client/epoch_wait_tests.rs"]
+mod epoch_wait_tests;
