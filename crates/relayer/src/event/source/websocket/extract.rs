@@ -400,3 +400,42 @@ fn extract_block_events(
 
     events
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::tx::tendermint_tests::fixture;
+    use ibc_relayer_types::core::ics02_client::header::AnyHeader;
+    use tendermint_rpc::event::{TxInfo, TxResult};
+
+    #[test]
+    fn live_v10_tendermint_updates_include_the_committed_headers() {
+        let (tx, events, headers) = fixture();
+        let event = RpcEvent {
+            query: queries::ibc_client().to_string(),
+            events: Some(HashMap::from([("tx.code".into(), vec!["0".into()])])),
+            data: RpcEventData::Tx {
+                tx_result: TxInfo {
+                    height: 60,
+                    index: Some(0),
+                    tx,
+                    result: TxResult {
+                        log: None,
+                        gas_wanted: None,
+                        gas_used: None,
+                        events,
+                    },
+                },
+            },
+        };
+        let found = extract_events(&ChainId::from_string("host-1"), event).unwrap();
+        assert_eq!(found.len(), headers.len());
+        for (event, header) in found.into_iter().zip(headers) {
+            let IbcEvent::UpdateClient(update) = event.event else {
+                panic!("missing client update")
+            };
+            assert_eq!(update.header, Some(AnyHeader::try_from(header).unwrap()));
+            assert_eq!(event.height, Height::new(1, 60).unwrap());
+        }
+    }
+}
