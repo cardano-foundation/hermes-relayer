@@ -1,5 +1,5 @@
 //! Real proof preparation and staging with deterministic runtime replies. These
-//! tests stop an unrelated wait with an error instead of waiting twelve hours.
+//! tests stop an unrelated wait with an error instead of waiting six hours.
 use super::*;
 use crate::chain::{
     endpoint::ChainStatus,
