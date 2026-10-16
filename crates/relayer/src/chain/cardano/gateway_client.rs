@@ -17,11 +17,12 @@ use ibc_proto::google::protobuf::Any as ProtoAny;
 use ibc_proto::ibc::core::channel::v1::query_client::QueryClient as ChannelQueryClient;
 use ibc_proto::ibc::core::channel::v1::{
     QueryChannelClientStateRequest, QueryChannelClientStateResponse, QueryChannelRequest,
-    QueryChannelsRequest, QueryConnectionChannelsRequest, QueryNextSequenceReceiveRequest,
-    QueryPacketAcknowledgementRequest, QueryPacketAcknowledgementsRequest,
-    QueryPacketCommitmentRequest, QueryPacketCommitmentsRequest, QueryPacketReceiptRequest,
-    QueryUnreceivedAcksRequest, QueryUnreceivedPacketsRequest, QueryUpgradeErrorRequest,
-    QueryUpgradeErrorResponse, QueryUpgradeRequest, QueryUpgradeResponse,
+    QueryChannelsRequest, QueryChannelsResponse, QueryConnectionChannelsRequest,
+    QueryNextSequenceReceiveRequest, QueryPacketAcknowledgementRequest,
+    QueryPacketAcknowledgementsRequest, QueryPacketCommitmentRequest,
+    QueryPacketCommitmentsRequest, QueryPacketReceiptRequest, QueryUnreceivedAcksRequest,
+    QueryUnreceivedPacketsRequest, QueryUpgradeErrorRequest, QueryUpgradeErrorResponse,
+    QueryUpgradeRequest, QueryUpgradeResponse,
 };
 use ibc_proto::ibc::core::client::v1::query_client::QueryClient as ClientQueryClient;
 use ibc_proto::ibc::core::client::v1::{
@@ -971,11 +972,10 @@ impl GatewayClient {
     /// Query all channels
     pub async fn query_channels(&self) -> Result<Vec<u8>, Error> {
         use ibc_proto::cosmos::base::query::v1beta1::PageRequest;
-        use ibc_proto::ibc::core::channel::v1::QueryChannelsResponse;
         let mut client = ChannelQueryClient::new(self.channel.clone());
         let mut key = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let mut channels = Vec::new();
+        let mut channels = QueryChannelsResponse::default();
         loop {
             let response = client
                 .channels(tonic::Request::new(QueryChannelsRequest {
@@ -989,11 +989,7 @@ impl GatewayClient {
                 }))
                 .await?
                 .into_inner();
-            channels.extend(response.channels);
-            key = response
-                .pagination
-                .map(|page| page.next_key)
-                .unwrap_or_default();
+            key = Self::append_channel_page(&mut channels, response)?;
             if key.is_empty() {
                 break;
             }
@@ -1003,11 +999,35 @@ impl GatewayClient {
                 ));
             }
         }
-        Ok(prost::Message::encode_to_vec(&QueryChannelsResponse {
-            channels,
-            pagination: None,
-            height: None,
-        }))
+        Ok(channels.encode_to_vec())
+    }
+
+    fn append_channel_page(
+        channels: &mut QueryChannelsResponse,
+        page: QueryChannelsResponse,
+    ) -> Result<Vec<u8>, Error> {
+        let height = page
+            .height
+            .as_ref()
+            .ok_or_else(|| Error::GatewayClient("channel page has no snapshot height".into()))?;
+        Height::try_from(height.clone()).map_err(|error| {
+            Error::GatewayClient(format!("invalid channel page snapshot height: {error}"))
+        })?;
+        if channels
+            .height
+            .as_ref()
+            .is_some_and(|previous| previous != height)
+        {
+            return Err(Error::GatewayClient(
+                "channel pagination snapshot height changed".into(),
+            ));
+        }
+        channels.height = page.height;
+        channels.channels.extend(page.channels);
+        Ok(page
+            .pagination
+            .map(|page| page.next_key)
+            .unwrap_or_default())
     }
 
     /// Query all clients
@@ -2608,6 +2628,82 @@ mod tests {
 
     fn gateway_uri(value: &str) -> Uri {
         value.parse().expect("valid test URI")
+    }
+
+    fn channel_page(height: u64, next_key: &[u8]) -> QueryChannelsResponse {
+        QueryChannelsResponse {
+            height: Some(ibc_proto::ibc::core::client::v1::Height {
+                revision_number: 0,
+                revision_height: height,
+            }),
+            pagination: Some(ibc_proto::cosmos::base::query::v1beta1::PageResponse {
+                next_key: next_key.to_vec(),
+                total: 0,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn channel_pages_preserve_empty_listing_snapshot_on_the_wire() {
+        let mut combined = QueryChannelsResponse::default();
+        assert!(
+            GatewayClient::append_channel_page(&mut combined, channel_page(2614, &[]))
+                .unwrap()
+                .is_empty()
+        );
+        let decoded = QueryChannelsResponse::decode(combined.encode_to_vec().as_slice()).unwrap();
+        assert!(decoded.channels.is_empty());
+        assert_eq!(
+            Height::try_from(decoded.height.unwrap()).unwrap(),
+            Height::new(0, 2614).unwrap()
+        );
+    }
+
+    #[test]
+    fn channel_pages_keep_channels_and_reject_a_changed_snapshot() {
+        use ibc_proto::ibc::core::channel::v1::IdentifiedChannel;
+        let mut combined = QueryChannelsResponse::default();
+        let mut first = channel_page(2614, b"next");
+        first.channels.push(IdentifiedChannel {
+            channel_id: "channel-0".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            GatewayClient::append_channel_page(&mut combined, first).unwrap(),
+            b"next"
+        );
+        let before = combined.clone();
+        assert!(
+            GatewayClient::append_channel_page(&mut combined, channel_page(2615, &[])).is_err()
+        );
+        assert_eq!(combined, before);
+        let mut second = channel_page(2614, &[]);
+        second.channels.push(IdentifiedChannel {
+            channel_id: "channel-1".into(),
+            ..Default::default()
+        });
+        assert!(GatewayClient::append_channel_page(&mut combined, second)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            combined
+                .channels
+                .iter()
+                .map(|c| c.channel_id.as_str())
+                .collect::<Vec<_>>(),
+            ["channel-0", "channel-1"]
+        );
+        assert_eq!(combined.height, before.height);
+    }
+
+    #[test]
+    fn channel_pages_reject_missing_and_zero_snapshot_heights() {
+        for page in [QueryChannelsResponse::default(), channel_page(0, &[])] {
+            let mut combined = QueryChannelsResponse::default();
+            assert!(GatewayClient::append_channel_page(&mut combined, page).is_err());
+            assert_eq!(combined, QueryChannelsResponse::default());
+        }
     }
 
     #[test]
