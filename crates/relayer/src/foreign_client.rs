@@ -2033,12 +2033,16 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             self.record_mithril_stake(&AnyClientState::Probabilistic(client.clone()));
         }
         let epochs = Self::probabilistic_observation_epochs(client, &header);
+        let proposal_epoch = header
+            .new_epoch_context
+            .as_ref()
+            .map(|context| context.epoch);
         let plan = staging::plan(&client.clone().into(), &header.into(), vec![])
             .map_err(|error| ForeignClientError::checkpoint_update(self.dst_chain.id(), error))?;
         // Activation checks the live base epoch and any table used by settlement
         // descendants. A new table gets its deadline when first proposed, so it
         // must be submitted once before there is a deadline to wait for.
-        self.wait_for_probabilistic_epoch_challenge(&epochs)?;
+        self.wait_for_probabilistic_epoch_challenge(&epochs, proposal_epoch)?;
         staging::submit(
             &plan,
             |id| self.verification_query(client, 8, id.to_vec(), vec![]),
@@ -2070,36 +2074,90 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
     fn wait_for_probabilistic_epoch_challenge(
         &self,
         epochs: &[u64],
+        proposal_epoch: Option<u64>,
     ) -> Result<(), ForeignClientError> {
+        use crate::chain::cardano::epoch_usability::{
+            EpochUsability, EpochUsabilityStatus, QUERY_EPOCH_USABILITY,
+        };
+        use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
+        let fail =
+            |error: String| ForeignClientError::checkpoint_update(self.dst_chain.id(), error);
+        let mut certificate_height = None;
         loop {
-            let (state, _) = self.validated_client_state()?;
-            let AnyClientState::Probabilistic(state) = state else {
-                return Ok(());
-            };
-            let deadline = state
-                .epoch_context_challenges
-                .iter()
-                .filter(|challenge| epochs.contains(&challenge.epoch))
-                .map(|challenge| challenge.usable_after_unix_ns)
-                .max()
-                .unwrap_or(0);
-            if deadline == 0 {
-                return Ok(());
-            }
-            let status = self
-                .dst_chain()
+            let committed = self
+                .dst_chain
                 .query_application_status()
-                .map_err(|error| {
-                    ForeignClientError::client_update(
-                        self.dst_chain.id(),
-                        "failed querying epoch challenge host time".to_string(),
-                        error,
+                .map_err(|e| fail(e.to_string()))?;
+            let (state, _) = self
+                .dst_chain
+                .query_client_state(
+                    QueryClientStateRequest {
+                        client_id: self.id.clone(),
+                        height: QueryHeight::Specific(committed.height),
+                    },
+                    IncludeProof::No,
+                )
+                .map_err(|e| fail(e.to_string()))?;
+            let AnyClientState::Probabilistic(client) = &state else {
+                return Err(fail(
+                    "Destination does not support probabilistic epoch usability".into(),
+                ));
+            };
+            let mut pending = false;
+            for &epoch in epochs {
+                let response = self
+                    .dst_chain
+                    .query_probabilistic_verification(
+                        raw::QueryVerificationRequest {
+                            namespace: client.storage_namespace.clone(),
+                            generation: client.verification_generation,
+                            kind: QUERY_EPOCH_USABILITY,
+                            epoch,
+                            client_id: self.id.to_string(),
+                            ..Default::default()
+                        },
+                        QueryHeight::Specific(committed.height),
                     )
-                })?;
-            if status.timestamp.nanoseconds() > deadline.saturating_add(10_000_000_000) {
+                    .map_err(|e| fail(format!("Destination epoch-usability query failed: {e}")))?;
+                let readiness: EpochUsability =
+                    serde_json::from_slice(&response).map_err(|e| fail(e.to_string()))?;
+                readiness
+                    .validate_at(epoch, client.verification_generation, &committed)
+                    .map_err(fail)?;
+                match readiness.status {
+                    EpochUsabilityStatus::Usable => {}
+                    EpochUsabilityStatus::Unproposed if proposal_epoch == Some(epoch) => {}
+                    EpochUsabilityStatus::Pending => pending = true,
+                    EpochUsabilityStatus::Frozen | EpochUsabilityStatus::Expired => {
+                        return Err(ForeignClientError::expired_or_frozen(
+                            if readiness.status == EpochUsabilityStatus::Frozen {
+                                ExpiredOrFrozen::Frozen
+                            } else {
+                                ExpiredOrFrozen::Expired
+                            },
+                            self.id.clone(),
+                            self.dst_chain.id(),
+                            readiness.reason,
+                        ));
+                    }
+                    EpochUsabilityStatus::Unproposed | EpochUsabilityStatus::Unsupported => {
+                        return Err(fail(format!(
+                            "Epoch {epoch} is not supported for this operation: {}",
+                            readiness.reason
+                        )));
+                    }
+                }
+            }
+            if !pending {
                 return Ok(());
             }
-            debug!(client_id = %self.id, ?epochs, deadline, "waiting for epoch context challenge window");
+            // A newly available certificate may release the remaining stake wait.
+            // Only committed destination readiness permits activation afterwards.
+            if certificate_height != Some(committed.height) {
+                self.record_mithril_stake(&state);
+                certificate_height = Some(committed.height);
+            }
+            debug!(client_id = %self.id, ?epochs, height = %committed.height, "waiting for destination epoch usability");
             thread::sleep(Duration::from_secs(1));
         }
     }
@@ -2143,7 +2201,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             // cannot delay it. The keeper still enforces generation, host
             // continuity and connection delays when verifying the proof.
             if let AnyConsensusState::Probabilistic(state) = &consensus_state {
-                self.wait_for_probabilistic_epoch_challenge(&[state.accepted_epoch])?;
+                self.wait_for_probabilistic_epoch_challenge(&[state.accepted_epoch], None)?;
             }
             debug!("consensus state already exists at height {target_height}, skipping update");
             trace!(?consensus_state, "consensus state");
@@ -3347,6 +3405,19 @@ mod tests {
                     ChainRequest::QueryClientStatus { reply_to, .. } => {
                         reply_to.send(Ok(Some("Active".to_owned()))).unwrap();
                     }
+                    ChainRequest::QueryProbabilisticVerification {
+                        request, reply_to, ..
+                    } => {
+                        assert_eq!(
+                            request.kind,
+                            crate::chain::cardano::epoch_usability::QUERY_EPOCH_USABILITY
+                        );
+                        assert_eq!(request.client_id, expected_client_id.to_string());
+                        let response = serde_json::json!({"status":"usable","epoch":request.epoch,"generation":request.generation,"revision":0,"height":60,"timestamp":110_000_000_000u64});
+                        reply_to
+                            .send(Ok(serde_json::to_vec(&response).unwrap()))
+                            .unwrap();
+                    }
                     ChainRequest::QueryConsensusState {
                         request, reply_to, ..
                     } => {
@@ -3407,7 +3478,7 @@ mod tests {
         assert!(result.expect("the exact proof root exists").is_empty());
         // Challenge checks also revalidate the client before and after preparing updates.
         assert_eq!(destination.consensus_heights, vec![height(33); 2]);
-        assert_eq!(destination.client_state_queries, 4);
+        assert_eq!(destination.client_state_queries, 3);
         assert_eq!(source.application_status_queries, 0);
         assert_eq!(source.submissions + destination.submissions, 0);
     }

@@ -7,6 +7,7 @@ pub mod chain_handle;
 pub(crate) mod checkpoint;
 pub mod config;
 pub mod endpoint;
+pub(crate) mod epoch_usability;
 pub mod error;
 pub mod event_parser;
 pub mod event_source;
