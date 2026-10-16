@@ -36,6 +36,29 @@ fn message_position(event: &Event) -> Result<Option<usize>, String> {
         .transpose()
 }
 
+fn same_message(emitted: &Any, submitted: &Any) -> Result<bool, String> {
+    if emitted.type_url != submitted.type_url {
+        return Ok(false);
+    }
+    // The SDK re-encodes its decoded message for the event. Compare protobuf
+    // contents so another valid field order is not mistaken for another message.
+    match submitted.type_url.as_str() {
+        PROBABILISTIC_HEADER_TYPE_URL => {
+            Ok(raw::ProbabilisticHeader::decode(emitted.value.as_slice())
+                .map_err(|e| e.to_string())?
+                == raw::ProbabilisticHeader::decode(submitted.value.as_slice())
+                    .map_err(|e| e.to_string())?)
+        }
+        MITHRIL_STAKE_CERTIFICATES_TYPE_URL => Ok(raw::MithrilStakeCertificates::decode(
+            emitted.value.as_slice(),
+        )
+        .map_err(|e| e.to_string())?
+            == raw::MithrilStakeCertificates::decode(submitted.value.as_slice())
+                .map_err(|e| e.to_string())?),
+        _ => Ok(emitted == submitted),
+    }
+}
+
 // Some adapters implement exported.Height.String using the protobuf debug
 // format. Only accept that spelling of the same height, never another height.
 fn check_height(event: &Event, expected: &str) -> Result<(), String> {
@@ -155,7 +178,7 @@ pub fn hydrate_client_updates(tx: &[u8], events: &[Event]) -> Result<Vec<Event>,
         if let Some(encoded) = enclosed {
             let bytes = hex::decode(encoded).map_err(|e| e.to_string())?;
             let emitted = Any::decode(bytes.as_slice()).map_err(|e| e.to_string())?;
-            if &emitted != message {
+            if !same_message(&emitted, message)? {
                 return Err("update event message disagrees with submitted message".to_owned());
             }
         }
@@ -520,5 +543,29 @@ mod operation_tests {
             .collect();
         assert_eq!(updates.len(), 1);
         assert_eq!(required(updates[0], "consensus_height").unwrap(), "0-969");
+    }
+
+    #[test]
+    fn message_binding_accepts_equivalent_protobuf_encodings() {
+        let header = raw::ProbabilisticHeader {
+            observation_chunk: Some(raw::ObservationChunk {
+                operation: 7,
+                session_id: vec![1; 32],
+                sequence: 10,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let submitted = Any {
+            type_url: PROBABILISTIC_HEADER_TYPE_URL.to_owned(),
+            value: header.encode_to_vec(),
+        };
+        let mut emitted = submitted.clone();
+        // An explicitly encoded zero output index is equivalent to its absence.
+        // The keeper's protobuf encoder omits it again.
+        emitted.value.extend_from_slice(&[0x30, 0]);
+        assert!(same_message(&emitted, &submitted).unwrap());
+        emitted.type_url = MITHRIL_STAKE_CERTIFICATES_TYPE_URL.to_owned();
+        assert!(!same_message(&emitted, &submitted).unwrap());
     }
 }
