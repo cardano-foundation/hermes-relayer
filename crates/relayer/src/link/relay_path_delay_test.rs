@@ -24,7 +24,7 @@ fn height(n: u64) -> Height {
 fn cardano_client() -> AnyClientState {
     AnyClientState::Probabilistic(ProbabilisticClientState {
         storage_version: 2,
-        verification_generation: 0,
+        verification_generation: 1,
         checkpoint_reference: vec![],
         storage_namespace: vec![],
         bootstrap_objects: vec![],
@@ -33,7 +33,16 @@ fn cardano_client() -> AnyClientState {
         mithril_aggregate_verification_key: String::new(),
         mithril_protocol_parameters_hash: String::new(),
         packet_lane_policy_id: vec![0x55; 28],
-        epoch_context_challenges: vec![],
+        epoch_context_challenges: vec![
+            ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::EpochContextChallenge {
+                epoch: 7,
+                usable_after_unix_ns: 90_000_000_000,
+            },
+            ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::EpochContextChallenge {
+                epoch: 8,
+                usable_after_unix_ns: 220_000_000_000,
+            },
+        ],
         latest_checkpoint_nonce_state: None,
         latest_checkpoint_pool_registry: None,
         latest_checkpoint_settlement_credit: None,
@@ -42,7 +51,7 @@ fn cardano_client() -> AnyClientState {
         chain_id: ChainId::from_string("cardano-0"),
         latest_height: height(33),
         frozen_height: None,
-        current_epoch: 0,
+        current_epoch: 7,
         trusting_period: Duration::from_secs(60),
         upgrade_path: vec![],
         host_state_nft_policy_id: vec![1; 28],
@@ -57,7 +66,7 @@ fn cardano_client() -> AnyClientState {
         epoch_contexts: vec![],
         latest_checkpoint_height: Some(height(50)),
         latest_checkpoint_block_hash: "02".repeat(32),
-        latest_checkpoint_epoch: 0,
+        latest_checkpoint_epoch: 7,
         max_kes_evolutions: 62,
         latest_checkpoint_operational_certificate_counters: vec![],
         operational_certificate_counter_history_start_height: Some(height(10)),
@@ -78,6 +87,14 @@ fn runtime(config: ChainConfig) -> (BaseChainHandle, thread::JoinHandle<Vec<Heig
             match request {
                 ChainRequest::Config { reply_to } => reply_to.send(Ok(config.clone())).unwrap(),
                 ChainRequest::QueryApplicationStatus { reply_to } => {
+                    if consensus_queries.is_empty() {
+                        reply_to
+                            .send(Err(RelayerError::query(
+                                "unrelated proposal delayed the packet root lookup".into(),
+                            )))
+                            .unwrap();
+                        continue;
+                    }
                     reply_to
                         .send(Ok(ChainStatus {
                             height: height(60),
@@ -98,14 +115,14 @@ fn runtime(config: ChainConfig) -> (BaseChainHandle, thread::JoinHandle<Vec<Heig
                     let answer = if request.consensus_height == height(33) {
                         Ok((
                             AnyConsensusState::Probabilistic(ProbabilisticConsensusState {
-                                verification_generation: 0,
+                                verification_generation: 1,
                                 checkpoint_reference: vec![],
                                 packet_state_reference: vec![],
 
                                 root: CommitmentRoot::from_bytes(&[1; 32]),
                                 timestamp: 100_000_000_000,
                                 accepted_block_hash: "01".repeat(32),
-                                accepted_epoch: 0,
+                                accepted_epoch: 7,
                                 unique_pools_count: 1,
                                 unique_stake_bps: 10_000,
                                 security_score_bps: 10_000,
@@ -142,7 +159,7 @@ fn runtime(config: ChainConfig) -> (BaseChainHandle, thread::JoinHandle<Vec<Heig
 }
 
 #[test]
-fn delayed_cardano_schedule_uses_exact_proof_height_in_both_directions() {
+fn delayed_cardano_schedule_uses_exact_root_despite_a_future_epoch_proposal() {
     for target in [
         OperationalDataTarget::Source,
         OperationalDataTarget::Destination,

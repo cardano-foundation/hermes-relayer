@@ -400,6 +400,43 @@ fn awaiting_source_settlement_is_not_a_renewal_or_a_retry_failure() {
 }
 
 #[test]
+fn unrelated_epoch_proposals_do_not_stop_checkpoint_refresh() {
+    let h = Harness::new(true, true);
+    {
+        let mut state = h.state.lock().unwrap();
+        let epoch = state.current_epoch;
+        state
+            .epoch_context_challenges
+            .push(raw::EpochContextChallenge {
+                epoch: epoch + 1,
+                usable_after_unix_ns: h.now.load(Ordering::SeqCst) + 12 * 3_600_000_000_000,
+            });
+    }
+    h.client().refresh().unwrap();
+    assert_eq!(h.commits.load(Ordering::SeqCst), 1);
+    h.close();
+}
+
+#[test]
+fn checkpoint_refresh_leaves_a_pending_base_for_the_next_poll() {
+    let h = Harness::new(true, true);
+    {
+        let mut state = h.state.lock().unwrap();
+        let epoch = state.current_epoch;
+        state
+            .epoch_context_challenges
+            .push(raw::EpochContextChallenge {
+                epoch,
+                usable_after_unix_ns: h.now.load(Ordering::SeqCst) + 12 * 3_600_000_000_000,
+            });
+    }
+    assert_eq!(h.client().refresh().unwrap(), Some(vec![]));
+    assert_eq!(h.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(h.submissions.load(Ordering::SeqCst), 0);
+    h.close();
+}
+
+#[test]
 fn missing_checkpoint_timestamps_fail_without_querying_proof_state() {
     let h = Harness::new(false, true);
     {
