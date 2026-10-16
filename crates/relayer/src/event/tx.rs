@@ -188,8 +188,11 @@ pub fn hydrate_client_updates(tx: &[u8], events: &[Event]) -> Result<Vec<Event>,
                 let header = raw::ProbabilisticHeader::decode(message.value.as_slice())
                     .map_err(|e| e.to_string())?;
                 if let Some(chunk) = header.observation_chunk {
-                    if enclosed.is_none() {
-                        return Err("bounded update event has no submitted message".to_owned());
+                    if enclosed.is_none() && position.is_none() {
+                        return Err(
+                            "bounded update event has neither a message nor a message index"
+                                .to_owned(),
+                        );
                     }
                     required(event, "consensus_height")?;
                     let height = if chunk.operation == 7 {
@@ -239,8 +242,12 @@ pub fn hydrate_client_updates(tx: &[u8], events: &[Event]) -> Result<Vec<Event>,
             MITHRIL_STAKE_CERTIFICATES_TYPE_URL => {
                 let certificates = raw::MithrilStakeCertificates::decode(message.value.as_slice())
                     .map_err(|e| e.to_string())?;
-                if enclosed.is_none() || certificates.certificates.is_empty() {
-                    return Err("certificate update event has no submitted certificates".to_owned());
+                if (enclosed.is_none() && position.is_none())
+                    || certificates.certificates.is_empty()
+                {
+                    return Err(
+                        "certificate update event has no bound submitted certificates".to_owned(),
+                    );
                 }
                 required(event, "consensus_height")?;
                 check_height(event, "")?;
@@ -386,17 +393,34 @@ pub(crate) mod operation_fixtures {
             .unwrap_or_else(|_| include_str!("fixtures/probabilistic-operations.json").to_owned());
         serde_json::from_str(&data).unwrap()
     }
+
+    pub(crate) fn v10_records() -> Vec<Record> {
+        let data = std::env::var("RELAYER_V10_OPERATION_EVENTS")
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .unwrap_or_else(|_| {
+                include_str!("fixtures/probabilistic-v10-operations.json").to_owned()
+            });
+        serde_json::from_str(&data).unwrap()
+    }
 }
 
 #[cfg(test)]
 mod operation_tests {
-    use super::{operation_fixtures::records, *};
+    use super::{
+        operation_fixtures::{records, v10_records, Record},
+        *,
+    };
     use ibc_relayer_types::{core::ics24_host::identifier::ChainId, events::IbcEvent};
 
     #[test]
     fn committed_keeper_operations_have_only_real_consensus_heights() {
+        check_committed_operations(records());
+        check_committed_operations(v10_records());
+    }
+
+    fn check_committed_operations(records: Vec<Record>) {
         let chain = ChainId::from_string("relayer-events-1");
-        for record in records() {
+        for record in records {
             let response = record.response();
             let hydrated = hydrate_client_updates(&response.tx, &record.events).unwrap();
             if record.name == "certificate" {
@@ -567,5 +591,22 @@ mod operation_tests {
         assert!(same_message(&emitted, &submitted).unwrap());
         emitted.type_url = MITHRIL_STAKE_CERTIFICATES_TYPE_URL.to_owned();
         assert!(!same_message(&emitted, &submitted).unwrap());
+    }
+
+    #[test]
+    fn v10_operations_require_the_keeper_message_position() {
+        for mut record in v10_records() {
+            if record.name == "create" {
+                continue;
+            }
+            for event in &mut record.events {
+                event.attributes.retain(|a| a.key_bytes() != b"msg_index");
+            }
+            assert!(
+                hydrate_client_updates(&hex::decode(&record.tx).unwrap(), &record.events).is_err(),
+                "accepted unbound {}",
+                record.name
+            );
+        }
     }
 }
