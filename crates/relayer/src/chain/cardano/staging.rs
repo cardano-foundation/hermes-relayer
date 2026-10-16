@@ -1,6 +1,6 @@
 //! Destination snapshot queries and resumable bounded observations. Public client
 //! records stay bounded, expansion happens only in this off-chain evidence builder.
-use bech32::FromBase32;
+use bech32::{FromBase32, ToBase32};
 use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -302,15 +302,19 @@ pub(crate) fn plan(
             {
                 return Err("Invalid canonical stake row".into());
             }
-            entries.push((key, row.stake));
+            // The destination rebuilds Mithril's stake root, which orders
+            // pools by their canonical bech32 identifier.
+            let name = bech32::encode("pool", key.to_base32(), bech32::Variant::Bech32)
+                .map_err(|e| e.to_string())?;
+            entries.push((name, key, row.stake));
         }
         entries.sort();
-        let mut last = vec![];
-        for (key, amount) in entries {
-            if key <= last {
+        let mut last = String::new();
+        for (name, key, amount) in entries {
+            if name <= last {
                 return Err("Duplicate stake identity".into());
             };
-            last = key.clone();
+            last = name;
             let row = [key, amount.to_be_bytes().to_vec()].concat();
             begin.table_total = begin
                 .table_total
@@ -509,13 +513,15 @@ mod tests {
             ..Default::default()
         };
         let plan = plan(&client, &header, vec![]).unwrap();
+        // Rows follow Mithril's pool ID order, which here reverses key order.
+        assert_eq!(plan.rows[..28], [2; 28]);
         assert_eq!(
             hex::encode(&plan.begin.evidence_digest),
-            "47f9a8871da8cf81d8345564d023a95888035fbb34189d7d183d5c69383caa0a"
+            "3bee5b87e4f6fb30cdcf230e735a11c5f31fc4f47380bbda95aac90ff903731a"
         );
         assert_eq!(
             hex::encode(&plan.row_suffixes[1]),
-            "879a70ff65d65797e73dcfa01a48711491871537323a01ca562f983fbf086381"
+            "fb5e5bea7446478c49fa0dde24a4d28eb73724005f3b3897214c99c8312349e6"
         );
         assert_eq!(
             hex::encode(&plan.block_suffixes[0]),

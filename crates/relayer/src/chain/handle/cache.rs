@@ -167,6 +167,13 @@ impl<Handle: ChainHandle> ChainHandle for CachingChainHandle<Handle> {
         self.inner().build_client_maintenance_header(client_state)
     }
 
+    fn query_mithril_stake_certificates(
+        &self,
+        mithril_epoch: u64,
+    ) -> Result<Option<ibc_proto::google::protobuf::Any>, Error> {
+        self.inner().query_mithril_stake_certificates(mithril_epoch)
+    }
+
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
         self.inner().query_application_status()
     }

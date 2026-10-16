@@ -1142,6 +1142,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             self.complete_bootstrap()?;
             return Ok(Some(vec![]));
         }
+        self.record_mithril_stake(&client_state);
 
         let src_config = self.src_chain.config().map_err(|e| {
             ForeignClientError::client_create(
@@ -1194,6 +1195,72 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                     Ok(None)
                 }
             }
+        }
+    }
+
+    /// Submits the Mithril certificates that extend an anchored probabilistic
+    /// client. Mithril publishes an epoch's distribution at least an epoch
+    /// before the rollover it covers, so refresh records it well in advance.
+    /// Failures leave the challenge period in place and are only logged.
+    fn record_mithril_stake(&self, state: &AnyClientState) {
+        let AnyClientState::Probabilistic(client) = state else {
+            return;
+        };
+        // A pending bootstrap's own certificate moves its anchor first.
+        if client.mithril_epoch == 0 || client.frozen_height.is_some() || client.bootstrap_pending {
+            return;
+        }
+        let message = match self
+            .src_chain
+            .query_mithril_stake_certificates(client.mithril_epoch)
+        {
+            Ok(Some(message)) => message,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    mithril_epoch = client.mithril_epoch,
+                    "Mithril stake certificates are unavailable: {error}"
+                );
+                return;
+            }
+        };
+        let signer = match self.dst_chain.get_signer() {
+            Ok(signer) => signer,
+            Err(error) => {
+                warn!("cannot sign Mithril stake certificates: {error}");
+                return;
+            }
+        };
+        let message = MsgUpdateClient {
+            client_id: self.id.clone(),
+            header: message,
+            signer,
+        }
+        .to_any();
+        match self
+            .dst_chain
+            .send_messages_and_wait_commit(TrackedMsgs::new_single(
+                message,
+                "Mithril-certified stake",
+            )) {
+            Ok(events)
+                if events
+                    .iter()
+                    .any(|event| event.event.event_type() == IbcEventType::ChainError) =>
+            {
+                warn!(
+                    mithril_epoch = client.mithril_epoch,
+                    "Mithril stake certificates were rejected: {events:?}"
+                )
+            }
+            Ok(_) => info!(
+                mithril_epoch = client.mithril_epoch,
+                "recorded Mithril-certified stake"
+            ),
+            Err(error) => warn!(
+                mithril_epoch = client.mithril_epoch,
+                "Mithril stake certificates were not committed: {error}"
+            ),
         }
     }
 
@@ -1804,6 +1871,10 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
     ) -> Result<(), ForeignClientError> {
         use crate::chain::cardano::staging;
         use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
+        if header.new_epoch_context.is_some() {
+            // A table Mithril has certified activates without a response window.
+            self.record_mithril_stake(&AnyClientState::Probabilistic(client.clone()));
+        }
         let plan = staging::plan(&client.clone().into(), &header.into(), vec![])
             .map_err(|error| ForeignClientError::checkpoint_update(self.dst_chain.id(), error))?;
         staging::submit(
@@ -2977,6 +3048,9 @@ mod tests {
             storage_namespace: vec![],
             bootstrap_objects: vec![],
             bootstrap_pending: false,
+            mithril_epoch: 0,
+            mithril_aggregate_verification_key: String::new(),
+            mithril_protocol_parameters_hash: String::new(),
             packet_lane_policy_id: vec![0x55; 28],
             epoch_context_challenges: vec![],
             latest_checkpoint_nonce_state: None,
@@ -3365,3 +3439,7 @@ mod freshness_tests;
 #[cfg(test)]
 #[path = "foreign_client/initialization_tests.rs"]
 mod initialization_tests;
+
+#[cfg(test)]
+#[path = "foreign_client/mithril_stake_tests.rs"]
+mod mithril_stake_tests;

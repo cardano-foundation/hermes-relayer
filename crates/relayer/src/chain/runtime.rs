@@ -242,6 +242,10 @@ where
                             let result = self.chain.build_client_maintenance_header(&client_state);
                             reply_to.send(result).map_err(Error::send)?;
                         },
+                        ChainRequest::QueryMithrilStakeCertificates { mithril_epoch, reply_to } => {
+                            let result = self.chain.query_mithril_stake_certificates(mithril_epoch);
+                            reply_to.send(result).map_err(Error::send)?;
+                        },
                         ChainRequest::QueryApplicationStatus { reply_to } => {
                             self.query_application_status(reply_to)?
                         },

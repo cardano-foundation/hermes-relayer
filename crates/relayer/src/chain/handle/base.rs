@@ -207,6 +207,16 @@ impl ChainHandle for BaseChainHandle {
         })
     }
 
+    fn query_mithril_stake_certificates(
+        &self,
+        mithril_epoch: u64,
+    ) -> Result<Option<ibc_proto::google::protobuf::Any>, Error> {
+        self.send(|reply_to| ChainRequest::QueryMithrilStakeCertificates {
+            mithril_epoch,
+            reply_to,
+        })
+    }
+
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
         self.send(|reply_to| ChainRequest::QueryApplicationStatus { reply_to })
     }
