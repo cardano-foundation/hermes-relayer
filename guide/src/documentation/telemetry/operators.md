@@ -33,6 +33,7 @@ The metrics in the table below are design to answer this question on multiple di
 | Name                       | Description                                                                                                                                                                 | OpenTelemetry type  | Configuration Dependencies |
 | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- | -------------------------- |
 | `workers`                  | Number of workers per type                                                                                                                                                  | `i64` UpDownCounter | Corresponding workers enabled |
+| `client_misbehaviour_check_incomplete` | One while a client watcher has unfinished startup or update verification. Returns to zero when verification completes. Labels are `src_chain`, `dst_chain` and `client`. | `u64` Gauge | Client misbehaviour worker enabled |
 | `client_updates_submitted_total` | Number of client update messages submitted, per sending chain, receiving chain and client                                                                                                            | `u64` Counter       | Client, Connection, Channel or Packet workers enabled |
 | `client_updates_skipped_total` | Number of client update messages skipped because the consensus state already exists, per sending chain, receiving chain and client                                                                                                            | `u64` Counter       | Client, Connection, Channel or Packet workers enabled |
 | `wallet_balance`           | The balance of each wallet Hermes uses per chain                                                                                                                            | `f64` ValueRecorder | None                       |
@@ -40,6 +41,8 @@ The metrics in the table below are design to answer this question on multiple di
 | `messages_submitted_total` | Number of messages submitted to a specific chain                                                                                                                            | `u64` Counter       | None                       |
 
 Notes & more details below:
+
+A running watcher can have incomplete coverage. Query or verification failures leave `client_misbehaviour_check_incomplete` at one and are retried after five seconds. Failed updates stay queued. Cardano watchers poll every five seconds even without update events. They check pending proposals before a bounded page of historical observations. Historical pages resume from the saved cursor and failed observations stay queued. Coverage returns to zero only after a complete successful scan. Unsupported checking stops the worker with coverage still incomplete. Submitted evidence stops it after the challenge commits.
 
 **What is a worker?**
   * A worker is a separate thread of execution and there are five types of workers:

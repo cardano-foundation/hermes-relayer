@@ -3,13 +3,15 @@ use core::time::Duration;
 use crossbeam_channel::Receiver;
 use retry::delay::Fibonacci;
 use retry::{retry_with_index, OperationResult};
-use tracing::{debug, debug_span, error_span, trace, warn};
+use std::{collections::VecDeque, time::Instant};
+use tracing::{debug, error_span, trace, warn};
 
 use ibc_relayer_types::core::ics02_client::client_type::ClientType;
 use ibc_relayer_types::core::ics02_client::events::UpdateClient;
 use ibc_relayer_types::core::ics24_host::identifier::ClientId;
 use ibc_relayer_types::events::IbcEvent;
 
+use crate::telemetry;
 use crate::util::retry::clamp_total;
 use crate::util::task::{spawn_background_task, Next, TaskError, TaskHandle};
 use crate::{
@@ -96,7 +98,18 @@ pub fn detect_misbehavior_task<ChainA: ChainHandle, ChainB: ChainHandle>(
         return None;
     }
 
-    let mut initial_check_done = false;
+    let probabilistic = client.id().as_str().starts_with(&format!(
+        "{}-",
+        ClientId::prefix(ClientType::CardanoProbabilistic)
+    ));
+    let mut monitor = MisbehaviourMonitor::new(probabilistic);
+    telemetry!(
+        client_misbehaviour_check_incomplete,
+        &client.src_chain.id(),
+        &client.dst_chain.id(),
+        client.id(),
+        true
+    );
 
     let handle = spawn_background_task(
         error_span!(
@@ -107,76 +120,134 @@ pub fn detect_misbehavior_task<ChainA: ChainHandle, ChainB: ChainHandle>(
         ),
         Some(Duration::from_millis(600)),
         move || -> Result<Next, TaskError<Infallible>> {
-            if !initial_check_done {
-                initial_check_done = true;
-
-                debug!("doing initial misbehavior check");
-                let result = client.detect_misbehaviour_and_submit_evidence(None);
-                debug!("misbehavior detection result: {:?}", result);
-            }
-
+            let mut updates = Vec::new();
             if let Ok(WorkerCmd::IbcEvents { batch }) = receiver.try_recv() {
                 trace!("received batch: {:?}", batch);
-
-                for event_with_height in batch.events {
-                    if let IbcEvent::UpdateClient(update) = event_with_height.event {
-                        match on_client_update(&client, update) {
-                            Next::Continue => continue,
-                            Next::Abort => return Ok(Next::Abort),
-                        }
+                for event in batch.events {
+                    if let IbcEvent::UpdateClient(update) = event.event {
+                        updates.push(update);
                     }
                 }
             }
-
-            Ok(Next::Continue)
+            if !updates.is_empty() || monitor.incomplete() {
+                telemetry!(
+                    client_misbehaviour_check_incomplete,
+                    &client.src_chain.id(),
+                    &client.dst_chain.id(),
+                    client.id(),
+                    true
+                );
+            }
+            let next = monitor.tick(Instant::now(), updates, |update| {
+                client.detect_misbehaviour_and_submit_evidence(update)
+            });
+            telemetry!(
+                client_misbehaviour_check_incomplete,
+                &client.src_chain.id(),
+                &client.dst_chain.id(),
+                client.id(),
+                monitor.incomplete()
+            );
+            Ok(next)
         },
     );
 
     Some(handle)
 }
 
-fn on_client_update<ChainA: ChainHandle, ChainB: ChainHandle>(
-    client: &ForeignClient<ChainB, ChainA>,
+const MISBEHAVIOUR_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_UPDATE_CHECKS_PER_POLL: usize = 16;
+
+struct PendingUpdate {
     update: UpdateClient,
-) -> Next {
-    let _span = debug_span!(
-        "on_client_update",
-        client = %update.client_id(),
-        client_type = %update.client_type(),
-        height = %update.consensus_height(),
-    );
+    retry_at: Instant,
+}
 
-    debug!("checking misbehavior for updated client");
+/// Work survives a transient query or verification failure. Probabilistic checks
+/// reconstruct the retained work from the destination, including staged cursors.
+pub(crate) struct MisbehaviourMonitor {
+    probabilistic: bool,
+    initial_check_done: bool,
+    retry_at: Instant,
+    updates: VecDeque<PendingUpdate>,
+}
 
-    let result = client.detect_misbehaviour_and_submit_evidence(Some(update));
-
-    trace!("misbehavior detection result: {:?}", result);
-
-    match result {
-        MisbehaviourResults::ValidClient => {
-            debug!("client is valid");
-
-            Next::Continue
+impl MisbehaviourMonitor {
+    pub(crate) fn new(probabilistic: bool) -> Self {
+        Self {
+            probabilistic,
+            initial_check_done: false,
+            retry_at: Instant::now(),
+            updates: VecDeque::new(),
         }
-        MisbehaviourResults::VerificationError => {
-            // can retry in next call
-            debug!("client verification error, will retry in next call");
+    }
 
-            Next::Continue
-        }
-        MisbehaviourResults::EvidenceSubmitted(_) => {
-            // if evidence was submitted successfully then exit
-            debug!("misbehavior detected! Evidence successfully submitted, exiting");
+    pub(crate) fn incomplete(&self) -> bool {
+        !self.initial_check_done || !self.updates.is_empty()
+    }
 
-            Next::Abort
+    pub(crate) fn tick(
+        &mut self,
+        now: Instant,
+        updates: impl IntoIterator<Item = UpdateClient>,
+        mut check: impl FnMut(Option<UpdateClient>) -> MisbehaviourResults,
+    ) -> Next {
+        for update in updates {
+            self.updates.push_back(PendingUpdate {
+                update,
+                retry_at: now,
+            });
         }
-        MisbehaviourResults::CannotExecute => {
-            // skip misbehaviour checking if chain does not have support for it (i.e. client
-            // update event does not include the header)
-            debug!("cannot execute misbehavior detection, exiting");
-
-            Next::Abort
+        // Proposals and rootless checkpoints do not need to emit an IBC
+        // UpdateClient event. Poll committed pending work even on idle routes.
+        if self.probabilistic && now >= self.retry_at {
+            self.initial_check_done = false;
         }
+        if !self.initial_check_done && now >= self.retry_at {
+            debug!("checking retained misbehaviour coverage");
+            match check(None) {
+                MisbehaviourResults::ValidClient => {
+                    self.initial_check_done = true;
+                    self.retry_at = now + MISBEHAVIOUR_RETRY_INTERVAL;
+                }
+                MisbehaviourResults::VerificationError => {
+                    warn!("misbehaviour coverage incomplete, retrying without restarting");
+                    self.retry_at = now + MISBEHAVIOUR_RETRY_INTERVAL;
+                }
+                MisbehaviourResults::EvidenceSubmitted(_) => {
+                    self.initial_check_done = true;
+                    self.updates.clear();
+                    return Next::Abort;
+                }
+                MisbehaviourResults::CannotExecute => return Next::Abort,
+            }
+        }
+        // A failing old update cannot starve newly received updates. Each failed
+        // item goes to the back with its own bounded retry delay.
+        for _ in 0..self.updates.len().min(MAX_UPDATE_CHECKS_PER_POLL) {
+            let mut pending = self.updates.pop_front().expect("queued update");
+            if now < pending.retry_at {
+                self.updates.push_back(pending);
+                continue;
+            }
+            match check(Some(pending.update.clone())) {
+                MisbehaviourResults::ValidClient => {}
+                MisbehaviourResults::VerificationError => {
+                    pending.retry_at = now + MISBEHAVIOUR_RETRY_INTERVAL;
+                    self.updates.push_back(pending);
+                }
+                MisbehaviourResults::EvidenceSubmitted(_) => {
+                    self.initial_check_done = true;
+                    self.updates.clear();
+                    return Next::Abort;
+                }
+                MisbehaviourResults::CannotExecute => {
+                    self.initial_check_done = false;
+                    return Next::Abort;
+                }
+            }
+        }
+        Next::Continue
     }
 }
 
@@ -186,4 +257,87 @@ fn refresh_strategy() -> impl Iterator<Item = Duration> {
         MAX_REFRESH_DELAY,
         MAX_REFRESH_TOTAL_DELAY,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ibc_relayer_types::core::ics02_client::events::Attributes;
+    use ibc_relayer_types::Height;
+
+    fn update(height: u64) -> UpdateClient {
+        UpdateClient {
+            common: Attributes {
+                client_id: "07-tendermint-0".parse().unwrap(),
+                client_type: ClientType::Tendermint,
+                consensus_height: Height::new(0, height).unwrap(),
+            },
+            header: None,
+        }
+    }
+
+    #[test]
+    fn transient_update_is_retained_without_starving_later_updates() {
+        let mut monitor = MisbehaviourMonitor::new(false);
+        let now = Instant::now();
+        let mut checked = Vec::new();
+        monitor.tick(now, [update(1), update(2)], |event| {
+            let Some(event) = event else {
+                return MisbehaviourResults::ValidClient;
+            };
+            checked.push(event.consensus_height().revision_height());
+            if event.consensus_height().revision_height() == 1 {
+                MisbehaviourResults::VerificationError
+            } else {
+                MisbehaviourResults::ValidClient
+            }
+        });
+        assert_eq!(checked, vec![1, 2]);
+        assert!(monitor.incomplete());
+        monitor.tick(now + Duration::from_secs(1), [], |_| {
+            panic!("retry must wait")
+        });
+        monitor.tick(now + Duration::from_secs(6), [], |event| {
+            assert_eq!(event.unwrap().consensus_height().revision_height(), 1);
+            MisbehaviourResults::ValidClient
+        });
+        assert!(!monitor.incomplete());
+    }
+
+    #[test]
+    fn probabilistic_monitor_polls_without_update_events_after_success() {
+        let mut monitor = MisbehaviourMonitor::new(true);
+        let now = Instant::now();
+        let mut checks = 0;
+        monitor.tick(now, [], |event| {
+            assert!(event.is_none());
+            checks += 1;
+            MisbehaviourResults::ValidClient
+        });
+        assert!(!monitor.incomplete());
+        monitor.tick(now + Duration::from_secs(1), [], |_| {
+            panic!("poll must wait")
+        });
+        monitor.tick(now + Duration::from_secs(6), [], |event| {
+            assert!(event.is_none());
+            checks += 1;
+            MisbehaviourResults::ValidClient
+        });
+        assert_eq!(checks, 2);
+        assert!(!monitor.incomplete());
+    }
+
+    #[test]
+    fn initial_evidence_or_unsupported_check_stops_the_worker() {
+        for result in [
+            MisbehaviourResults::EvidenceSubmitted(vec![]),
+            MisbehaviourResults::CannotExecute,
+        ] {
+            let mut monitor = MisbehaviourMonitor::new(true);
+            assert!(matches!(
+                monitor.tick(Instant::now(), [], |_| result.clone()),
+                Next::Abort
+            ));
+        }
+    }
 }

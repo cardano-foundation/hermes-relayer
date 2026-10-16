@@ -231,6 +231,7 @@ pub enum ChainRequest {
     QueryCardanoChallengeContext {
         client_id: ClientId,
         trusted_height: Height,
+        receipt_id: Option<Vec<u8>>,
         reply_to: ReplyTo<Vec<u8>>,
     },
 
@@ -540,6 +541,7 @@ pub trait ChainHandle: Clone + Display + Send + Sync + Debug + 'static {
         &self,
         client_id: ClientId,
         trusted_height: Height,
+        receipt_id: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, Error>;
 
     /// Performs a query to retrieve the state of the specified light client. A

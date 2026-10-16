@@ -5,6 +5,8 @@
 //! refers to light clients running *locally* as part of the relayer.
 
 use core::{fmt, time::Duration};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -385,6 +387,14 @@ pub enum ConsensusStateTrusted {
     },
 }
 
+#[derive(Debug, Default)]
+struct ProbabilisticScan {
+    namespace: Vec<u8>,
+    generation: u64,
+    after: Vec<u8>,
+    retry: VecDeque<(Vec<u8>, serde_json::Value)>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ForeignClient<DstChain: ChainHandle, SrcChain: ChainHandle> {
     /// The identifier of this client. The host chain determines this id upon client creation,
@@ -396,6 +406,7 @@ pub struct ForeignClient<DstChain: ChainHandle, SrcChain: ChainHandle> {
 
     /// A handle to the chain whose headers this client is verifying, aka the source chain.
     pub src_chain: SrcChain,
+    probabilistic_scan: Arc<Mutex<ProbabilisticScan>>,
 }
 
 /// Used in Output messages.
@@ -436,6 +447,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             id: ClientId::default(),
             dst_chain,
             src_chain,
+            probabilistic_scan: Arc::default(),
         };
 
         client.create()?;
@@ -452,6 +464,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             id,
             dst_chain,
             src_chain,
+            probabilistic_scan: Arc::default(),
         }
     }
 
@@ -1275,7 +1288,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         use prost::Message;
         let bytes = self
             .dst_chain
-            .query_cardano_challenge_context(self.id.clone(), client.latest_verified_height())
+            .query_cardano_challenge_context(self.id.clone(), client.latest_verified_height(), None)
             .map_err(|error| {
                 ForeignClientError::checkpoint_update(self.dst_chain.id(), error.to_string())
             })?;
@@ -1573,11 +1586,184 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         }
     }
 
-    /// Use committed host timestamps, never a local wall clock or estimated
-    /// block cadence. Recheck client status so a challenge freeze stops waiting.
+    /// Pending proposals are checked before historical pagination. A failed
+    /// observation leaves coverage incomplete without starving other proposals.
     fn detect_probabilistic_misbehaviour(
         &self,
         client: &ibc_relayer_types::clients::ics08_cardano_probabilistic::client_state::ClientState,
+        update: Option<&UpdateClient>,
+    ) -> Result<Option<MisbehaviourEvidence>, ForeignClientError> {
+        use crate::chain::cardano::staging;
+        use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
+        let fail =
+            |error: String| ForeignClientError::checkpoint_update(self.dst_chain.id(), error);
+        let mut scan = self
+            .probabilistic_scan
+            .lock()
+            .map_err(|_| fail("Watcher progress lock is poisoned".into()))?;
+        if scan.namespace != client.storage_namespace
+            || scan.generation != client.verification_generation
+        {
+            *scan = ProbabilisticScan {
+                namespace: client.storage_namespace.clone(),
+                generation: client.verification_generation,
+                ..Default::default()
+            };
+        }
+        let retries = scan.retry.len().min(8);
+        let retrying: Vec<_> = scan.retry.drain(..retries).collect();
+        let mut incomplete = None;
+        let mut checked = std::collections::BTreeSet::new();
+        let mut check =
+            |id: Vec<u8>,
+             receipt: serde_json::Value,
+             incomplete: &mut Option<ForeignClientError>,
+             retry: &mut VecDeque<(Vec<u8>, serde_json::Value)>| {
+                if !checked.insert(id.clone()) {
+                    return None;
+                }
+                match self.check_probabilistic_receipt(client, id.clone(), receipt.clone()) {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        warn!(receipt_id = %hex::encode(&id), %error, "observation check incomplete, will retry");
+                        *incomplete = Some(error);
+                        if !retry.iter().any(|(other, _)| other == &id) {
+                            retry.push_back((id, receipt));
+                        }
+                        None
+                    }
+                }
+            };
+        match self.verification_query(client, 10, vec![], vec![]) {
+            Ok(pending) => {
+                let proposals = pending
+                    .as_array()
+                    .ok_or_else(|| fail("Invalid pending proposal response".into()))?;
+                for proposal in proposals {
+                    let result = staging::decode_bytes(proposal, "Receipt").and_then(|id| {
+                        if id.len() != 32 {
+                            return Err("Invalid proposal receipt identifier".into());
+                        }
+                        self.verification_query(client, 9, vec![], id.clone())
+                            .map(|receipt| (id, receipt))
+                    });
+                    match result {
+                        Ok((id, receipt)) => {
+                            if let Some(evidence) =
+                                check(id, receipt, &mut incomplete, &mut scan.retry)
+                            {
+                                return Ok(Some(evidence));
+                            }
+                        }
+                        Err(error) => {
+                            incomplete = Some(fail(error));
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                incomplete = Some(fail(error));
+            }
+        }
+        // Newly committed proof updates take priority too. Their activation
+        // header identifies the session even if old history still needs work.
+        if let Some(AnyHeader::Probabilistic(header)) =
+            update.and_then(|event| event.header.as_ref())
+        {
+            if let Some(chunk) = &header.observation_chunk {
+                let result = self
+                    .verification_query(client, 8, chunk.session_id.clone(), vec![])
+                    .and_then(|session| staging::decode_bytes(&session, "Receipt"))
+                    .and_then(|id| {
+                        self.verification_query(client, 9, vec![], id.clone())
+                            .map(|receipt| (id, receipt))
+                    });
+                match result {
+                    Ok((id, receipt)) => {
+                        if let Some(evidence) = check(id, receipt, &mut incomplete, &mut scan.retry)
+                        {
+                            return Ok(Some(evidence));
+                        }
+                    }
+                    Err(error) => incomplete = Some(fail(error)),
+                }
+            }
+        }
+        for (id, receipt) in retrying {
+            if let Some(evidence) = check(id, receipt, &mut incomplete, &mut scan.retry) {
+                return Ok(Some(evidence));
+            }
+        }
+        let after = scan.after.clone();
+        // One page per poll bounds old-history work. Failed observations and
+        // the committed page cursor survive the next worker poll.
+        let mut malformed = false;
+        let response = self
+            .dst_chain
+            .query_probabilistic_verification(
+                raw::QueryVerificationRequest {
+                    namespace: client.storage_namespace.clone(),
+                    generation: client.verification_generation,
+                    kind: 12,
+                    after: after.clone(),
+                    limit: 8,
+                    ..Default::default()
+                },
+                QueryHeight::Latest,
+            )
+            .map_err(|error| fail(error.to_string()))?;
+        let page: serde_json::Value =
+            serde_json::from_slice(&response).map_err(|error| fail(error.to_string()))?;
+        let records = page
+            .get("records")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| fail("Invalid historical receipt page".into()))?;
+        for record in records {
+            let entry = staging::decode_bytes(record, "ID").and_then(|id| {
+                if id.len() != 32 {
+                    return Err("Invalid historical receipt identifier".into());
+                }
+                record
+                    .get("Receipt")
+                    .cloned()
+                    .map(|receipt| (id, receipt))
+                    .ok_or_else(|| "Missing historical receipt".to_owned())
+            });
+            match entry {
+                Ok((id, receipt)) => {
+                    if let Some(evidence) = check(id, receipt, &mut incomplete, &mut scan.retry) {
+                        return Ok(Some(evidence));
+                    }
+                }
+                Err(error) => {
+                    malformed = true;
+                    incomplete = Some(fail(error));
+                }
+            }
+        }
+        let next = staging::decode_bytes(&page, "next").map_err(fail)?;
+        if !next.is_empty() && next <= after {
+            return Err(fail("Receipt index did not advance".into()));
+        }
+        if !malformed {
+            scan.after = next.clone();
+        }
+        if let Some(error) = incomplete {
+            return Err(error);
+        }
+        if !next.is_empty() || !scan.retry.is_empty() {
+            return Err(fail(
+                "Historical verification has pending pages or observations".into(),
+            ));
+        }
+        Ok(None)
+    }
+
+    fn check_probabilistic_receipt(
+        &self,
+        client: &ibc_relayer_types::clients::ics08_cardano_probabilistic::client_state::ClientState,
+        id: Vec<u8>,
+        receipt: serde_json::Value,
     ) -> Result<Option<MisbehaviourEvidence>, ForeignClientError> {
         use crate::chain::cardano::staging;
         use ibc_relayer_types::clients::ics08_cardano_probabilistic::{
@@ -1589,149 +1775,96 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         use prost::Message;
         let fail =
             |error: String| ForeignClientError::checkpoint_update(self.dst_chain.id(), error);
-        let pending = self
-            .verification_query(client, 10, vec![], vec![])
-            .map_err(fail)?;
-        let mut originals = Vec::new();
-        if let Some(pending) = pending.as_array() {
-            for proposal in pending {
-                let id = staging::decode_bytes(proposal, "Receipt").map_err(fail)?;
-                if id.len() == 32 {
-                    let receipt = self
-                        .verification_query(client, 9, vec![], id.clone())
-                        .map_err(fail)?;
-                    originals.push((id, receipt));
-                }
-            }
-        }
-        // Published ordinary observations are indexed too. A restart does not
-        // depend on an in-memory event or retransmission of the original bodies.
-        let mut after = vec![];
-        for _ in 0..4096 {
-            let response = self
-                .dst_chain
-                .query_probabilistic_verification(
-                    raw::QueryVerificationRequest {
-                        namespace: client.storage_namespace.clone(),
-                        generation: client.verification_generation,
-                        kind: 12,
-                        after: after.clone(),
-                        limit: 8,
-                        ..Default::default()
-                    },
-                    QueryHeight::Latest,
-                )
-                .map_err(|error| fail(error.to_string()))?;
-            let page: serde_json::Value =
-                serde_json::from_slice(&response).map_err(|error| fail(error.to_string()))?;
-            if let Some(records) = page.get("records").and_then(serde_json::Value::as_array) {
-                for record in records {
-                    let id = staging::decode_bytes(record, "ID").map_err(fail)?;
-                    if let Some(receipt) = record.get("Receipt") {
-                        originals.push((id, receipt.clone()))
-                    }
-                }
-            }
-            let next = staging::decode_bytes(&page, "next").map_err(fail)?;
-            if next.is_empty() {
-                break;
-            }
-            if next <= after {
-                return Err(fail("Receipt index did not advance".into()));
-            };
-            after = next;
-        }
-        for (id, receipt) in originals {
-            let base = staging::decode_bytes(&receipt, "BaseReference").map_err(fail)?;
-            let height = Height::new(0, staging::integer(&receipt, "AnchorHeight").map_err(fail)?)
-                .map_err(|error| fail(error.to_string()))?;
-            // Recover the original verification base and capped history from
-            // destination storage, not the latest state or observer counts.
-            let metadata = self
-                .dst_chain
-                .query_probabilistic_verification(
-                    raw::QueryVerificationRequest {
-                        namespace: client.storage_namespace.clone(),
-                        generation: client.verification_generation,
-                        checkpoint_reference: base.clone(),
-                        kind: 0,
-                        ..Default::default()
-                    },
-                    QueryHeight::Latest,
-                )
-                .map_err(|error| fail(error.to_string()))?;
-            let metadata: serde_json::Value =
-                serde_json::from_slice(&metadata).map_err(|error| fail(error.to_string()))?;
-            let trusted = Height::new(0, staging::integer(&metadata, "Height").map_err(fail)?)
-                .map_err(|error| fail(error.to_string()))?;
-            let context = self
-                .dst_chain
-                .query_cardano_challenge_context(self.id.clone(), trusted)
-                .map_err(|error| fail(error.to_string()))?;
-            let historical = raw::ClientState::decode(context.as_slice())
-                .map_err(|error| fail(error.to_string()))?;
-            let hash = hex::encode(staging::decode_bytes(&receipt, "AnchorHash").map_err(fail)?);
-            let placeholder = ProbabilisticHeader {
-                trusted_height: trusted,
-                height,
-                timestamp: ibc_relayer_types::timestamp::Timestamp::none(),
-                anchor_block: raw::ProbabilisticBlock {
-                    height: Some(height.into()),
-                    hash,
+        let base = staging::decode_bytes(&receipt, "BaseReference").map_err(fail)?;
+        let height = Height::new(0, staging::integer(&receipt, "AnchorHeight").map_err(fail)?)
+            .map_err(|error| fail(error.to_string()))?;
+        // Recover the original verification base and capped history from
+        // destination storage, not the latest state or observer counts.
+        let metadata = self
+            .dst_chain
+            .query_probabilistic_verification(
+                raw::QueryVerificationRequest {
+                    namespace: client.storage_namespace.clone(),
+                    generation: client.verification_generation,
+                    checkpoint_reference: base.clone(),
+                    receipt_id: id.clone(),
+                    kind: 0,
                     ..Default::default()
                 },
-                bridge_blocks: vec![],
-                descendant_blocks: vec![],
-                host_state_tx_hash: String::new(),
-                host_state_tx_output_index: 0,
-                new_epoch_context: None,
-                is_checkpoint: true,
-                observation_chunk: None,
-            };
-            let event = UpdateClient {
-                common: Attributes {
-                    client_id: self.id.clone(),
-                    client_type: ClientType::CardanoProbabilistic,
-                    consensus_height: height,
-                },
-                header: Some(AnyHeader::Probabilistic(placeholder)),
-            };
-            let evidence = self
-                .src_chain
-                .check_misbehaviour(
-                    event,
-                    AnyClientState::Probabilistic(client.clone()),
-                    Some(context),
-                )
-                .map_err(|error| fail(error.to_string()))?;
-            let Some(evidence) = evidence else { continue };
-            let crate::misbehaviour::AnyMisbehaviour::Probabilistic(evidence) =
-                evidence.misbehaviour
-            else {
-                return Err(fail("Unexpected probabilistic challenge type".into()));
-            };
-            let alternative: raw::ProbabilisticHeader = evidence.header2.into();
-            let plan = staging::plan(&historical, &alternative, id.clone()).map_err(fail)?;
-            let other = staging::submit(
-                &plan,
-                |session| self.verification_query(client, 8, session.to_vec(), vec![]),
-                |chunk| self.send_observation_step(chunk),
+                QueryHeight::Latest,
             )
-            .map_err(fail)?;
-            let receipt_challenge = raw::Misbehaviour {
-                client_id: self.id.to_string(),
-                verified_observation_1: id,
-                verified_observation_2: other,
+            .map_err(|error| fail(error.to_string()))?;
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&metadata).map_err(|error| fail(error.to_string()))?;
+        let trusted = Height::new(0, staging::integer(&metadata, "Height").map_err(fail)?)
+            .map_err(|error| fail(error.to_string()))?;
+        let context = self
+            .dst_chain
+            .query_cardano_challenge_context(self.id.clone(), trusted, Some(id.clone()))
+            .map_err(|error| fail(error.to_string()))?;
+        let historical = raw::ClientState::decode(context.as_slice())
+            .map_err(|error| fail(error.to_string()))?;
+        let hash = hex::encode(staging::decode_bytes(&receipt, "AnchorHash").map_err(fail)?);
+        let placeholder = ProbabilisticHeader {
+            trusted_height: trusted,
+            height,
+            timestamp: ibc_relayer_types::timestamp::Timestamp::none(),
+            anchor_block: raw::ProbabilisticBlock {
+                height: Some(height.into()),
+                hash,
                 ..Default::default()
-            };
-            let misbehaviour = ProbabilisticMisbehaviour::try_from(receipt_challenge)
-                .map_err(|error| fail(error.to_string()))?;
-            return Ok(Some(MisbehaviourEvidence {
-                misbehaviour: crate::misbehaviour::AnyMisbehaviour::Probabilistic(misbehaviour),
-                supporting_headers: vec![],
-            }));
-        }
-        Ok(None)
+            },
+            bridge_blocks: vec![],
+            descendant_blocks: vec![],
+            host_state_tx_hash: String::new(),
+            host_state_tx_output_index: 0,
+            new_epoch_context: None,
+            is_checkpoint: true,
+            observation_chunk: None,
+        };
+        let event = UpdateClient {
+            common: Attributes {
+                client_id: self.id.clone(),
+                client_type: ClientType::CardanoProbabilistic,
+                consensus_height: height,
+            },
+            header: Some(AnyHeader::Probabilistic(placeholder)),
+        };
+        let evidence = self
+            .src_chain
+            .check_misbehaviour(
+                event,
+                AnyClientState::Probabilistic(client.clone()),
+                Some(context),
+            )
+            .map_err(|error| fail(error.to_string()))?;
+        let Some(evidence) = evidence else {
+            return Ok(None);
+        };
+        let crate::misbehaviour::AnyMisbehaviour::Probabilistic(evidence) = evidence.misbehaviour
+        else {
+            return Err(fail("Unexpected probabilistic challenge type".into()));
+        };
+        let alternative: raw::ProbabilisticHeader = evidence.header2.into();
+        let plan = staging::plan(&historical, &alternative, id.clone()).map_err(fail)?;
+        let other = staging::submit(
+            &plan,
+            |session| self.verification_query(client, 8, session.to_vec(), vec![]),
+            |chunk| self.send_observation_step(chunk),
+        )
+        .map_err(fail)?;
+        let receipt_challenge = raw::Misbehaviour {
+            client_id: self.id.to_string(),
+            verified_observation_1: id,
+            verified_observation_2: other,
+            ..Default::default()
+        };
+        let misbehaviour = ProbabilisticMisbehaviour::try_from(receipt_challenge)
+            .map_err(|error| fail(error.to_string()))?;
+        Ok(Some(MisbehaviourEvidence {
+            misbehaviour: crate::misbehaviour::AnyMisbehaviour::Probabilistic(misbehaviour),
+            supporting_headers: vec![],
+        }))
     }
 
     fn complete_bootstrap(&self) -> Result<(), ForeignClientError> {
@@ -2150,7 +2283,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             use prost::Message;
             let bytes = self
                 .dst_chain
-                .query_cardano_challenge_context(self.id.clone(), trusted_height)
+                .query_cardano_challenge_context(self.id.clone(), trusted_height, None)
                 .map_err(|error| {
                     ForeignClientError::client_update(
                         self.dst_chain.id(),
@@ -2563,7 +2696,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         };
 
         if let AnyClientState::Probabilistic(state) = &client_state {
-            return self.detect_probabilistic_misbehaviour(state);
+            return self.detect_probabilistic_misbehaviour(state, update);
         }
 
         let consensus_state_heights = if let Some(event) = update {
@@ -2674,7 +2807,10 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                     start_time.elapsed()
                 );
 
-                return Ok(None);
+                return Err(ForeignClientError::misbehaviour(
+                    "historical verification did not complete".to_owned(),
+                    RelayerError::query("misbehaviour scan exceeded its time budget".to_owned()),
+                ));
             }
 
             // Clear the update
@@ -2795,6 +2931,20 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 )
             })?;
 
+        if events.is_empty() {
+            return Err(ForeignClientError::misbehaviour(
+                "evidence submission did not return a committed result".to_owned(),
+                RelayerError::query("missing evidence confirmation".to_owned()),
+            ));
+        }
+        for event in &events {
+            if matches!(event.event, IbcEvent::ChainError(_)) {
+                return Err(ForeignClientError::chain_error_event(
+                    self.dst_chain.id(),
+                    event.event.clone(),
+                ));
+            }
+        }
         Ok(events.into_iter().map(|ev| ev.event).collect())
     }
 
@@ -2830,9 +2980,8 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             }
         };
 
-        // Filter the errors if the detection was run for all consensus states.
-        // Even if some states may have failed to verify, e.g. if they were expired, just
-        // warn the user and continue.
+        // Incomplete verification is retryable for both startup and update
+        // checks. Only unsupported checking and expired/frozen clients stop it.
         match result {
             Ok(events) => {
                 if !events.is_empty() {
@@ -2859,19 +3008,9 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                     MisbehaviourResults::CannotExecute
                 }
 
-                // FIXME: This is fishy
-                e if update_event.is_some() => {
-                    error!("encountered unexpected error while checking misbehaviour: {e}");
-                    debug!("update event: {}", update_event.unwrap());
-
-                    MisbehaviourResults::CannotExecute
-                }
-
-                // FIXME: This is fishy
                 _ => {
-                    warn!("misbehaviour checking result: {e}");
-
-                    MisbehaviourResults::ValidClient
+                    warn!(%e, "misbehaviour verification incomplete, retry required");
+                    MisbehaviourResults::VerificationError
                 }
             },
         }
@@ -2886,6 +3025,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             id: self.id,
             dst_chain: map_dst(self.dst_chain),
             src_chain: map_src(self.src_chain),
+            probabilistic_scan: self.probabilistic_scan,
         }
     }
 }
@@ -2954,7 +3094,7 @@ pub fn fetch_ccv_consumer_id(
 #[cfg(test)]
 mod tests {
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use ibc_proto::google::protobuf::Any;
     use ibc_relayer_types::clients::ics08_cardano_probabilistic::{
@@ -3269,6 +3409,21 @@ mod tests {
     }
     #[test]
     fn snapshot_restart_discovers_future_proposal_at_its_saved_checkpoint() {
+        run_snapshot_startup_check(None, false);
+    }
+
+    #[test]
+    fn startup_retries_failed_history_without_events_or_restart() {
+        run_snapshot_startup_check(Some(true), false);
+        run_snapshot_startup_check(Some(false), false);
+    }
+
+    #[test]
+    fn startup_resumes_bounded_history_while_rechecking_pending_proposals() {
+        run_snapshot_startup_check(None, true);
+    }
+
+    fn run_snapshot_startup_check(fail_history_page: Option<bool>, paged_history: bool) {
         use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
         use ibc_relayer_types::core::ics02_client::header::AnyHeader;
         use prost::Message;
@@ -3338,7 +3493,7 @@ mod tests {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let source = BaseChainHandle::new(ChainId::from_string("cardano-0"), sender);
         let source_runtime = thread::spawn(move || {
-            let mut found = 0;
+            let mut found = Vec::new();
             for (_, request) in receiver {
                 match request {
                     ChainRequest::BuildMisbehaviour {
@@ -3351,7 +3506,7 @@ mod tests {
                             panic!("missing receipt observation")
                         };
                         assert_eq!(header.trusted_height, height(966));
-                        assert_eq!(header.height, height(1001));
+                        assert!(header.height == height(1001) || header.height == height(990));
                         let context =
                             raw::ClientState::decode(challenge_context.unwrap().as_slice())
                                 .unwrap();
@@ -3370,7 +3525,7 @@ mod tests {
                                 .numerator,
                             vec![1]
                         );
-                        found += 1;
+                        found.push(header.height.revision_height());
                         reply_to.send(Ok(None)).unwrap();
                     }
                     request => panic!("unexpected source request: {request:?}"),
@@ -3382,6 +3537,8 @@ mod tests {
         let destination = BaseChainHandle::new(ChainId::from_string("cosmos-0"), sender);
         let destination_runtime = thread::spawn(move || {
             let mut requested = vec![];
+            let mut page_cursors = vec![];
+            let mut failed = false;
             for (_, request) in receiver {
                 match request {
                     ChainRequest::QueryClientState { reply_to, .. } => {
@@ -3390,45 +3547,115 @@ mod tests {
                     ChainRequest::QueryProbabilisticVerification {
                         request, reply_to, ..
                     } => {
+                        requested.push(request.kind);
+                        let fail = match fail_history_page {
+                            Some(true) => request.kind == 12,
+                            Some(false) => request.kind == 0 && request.receipt_id == vec![9; 32],
+                            None => false,
+                        };
+                        if fail && !failed {
+                            failed = true;
+                            reply_to
+                                .send(Err(RelayerError::query(
+                                    "temporary historical query failure".into(),
+                                )))
+                                .unwrap();
+                            continue;
+                        }
                         let response = match request.kind {
                             10 => json!([{"Receipt":vec![7;32],"Table":{"Epoch":8}}]),
                             9 => {
                                 json!({"BaseReference":vec![2;32],"AnchorHeight":1001,"AnchorHash":vec![8;32]})
                             }
+                            12 if paged_history => {
+                                page_cursors.push(request.after.clone());
+                                if request.after.is_empty() {
+                                    json!({"records":[{"ID":vec![9;32],"Receipt":{"BaseReference":vec![2;32],"AnchorHeight":990,"AnchorHash":vec![9;32]}}],"next":vec![9;32]})
+                                } else {
+                                    assert_eq!(request.after, vec![9; 32]);
+                                    json!({"records":[],"next":[]})
+                                }
+                            }
+                            12 if fail_history_page.is_some() => {
+                                json!({"records":[{"ID":vec![9;32],"Receipt":{"BaseReference":vec![2;32],"AnchorHeight":990,"AnchorHash":vec![9;32]}}],"next":[]})
+                            }
                             12 => json!({"records":[],"next":[]}),
                             0 => {
                                 assert_eq!(request.checkpoint_reference, vec![2; 32]);
+                                assert!(
+                                    request.receipt_id == vec![7; 32]
+                                        || request.receipt_id == vec![9; 32]
+                                );
                                 json!({"Height":966})
                             }
                             other => panic!("unexpected verification query {other}"),
                         };
-                        requested.push(request.kind);
                         reply_to
                             .send(Ok(serde_json::to_vec(&response).unwrap()))
                             .unwrap();
                     }
                     ChainRequest::QueryCardanoChallengeContext {
                         trusted_height,
+                        receipt_id,
                         reply_to,
                         ..
                     } => {
                         assert_eq!(trusted_height, height(966));
+                        assert!(receipt_id == Some(vec![7; 32]) || receipt_id == Some(vec![9; 32]));
                         reply_to.send(Ok(historical.encode_to_vec())).unwrap();
                     }
                     request => panic!("unexpected destination request: {request:?}"),
                 }
             }
-            requested
+            (requested, page_cursors)
         });
         let client = ForeignClient::restore(
             "08-cardano-probabilistic-0".parse().unwrap(),
             destination,
             source,
         );
-        assert!(client.detect_misbehaviour(None).unwrap().is_none());
+        let mut monitor = crate::worker::client::MisbehaviourMonitor::new(true);
+        let now = Instant::now();
+        assert!(monitor.incomplete());
+        assert!(matches!(
+            monitor.tick(now, [], |update| client
+                .detect_misbehaviour_and_submit_evidence(update)),
+            crate::util::task::Next::Continue
+        ));
+        if fail_history_page.is_some() || paged_history {
+            assert!(
+                monitor.incomplete(),
+                "a failed scan must expose incomplete coverage"
+            );
+            monitor.tick(now + Duration::from_secs(1), [], |_| {
+                panic!("must respect retry backoff")
+            });
+            assert!(matches!(
+                monitor.tick(now + Duration::from_secs(6), [], |update| client
+                    .detect_misbehaviour_and_submit_evidence(update)),
+                crate::util::task::Next::Continue
+            ));
+        }
+        assert!(
+            !monitor.incomplete(),
+            "coverage recovers without new update events"
+        );
         drop(client);
-        assert_eq!(source_runtime.join().unwrap(), 1);
-        assert_eq!(destination_runtime.join().unwrap(), vec![10, 9, 12, 0]);
+        let checked = source_runtime.join().unwrap();
+        let (requested, page_cursors) = destination_runtime.join().unwrap();
+        if paged_history {
+            assert_eq!(checked, vec![1001, 990, 1001]);
+            assert_eq!(page_cursors, vec![vec![], vec![9; 32]]);
+        } else if fail_history_page.is_some() {
+            assert_eq!(
+                checked,
+                vec![1001, 1001, 990],
+                "pending proposal is checked even while historical queries fail"
+            );
+        } else {
+            assert_eq!(checked, vec![1001]);
+            assert_eq!(requested, vec![10, 9, 0, 12]);
+        }
     }
 }
 

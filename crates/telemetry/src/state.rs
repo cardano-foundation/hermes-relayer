@@ -109,6 +109,9 @@ pub struct TelemetryState {
     /// Number of misbehaviours detected and submitted per client
     client_misbehaviours_submitted: Counter<u64>,
 
+    /// One while a client watcher has unfinished verification work.
+    client_misbehaviour_check_incomplete: ObservableGauge<u64>,
+
     /// Number of confirmed receive packets per channel
     receive_packets_confirmed: Counter<u64>,
 
@@ -319,6 +322,11 @@ impl TelemetryState {
             client_updates_skipped: meter
                 .u64_counter("client_updates_skipped")
                 .with_description("Number of client update messages skipped")
+                .init(),
+
+            client_misbehaviour_check_incomplete: meter
+                .u64_observable_gauge("client_misbehaviour_check_incomplete")
+                .with_description("One while client misbehaviour verification is incomplete")
                 .init(),
 
             client_misbehaviours_submitted: meter
@@ -669,6 +677,24 @@ impl TelemetryState {
         ];
 
         self.client_misbehaviours_submitted.add(count, labels);
+    }
+
+    /// Reports degraded coverage until every queued check succeeds.
+    pub fn client_misbehaviour_check_incomplete(
+        &self,
+        src_chain: &ChainId,
+        dst_chain: &ChainId,
+        client: &ClientId,
+        incomplete: bool,
+    ) {
+        self.client_misbehaviour_check_incomplete.observe(
+            u64::from(incomplete),
+            &[
+                KeyValue::new("src_chain", src_chain.to_string()),
+                KeyValue::new("dst_chain", dst_chain.to_string()),
+                KeyValue::new("client", client.to_string()),
+            ],
+        );
     }
 
     /// Number of receive packets relayed, per channel
@@ -1441,6 +1467,23 @@ mod tests {
             assert_metric_value(backlog_oldest_sequence.get_metric(), 0),
             "expected backlog_oldest_sequence to be 0"
         );
+    }
+
+    #[test]
+    fn watcher_coverage_gauge_recovers_after_verification() {
+        let state = TelemetryState::new(0..1000, 10, 0..1000, 10, "hermes");
+        let src = ChainId::from_string("cardano-0");
+        let dst = ChainId::from_string("cosmos-0");
+        let client: ClientId = "08-cardano-probabilistic-0".parse().unwrap();
+        for (incomplete, expected) in [(true, 1), (false, 0)] {
+            state.client_misbehaviour_check_incomplete(&src, &dst, &client, incomplete);
+            let metrics = state.gather();
+            let metric = metrics
+                .iter()
+                .find(|m| m.get_name() == "hermes_client_misbehaviour_check_incomplete")
+                .unwrap();
+            assert!(assert_metric_value(metric.get_metric(), expected));
+        }
     }
 
     fn assert_metric_value(metric: &[Metric], expected: u64) -> bool {

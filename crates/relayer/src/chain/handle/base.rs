@@ -233,10 +233,12 @@ impl ChainHandle for BaseChainHandle {
         &self,
         client_id: ClientId,
         trusted_height: Height,
+        receipt_id: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, Error> {
         self.send(|reply_to| ChainRequest::QueryCardanoChallengeContext {
             client_id,
             trusted_height,
+            receipt_id,
             reply_to,
         })
     }
