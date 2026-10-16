@@ -2,6 +2,7 @@
 use ibc_proto::cosmos::tx::v1beta1::{TxBody, TxRaw};
 use ibc_proto::google::protobuf::Any;
 use ibc_proto::ibc::core::client::v1::MsgUpdateClient;
+use ibc_relayer_types::clients::ics07_tendermint::header::TENDERMINT_HEADER_TYPE_URL;
 use ibc_relayer_types::clients::ics08_cardano_probabilistic::{
     header::PROBABILISTIC_HEADER_TYPE_URL, raw,
 };
@@ -55,6 +56,13 @@ fn same_message(emitted: &Any, submitted: &Any) -> Result<bool, String> {
         .map_err(|e| e.to_string())?
             == raw::MithrilStakeCertificates::decode(submitted.value.as_slice())
                 .map_err(|e| e.to_string())?),
+        TENDERMINT_HEADER_TYPE_URL => {
+            type Header = ibc_proto::ibc::lightclients::tendermint::v1::Header;
+            Ok(
+                Header::decode(emitted.value.as_slice()).map_err(|e| e.to_string())?
+                    == Header::decode(submitted.value.as_slice()).map_err(|e| e.to_string())?,
+            )
+        }
         _ => Ok(emitted == submitted),
     }
 }
@@ -124,15 +132,25 @@ fn activation_result<'a>(
 }
 
 pub fn hydrate_client_updates(tx: &[u8], events: &[Event]) -> Result<Vec<Event>, String> {
-    let is_probabilistic = |event: &Event| {
+    let supported_update = |event: &Event| {
         event.kind == "update_client"
             && event.attributes.iter().any(|a| {
                 a.key_bytes() == b"client_id"
-                    && a.value_str()
-                        .is_ok_and(|id| id.starts_with("08-cardano-probabilistic-"))
+                    && a.value_str().is_ok_and(|id| {
+                        id.starts_with("08-cardano-probabilistic-")
+                            || id.starts_with("07-tendermint-")
+                    })
             })
     };
-    if !events.iter().any(is_probabilistic) {
+    // Existing Tendermint headers also come from hosts with a non-SDK tx
+    // format. Only decode their transaction when a header needs recovery.
+    let needs_hydration = |event: &Event| {
+        supported_update(event)
+            && (required(event, "client_id")
+                .is_ok_and(|id| id.starts_with("08-cardano-probabilistic-"))
+                || attribute(event, "header").is_ok_and(|header| header.is_none_or(str::is_empty)))
+    };
+    if !events.iter().any(needs_hydration) {
         return Ok(events.to_vec());
     }
     let raw = TxRaw::decode(tx).map_err(|e| format!("decode update transaction: {e}"))?;
@@ -156,7 +174,7 @@ pub fn hydrate_client_updates(tx: &[u8], events: &[Event]) -> Result<Vec<Event>,
         if event.kind == "update_client" {
             boundary = event_index + 1;
         }
-        if !is_probabilistic(event) {
+        if !supported_update(event) {
             result.push(event.clone());
             continue;
         }
@@ -183,6 +201,22 @@ pub fn hydrate_client_updates(tx: &[u8], events: &[Event]) -> Result<Vec<Event>,
             }
         }
         let mut hydrated = event.clone();
+        if client.starts_with("07-tendermint-") {
+            // IBC v10 omits headers from update events. Recover the exact
+            // committed header for both startup queries and live monitoring.
+            // Misbehaviour messages can also use MsgUpdateClient and are not
+            // headers, so retain their events without inventing one.
+            if message.type_url == TENDERMINT_HEADER_TYPE_URL {
+                let header = AnyHeader::try_from(message.clone()).map_err(|e| e.to_string())?;
+                check_height(event, &header.height().to_string())?;
+                hydrated.attributes.retain(|a| a.key_bytes() != b"header");
+                hydrated
+                    .attributes
+                    .push(("header", hex::encode(message.encode_to_vec())).into());
+            }
+            result.push(hydrated);
+            continue;
+        }
         match message.type_url.as_str() {
             PROBABILISTIC_HEADER_TYPE_URL => {
                 let header = raw::ProbabilisticHeader::decode(message.value.as_slice())
@@ -260,6 +294,144 @@ pub fn hydrate_client_updates(tx: &[u8], events: &[Event]) -> Result<Vec<Event>,
         result.push(hydrated);
     }
     Ok(result)
+}
+
+#[cfg(test)]
+pub(crate) mod tendermint_tests {
+    use super::*;
+    use ibc_relayer_types::clients::ics07_tendermint::header::Header as TmHeader;
+    use ibc_relayer_types::events::IbcEvent;
+    use ibc_relayer_types::Height;
+    use tendermint_testgen::{Generator, LightBlock};
+
+    pub(crate) fn fixture() -> (Vec<u8>, Vec<Event>, Vec<Any>) {
+        let mut messages = vec![];
+        let mut events = vec![];
+        let mut headers = vec![];
+        for n in [11, 12] {
+            let block = LightBlock::new_default(n).generate().unwrap();
+            let header: Any = TmHeader {
+                signed_header: block.signed_header,
+                validator_set: block.validators.clone(),
+                trusted_height: Height::new(0, 10).unwrap(),
+                trusted_validator_set: block.validators,
+            }
+            .into();
+            let update = MsgUpdateClient {
+                client_id: "07-tendermint-0".into(),
+                client_message: Some(header.clone()),
+                signer: "cosmos1relayer".into(),
+            };
+            events.push(Event::new(
+                "update_client",
+                [
+                    ("client_id", update.client_id.clone()),
+                    ("client_type", "07-tendermint".into()),
+                    ("consensus_height", format!("0-{n}")),
+                    ("consensus_heights", format!("0-{n}")),
+                    ("msg_index", messages.len().to_string()),
+                ],
+            ));
+            messages.push(Any {
+                type_url: "/ibc.core.client.v1.MsgUpdateClient".into(),
+                value: update.encode_to_vec(),
+            });
+            // Message indices refer to the whole transaction, not just updates.
+            messages.push(Any {
+                type_url: "/test/other-message".into(),
+                value: vec![],
+            });
+            headers.push(header);
+        }
+        let body = TxBody {
+            messages,
+            ..Default::default()
+        };
+        let tx = TxRaw {
+            body_bytes: body.encode_to_vec(),
+            ..Default::default()
+        };
+        (tx.encode_to_vec(), events, headers)
+    }
+
+    #[test]
+    fn v10_tendermint_headers_are_recovered_from_committed_messages() {
+        let (tx, events, headers) = fixture();
+        let hydrated = hydrate_client_updates(&tx, &events).unwrap();
+        for (event, header) in hydrated.iter().zip(headers) {
+            let IbcEvent::UpdateClient(update) =
+                crate::event::ibc_event_try_from_abci_event(event).unwrap()
+            else {
+                panic!("missing client update")
+            };
+            assert_eq!(update.header, Some(AnyHeader::try_from(header).unwrap()));
+            assert_eq!(
+                update.header.unwrap().height(),
+                update.common.consensus_height
+            );
+        }
+    }
+
+    #[test]
+    fn v8_tendermint_headers_remain_bound_without_message_indices() {
+        let (tx, mut events, headers) = fixture();
+        for (event, header) in events.iter_mut().zip(&headers) {
+            event.attributes.retain(|a| a.key_bytes() != b"msg_index");
+            event
+                .attributes
+                .push(("header", hex::encode(header.encode_to_vec())).into());
+        }
+        assert_eq!(hydrate_client_updates(&[0xff], &events).unwrap(), events);
+        let hydrated = hydrate_client_updates(&tx, &events).unwrap();
+        for (event, header) in hydrated.iter().zip(headers) {
+            assert_eq!(
+                crate::event::extract_header_from_tx(event).unwrap(),
+                AnyHeader::try_from(header).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn tendermint_recovery_rejects_mismatched_client_height_index_or_header() {
+        for (key, value) in [
+            ("client_id", "07-tendermint-9"),
+            ("consensus_height", "0-99"),
+            ("consensus_heights", "0-99"),
+            ("msg_index", "1"),
+        ] {
+            let (tx, mut events, _) = fixture();
+            events[0]
+                .attributes
+                .retain(|a| a.key_bytes() != key.as_bytes());
+            events[0].attributes.push((key, value).into());
+            assert!(
+                hydrate_client_updates(&tx, &events).is_err(),
+                "accepted altered {key}"
+            );
+        }
+        let (tx, mut events, headers) = fixture();
+        events[0]
+            .attributes
+            .push(("header", hex::encode(headers[1].encode_to_vec())).into());
+        assert!(hydrate_client_updates(&tx, &events).is_err());
+    }
+
+    #[test]
+    fn tendermint_misbehaviour_messages_do_not_become_headers() {
+        let (tx, events, _) = fixture();
+        let mut raw = TxRaw::decode(tx.as_slice()).unwrap();
+        let mut body = TxBody::decode(raw.body_bytes.as_slice()).unwrap();
+        let mut update = MsgUpdateClient::decode(body.messages[0].value.as_slice()).unwrap();
+        update.client_message = Some(Any {
+            type_url: "/ibc.lightclients.tendermint.v1.Misbehaviour".into(),
+            value: vec![],
+        });
+        body.messages[0].value = update.encode_to_vec();
+        raw.body_bytes = body.encode_to_vec();
+        let hydrated = hydrate_client_updates(&raw.encode_to_vec(), &events).unwrap();
+        assert_eq!(hydrated[0], events[0]);
+        assert!(crate::event::extract_header_from_tx(&hydrated[0]).is_err());
+    }
 }
 
 #[cfg(test)]

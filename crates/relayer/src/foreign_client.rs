@@ -3023,7 +3023,7 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         match result {
             Ok(events) => {
                 if !events.is_empty() {
-                    info!("evidence submission result: {}", PrettySlice(&events));
+                    info!("Evidence successfully submitted: {}", PrettySlice(&events));
 
                     MisbehaviourResults::EvidenceSubmitted(events)
                 } else {
