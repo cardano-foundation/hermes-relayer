@@ -258,7 +258,9 @@ pub trait ChainEndpoint: Sized {
         &self,
         client_id: ClientId,
         trusted_height: ICSHeight,
+        receipt_id: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, Error> {
+        let _ = receipt_id;
         Err(Error::query(format!(
             "Cardano challenge context is unsupported for client {client_id} at {trusted_height}"
         )))

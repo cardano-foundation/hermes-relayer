@@ -203,9 +203,10 @@ impl<Handle: ChainHandle> ChainHandle for CachingChainHandle<Handle> {
         &self,
         client_id: ClientId,
         trusted_height: Height,
+        receipt_id: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, Error> {
         self.inner()
-            .query_cardano_challenge_context(client_id, trusted_height)
+            .query_cardano_challenge_context(client_id, trusted_height, receipt_id)
     }
 
     // TODO: Introduce new query_client_state_latest to separate from this one.

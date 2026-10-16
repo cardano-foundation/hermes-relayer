@@ -258,8 +258,8 @@ where
                             self.query_client_connections(request, reply_to)?
                         },
 
-                        ChainRequest::QueryCardanoChallengeContext { client_id, trusted_height, reply_to } => {
-                            let result = self.chain.query_cardano_challenge_context(client_id, trusted_height);
+                        ChainRequest::QueryCardanoChallengeContext { client_id, trusted_height, receipt_id, reply_to } => {
+                            let result = self.chain.query_cardano_challenge_context(client_id, trusted_height, receipt_id);
                             reply_to.send(result).map_err(Error::send)?;
                         },
 

@@ -421,3 +421,47 @@ pub fn all_ibc_events_from_tx_search_response(
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::tx::{operation_fixtures::Record, tendermint_tests::fixture};
+    use ibc_relayer_types::core::ics02_client::header::AnyHeader;
+    use ibc_relayer_types::events::WithBlockDataType;
+
+    #[test]
+    fn startup_query_recovers_the_requested_v10_tendermint_header() {
+        let (tx, events, headers) = fixture();
+        let response = Record {
+            name: "v10 Tendermint update".into(),
+            tx: hex::encode(tx),
+            events,
+            height: 60,
+            consensus_heights: None,
+        }
+        .response();
+        let request = QueryClientEventRequest {
+            client_id: "07-tendermint-0".parse().unwrap(),
+            event_id: WithBlockDataType::UpdateClient,
+            consensus_height: Height::new(0, 12).unwrap(),
+            query_height: QueryHeight::Latest,
+            probabilistic_epoch: None,
+        };
+        let found = update_client_from_tx_search_response(
+            &ChainId::from_string("host-1"),
+            &request,
+            response,
+        )
+        .unwrap()
+        .unwrap();
+        let IbcEvent::UpdateClient(update) = found.event else {
+            panic!("missing update")
+        };
+        assert_eq!(
+            update.header,
+            Some(AnyHeader::try_from(headers[1].clone()).unwrap())
+        );
+        assert_eq!(update.consensus_height(), request.consensus_height);
+        assert_eq!(found.height, Height::new(1, 60).unwrap());
+    }
+}

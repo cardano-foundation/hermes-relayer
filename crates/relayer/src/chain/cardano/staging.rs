@@ -106,6 +106,31 @@ fn records<T: DeserializeOwned>(
     Err("Destination snapshot exceeded the retained identity capacity".into())
 }
 
+/// A retained receipt authorizes its exact base even after the ordinary height
+/// index expires. Carry that authorization on metadata and every paginated read.
+pub(crate) fn hydrate_receipt(
+    client: raw::ClientState,
+    receipt_id: Vec<u8>,
+    mut query: impl FnMut(raw::QueryVerificationRequest) -> Result<Vec<u8>, String>,
+) -> Result<raw::ClientState, String> {
+    let raw = query(raw::QueryVerificationRequest {
+        namespace: client.storage_namespace.clone(),
+        generation: client.verification_generation,
+        kind: 9,
+        receipt_id: receipt_id.clone(),
+        ..Default::default()
+    })?;
+    let receipt: Value = serde_json::from_slice(&raw).map_err(|error| error.to_string())?;
+    let base = decode_bytes(&receipt, "BaseReference")?;
+    if base.len() != 32 {
+        return Err("Receipt has an invalid historical base".to_owned());
+    }
+    hydrate(client, base, |mut request| {
+        request.receipt_id = receipt_id.clone();
+        query(request)
+    })
+}
+
 pub(crate) fn hydrate(
     mut client: raw::ClientState,
     reference: Vec<u8>,
@@ -457,6 +482,48 @@ mod tests {
     use bech32::ToBase32;
     use serde_json::json;
     use std::cell::RefCell;
+
+    #[test]
+    fn retained_receipt_hydrates_every_page_without_a_height_index() {
+        let client = raw::ClientState {
+            storage_version: 2,
+            verification_generation: 3,
+            storage_namespace: vec![1; 32],
+            current_epoch: 8,
+            current_epoch_start_slot: 100,
+            current_epoch_end_slot_exclusive: 200,
+            checkpoint_reference: vec![4; 32],
+            ..Default::default()
+        };
+        let mut requested = Vec::new();
+        let hydrated=hydrate_receipt(client,vec![7;32],|request| {
+            assert_eq!(request.namespace,vec![1;32]);
+            assert_eq!(request.generation,3);
+            assert_eq!(request.receipt_id,vec![7;32]);
+            requested.push(request.kind);
+            let value=match request.kind {
+                9=>json!({"BaseReference":vec![2;32]}),
+                0=>{
+                    assert_eq!(request.checkpoint_reference,vec![2;32]);
+                    json!({"Height":966,"Slot":50,"Epoch":7,"Timestamp":1000,"BlockHash":"01".repeat(32),"Nonce":{
+                        "epoch_nonce":vec![3;32],"evolving_nonce":vec![3;32],"candidate_nonce":vec![3;32],"last_applied_block_nonce":vec![3;32],"last_epoch_block_nonce":vec![3;32]
+                    }})
+                }
+                1..=7=>{
+                    assert_eq!(request.checkpoint_reference,vec![2;32]);
+                    json!({"records":[],"next":[]})
+                }
+                other=>panic!("unexpected query {other}"),
+            };
+            Ok(serde_json::to_vec(&value).unwrap())
+        }).unwrap();
+        assert_eq!(hydrated.checkpoint_reference, vec![2; 32]);
+        assert_eq!(
+            hydrated.latest_checkpoint_height.unwrap().revision_height,
+            966
+        );
+        assert_eq!(requested, vec![9, 0, 1, 2, 3, 4, 6, 7]);
+    }
 
     #[test]
     fn segment_commitments_match_go() {

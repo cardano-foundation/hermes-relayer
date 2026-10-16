@@ -1268,6 +1268,7 @@ impl ChainEndpoint for CosmosSdkChain {
         &self,
         client_id: ClientId,
         trusted_height: Height,
+        receipt_id: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, Error> {
         // Pin all reads to one host height so an intervening update cannot mix
         // the latest client state with challenge metadata from a later block.
@@ -1286,31 +1287,41 @@ impl ChainEndpoint for CosmosSdkChain {
         };
 
         use prost::Message;
-        let mut path = format!("clients/{client_id}/verifiedCheckpoints/").into_bytes();
-        path.extend_from_slice(&client.verification_generation.to_be_bytes());
-        path.extend_from_slice(&trusted_height.revision_height().to_be_bytes());
-        let response = self
-            .block_on(self.rpc_client.abci_query(
-                Some("/store/ibc/key".to_owned()),
-                path,
-                Some(host_height.into()),
-                false,
-            ))
-            .map_err(|error| Error::rpc(self.config.rpc_addr.clone(), error))?;
-        if !response.code.is_ok() {
-            return Err(Error::abci_query(response));
-        }
-        if response.value.len() != 32 {
+        let query = |request| {
+            self.query_probabilistic_verification(request, QueryHeight::Specific(host_height))
+                .map_err(|error| error.to_string())
+        };
+        let hydrated = if let Some(id) = receipt_id {
+            crate::chain::cardano::staging::hydrate_receipt(client.into(), id, query)
+                .map_err(Error::query)?
+        } else {
+            let mut path = format!("clients/{client_id}/verifiedCheckpoints/").into_bytes();
+            path.extend_from_slice(&client.verification_generation.to_be_bytes());
+            path.extend_from_slice(&trusted_height.revision_height().to_be_bytes());
+            let response = self
+                .block_on(self.rpc_client.abci_query(
+                    Some("/store/ibc/key".to_owned()),
+                    path,
+                    Some(host_height.into()),
+                    false,
+                ))
+                .map_err(|error| Error::rpc(self.config.rpc_addr.clone(), error))?;
+            if !response.code.is_ok() {
+                return Err(Error::abci_query(response));
+            }
+            if response.value.len() != 32 {
+                return Err(Error::query(
+                    "Historical snapshot checkpoint reference is unavailable".to_owned(),
+                ));
+            }
+            crate::chain::cardano::staging::hydrate(client.into(), response.value, query)
+                .map_err(Error::query)?
+        };
+        if hydrated.latest_checkpoint_height != Some(trusted_height.into()) {
             return Err(Error::query(
-                "Historical snapshot checkpoint reference is unavailable".to_owned(),
+                "Receipt base does not match the requested trusted height".to_owned(),
             ));
         }
-        let hydrated =
-            crate::chain::cardano::staging::hydrate(client.into(), response.value, |request| {
-                self.query_probabilistic_verification(request, QueryHeight::Specific(host_height))
-                    .map_err(|error| error.to_string())
-            })
-            .map_err(Error::query)?;
         Ok(hydrated.encode_to_vec())
     }
 
