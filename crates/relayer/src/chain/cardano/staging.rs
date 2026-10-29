@@ -246,6 +246,47 @@ pub(crate) struct ObservationPlan {
     row_suffixes: Vec<Vec<u8>>,
     block_suffixes: Vec<Vec<u8>>,
 }
+
+/// Only errors known to occur before broadcast may reduce a chunk. A failed
+/// delivery or an ambiguous RPC response must leave recovery to the session cursor.
+#[derive(Debug)]
+pub(crate) enum StepError {
+    PackingLimit(String),
+    Other(String),
+}
+
+impl std::fmt::Display for StepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PackingLimit(message) | Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<crate::error::Error> for StepError {
+    fn from(error: crate::error::Error) -> Self {
+        use crate::error::ErrorDetail;
+        let packing_limit = match error.detail() {
+            ErrorDetail::TxSimulateGasEstimateExceeded(_) | ErrorDetail::MessageTooBigForTx(_) => {
+                true
+            }
+            ErrorDetail::GrpcStatus(detail) if detail.query == "send_tx_simulate" => {
+                let message = detail.status.message();
+                message.contains("a pending body must finish before subsequent blocks are appended")
+                    || message.contains(
+                        "bounded verification operation exceeded its metered gas envelope",
+                    )
+                    || message.contains("out of gas in location:")
+            }
+            _ => false,
+        };
+        if packing_limit {
+            Self::PackingLimit(error.to_string())
+        } else {
+            Self::Other(error.to_string())
+        }
+    }
+}
 fn extend_u64(raw: &mut Vec<u8>, value: u64) {
     raw.extend_from_slice(&value.to_be_bytes())
 }
@@ -421,9 +462,10 @@ pub(crate) fn plan(
 pub(crate) fn submit(
     plan: &ObservationPlan,
     mut query: impl FnMut(&[u8]) -> Result<Value, String>,
-    mut send: impl FnMut(raw::ObservationChunk) -> Result<(), String>,
+    mut send: impl FnMut(raw::ObservationChunk) -> Result<(), StepError>,
 ) -> Result<Vec<u8>, String> {
-    send(plan.begin.clone())?;
+    send(plan.begin.clone()).map_err(|error| error.to_string())?;
+    let mut block_limit = 4;
     for _ in 0..4096 {
         let session = query(&plan.id)?;
         if session.get("Complete").and_then(Value::as_bool) == Some(true) {
@@ -451,20 +493,25 @@ pub(crate) fn submit(
         } else {
             let count = number(&session, "ProcessedBlocks")? as usize;
             if count < plan.blocks.len() {
-                let size = if plan.blocks[count].block_cbor.is_empty() {
-                    4
-                } else {
-                    1
-                };
                 chunk.operation = 4;
-                chunk.blocks =
-                    plan.blocks[count..std::cmp::min(count + size, plan.blocks.len())].to_vec();
+                chunk.blocks = plan.blocks
+                    [count..std::cmp::min(count + block_limit, plan.blocks.len())]
+                    .to_vec();
                 chunk.evidence_digest = plan.block_suffixes[count + chunk.blocks.len()].clone();
             } else {
                 chunk.operation = 6
             }
         }
-        send(chunk)?;
+        let block_count = chunk.blocks.len();
+        match send(chunk) {
+            Ok(()) => block_limit = 4,
+            Err(StepError::PackingLimit(_)) if block_count > 1 => {
+                block_limit = block_count - 1;
+                // Re-query committed progress even after a preflight rejection.
+                // Another uploader may have advanced this session meanwhile.
+            }
+            Err(error) => return Err(error.to_string()),
+        }
     }
     Err("Observation exceeded its bounded step count".into())
 }
@@ -482,6 +529,225 @@ mod tests {
     use bech32::ToBase32;
     use serde_json::json;
     use std::cell::RefCell;
+
+    fn packing_plan(count: usize) -> ObservationPlan {
+        ObservationPlan {
+            id: vec![8; 32],
+            begin: raw::ObservationChunk {
+                operation: 1,
+                ..Default::default()
+            },
+            rows: vec![],
+            blocks: (0..count)
+                .map(|i| raw::ProbabilisticBlock {
+                    block_cbor: vec![i as u8 + 1],
+                    ..Default::default()
+                })
+                .collect(),
+            row_suffixes: vec![],
+            block_suffixes: (0..=count).map(|i| vec![i as u8; 32]).collect(),
+        }
+    }
+
+    fn ready_session() -> Value {
+        json!({"Sequence":0,"RowsRead":0,"CreditReady":true,"PendingBlock":null,"ProcessedBlocks":0,"Complete":false})
+    }
+
+    fn commit_blocks(plan: &ObservationPlan, session: &mut Value, chunk: &raw::ObservationChunk) {
+        assert_eq!(
+            chunk.sequence,
+            session["Sequence"].as_u64().unwrap() as u32 + 1
+        );
+        assert_eq!(chunk.session_id, plan.id);
+        if chunk.operation == 4 {
+            let start = session["ProcessedBlocks"].as_u64().unwrap() as usize;
+            let end = start + chunk.blocks.len();
+            assert!((1..=4).contains(&chunk.blocks.len()));
+            assert_eq!(chunk.blocks, plan.blocks[start..end]);
+            assert_eq!(chunk.evidence_digest, plan.block_suffixes[end]);
+            session["ProcessedBlocks"] = json!(end);
+        } else {
+            assert_eq!(chunk.operation, 6);
+            assert_eq!(session["ProcessedBlocks"], json!(plan.blocks.len()));
+            session["Complete"] = json!(true);
+            session["Receipt"] = json!(vec![7; 32]);
+        }
+        session["Sequence"] = json!(chunk.sequence);
+    }
+
+    #[test]
+    fn adaptive_packing_uses_one_to_four_bodies_and_the_exact_committed_suffix() {
+        for limit in 1..=4 {
+            let plan = packing_plan(9);
+            let session = RefCell::new(ready_session());
+            let accepted = RefCell::new(vec![]);
+            let attempts = RefCell::new(vec![]);
+            let receipt = submit(
+                &plan,
+                |_| Ok(session.borrow().clone()),
+                |chunk| {
+                    if chunk.operation == 1 {
+                        return Ok(());
+                    }
+                    if chunk.operation == 4 {
+                        attempts.borrow_mut().push(chunk.blocks.len());
+                        if chunk.blocks.len() > limit {
+                            return Err(StepError::PackingLimit("preflight limit".into()));
+                        }
+                        accepted.borrow_mut().push(chunk.blocks.len());
+                    }
+                    commit_blocks(&plan, &mut session.borrow_mut(), &chunk);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(receipt, vec![7; 32]);
+            assert_eq!(attempts.borrow()[0], 4);
+            let expected: Vec<_> = (0..9)
+                .collect::<Vec<_>>()
+                .chunks(limit)
+                .map(|c| c.len())
+                .collect();
+            assert_eq!(*accepted.borrow(), expected);
+        }
+    }
+
+    #[test]
+    fn only_prebroadcast_packing_errors_can_shrink_an_observation() {
+        use crate::error::Error;
+        let gas =
+            Error::tx_simulate_gas_estimate_exceeded("injective-777".parse().unwrap(), 101, 100);
+        assert!(matches!(StepError::from(gas), StepError::PackingLimit(_)));
+        assert!(matches!(
+            StepError::from(Error::message_too_big_for_tx(999)),
+            StepError::PackingLimit(_)
+        ));
+        for reason in [
+            "a pending body must finish before subsequent blocks are appended",
+            "bounded verification operation exceeded its metered gas envelope",
+            "out of gas in location: WritePerByte",
+        ] {
+            let error =
+                Error::grpc_status(tonic::Status::unknown(reason), "send_tx_simulate".into());
+            assert!(matches!(StepError::from(error), StepError::PackingLimit(_)));
+            let error = Error::grpc_status(tonic::Status::unknown(reason), "broadcast".into());
+            assert!(matches!(StepError::from(error), StepError::Other(_)));
+        }
+        for reason in [
+            "invalid VRF proof",
+            "staged block does not follow the verified cursor",
+            "account sequence mismatch",
+            "connection reset",
+        ] {
+            let error =
+                Error::grpc_status(tonic::Status::unknown(reason), "send_tx_simulate".into());
+            assert!(matches!(StepError::from(error), StepError::Other(_)));
+        }
+        let plan = packing_plan(4);
+        for error in [
+            StepError::Other("invalid VRF proof".into()),
+            StepError::Other("broadcast response lost".into()),
+        ] {
+            let mut attempts = 0;
+            let mut error = Some(error);
+            let result = submit(
+                &plan,
+                |_| Ok(ready_session()),
+                |chunk| {
+                    if chunk.operation == 1 {
+                        return Ok(());
+                    }
+                    attempts += 1;
+                    Err(error.take().unwrap())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(attempts, 1);
+        }
+        let plan = packing_plan(1);
+        let mut attempts = 0;
+        let error = submit(
+            &plan,
+            |_| Ok(ready_session()),
+            |chunk| {
+                if chunk.operation == 1 {
+                    return Ok(());
+                }
+                attempts += 1;
+                Err(StepError::PackingLimit(
+                    "single body exceeds gas budget".into(),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("single body exceeds gas budget"));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn ambiguous_broadcast_resumes_from_committed_progress_with_new_packing() {
+        let plan = packing_plan(9);
+        let session = RefCell::new(ready_session());
+        let result = submit(
+            &plan,
+            |_| Ok(session.borrow().clone()),
+            |chunk| {
+                if chunk.operation == 1 {
+                    return Ok(());
+                }
+                if chunk.blocks.len() > 3 {
+                    return Err(StepError::PackingLimit("gas budget".into()));
+                }
+                commit_blocks(&plan, &mut session.borrow_mut(), &chunk);
+                Err(StepError::Other("broadcast response lost".into()))
+            },
+        );
+        assert_eq!(result.unwrap_err(), "broadcast response lost");
+        assert_eq!(session.borrow()["ProcessedBlocks"], json!(3));
+        let sizes = RefCell::new(vec![]);
+        submit(
+            &plan,
+            |_| Ok(session.borrow().clone()),
+            |chunk| {
+                if chunk.operation == 1 {
+                    return Ok(());
+                }
+                if chunk.operation == 4 {
+                    sizes.borrow_mut().push(chunk.blocks.len());
+                }
+                commit_blocks(&plan, &mut session.borrow_mut(), &chunk);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*sizes.borrow(), vec![4, 2]);
+    }
+
+    #[test]
+    fn a_preflight_rejection_reloads_progress_advanced_by_another_uploader() {
+        let plan = packing_plan(7);
+        let session = RefCell::new(ready_session());
+        let mut rejected = false;
+        submit(
+            &plan,
+            |_| Ok(session.borrow().clone()),
+            |chunk| {
+                if chunk.operation == 1 {
+                    return Ok(());
+                }
+                if !rejected {
+                    rejected = true;
+                    session.borrow_mut()["Sequence"] = json!(1);
+                    session.borrow_mut()["ProcessedBlocks"] = json!(2);
+                    return Err(StepError::PackingLimit("size budget".into()));
+                }
+                commit_blocks(&plan, &mut session.borrow_mut(), &chunk);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(session.borrow()["ProcessedBlocks"], json!(7));
+    }
 
     #[test]
     fn retained_receipt_hydrates_every_page_without_a_height_index() {
@@ -668,6 +934,11 @@ mod tests {
                 if chunk.operation == 1 {
                     return Ok(());
                 }
+                if chunk.operation == 4 && chunk.blocks.len() > 1 {
+                    return Err(StepError::PackingLimit(
+                        "a pending body must finish before subsequent blocks are appended".into(),
+                    ));
+                }
                 assert_eq!(
                     chunk.sequence,
                     state["Sequence"].as_u64().unwrap() as u32 + 1
@@ -703,6 +974,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(receipt, vec![7; 32]);
-        assert_eq!(*operations.borrow(), vec![1, 2, 3, 4, 5, 4, 6]);
+        assert_eq!(*operations.borrow(), vec![1, 2, 3, 4, 4, 5, 4, 6]);
     }
 }
