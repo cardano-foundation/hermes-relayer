@@ -1933,7 +1933,8 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                     "Invalid client initialization operation or sequence".into(),
                 ));
             }
-            self.send_observation_step(chunk).map_err(fail)?;
+            self.send_observation_step(chunk)
+                .map_err(|error| fail(error.to_string()))?;
         }
         Err(fail(
             "Client initialization exceeds its import allowance".into(),
@@ -1967,15 +1968,13 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
     fn send_observation_step(
         &self,
         chunk: ibc_relayer_types::clients::ics08_cardano_probabilistic::raw::ObservationChunk,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::chain::cardano::staging::StepError> {
+        use crate::chain::cardano::staging::StepError;
         use ibc_relayer_types::clients::ics08_cardano_probabilistic::{
             header::PROBABILISTIC_HEADER_TYPE_URL, raw,
         };
         use prost::Message;
-        let signer = self
-            .dst_chain
-            .get_signer()
-            .map_err(|error| error.to_string())?;
+        let signer = self.dst_chain.get_signer().map_err(StepError::from)?;
         let header = raw::ProbabilisticHeader {
             observation_chunk: Some(chunk),
             ..Default::default()
@@ -1998,10 +1997,10 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 message,
                 "bounded Cardano verification",
             ))
-            .map_err(|error| error.to_string())?;
+            .map_err(StepError::from)?;
         for event in events {
             if let IbcEvent::ChainError(error) = event.event {
-                return Err(error);
+                return Err(StepError::Other(error));
             }
         }
         Ok(())
@@ -2068,7 +2067,9 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
                 })?,
             ..Default::default()
         })
-        .map_err(|error| ForeignClientError::checkpoint_update(self.dst_chain.id(), error))
+        .map_err(|error| {
+            ForeignClientError::checkpoint_update(self.dst_chain.id(), error.to_string())
+        })
     }
 
     fn wait_for_probabilistic_epoch_challenge(

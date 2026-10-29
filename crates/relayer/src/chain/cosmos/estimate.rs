@@ -1,6 +1,7 @@
 use ibc_proto::cosmos::tx::v1beta1::{Fee, Tx};
 use ibc_proto::google::protobuf::Any;
 use ibc_relayer_types::core::ics24_host::identifier::ChainId;
+use prost::Message;
 use tendermint_rpc::Url;
 use tonic::codegen::http::Uri;
 use tracing::{debug, error, span, warn, Level};
@@ -133,6 +134,7 @@ async fn estimate_gas_with_tx(
     tx: Tx,
     _account: &Account,
 ) -> Result<EstimatedGas, Error> {
+    let require_simulation = requires_observation_simulation(&tx);
     let simulated_gas = send_tx_simulate(grpc_address, tx)
         .await
         .map(|sr| sr.gas_info);
@@ -149,6 +151,10 @@ async fn estimate_gas_with_tx(
             Ok(EstimatedGas::Simulated(gas_info.gas_used))
         }
 
+        Ok(None) if require_simulation => {
+            Err(Error::grpc_response_param("simulation gas_info".to_owned()))
+        }
+
         Ok(None) => {
             warn!(
                 "tx simulation successful but no gas amount used was returned, falling back on default gas: {}",
@@ -161,7 +167,7 @@ async fn estimate_gas_with_tx(
         // If there is a chance that the tx will be accepted once actually submitted, we fall
         // back on the default gas and will attempt to send it anyway.
         // See `can_recover_from_simulation_failure` for more info.
-        Err(e) if can_recover_from_simulation_failure(&e) => {
+        Err(e) if can_recover_from_simulation_failure(&e, require_simulation) => {
             warn!(
                 "failed to simulate tx, falling back on default gas because the error is potentially recoverable: {}",
                 e.detail()
@@ -196,11 +202,44 @@ async fn estimate_gas_with_tx(
     }
 }
 
+// Packed block evidence must fit using a real simulation. The generic fallback
+// for dependent packet batches cannot establish a safe observation chunk size.
+fn requires_observation_simulation(tx: &Tx) -> bool {
+    use ibc_proto::ibc::core::client::v1::MsgUpdateClient;
+    use ibc_relayer_types::clients::ics08_cardano_probabilistic::{
+        header::PROBABILISTIC_HEADER_TYPE_URL, raw,
+    };
+    tx.body
+        .iter()
+        .flat_map(|body| &body.messages)
+        .any(|message| {
+            if message.type_url != "/ibc.core.client.v1.MsgUpdateClient" {
+                return false;
+            }
+            let Ok(update) = MsgUpdateClient::decode(message.value.as_slice()) else {
+                return false;
+            };
+            let Some(header) = update
+                .client_message
+                .filter(|header| header.type_url == PROBABILISTIC_HEADER_TYPE_URL)
+            else {
+                return false;
+            };
+            raw::ProbabilisticHeader::decode(header.value.as_slice())
+                .ok()
+                .and_then(|header| header.observation_chunk)
+                .is_some_and(|chunk| chunk.operation == 4)
+        })
+}
+
 /// Determine whether the given error yielded by `tx_simulate`
 /// can be recovered from by submitting the tx anyway.
-fn can_recover_from_simulation_failure(e: &Error) -> bool {
+fn can_recover_from_simulation_failure(e: &Error, require_simulation: bool) -> bool {
     use crate::error::ErrorDetail::*;
 
+    if require_simulation {
+        return false;
+    }
     match e.detail() {
         GrpcStatus(detail) => {
             detail.is_client_state_height_too_low()
@@ -218,5 +257,66 @@ fn get_error_text(e: &Error) -> String {
     match e.detail() {
         GrpcStatus(detail) => detail.status.code().to_string(),
         detail => detail.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ibc_proto::cosmos::tx::v1beta1::TxBody;
+    use ibc_proto::ibc::core::client::v1::MsgUpdateClient;
+    use ibc_relayer_types::clients::ics08_cardano_probabilistic::{
+        header::PROBABILISTIC_HEADER_TYPE_URL, raw,
+    };
+
+    #[test]
+    fn block_updates_require_simulation_even_after_reducing_to_one_block() {
+        for count in 1..=4 {
+            for operation in [1, 2, 4, 5, 6, 7] {
+                let header = raw::ProbabilisticHeader {
+                    observation_chunk: Some(raw::ObservationChunk {
+                        operation,
+                        blocks: vec![raw::ProbabilisticBlock::default(); count],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let update = MsgUpdateClient {
+                    client_id: "08-cardano-probabilistic-0".into(),
+                    signer: "inj1relayer".into(),
+                    client_message: Some(Any {
+                        type_url: PROBABILISTIC_HEADER_TYPE_URL.into(),
+                        value: header.encode_to_vec(),
+                    }),
+                };
+                let tx = Tx {
+                    body: Some(TxBody {
+                        messages: vec![Any {
+                            type_url: "/ibc.core.client.v1.MsgUpdateClient".into(),
+                            value: update.encode_to_vec(),
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                assert_eq!(requires_observation_simulation(&tx), operation == 4);
+            }
+        }
+        assert!(!requires_observation_simulation(&Tx::default()));
+    }
+
+    #[test]
+    fn block_evidence_does_not_use_default_gas_after_recoverable_simulation_errors() {
+        for message in [
+            "account sequence mismatch, expected 1, got 2: incorrect account sequence",
+            "packet sequence is out of order",
+            "invalid empty tx",
+            "verification failed: client state height < proof height",
+        ] {
+            let error =
+                Error::grpc_status(tonic::Status::unknown(message), "send_tx_simulate".into());
+            assert!(can_recover_from_simulation_failure(&error, false));
+            assert!(!can_recover_from_simulation_failure(&error, true));
+        }
     }
 }

@@ -48,6 +48,9 @@ async fn send_tx_with_fee(
     fee: &Fee,
 ) -> Result<Response, Error> {
     let tx_bytes = sign_and_encode_tx(config, key_pair, account, tx_memo, messages, fee)?;
+    if tx_bytes.len() > config.max_tx_size.to_usize() {
+        return Err(Error::message_too_big_for_tx(tx_bytes.len()));
+    }
 
     let response = broadcast_tx_sync(rpc_client, &config.rpc_address, tx_bytes).await?;
 
@@ -146,4 +149,56 @@ pub async fn batched_send_tx(
     }
 
     Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::cosmos::types::account::{AccountAddress, AccountNumber, AccountSequence};
+    use crate::config::types::MaxTxSize;
+    use crate::config::ChainConfig;
+    use crate::error::ErrorDetail;
+
+    #[tokio::test]
+    async fn oversized_signed_transaction_is_rejected_before_broadcast() {
+        let config = crate::config::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/config/fixtures/relayer_conf_example.toml"
+        ))
+        .unwrap();
+        let chain_id = "chain_A".parse().unwrap();
+        let ChainConfig::CosmosSdk(chain) = config.find_chain(&chain_id).unwrap() else {
+            panic!("expected Cosmos config")
+        };
+        let mut config = TxConfig::try_from(chain).unwrap();
+        config.max_tx_size = MaxTxSize::new(1024).unwrap();
+        let seed = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/config/fixtures/relayer-seed.json"
+        ))
+        .unwrap();
+        let key =
+            Secp256k1KeyPair::from_seed_file(&seed, &"m/44'/118'/0'/0/0".parse().unwrap()).unwrap();
+        let account = Account {
+            address: AccountAddress::new(key.account()),
+            number: AccountNumber::new(0),
+            sequence: AccountSequence::new(0),
+        };
+        let client = HttpClient::new("http://127.0.0.1:1").unwrap();
+        let error = send_tx_with_fee(
+            &client,
+            &config,
+            &key,
+            &account,
+            &Memo::default(),
+            &[Any {
+                type_url: "/test".into(),
+                value: vec![0; 2048],
+            }],
+            &config.gas_config.max_fee,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error.detail(), ErrorDetail::MessageTooBigForTx(_)));
+    }
 }
