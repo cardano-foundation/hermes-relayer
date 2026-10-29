@@ -5,8 +5,8 @@
 //! refers to light clients running *locally* as part of the relayer.
 
 use core::{fmt, time::Duration};
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::thread;
 use std::time::Instant;
 
@@ -53,6 +53,25 @@ const MAX_RETRIES: usize = 5;
 const CREATE_CLIENT_DISCOVERY_MAX_RETRIES: usize = 30;
 const CREATE_CLIENT_DISCOVERY_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_PROBABILISTIC_CHECKPOINT_UPDATES: usize = 4_096;
+
+type UpdateKey = (ChainId, ChainId, ClientId, Height);
+static UPDATE_LOCKS: LazyLock<Mutex<HashMap<UpdateKey, Weak<Mutex<()>>>>> =
+    LazyLock::new(Mutex::default);
+
+// ForeignClient is restored separately by packet paths and refresh workers.
+// Share only work for the same client and exact height across those instances.
+fn update_lock(key: UpdateKey) -> Arc<Mutex<()>> {
+    let mut locks = UPDATE_LOCKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExpiredOrFrozen {
@@ -2475,11 +2494,76 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         &self,
         height: Height,
     ) -> Result<Vec<Any>, ForeignClientError> {
+        if self.coordinates_cardano_updates()? {
+            self.ensure_cardano_update(height, None)?;
+            return Ok(vec![]);
+        }
         let messages = self.wait_and_build_update_client(height)?;
         if messages.is_empty() {
             self.require_consensus_state_for_proof(height)?;
         }
         Ok(messages)
+    }
+
+    fn coordinates_cardano_updates(&self) -> Result<bool, ForeignClientError> {
+        if !self
+            .id
+            .as_str()
+            .starts_with(&format!("{}-", ClientId::prefix(ClientType::Tendermint)))
+        {
+            return Ok(false);
+        }
+        self.dst_chain
+            .config()
+            .map(|config| matches!(config, ChainConfig::Cardano(_)))
+            .map_err(|error| {
+                ForeignClientError::client_update(
+                    self.dst_chain.id(),
+                    "failed querying destination configuration".into(),
+                    error,
+                )
+            })
+    }
+
+    fn ensure_cardano_update(
+        &self,
+        height: Height,
+        trusted_height: Option<Height>,
+    ) -> Result<Vec<IbcEvent>, ForeignClientError> {
+        let lock = update_lock((
+            self.dst_chain.id(),
+            self.src_chain.id(),
+            self.id.clone(),
+            height,
+        ));
+        let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+        // A preceding worker may have committed this exact root while we waited.
+        // Query again rather than caching success across recovery or rollbacks.
+        let messages = self.wait_and_build_update_client_with_trusted(height, trusted_height)?;
+        let events = if messages.is_empty() || self.fetch_consensus_state(height).is_ok() {
+            vec![]
+        } else {
+            // The Cardano endpoint already submits an update separately from its
+            // packet. Finish it here so other workers can reuse its accepted root.
+            self.dst_chain
+                .send_messages_and_wait_commit(TrackedMsgs::new_static(
+                    messages,
+                    "shared client update",
+                ))
+                .map_err(|error| {
+                    ForeignClientError::client_update(
+                        self.dst_chain.id(),
+                        "failed submitting shared client update".into(),
+                        error,
+                    )
+                })?
+                .into_iter()
+                .map(|event| event.event)
+                .collect()
+        };
+        self.validated_client_state()?;
+        self.require_consensus_state_for_proof(height)?;
+        Ok(events)
     }
 
     /// Prepare updates that can be followed by a membership proof at `height`.
@@ -2530,6 +2614,19 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             })?,
             QueryHeight::Specific(height) => height,
         };
+
+        if self.coordinates_cardano_updates()? {
+            let events = self.ensure_cardano_update(target_height, trusted_height)?;
+            return if events.is_empty() {
+                Err(ForeignClientError::client_already_up_to_date(
+                    self.id.clone(),
+                    self.src_chain.id(),
+                    target_height,
+                ))
+            } else {
+                Ok(events)
+            };
+        }
 
         let mut next_trusted_height = trusted_height;
         for _ in 0..MAX_PROBABILISTIC_CHECKPOINT_UPDATES {
@@ -3215,6 +3312,263 @@ mod tests {
 
     fn height(revision_height: u64) -> Height {
         Height::new(0, revision_height).expect("valid test height")
+    }
+
+    #[test]
+    fn shared_update_lock_does_not_hold_other_heights_or_clients() {
+        let key = (
+            ChainId::from_string("cardano-lock-test"),
+            ChainId::from_string("cosmos-0"),
+            "07-tendermint-0".parse().unwrap(),
+            height(20),
+        );
+        let first = super::update_lock(key.clone());
+        let same = super::update_lock(key.clone());
+        assert!(std::sync::Arc::ptr_eq(&first, &same));
+        let _guard = first.lock().unwrap();
+        let mut newer = key.clone();
+        newer.3 = height(21);
+        assert!(super::update_lock(newer).try_lock().is_ok());
+        let mut other = key;
+        other.2 = "07-tendermint-1".parse().unwrap();
+        assert!(super::update_lock(other).try_lock().is_ok());
+    }
+
+    // Exercise preparation and submission through the actual runtime messages.
+    // Cryptographic verification remains the chain endpoint's responsibility.
+    fn concurrent_cardano_updates(fail_first: bool) {
+        use ibc_relayer_types::{
+            clients::ics07_tendermint::{
+                client_state::{AllowUpdate, ClientState as TmClientState},
+                consensus_state::ConsensusState as TmConsensusState,
+                header::Header as TmHeader,
+            },
+            core::{
+                ics02_client::{
+                    events::NewBlock, header::AnyHeader, trust_threshold::TrustThreshold,
+                },
+                ics23_commitment::specs::ProofSpecs,
+            },
+            events::IbcEvent,
+        };
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Barrier,
+        };
+        let signed: tendermint::block::signed_header::SignedHeader = serde_json::from_str(
+            include_str!("../../relayer-types/tests/support/signed_header.json"),
+        )
+        .unwrap();
+        let source_id = ChainId::from_string(signed.header.chain_id.as_str());
+        let target = Height::new(1, 20).unwrap();
+        let trusted = Height::new(1, 19).unwrap();
+        let timestamp: Timestamp = signed.header.time.into();
+        let status = ChainStatus {
+            height: Height::new(1, 40).unwrap(),
+            timestamp,
+        };
+        let consensus = AnyConsensusState::Tendermint(TmConsensusState::new(
+            CommitmentRoot::from_bytes(&[1; 32]),
+            signed.header.time,
+            signed.header.next_validators_hash,
+        ));
+        let client_state = TmClientState::new(
+            source_id.clone(),
+            TrustThreshold::ONE_THIRD,
+            Duration::from_secs(60),
+            Duration::from_secs(120),
+            Duration::from_secs(5),
+            trusted,
+            ProofSpecs::cosmos(),
+            vec![],
+            AllowUpdate {
+                after_expiry: false,
+                after_misbehaviour: false,
+            },
+        )
+        .unwrap();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::new(AtomicBool::new(false));
+        let (source_sender, source_receiver) = crossbeam_channel::unbounded();
+        let source = BaseChainHandle::new(source_id, source_sender);
+        let build_count = builds.clone();
+        let source_status = status.clone();
+        let source_runtime = thread::spawn(move || {
+            for (_, request) in source_receiver {
+                match request {
+                    ChainRequest::QueryApplicationStatus { reply_to } => {
+                        reply_to.send(Ok(source_status.clone())).unwrap();
+                    }
+                    ChainRequest::BuildHeader {
+                        trusted_height,
+                        target_height,
+                        reply_to,
+                        ..
+                    } => {
+                        assert_eq!(trusted_height, trusted);
+                        assert_eq!(target_height, target);
+                        build_count.fetch_add(1, Ordering::SeqCst);
+                        reply_to
+                            .send(Ok((
+                                AnyHeader::Tendermint(TmHeader {
+                                    signed_header: signed.clone(),
+                                    validator_set: tendermint::validator::Set::without_proposer(
+                                        vec![],
+                                    ),
+                                    trusted_height: trusted,
+                                    trusted_validator_set:
+                                        tendermint::validator::Set::without_proposer(vec![]),
+                                }),
+                                vec![],
+                            )))
+                            .unwrap();
+                    }
+                    unexpected => panic!("unexpected source request: {unexpected:?}"),
+                }
+            }
+        });
+        let (destination_sender, destination_receiver) = crossbeam_channel::unbounded();
+        let destination = BaseChainHandle::new(
+            ChainId::from_string("cardano-coordination-test"),
+            destination_sender,
+        );
+        let included = accepted.clone();
+        let submission_count = submissions.clone();
+        let destination_runtime = thread::spawn(move || {
+            for (_, request) in destination_receiver {
+                match request {
+                    ChainRequest::Config { reply_to } => {
+                        reply_to
+                            .send(Ok(crate::config::ChainConfig::Cardano(
+                                crate::chain::cardano::CardanoConfig::default(),
+                            )))
+                            .unwrap();
+                    }
+                    ChainRequest::Signer { reply_to } => {
+                        reply_to.send(Ok("relayer".parse().unwrap())).unwrap();
+                    }
+                    ChainRequest::QueryApplicationStatus { reply_to } => {
+                        reply_to.send(Ok(status.clone())).unwrap();
+                    }
+                    ChainRequest::QueryConsensusState {
+                        request, reply_to, ..
+                    } => {
+                        let exists = request.consensus_height == trusted
+                            || (request.consensus_height == target
+                                && included.load(Ordering::SeqCst));
+                        reply_to
+                            .send(if exists {
+                                Ok((consensus.clone(), None))
+                            } else {
+                                Err(RelayerError::query("missing root".into()))
+                            })
+                            .unwrap();
+                    }
+                    ChainRequest::QueryClientState { reply_to, .. } => {
+                        let mut state = client_state.clone();
+                        if included.load(Ordering::SeqCst) {
+                            state.latest_height = target;
+                        }
+                        reply_to
+                            .send(Ok((AnyClientState::Tendermint(state), None)))
+                            .unwrap();
+                    }
+                    ChainRequest::SendMessagesAndWaitCommit {
+                        tracked_msgs,
+                        reply_to,
+                    } => {
+                        assert_eq!(tracked_msgs.msgs.len(), 1);
+                        let number = submission_count.fetch_add(1, Ordering::SeqCst);
+                        if fail_first && number == 0 {
+                            reply_to
+                                .send(Err(RelayerError::send_tx("injected failure".into())))
+                                .unwrap();
+                        } else {
+                            included.store(true, Ordering::SeqCst);
+                            reply_to
+                                .send(Ok(vec![crate::event::IbcEventWithHeight::new(
+                                    IbcEvent::NewBlock(NewBlock::new(target)),
+                                    target,
+                                )]))
+                                .unwrap();
+                        }
+                    }
+                    unexpected => panic!("unexpected destination request: {unexpected:?}"),
+                }
+            }
+        });
+        let barrier = Arc::new(Barrier::new(5));
+        let workers: Vec<_> = (0..4)
+            .map(|worker| {
+                let client = ForeignClient::restore(
+                    "07-tendermint-0".parse().unwrap(),
+                    destination.clone(),
+                    source.clone(),
+                );
+                let start = barrier.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    if worker == 0 {
+                        client
+                            .build_update_client_and_send(
+                                crate::chain::requests::QueryHeight::Specific(target),
+                                None,
+                            )
+                            .map(|_| ())
+                            .or_else(|error| {
+                                if error.to_string().contains("already up-to-date") {
+                                    Ok(())
+                                } else {
+                                    Err(error)
+                                }
+                            })
+                    } else {
+                        client
+                            .wait_and_build_update_client_for_proof(target)
+                            .map(|messages| assert!(messages.is_empty()))
+                    }
+                })
+            })
+            .collect();
+        barrier.wait();
+        let failures = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(Result::is_err)
+            .count();
+        assert_eq!(failures, usize::from(fail_first));
+        assert_eq!(builds.load(Ordering::SeqCst), 1 + usize::from(fail_first));
+        assert_eq!(
+            submissions.load(Ordering::SeqCst),
+            1 + usize::from(fail_first)
+        );
+        // A rollback must invalidate reuse. A restored worker queries the chain
+        // rather than trusting a cached successful update.
+        accepted.store(false, Ordering::SeqCst);
+        let restored =
+            ForeignClient::restore("07-tendermint-0".parse().unwrap(), destination, source);
+        assert!(restored
+            .wait_and_build_update_client_for_proof(target)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            submissions.load(Ordering::SeqCst),
+            2 + usize::from(fail_first)
+        );
+        drop(restored);
+        source_runtime.join().unwrap();
+        destination_runtime.join().unwrap();
+    }
+
+    #[test]
+    fn packet_and_refresh_workers_share_one_accepted_update() {
+        concurrent_cardano_updates(false);
+    }
+
+    #[test]
+    fn failed_shared_update_can_retry_and_restart_from_canonical_state() {
+        concurrent_cardano_updates(true);
     }
 
     #[test]
