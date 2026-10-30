@@ -709,6 +709,15 @@ impl TransactionSigningPolicy {
             }),
         };
 
+        if scripts.contains_key("updateclient")
+            && (tendermint_session.is_none()
+                || consensus_history_format != ConsensusHistoryFormat::ProofBackedV1)
+        {
+            return Err(
+                "ordinary update forwarding requires proof-backed staged sessions".to_string(),
+            );
+        }
+
         let mut protocol_addresses = HashSet::from([
             host_state_address.clone(),
             client_state.address.clone(),
@@ -960,6 +969,14 @@ impl TransactionSigningPolicy {
         })
     }
 
+    fn staged_history_script(&self) -> &'static str {
+        if self.scripts.contains_key("updateclient") {
+            "updateclient"
+        } else {
+            "recoverclient"
+        }
+    }
+
     fn staged_tendermint_requirements<'a>(
         &'a self,
         body: &pallas_primitives::conway::MintedTransactionBody<'_>,
@@ -1026,7 +1043,7 @@ impl TransactionSigningPolicy {
         if requirement.action.is_finalization()
             && self.consensus_history_format == ConsensusHistoryFormat::ProofBackedV1
         {
-            required_scripts.push("recoverclient");
+            required_scripts.push(self.staged_history_script());
         }
         Ok(OperationRequirements {
             required_scripts,
@@ -1532,7 +1549,12 @@ impl TransactionSigningPolicy {
             ));
         }
 
-        let recovery_script = required_script(&self.scripts, "recoverclient").map_err(reject)?;
+        let script = if intent.staged_tendermint && staged_finalization {
+            self.staged_history_script()
+        } else {
+            "recoverclient"
+        };
+        let recovery_script = required_script(&self.scripts, script).map_err(reject)?;
         let expected_reward_account = [
             &[0xf0 | self.network_id][..],
             recovery_script.hash.as_slice(),
@@ -1544,7 +1566,7 @@ impl TransactionSigningPolicy {
             .expect("non-empty withdrawal map has one entry");
         if reward_account.as_slice() != expected_reward_account || *amount != 0 {
             return Err(reject(
-                "client transition withdrawal does not execute the pinned recovery validator with zero value"
+                "client transition withdrawal does not execute the pinned client validator with zero value"
                     .to_string(),
             ));
         }
@@ -7246,7 +7268,7 @@ mod tests {
         }
         tx.transaction_body.reference_inputs = Some(references.try_into().unwrap());
         if policy.consensus_history_format == ConsensusHistoryFormat::ProofBackedV1 {
-            let support = required_script(&policy.scripts, "recoverclient").unwrap();
+            let support = required_script(&policy.scripts, policy.staged_history_script()).unwrap();
             let account = [&[0xf0 | policy.network_id][..], support.hash.as_slice()].concat();
             tx.transaction_body.withdrawals = Some(vec![(account.into(), 0)].try_into().unwrap());
             let mut refs = tx
@@ -7437,6 +7459,100 @@ mod tests {
                 assert!(validate_staged_fixture(&policy, &changed, &resolved, &intent).is_err());
             }
         }
+    }
+
+    #[test]
+    fn forwarded_finalization_pins_ordinary_support_without_changing_recovery() {
+        let mut policy = staged_policy();
+        policy.consensus_history_format = ConsensusHistoryFormat::ProofBackedV1;
+        let mut ordinary = required_script(&policy.scripts, "recoverclient")
+            .unwrap()
+            .clone();
+        ordinary.hash = vec![0x91; 28];
+        ordinary.reference = (vec![0x92; 32], 0);
+        policy
+            .scripts
+            .insert("updateclient".to_string(), ordinary.clone());
+        for evidence in [false, true] {
+            let (tx, resolved, intent) = staged_finalization_fixture(&policy, evidence);
+            validate_staged_fixture(&policy, &tx, &resolved, &intent).unwrap();
+            let admin = required_script(&policy.scripts, "recoverclient").unwrap();
+            let mut fallback = tx.clone();
+            let account = [&[0xf0][..], admin.hash.as_slice()].concat();
+            fallback.transaction_body.withdrawals =
+                Some(vec![(account.into(), 0)].try_into().unwrap());
+            assert!(validate_staged_fixture(&policy, &fallback, &resolved, &intent).is_err());
+            let mut nonzero = tx.clone();
+            let account = [&[0xf0][..], ordinary.hash.as_slice()].concat();
+            nonzero.transaction_body.withdrawals =
+                Some(vec![(account.into(), 1)].try_into().unwrap());
+            assert!(validate_staged_fixture(&policy, &nonzero, &resolved, &intent).is_err());
+            let mut missing_reference = tx.clone();
+            let refs = missing_reference
+                .transaction_body
+                .reference_inputs
+                .take()
+                .unwrap()
+                .to_vec()
+                .into_iter()
+                .filter(|input| input.transaction_id.as_ref() != ordinary.reference.0.as_slice())
+                .collect::<Vec<_>>();
+            missing_reference.transaction_body.reference_inputs = Some(refs.try_into().unwrap());
+            assert!(
+                validate_staged_fixture(&policy, &missing_reference, &resolved, &intent).is_err()
+            );
+        }
+        for intent in [
+            recovery_intent(),
+            upgrade_intent("07-tendermint-7").unwrap(),
+        ] {
+            for role in ["recoverclient", "updateclient"] {
+                let script = required_script(&policy.scripts, role).unwrap();
+                let account = [&[0xf0][..], script.hash.as_slice()].concat();
+                let encoded = transaction_with_withdrawal(&account, 0);
+                let tx: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
+                let result =
+                    policy.validate_withdrawals(&tx.transaction_body, &intent, false, &|reason| {
+                        Error::Signer(reason)
+                    });
+                assert_eq!(result.is_ok(), role == "recoverclient");
+            }
+        }
+        let recovery = policy.operation_requirements(&recovery_intent()).unwrap();
+        assert_eq!(
+            recovery.required_scripts,
+            vec!["spendclient", "recoverclient"]
+        );
+        let upgrade = policy
+            .operation_requirements(&upgrade_intent("07-tendermint-7").unwrap())
+            .unwrap();
+        assert_eq!(
+            upgrade.required_scripts,
+            vec!["spendclient", "recoverclient", "verifyproof"]
+        );
+    }
+
+    #[test]
+    fn ordinary_support_requires_staged_proof_backed_manifest() {
+        let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
+        value["validators"]["update_client"] = serde_json::json!({
+            "script_hash": hex::encode([0x91; 28]),
+            "ref_utxo": {"tx_hash": hex::encode([0x92; 32]), "output_index": 0}
+        });
+        assert!(TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).is_err());
+        value["consensus_history_format"] = "proof-backed-v1".into();
+        assert!(TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).is_err());
+        value["validators"]["spend_tendermint_update_session"] = serde_json::json!({
+            "address": format!("70{}", "18".repeat(28)),
+            "script_hash": "40".repeat(28),
+            "ref_utxo": {"tx_hash": "50".repeat(32), "output_index": 0}
+        });
+        value["validators"]["mint_tendermint_update_session"] = serde_json::json!({
+            "script_hash": "41".repeat(28),
+            "ref_utxo": {"tx_hash": "51".repeat(32), "output_index": 0}
+        });
+        let policy = TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).unwrap();
+        assert_eq!(policy.staged_history_script(), "updateclient");
     }
 
     #[test]
