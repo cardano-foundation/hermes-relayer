@@ -377,6 +377,29 @@ impl GatewayClient {
                     port_id: port.to_string(),
                     channel_id: channel.to_string(),
                     intent_tx_hash: intent_hash.to_string(),
+                    acknowledgements: vec![],
+                },
+            ))
+            .await?
+            .into_inner())
+    }
+
+    pub async fn build_acknowledgement_batch(
+        &self,
+        signer: &str,
+        port: &str,
+        channel: &str,
+        acknowledgements: Vec<Vec<u8>>,
+    ) -> Result<super::generated::ibc::cardano::v1::BuildPacketBatchResponse, Error> {
+        let mut client = CardanoMsgClient::new(self.channel.clone());
+        Ok(client
+            .build_packet_batch(tonic::Request::new(
+                super::generated::ibc::cardano::v1::BuildPacketBatchRequest {
+                    signer: signer.to_owned(),
+                    port_id: port.to_owned(),
+                    channel_id: channel.to_owned(),
+                    intent_tx_hash: String::new(),
+                    acknowledgements,
                 },
             ))
             .await?
@@ -2620,6 +2643,18 @@ fn parse_cardano_native_asset_quantity(amount: &str, denom: &str) -> Result<u64,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn acknowledgement_batch_request_decodes_gateway_wire_fields() {
+        use prost::Message;
+        let bytes = hex::decode("0a01611201701a01632a0201022a0103").unwrap();
+        let request = super::super::generated::ibc::cardano::v1::BuildPacketBatchRequest::decode(
+            bytes.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(request.signer, "a");
+        assert_eq!(request.channel_id, "c");
+        assert_eq!(request.acknowledgements, vec![vec![1, 2], vec![3]]);
+    }
     use super::*;
     use ibc_proto::cosmos::base::v1beta1::Coin as ProtoCoin;
     use ibc_proto::ibc::core::client::v1::MsgRecoverClient as CanonicalMsgRecoverClient;

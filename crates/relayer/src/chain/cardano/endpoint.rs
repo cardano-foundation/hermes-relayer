@@ -4,7 +4,8 @@
 
 use super::config::CardanoConfig;
 use super::gateway_client::{
-    BuiltIbcTxKind, GatewayClient, TxSubmitResponse, MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH,
+    BuiltIbcTxKind, GatewayClient, TxSubmitResponse, UnsignedTx,
+    MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH,
 };
 use super::intent_executor::ExecutorSchedule;
 use super::signing_key_pair::CardanoSigningKeyPair;
@@ -686,6 +687,64 @@ impl CardanoChainEndpoint {
             })?;
         assert_submitted_tx_hash(&signed_tx.tx_hash, &submitted_hash)?;
         Ok(())
+    }
+
+    /// The input slice is work already available in this submission request.
+    /// Never wait for another packet to form an acknowledgement batch.
+    async fn submit_ready_ibc_message(
+        &self,
+        messages: &[ibc_proto::google::protobuf::Any],
+    ) -> Result<(usize, TxSubmitResponse), Error> {
+        if messages.len() >= 2 {
+            if let Ok(intent) = SigningIntent::acknowledgement_batch(
+                &messages[..2],
+                &self.signer_address,
+                self.config.network_id,
+            ) {
+                if self.signing_policy.can_batch_acknowledgements(&intent) {
+                    use prost::Message;
+                    let request =
+                        super::generated::ibc::core::channel::v1::MsgAcknowledgement::decode(
+                            messages[0].value.as_slice(),
+                        )
+                        .map_err(|error| Error::send_tx(error.to_string()))?;
+                    let packet = request
+                        .packet
+                        .ok_or_else(|| Error::send_tx("missing packet".into()))?;
+                    let built = self
+                        .gateway_client
+                        .build_acknowledgement_batch(
+                            &self.signer_address,
+                            &packet.source_port,
+                            &packet.source_channel,
+                            messages[..2]
+                                .iter()
+                                .map(|message| message.value.clone())
+                                .collect(),
+                        )
+                        .await;
+                    if let Ok(batch) = built {
+                        if batch.stage == "acknowledge" {
+                            let unsigned = UnsignedTx::from_packet_batch(&batch)
+                                .map_err(|error| Error::send_tx(error.to_string()))?;
+                            // A policy rejection or an ambiguous broadcast propagates.
+                            // Only a failed Gateway build can fall back to singletons.
+                            let (response, _) =
+                                self.sign_submit_until_included(&unsigned, &intent).await?;
+                            return Ok((2, response));
+                        }
+                    }
+                    // Build failure is pre-broadcast. Older Gateways and transactions
+                    // beyond their limits keep the existing singleton path.
+                }
+            }
+        }
+        let message = messages
+            .first()
+            .ok_or_else(|| Error::send_tx("empty ready batch".into()))?;
+        self.submit_ibc_message_until_final(&message.type_url, &message.value)
+            .await
+            .map(|response| (1, response))
     }
 
     /// Submit one logical IBC message. A staged Tendermint update may return
@@ -1658,14 +1717,17 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 );
             }
 
-            for msg in tracked_msgs.msgs.iter().filter(|_| !transfers_only) {
+            let mut message_index = 0;
+            while !transfers_only && message_index < tracked_msgs.msgs.len() {
+                let msg = &tracked_msgs.msgs[message_index];
                 tracing::debug!("Processing message type: {:?}", msg.type_url);
 
                 // Build, sign, and submit. Tendermint header updates repeat this
                 // operation while the Gateway returns an intermediate marker.
-                let tx_response = self
-                    .submit_ibc_message_until_final(&msg.type_url, &msg.value)
+                let (consumed, tx_response) = self
+                    .submit_ready_ibc_message(&tracked_msgs.msgs[message_index..])
                     .await?;
+                message_index += consumed;
 
                 let tx_hash = tx_response.tx_hash.clone();
                 let event_count = tx_response.events.len();
@@ -1815,12 +1877,12 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
             let mut responses = Vec::with_capacity(tracked_msgs.msgs.len());
 
-            for msg in tracked_msgs.msgs.iter() {
-                tracing::debug!("Processing message type: {:?}", msg.type_url);
-
-                let tx_response = self
-                    .submit_ibc_message_until_final(&msg.type_url, &msg.value)
+            let mut message_index = 0;
+            while message_index < tracked_msgs.msgs.len() {
+                let (consumed, tx_response) = self
+                    .submit_ready_ibc_message(&tracked_msgs.msgs[message_index..])
                     .await?;
+                message_index += consumed;
 
                 let included_height = tx_response.height.ok_or_else(|| {
                     Error::send_tx(format!(

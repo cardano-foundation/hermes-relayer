@@ -137,6 +137,7 @@ pub struct SigningIntent {
     recovery_substitute_sequence: Option<u64>,
     packet: Option<PacketIntent>,
     acknowledgement: Option<Vec<u8>>,
+    acknowledgement_packets: Vec<PacketIntent>,
     prune_sequence: Option<u64>,
     funded_intent: Option<[u8; 32]>,
     staged_tendermint: bool,
@@ -486,6 +487,18 @@ enum ClientWithdrawal<'a> {
 }
 
 impl TransactionSigningPolicy {
+    pub(crate) fn can_batch_acknowledgements(&self, intent: &SigningIntent) -> bool {
+        if !self.packet_lanes.acknowledgement_batch {
+            return false;
+        }
+        let Some(count) = self.packet_lanes.lane_count else {
+            return false;
+        };
+        let [first, second] = intent.acknowledgement_packets.as_slice() else {
+            return false;
+        };
+        first.sequence % count != second.sequence % count
+    }
     pub fn load(path: &Path, network_id: u8, limits: SigningPolicyLimits) -> Result<Self, Error> {
         let contents = fs::read_to_string(path).map_err(|error| {
             Error::Config(format!(
@@ -744,6 +757,11 @@ impl TransactionSigningPolicy {
         intent: &SigningIntent,
     ) -> Result<OperationRequirements<'a>, String> {
         if packet_signing::is_lane_operation(intent) {
+            if !intent.acknowledgement_packets.is_empty()
+                && !self.packet_lanes.acknowledgement_batch
+            {
+                return Err("pinned deployment does not support acknowledgement batching".into());
+            }
             return Ok(OperationRequirements {
                 requires_host_state: false,
                 tendermint_session: None,
@@ -3672,6 +3690,64 @@ fn is_cardano_token_unit(denom: &str) -> bool {
 }
 
 impl SigningIntent {
+    pub fn acknowledgement_batch(
+        messages: &[ibc_proto::google::protobuf::Any],
+        signer: &str,
+        network: u8,
+    ) -> Result<Self, Error> {
+        if messages.len() != 2
+            || messages
+                .iter()
+                .any(|message| message.type_url != "/ibc.core.channel.v1.MsgAcknowledgement")
+        {
+            return Err(Error::Signer("expected two acknowledgements".into()));
+        }
+        let requests = messages
+            .iter()
+            .map(|message| {
+                super::generated::ibc::core::channel::v1::MsgAcknowledgement::decode(
+                    message.value.as_slice(),
+                )
+                .map_err(|error| Error::Signer(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if requests[0].proof_height.is_none()
+            || requests[0].proof_height != requests[1].proof_height
+        {
+            return Err(Error::Signer("acknowledgement proof heights differ".into()));
+        }
+        let mut intents = messages
+            .iter()
+            .map(|message| Self::ibc(&message.type_url, &message.value, signer, network))
+            .collect::<Result<Vec<_>, _>>()?;
+        if intents.iter().any(|intent| {
+            intent.module_port.as_deref() != Some("transfer")
+                || intent.acknowledgement.as_deref() != Some(b"{\"result\":\"AQ==\"}")
+        }) || intents[0].state_sequence != intents[1].state_sequence
+        {
+            return Err(Error::Signer("acknowledgements are not compatible".into()));
+        }
+        let packets = intents
+            .iter()
+            .map(|intent| {
+                intent
+                    .packet
+                    .clone()
+                    .ok_or_else(|| Error::Signer("missing acknowledged packet".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if packets[0].sequence == packets[1].sequence
+            || packets[0].destination_port != packets[1].destination_port
+            || packets[0].destination_channel != packets[1].destination_channel
+        {
+            return Err(Error::Signer("duplicate acknowledged packet".into()));
+        }
+        let mut combined = intents.remove(0);
+        combined.operation = "PacketAcknowledgementBatch".into();
+        combined.packet = None;
+        combined.acknowledgement_packets = packets;
+        Ok(combined)
+    }
     pub fn uses_packet_lanes(&self) -> bool {
         packet_signing::is_lane_operation(self)
     }
@@ -3707,8 +3783,10 @@ impl SigningIntent {
             recovery_substitute_sequence: None,
             packet: None,
             acknowledgement: None,
+
             prune_sequence: None,
             funded_intent: None,
+            acknowledgement_packets: vec![],
             staged_tendermint: false,
             staged_misbehaviour: false,
             channel_upgrade: None,
@@ -3769,8 +3847,10 @@ impl SigningIntent {
             recovery_substitute_sequence: None,
             packet: None,
             acknowledgement: None,
+
             prune_sequence: None,
             funded_intent: None,
+            acknowledgement_packets: vec![],
             staged_tendermint: false,
             staged_misbehaviour: false,
             channel_upgrade: None,
@@ -4246,6 +4326,7 @@ impl SigningIntent {
             acknowledgement,
             prune_sequence,
             funded_intent: None,
+            acknowledgement_packets: vec![],
             staged_tendermint: false,
             staged_misbehaviour: false,
             channel_upgrade,
@@ -7821,6 +7902,138 @@ mod tests {
         }
     }
 
+    fn ready_acknowledgement(sequence: u64, height: u64) -> ibc_proto::google::protobuf::Any {
+        use super::super::generated::ibc::core::{
+            channel::v1::{MsgAcknowledgement, Packet},
+            client::v1::Height,
+        };
+        let request = MsgAcknowledgement {
+            packet: Some(Packet {
+                sequence,
+                source_port: "transfer".into(),
+                source_channel: "channel-0".into(),
+                destination_port: "transfer".into(),
+                destination_channel: "channel-7".into(),
+                data: serde_json::to_vec(&serde_json::json!({
+                    "denom": LOVELACE_HEX, "amount": "42", "sender": "99".repeat(28),
+                    "receiver": "destination", "memo": "",
+                }))
+                .unwrap(),
+                timeout_height: None,
+                timeout_timestamp: 1,
+            }),
+            acknowledgement: b"{\"result\":\"AQ==\"}".to_vec(),
+            proof_acked: vec![1],
+            proof_height: Some(Height {
+                revision_number: 1,
+                revision_height: height,
+            }),
+            signer: format!("60{}", "99".repeat(28)),
+        };
+        ibc_proto::google::protobuf::Any {
+            type_url: "/ibc.core.channel.v1.MsgAcknowledgement".into(),
+            value: request.encode_to_vec(),
+        }
+    }
+
+    #[test]
+    fn ready_acknowledgements_require_compatible_heights_and_independent_lanes() {
+        let signer = format!("60{}", "99".repeat(28));
+        let first = ready_acknowledgement(1, 10);
+        assert!(SigningIntent::acknowledgement_batch(&[first.clone()], &signer, 0).is_err());
+        assert!(
+            SigningIntent::acknowledgement_batch(&[first.clone(), first.clone()], &signer, 0)
+                .is_err()
+        );
+        assert!(SigningIntent::acknowledgement_batch(
+            &[first.clone(), ready_acknowledgement(2, 11)],
+            &signer,
+            0
+        )
+        .is_err());
+        let mut policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        policy.packet_lanes.lane_count = Some(16);
+        let compatible = SigningIntent::acknowledgement_batch(
+            &[first.clone(), ready_acknowledgement(2, 10)],
+            &signer,
+            0,
+        )
+        .unwrap();
+        assert!(compatible.uses_packet_lanes());
+        assert!(!policy.can_batch_acknowledgements(&compatible));
+        assert!(policy.operation_requirements(&compatible).is_err());
+        policy.packet_lanes.acknowledgement_batch = true;
+        assert!(policy.operation_requirements(&compatible).is_ok());
+        assert!(policy.can_batch_acknowledgements(&compatible));
+        let shared = SigningIntent::acknowledgement_batch(
+            &[first, ready_acknowledgement(17, 10)],
+            &signer,
+            0,
+        )
+        .unwrap();
+        assert!(!policy.can_batch_acknowledgements(&shared));
+    }
+
+    #[test]
+    fn acknowledgement_batch_signing_binds_every_packet_and_rejects_extras() {
+        let signer = format!("60{}", "99".repeat(28));
+        let intent = SigningIntent::acknowledgement_batch(
+            &[ready_acknowledgement(1, 10), ready_acknowledgement(2, 10)],
+            &signer,
+            0,
+        )
+        .unwrap();
+        let bytes = |value: &[u8]| PlutusData::BoundedBytes(value.to_vec().into());
+        let integer = |value: u64| PlutusData::BigInt(BigInt::Int((value as i64).into()));
+        let packets: Vec<_> = intent
+            .acknowledgement_packets
+            .iter()
+            .map(|packet| {
+                let encoded = data_constructor(
+                    0,
+                    vec![
+                        integer(packet.sequence),
+                        bytes(packet.source_port.as_bytes()),
+                        bytes(packet.source_channel.as_bytes()),
+                        bytes(packet.destination_port.as_bytes()),
+                        bytes(packet.destination_channel.as_bytes()),
+                        bytes(&packet.data),
+                        data_constructor(0, vec![integer(0), integer(0)]),
+                        integer(packet.timeout_timestamp),
+                    ],
+                );
+                data_constructor(
+                    1,
+                    vec![
+                        encoded,
+                        data_constructor(0, vec![]),
+                        data_constructor(0, vec![]),
+                        data_constructor(0, vec![]),
+                    ],
+                )
+            })
+            .collect();
+        let operation = |packets| data_constructor(10, vec![PlutusData::Array(packets)]);
+        assert!(packet_signing::acknowledgement_batch_matches(
+            &operation(packets.clone()),
+            &intent.acknowledgement_packets
+        ));
+        assert!(!packet_signing::acknowledgement_batch_matches(
+            &operation(vec![packets[0].clone()]),
+            &intent.acknowledgement_packets
+        ));
+        assert!(!packet_signing::acknowledgement_batch_matches(
+            &operation(vec![packets[0].clone(); 3]),
+            &intent.acknowledgement_packets
+        ));
+        let mut changed = packets.clone();
+        changed[1] = packets[0].clone();
+        assert!(!packet_signing::acknowledgement_batch_matches(
+            &operation(changed),
+            &intent.acknowledgement_packets
+        ));
+    }
+
     #[test]
     fn outbound_packet_binding_still_rejects_altered_fields() {
         let signer = format!("60{}", "99".repeat(28));
@@ -8003,8 +8216,10 @@ mod tests {
             recovery_substitute_sequence: None,
             packet: None,
             acknowledgement: None,
+
             prune_sequence: None,
             funded_intent: None,
+            acknowledgement_packets: vec![],
             staged_tendermint: false,
             staged_misbehaviour: false,
             channel_upgrade: None,
