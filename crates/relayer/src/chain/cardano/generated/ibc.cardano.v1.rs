@@ -473,6 +473,8 @@ pub struct BuildPacketBatchRequest {
     pub channel_id: String,
     #[prost(string, tag = "4")]
     pub intent_tx_hash: String,
+    #[prost(bytes = "vec", repeated, tag = "5")]
+    pub acknowledgements: Vec<Vec<u8>>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BuildPacketBatchResponse {

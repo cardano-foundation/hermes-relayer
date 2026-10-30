@@ -12,6 +12,8 @@ pub(super) struct PacketRoots {
     state_policy: Vec<u8>,
     batch_policy: Vec<u8>,
     operation_scripts: Vec<ScriptRoot>,
+    pub(super) lane_count: Option<u64>,
+    pub(super) acknowledgement_batch: bool,
 }
 impl PacketRoots {
     pub(super) fn load(
@@ -60,6 +62,15 @@ impl PacketRoots {
         }
         operation_scripts.push(required_script(scripts, "verifyproof")?.clone());
         Ok(Self {
+            acknowledgement_batch: root
+                .get("acknowledgement_batch_size")
+                .and_then(JsonValue::as_u64)
+                == Some(2),
+            lane_count: root
+                .get("lane_count")
+                .or_else(|| root.get("laneCount"))
+                .and_then(JsonValue::as_u64)
+                .filter(|count| *count > 0 && *count <= 64),
             operation_scripts,
             registry: addresses[0].clone(),
             batch: addresses[1].clone(),
@@ -72,10 +83,33 @@ impl PacketRoots {
 
 pub(super) fn is_lane_operation(intent: &SigningIntent) -> bool {
     intent.operation == "PacketBatch"
+        || intent.operation == "PacketAcknowledgementBatch"
         || intent.operation == "InitializePacketLanes"
         || intent.operation == "/ibc.applications.transfer.v1.MsgTransfer"
         || intent.module_port.as_deref() == Some("transfer")
             && (intent.packet.is_some() || intent.prune_sequence.is_some())
+}
+
+pub(super) fn acknowledgement_batch_matches(
+    operation: &PlutusData,
+    packets: &[PacketIntent],
+) -> bool {
+    let Some(children) = constructor_fields(operation, 10)
+        .filter(|fields| fields.len() == 1)
+        .and_then(|fields| match &fields[0] {
+            PlutusData::Array(items) => Some(items.as_slice()),
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    packets.len() == 2
+        && children.len() == packets.len()
+        && children.iter().zip(packets).all(|(child, packet)| {
+            constructor_fields(child, 1)
+                .filter(|fields| fields.len() == 4)
+                .is_some_and(|fields| packet_plutus_matches(&fields[0], packet))
+        })
 }
 
 fn inline_datum<'a>(output: &'a MintedTransactionOutput<'_>) -> Option<&'a PlutusData> {
@@ -312,6 +346,12 @@ impl TransactionSigningPolicy {
             if batch {
                 if constructor_fields(operation, 0).is_none() {
                     return Err(reject("unexpected send-batch operation".into()));
+                }
+            } else if !intent.acknowledgement_packets.is_empty() {
+                if !acknowledgement_batch_matches(operation, &intent.acknowledgement_packets) {
+                    return Err(reject(
+                        "acknowledgement batch changes the requested packets".into(),
+                    ));
                 }
             } else if let Some(packet) = &intent.packet {
                 let alternatives: &[u64] = if intent.operation.ends_with("MsgRecvPacket") {
