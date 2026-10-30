@@ -55,7 +55,7 @@ const MAX_INPUTS: usize = 128;
 const MAX_OUTPUTS: usize = 128;
 const MAX_REFERENCE_INPUTS: usize = 128;
 const MAX_COLLATERAL_INPUTS: usize = 3;
-const MAX_TENDERMINT_SESSION_BATCH_SIZE: usize = 6;
+const MAX_TENDERMINT_SESSION_BATCH_SIZE: usize = 24;
 const TENDERMINT_SESSION_TOKEN_NAME_BYTES: usize = 32;
 
 /// Limits that bound the wallet value a transaction may put at risk.
@@ -7130,7 +7130,33 @@ mod tests {
                 let transaction: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
                 policy.validate(&transaction, encoded.len(), &signer, &intent, &resolved)
             };
-            validate(&tx).unwrap();
+            for batch_size in [1, 6, 24] {
+                edit_redeemers(&mut tx, |redeemers| {
+                    redeemers[0].1.data = data_constructor(
+                        1,
+                        vec![PlutusData::Array(vec![
+                            data_constructor(0, vec![]);
+                            batch_size
+                        ])],
+                    );
+                });
+                validate(&tx).unwrap();
+            }
+            for batch_size in [0, 25] {
+                edit_redeemers(&mut tx, |redeemers| {
+                    redeemers[0].1.data = data_constructor(
+                        1,
+                        vec![PlutusData::Array(vec![
+                            data_constructor(0, vec![]);
+                            batch_size
+                        ])],
+                    );
+                });
+                assert!(validate(&tx)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("between 1 and 24 entries"));
+            }
             edit_redeemers(&mut tx, |redeemers| {
                 redeemers[0].1.data = data_constructor(3, vec![]);
             });
