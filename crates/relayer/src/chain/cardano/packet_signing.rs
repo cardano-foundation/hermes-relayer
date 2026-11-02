@@ -54,6 +54,15 @@ impl PacketRoots {
             "funds",
             "send_funds",
         ] {
+            // Merkle receipt histories do not mint the old pruning policy.
+            // Keep that ABI change explicit instead of inventing a script root.
+            if name == "prune"
+                && object_field(operations, &[name]).is_none()
+                && root.get("receipt_storage").and_then(JsonValue::as_str)
+                    == Some("merkle-history-v1")
+            {
+                continue;
+            }
             let validator =
                 object_field(operations, &[name]).ok_or("missing packet operation policy")?;
             let key = normalize_manifest_key(&format!("packetoperation{name}"));
