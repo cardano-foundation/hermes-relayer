@@ -7,6 +7,9 @@
 #[path = "packet_signing.rs"]
 mod packet_signing;
 
+#[path = "signing_policy_cached.rs"]
+mod cached;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -124,6 +127,7 @@ pub struct TransactionSigningPolicy {
     voucher_policy: Vec<u8>,
     packet_lanes: packet_signing::PacketRoots,
     tendermint_session: Option<StateOutputRoot>,
+    validator_cache: Option<StateOutputRoot>,
 }
 
 /// Authorization derived exclusively from the request Hermes intended to send.
@@ -142,6 +146,7 @@ pub struct SigningIntent {
     funded_intent: Option<[u8; 32]>,
     staged_tendermint: bool,
     staged_misbehaviour: bool,
+    tendermint_header: Option<Vec<u8>>,
     channel_upgrade: Option<ChannelUpgradeIntent>,
 }
 
@@ -547,9 +552,14 @@ impl TransactionSigningPolicy {
             Some(_) => return Err("unsupported consensus_history_format".to_string()),
         };
         if let Some(migration) = manifest.get("migration") {
-            if migration.get("profile").and_then(JsonValue::as_str)
-                != Some("cardano-ibc-compatible-v3")
-            {
+            if !matches!(
+                migration.get("profile").and_then(JsonValue::as_str),
+                Some(
+                    "cardano-ibc-compatible-v3"
+                        | "cardano-ibc-compatible-v4"
+                        | "cardano-ibc-compatible-v5"
+                )
+            ) {
                 return Err("unsupported migration profile".to_string());
             }
             if consensus_history_format != ConsensusHistoryFormat::ProofBackedV1 {
@@ -626,6 +636,7 @@ impl TransactionSigningPolicy {
 
         let mut scripts = collect_validator_script_roots(validators)?;
         let packet_lanes = packet_signing::PacketRoots::load(&manifest, network_id, &mut scripts)?;
+        let validator_cache = cached::load(&manifest, network_id, &mut scripts)?;
         if consensus_history_format == ConsensusHistoryFormat::ProofBackedV1 {
             required_script(&scripts, "recoverclient")?;
         }
@@ -736,6 +747,16 @@ impl TransactionSigningPolicy {
             protocol_addresses.insert(session.address.clone());
         }
 
+        if let Some(cache) = &validator_cache {
+            if tendermint_session.is_none()
+                || consensus_history_format != ConsensusHistoryFormat::ProofBackedV1
+            {
+                return Err("validator cache requires proof-backed staged sessions".into());
+            }
+            if !protocol_addresses.insert(cache.address.clone()) {
+                return Err("validator cache address overlaps another protocol role".into());
+            }
+        }
         Ok(Self {
             network_id,
             consensus_history_format,
@@ -758,6 +779,7 @@ impl TransactionSigningPolicy {
             voucher_policy,
             packet_lanes,
             tendermint_session,
+            validator_cache,
         })
     }
 
@@ -766,6 +788,10 @@ impl TransactionSigningPolicy {
         intent: &SigningIntent,
     ) -> Result<OperationRequirements<'a>, String> {
         if packet_signing::is_lane_operation(intent) {
+            if intent.prune_sequence.is_some() && !self.scripts.contains_key("packetoperationprune")
+            {
+                return Err("deployment has no legacy packet pruning policy".into());
+            }
             if !intent.acknowledgement_packets.is_empty()
                 && !self.packet_lanes.acknowledgement_batch
             {
@@ -1106,12 +1132,29 @@ impl TransactionSigningPolicy {
                 intent.operation
             ))
         };
-        let requirements = if intent.staged_tendermint {
+        let mut requirements = if intent.staged_tendermint {
             self.staged_tendermint_requirements(&tx.transaction_body, intent, resolved_inputs)
                 .map_err(reject)?
         } else {
             self.operation_requirements(intent).map_err(reject)?
         };
+        if self.validator_cache.is_some() {
+            if intent.operation == "/ibc.core.client.v1.MsgCreateClient" {
+                requirements.required_scripts.push("mintvalidatorcache");
+                requirements
+                    .required_mint_scripts
+                    .push("mintvalidatorcache");
+            } else if self.is_cached_direct(intent) {
+                requirements.required_scripts = vec![
+                    "spendclient",
+                    "spendvalidatorcache",
+                    "updatecachedclient",
+                    self.cached_core(&tx.transaction_body).map_err(reject)?,
+                ];
+            } else if self.uses_validator_cache(intent, &requirements) {
+                requirements.required_scripts.push("spendvalidatorcache");
+            }
+        }
         if intent.unresolved_ibc_denom_hash().is_some() {
             return Err(reject(
                 "hashed ICS-20 denomination was not resolved and verified".to_string(),
@@ -1528,6 +1571,9 @@ impl TransactionSigningPolicy {
     where
         F: Fn(String) -> Error,
     {
+        if self.is_cached_direct(intent) {
+            return self.validate_cached_withdrawals(body).map_err(reject);
+        }
         let requires_withdrawal = intent.operation == "/ibc.core.client.v1.MsgRecoverClient"
             || intent.operation == "/ibc.core.client.v1.MsgUpgradeClient"
             || (intent.operation == "/ibc.core.client.v1.MsgUpdateClient"
@@ -1657,6 +1703,11 @@ impl TransactionSigningPolicy {
                 && input.address == self.host_state_address)
                 || expected_state.is_some_and(|state| input.address == state.address)
                 || expected_session.is_some_and(|(_, session)| input.address == session.address)
+                || (self.uses_validator_cache(intent, requirements)
+                    && self
+                        .validator_cache
+                        .as_ref()
+                        .is_some_and(|cache| input.address == cache.address))
                 || requirements
                     .module
                     .is_some_and(|module| input.address == module.address)
@@ -1780,6 +1831,8 @@ impl TransactionSigningPolicy {
                 "transaction does not consume an input owned by the configured signer".to_string(),
             ));
         }
+        self.validate_cache_transition(body, intent, requirements, resolved_inputs)
+            .map_err(reject)?;
         let expected_host_state_quantity = u64::from(requirements.requires_host_state);
         if host_state_nft_quantity != expected_host_state_quantity {
             return Err(reject(format!(
@@ -2521,6 +2574,11 @@ impl TransactionSigningPolicy {
             )));
         }
 
+        if self.is_cached_direct(intent) {
+            return self
+                .validate_cached_message(body, redeemers, intent, resolved_inputs)
+                .map_err(reject);
+        }
         let expected = match intent.operation.as_str() {
             "/ibc.core.client.v1.MsgUpdateClient" => {
                 let expected = if intent.staged_misbehaviour {
@@ -3034,6 +3092,18 @@ impl TransactionSigningPolicy {
                         "transaction creates multiple staged Tendermint session outputs"
                             .to_string(),
                     ));
+                }
+                protocol_lovelace = checked_protocol_coin(protocol_lovelace, output.coin, reject)?;
+                continue;
+            }
+
+            if self
+                .validator_cache
+                .as_ref()
+                .is_some_and(|cache| output.address == cache.address)
+            {
+                if !self.uses_validator_cache(intent, requirements) {
+                    return Err(reject("unrelated validator cache output".into()));
                 }
                 protocol_lovelace = checked_protocol_coin(protocol_lovelace, output.coin, reject)?;
                 continue;
@@ -3811,6 +3881,7 @@ impl SigningIntent {
             acknowledgement_packets: vec![],
             staged_tendermint: false,
             staged_misbehaviour: false,
+            tendermint_header: None,
             channel_upgrade: None,
         };
         Self::packet_batch(&original, hash, initialize)
@@ -3875,6 +3946,7 @@ impl SigningIntent {
             acknowledgement_packets: vec![],
             staged_tendermint: false,
             staged_misbehaviour: false,
+            tendermint_header: None,
             channel_upgrade: None,
         })
     }
@@ -3929,6 +4001,7 @@ impl SigningIntent {
         let mut acknowledgement = None;
         let mut prune_sequence = None;
         let mut channel_upgrade = None;
+        let mut tendermint_header = None;
 
         let signer = match type_url {
             "/ibc.core.client.v1.MsgCreateClient" => {
@@ -3939,6 +4012,10 @@ impl SigningIntent {
             "/ibc.core.client.v1.MsgUpdateClient" => {
                 let msg = MsgUpdateClient::decode(message).map_err(decode_error)?;
                 state_sequence = Some(parse_identifier_sequence(&msg.client_id, None)?);
+                tendermint_header = msg
+                    .client_message
+                    .filter(|message| message.type_url == TENDERMINT_HEADER_TYPE_URL)
+                    .map(|message| message.value);
                 msg.signer
             }
             "/ibc.core.client.v1.MsgRecoverClient" => {
@@ -4351,6 +4428,7 @@ impl SigningIntent {
             acknowledgement_packets: vec![],
             staged_tendermint: false,
             staged_misbehaviour: false,
+            tendermint_header,
             channel_upgrade,
         })
     }
@@ -5161,7 +5239,7 @@ mod tests {
     use crate::chain::cardano::utxo_resolver::ResolvedAsset;
     use pallas_codec::minicbor;
 
-    fn limits() -> SigningPolicyLimits {
+    pub(super) fn limits() -> SigningPolicyLimits {
         SigningPolicyLimits {
             max_fee_lovelace: 5_000_000,
             max_total_collateral_lovelace: 10_000_000,
@@ -5173,7 +5251,7 @@ mod tests {
         }
     }
 
-    fn manifest() -> String {
+    pub(super) fn manifest() -> String {
         let raw = format!(
             r#"{{
                 "validators": {{
@@ -5794,7 +5872,7 @@ mod tests {
             .contains("state input does not match the original IBC message"));
     }
 
-    fn proof_backed_policy() -> TransactionSigningPolicy {
+    pub(super) fn proof_backed_policy() -> TransactionSigningPolicy {
         let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
         value["consensus_history_format"] = "proof-backed-v1".into();
         TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).unwrap()
@@ -5838,7 +5916,7 @@ mod tests {
         );
     }
 
-    fn update_intent() -> SigningIntent {
+    pub(super) fn update_intent() -> SigningIntent {
         let signer = recovery_signer();
         let message = MsgUpdateClient {
             client_id: "07-tendermint-7".to_string(),
@@ -5849,7 +5927,7 @@ mod tests {
         SigningIntent::ibc("/ibc.core.client.v1.MsgUpdateClient", &message, &signer, 0).unwrap()
     }
 
-    fn data_constructor(alternative: u64, fields: Vec<PlutusData>) -> PlutusData {
+    pub(super) fn data_constructor(alternative: u64, fields: Vec<PlutusData>) -> PlutusData {
         PlutusData::Constr(pallas_primitives::alonzo::Constr {
             tag: if alternative < 7 {
                 121 + alternative
@@ -5914,7 +5992,7 @@ mod tests {
         }
     }
 
-    fn data_token(policy: &[u8], name: &[u8]) -> PlutusData {
+    pub(super) fn data_token(policy: &[u8], name: &[u8]) -> PlutusData {
         data_constructor(
             0,
             vec![
@@ -8364,6 +8442,7 @@ mod tests {
             acknowledgement_packets: vec![],
             staged_tendermint: false,
             staged_misbehaviour: false,
+            tendermint_header: None,
             channel_upgrade: None,
         }
     }
