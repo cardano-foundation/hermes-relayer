@@ -8240,25 +8240,37 @@ mod tests {
                 )
             })
             .collect();
-        let operation = |packets| data_constructor(10, vec![PlutusData::Array(packets)]);
-        assert!(packet_signing::acknowledgement_batch_matches(
-            &operation(packets.clone()),
-            &intent.acknowledgement_packets
-        ));
-        assert!(!packet_signing::acknowledgement_batch_matches(
-            &operation(vec![packets[0].clone()]),
-            &intent.acknowledgement_packets
-        ));
-        assert!(!packet_signing::acknowledgement_batch_matches(
-            &operation(vec![packets[0].clone(); 3]),
-            &intent.acknowledgement_packets
-        ));
-        let mut changed = packets.clone();
-        changed[1] = packets[0].clone();
-        assert!(!packet_signing::acknowledgement_batch_matches(
-            &operation(changed),
-            &intent.acknowledgement_packets
-        ));
+        for receipt_storage in [None, Some("merkle-history-v1")] {
+            let mut deployment: JsonValue = serde_json::from_str(&manifest()).unwrap();
+            if let Some(format) = receipt_storage {
+                deployment["packet_state"]["receipt_storage"] = format.into();
+            }
+            let policy =
+                TransactionSigningPolicy::from_json(&deployment.to_string(), 0, limits()).unwrap();
+            let expected_tag = policy.packet_lanes.acknowledgement_batch_tag;
+            assert_eq!(expected_tag, if receipt_storage.is_some() { 9 } else { 10 });
+            let operation = |tag, packets| data_constructor(tag, vec![PlutusData::Array(packets)]);
+            let matches = |data: &PlutusData| {
+                packet_signing::acknowledgement_batch_matches(
+                    data,
+                    &intent.acknowledgement_packets,
+                    expected_tag,
+                )
+            };
+            assert!(matches(&operation(expected_tag, packets.clone())));
+            assert!(!matches(&operation(
+                if expected_tag == 9 { 10 } else { 9 },
+                packets.clone()
+            )));
+            assert!(!matches(&operation(expected_tag, vec![packets[0].clone()])));
+            assert!(!matches(&operation(
+                expected_tag,
+                vec![packets[0].clone(); 3]
+            )));
+            let mut changed = packets.clone();
+            changed[1] = packets[0].clone();
+            assert!(!matches(&operation(expected_tag, changed)));
+        }
     }
 
     #[test]

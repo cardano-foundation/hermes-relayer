@@ -123,6 +123,92 @@ fn native_packet_transactions_pass_with_only_their_executed_script_references() 
 }
 
 #[test]
+fn successful_acknowledgement_signing_does_not_require_the_funds_policy() {
+    use pallas_primitives::conway::{RedeemerTag, Redeemers, RedeemersKey, RedeemersValue};
+
+    let fixture = Fixture::load("acknowledge");
+    let funds = required_script(&fixture.policy.scripts, "packetoperationfunds").unwrap();
+    let mut tx = fixture.transaction();
+    let mut mint = tx.transaction_body.mint.take().unwrap().to_vec();
+    mint.sort_by(|a, b| a.0.cmp(&b.0));
+    let index = mint
+        .iter()
+        .position(|(policy, _)| policy.as_ref() == funds.hash)
+        .unwrap();
+    mint.remove(index);
+    tx.transaction_body.mint = Some(mint.try_into().unwrap());
+    let references = tx
+        .transaction_body
+        .reference_inputs
+        .take()
+        .unwrap()
+        .to_vec();
+    tx.transaction_body.reference_inputs = Some(
+        references
+            .into_iter()
+            .filter(|input| {
+                (input.transaction_id.as_ref().to_vec(), input.index) != funds.reference
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap(),
+    );
+    let mut redeemers: Vec<(RedeemersKey, RedeemersValue)> = tx
+        .transaction_witness_set
+        .redeemer
+        .as_ref()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect();
+    redeemers.retain(|(key, _)| key.tag != RedeemerTag::Mint || key.index != index as u32);
+    for (key, _) in &mut redeemers {
+        if key.tag == RedeemerTag::Mint && key.index > index as u32 {
+            key.index -= 1;
+        }
+    }
+    tx.transaction_witness_set.redeemer = Some(Redeemers::from(
+        pallas_codec::utils::NonEmptyKeyValuePairs::try_from(redeemers).unwrap(),
+    ));
+    fixture.validate(&minicbor::to_vec(&tx).unwrap()).unwrap();
+
+    for script in [
+        "packetoperationacknowledge",
+        "verifyproof",
+        "packetguard",
+        "packetbatch",
+    ] {
+        let required = required_script(&fixture.policy.scripts, script).unwrap();
+        let mut missing = tx.clone();
+        let references = missing
+            .transaction_body
+            .reference_inputs
+            .take()
+            .unwrap()
+            .to_vec();
+        missing.transaction_body.reference_inputs = Some(
+            references
+                .into_iter()
+                .filter(|input| {
+                    (input.transaction_id.as_ref().to_vec(), input.index) != required.reference
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+        );
+        assert!(
+            fixture
+                .validate(&minicbor::to_vec(missing).unwrap())
+                .is_err(),
+            "missing {script}"
+        );
+    }
+    let mut changed = Fixture::load("acknowledge");
+    changed.intent.packet.as_mut().unwrap().sequence += 1;
+    assert!(changed.validate(&minicbor::to_vec(tx).unwrap()).is_err());
+}
+
+#[test]
 fn native_packet_transactions_reject_missing_executed_script_references() {
     for (name, scripts) in [
         ("initialize", vec!["packetstate"]),
