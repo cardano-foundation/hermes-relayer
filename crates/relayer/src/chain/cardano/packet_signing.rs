@@ -265,6 +265,13 @@ impl TransactionSigningPolicy {
                     return Err(reject("unauthenticated packet registry".into()));
                 }
             } else if !initialization && input.address == self.packet_lanes.guard {
+                if !reference_set.contains(
+                    &required_script(&self.scripts, "packetguard")
+                        .map_err(reject)?
+                        .reference,
+                ) {
+                    return Err(reject("missing pinned packet guard validator".into()));
+                }
                 let action =
                     spend_redeemer_for_input(body, redeemers, reference).map_err(reject)?;
                 if constructor_fields(action, 3).is_none()

@@ -10,6 +10,10 @@ mod packet_signing;
 #[path = "signing_policy_cached.rs"]
 mod cached;
 
+#[cfg(test)]
+#[path = "signing_policy_packet_tests.rs"]
+mod packet_tests;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -800,11 +804,10 @@ impl TransactionSigningPolicy {
             return Ok(OperationRequirements {
                 requires_host_state: false,
                 tendermint_session: None,
-                required_scripts: if intent.operation == "/ibc.applications.transfer.v1.MsgTransfer"
-                {
-                    vec![]
-                } else {
-                    vec!["packetstate", "packetbatch", "packetguard"]
+                required_scripts: match intent.operation.as_str() {
+                    "/ibc.applications.transfer.v1.MsgTransfer" => vec![],
+                    "InitializePacketLanes" => vec!["packetstate"],
+                    _ => vec!["packetbatch"],
                 },
                 required_mint_scripts: vec![],
                 state_output: StateOutputKind::None,
@@ -3782,6 +3785,10 @@ fn is_cardano_token_unit(denom: &str) -> bool {
 }
 
 impl SigningIntent {
+    pub(super) fn is_transfer_admission(&self) -> bool {
+        self.operation == "/ibc.applications.transfer.v1.MsgTransfer"
+    }
+
     pub fn acknowledgement_batch(
         messages: &[ibc_proto::google::protobuf::Any],
         signer: &str,
@@ -8400,10 +8407,7 @@ mod tests {
         let batch = SigningIntent::packet_batch(&intent, &"aa".repeat(32), false).unwrap();
         let batch_requirements = policy.operation_requirements(&batch).unwrap();
         assert!(batch_requirements.module.is_none());
-        assert_eq!(
-            batch_requirements.required_scripts,
-            vec!["packetstate", "packetbatch", "packetguard"]
-        );
+        assert_eq!(batch_requirements.required_scripts, vec!["packetbatch"]);
     }
 
     #[test]
@@ -8416,10 +8420,7 @@ mod tests {
         assert_eq!(intent.funded_intent, Some([0xab; 32]));
         let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
         let requirements = policy.operation_requirements(&intent).unwrap();
-        assert_eq!(
-            requirements.required_scripts,
-            vec!["packetstate", "packetbatch", "packetguard"]
-        );
+        assert_eq!(requirements.required_scripts, vec!["packetbatch"]);
         assert!(
             SigningIntent::funded_batch("other", "channel-7", &"ab".repeat(32), false).is_err()
         );
