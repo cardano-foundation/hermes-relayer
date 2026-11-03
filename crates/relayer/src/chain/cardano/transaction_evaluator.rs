@@ -20,7 +20,9 @@ use serde_json::Value as JsonValue;
 
 use super::config::CardanoConfig;
 use super::error::Error;
-use super::utxo_resolver::{OgmiosAdditionalUtxo, TrustedUtxoOverlay};
+use super::utxo_resolver::{
+    OgmiosAdditionalUtxo, ResolvedTransactionInputs, TransactionOutRef, TrustedUtxoOverlay,
+};
 
 const OGMIOS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_OGMIOS_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
@@ -561,6 +563,56 @@ impl OgmiosTransactionEvaluator {
 struct DeclaredBudget {
     memory: u64,
     cpu: u64,
+}
+
+/// A funded user intent only spends key-owned inputs. It has no phase-2 work.
+/// Resolve every input independently before taking this exception.
+pub(super) fn validate_key_only_transaction(
+    unsigned_tx_cbor: &[u8],
+    resolved: &ResolvedTransactionInputs,
+) -> Result<(), Error> {
+    let mut decoder = minicbor::Decoder::new(unsigned_tx_cbor);
+    let tx: MintedTx<'_> = decoder
+        .decode()
+        .map_err(|error| Error::CborDecode(format!("invalid key-only transaction: {error:?}")))?;
+    if decoder.position() != unsigned_tx_cbor.len() {
+        return Err(Error::CborDecode(
+            "key-only transaction has trailing CBOR data".into(),
+        ));
+    }
+    let body = &*tx.transaction_body;
+    let witnesses = &*tx.transaction_witness_set;
+    let inputs: BTreeSet<_> = body
+        .inputs
+        .iter()
+        .map(TransactionOutRef::from_transaction_input)
+        .collect();
+    if !tx.success
+        || inputs.is_empty()
+        || inputs != resolved.regular.keys().cloned().collect()
+        || resolved.regular.values().any(|input| {
+            !matches!(
+                input.address.first().map(|header| header >> 4),
+                Some(0 | 2 | 4 | 6)
+            )
+        })
+        || body.mint.is_some()
+        || body.withdrawals.is_some()
+        || body.certificates.is_some()
+        || body.voting_procedures.is_some()
+        || body.proposal_procedures.is_some()
+        || body.script_data_hash.is_some()
+        || witnesses.redeemer.is_some()
+        || witnesses.native_script.is_some()
+        || witnesses.plutus_v1_script.is_some()
+        || witnesses.plutus_v2_script.is_some()
+        || witnesses.plutus_v3_script.is_some()
+    {
+        return Err(Error::Transaction(
+            "user intent is not a key-only transaction".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn transaction_redeemer_budgets(

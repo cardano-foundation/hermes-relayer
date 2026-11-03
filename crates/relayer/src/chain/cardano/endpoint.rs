@@ -13,7 +13,7 @@ use super::signing_policy::{
     SigningIntent, SigningPolicyLimits, TendermintSessionAction, TransactionSigningPolicy,
     ValidatedTendermintSessionAction,
 };
-use super::transaction_evaluator::OgmiosTransactionEvaluator;
+use super::transaction_evaluator::{validate_key_only_transaction, OgmiosTransactionEvaluator};
 use super::utxo_resolver::{
     transaction_consumes_output_from, KupoInputResolver, TrustedUtxoOverlay,
 };
@@ -497,16 +497,25 @@ impl CardanoChainEndpoint {
                     })
             },
             async {
-                self.transaction_evaluator
-                    .evaluate_unsigned_transaction_with_overlay(&unsigned_tx_bytes, overlay)
-                    .await
-                    .map_err(|error| {
-                        Error::send_tx(format!(
-                            "Failed trusted phase-2 evaluation before signing: {error}"
-                        ))
-                    })
+                if intent.is_transfer_admission() {
+                    Ok(Vec::new())
+                } else {
+                    self.transaction_evaluator
+                        .evaluate_unsigned_transaction_with_overlay(&unsigned_tx_bytes, overlay)
+                        .await
+                        .map_err(|error| {
+                            Error::send_tx(format!(
+                                "Failed trusted phase-2 evaluation before signing: {error}"
+                            ))
+                        })
+                }
             }
         )?;
+        if intent.is_transfer_admission() {
+            validate_key_only_transaction(&unsigned_tx_bytes, &resolved_inputs).map_err(
+                |error| Error::send_tx(format!("Invalid key-only user intent: {error}")),
+            )?;
+        }
 
         let staged_action = if intent.is_staged_tendermint() {
             Some(
