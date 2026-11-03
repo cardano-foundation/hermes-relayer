@@ -1170,6 +1170,7 @@ impl CardanoChainEndpoint {
         port_id: &PortId,
         channel_id: &ChannelId,
         sequence: Sequence,
+        height: ICSHeight,
     ) -> Result<QueryPacketCommitmentResponse, Error> {
         self.rt.block_on(async {
             let response_bytes = self
@@ -1178,7 +1179,7 @@ impl CardanoChainEndpoint {
                     port_id.as_ref(),
                     channel_id.as_ref(),
                     sequence.into(),
-                    None,
+                    Some(height),
                 )
                 .await
                 .map_err(|e| Error::query(format!("Failed to query packet commitment: {}", e)))?;
@@ -1197,6 +1198,7 @@ impl CardanoChainEndpoint {
         port_id: &PortId,
         channel_id: &ChannelId,
         sequence: Sequence,
+        height: ICSHeight,
     ) -> Result<QueryPacketAcknowledgementResponse, Error> {
         self.rt.block_on(async {
             let response_bytes = self
@@ -1205,7 +1207,7 @@ impl CardanoChainEndpoint {
                     port_id.as_ref(),
                     channel_id.as_ref(),
                     sequence.into(),
-                    None,
+                    Some(height),
                 )
                 .await
                 .map_err(|e| {
@@ -1226,11 +1228,17 @@ impl CardanoChainEndpoint {
         port_id: &PortId,
         channel_id: &ChannelId,
         sequence: Sequence,
+        height: ICSHeight,
     ) -> Result<QueryPacketReceiptResponse, Error> {
         self.rt.block_on(async {
             let response_bytes = self
                 .gateway_client
-                .query_packet_receipt(port_id.as_ref(), channel_id.as_ref(), sequence.into(), None)
+                .query_packet_receipt(
+                    port_id.as_ref(),
+                    channel_id.as_ref(),
+                    sequence.into(),
+                    Some(height),
+                )
                 .await
                 .map_err(|e| Error::query(format!("Failed to query packet receipt: {}", e)))?;
 
@@ -1244,11 +1252,12 @@ impl CardanoChainEndpoint {
         &self,
         port_id: &PortId,
         channel_id: &ChannelId,
+        height: ICSHeight,
     ) -> Result<QueryNextSequenceReceiveResponse, Error> {
         self.rt.block_on(async {
             let response_bytes = self
                 .gateway_client
-                .query_next_sequence_receive(port_id.as_ref(), channel_id.as_ref(), None)
+                .query_next_sequence_receive(port_id.as_ref(), channel_id.as_ref(), Some(height))
                 .await
                 .map_err(|e| {
                     Error::query(format!("Failed to query next sequence receive: {}", e))
@@ -3675,7 +3684,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
         let (maybe_packet_proof, channel_proof, proof_height) = match packet_type {
             PacketMsgType::Recv => {
                 let response =
-                    self.query_packet_commitment_response(&port_id, &channel_id, sequence)?;
+                    self.query_packet_commitment_response(&port_id, &channel_id, sequence, height)?;
                 (
                     decode_optional_merkle_proof(&response.proof, "packet commitment")?,
                     None,
@@ -3683,8 +3692,12 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 )
             }
             PacketMsgType::Ack => {
-                let response =
-                    self.query_packet_acknowledgement_response(&port_id, &channel_id, sequence)?;
+                let response = self.query_packet_acknowledgement_response(
+                    &port_id,
+                    &channel_id,
+                    sequence,
+                    height,
+                )?;
                 (
                     decode_optional_merkle_proof(&response.proof, "packet acknowledgement")?,
                     None,
@@ -3697,7 +3710,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             }
             PacketMsgType::TimeoutUnordered => {
                 let response =
-                    self.query_packet_receipt_response(&port_id, &channel_id, sequence)?;
+                    self.query_packet_receipt_response(&port_id, &channel_id, sequence, height)?;
                 (
                     decode_optional_merkle_proof(&response.proof, "packet receipt")?,
                     None,
@@ -3705,7 +3718,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 )
             }
             PacketMsgType::TimeoutOrdered => {
-                let response = self.query_next_sequence_receive_response(&port_id, &channel_id)?;
+                let response =
+                    self.query_next_sequence_receive_response(&port_id, &channel_id, height)?;
                 (
                     decode_optional_merkle_proof(&response.proof, "next sequence receive")?,
                     None,
@@ -3718,7 +3732,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             }
             PacketMsgType::TimeoutOnCloseUnordered => {
                 let response =
-                    self.query_packet_receipt_response(&port_id, &channel_id, sequence)?;
+                    self.query_packet_receipt_response(&port_id, &channel_id, sequence, height)?;
                 let proof_height =
                     proof_height_from_response(response.proof_height, height, "packet receipt")?;
                 let channel_proof = self
@@ -3742,7 +3756,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 )
             }
             PacketMsgType::TimeoutOnCloseOrdered => {
-                let response = self.query_next_sequence_receive_response(&port_id, &channel_id)?;
+                let response =
+                    self.query_next_sequence_receive_response(&port_id, &channel_id, height)?;
                 let proof_height = proof_height_from_response(
                     response.proof_height,
                     height,
