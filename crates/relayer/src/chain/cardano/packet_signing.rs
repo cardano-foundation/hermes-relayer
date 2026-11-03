@@ -14,6 +14,7 @@ pub(super) struct PacketRoots {
     operation_scripts: Vec<ScriptRoot>,
     pub(super) lane_count: Option<u64>,
     pub(super) acknowledgement_batch: bool,
+    pub(super) acknowledgement_batch_tag: u64,
 }
 impl PacketRoots {
     pub(super) fn load(
@@ -71,6 +72,13 @@ impl PacketRoots {
         }
         operation_scripts.push(required_script(scripts, "verifyproof")?.clone());
         Ok(Self {
+            acknowledgement_batch_tag: if root.get("receipt_storage").and_then(JsonValue::as_str)
+                == Some("merkle-history-v1")
+            {
+                9
+            } else {
+                10
+            },
             acknowledgement_batch: root
                 .get("acknowledgement_batch_size")
                 .and_then(JsonValue::as_u64)
@@ -102,8 +110,9 @@ pub(super) fn is_lane_operation(intent: &SigningIntent) -> bool {
 pub(super) fn acknowledgement_batch_matches(
     operation: &PlutusData,
     packets: &[PacketIntent],
+    expected_tag: u64,
 ) -> bool {
-    let Some(children) = constructor_fields(operation, 10)
+    let Some(children) = constructor_fields(operation, expected_tag)
         .filter(|fields| fields.len() == 1)
         .and_then(|fields| match &fields[0] {
             PlutusData::Array(items) => Some(items.as_slice()),
@@ -364,7 +373,11 @@ impl TransactionSigningPolicy {
                     return Err(reject("unexpected send-batch operation".into()));
                 }
             } else if !intent.acknowledgement_packets.is_empty() {
-                if !acknowledgement_batch_matches(operation, &intent.acknowledgement_packets) {
+                if !acknowledgement_batch_matches(
+                    operation,
+                    &intent.acknowledgement_packets,
+                    self.packet_lanes.acknowledgement_batch_tag,
+                ) {
                     return Err(reject(
                         "acknowledgement batch changes the requested packets".into(),
                     ));
