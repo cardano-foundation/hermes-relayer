@@ -75,6 +75,9 @@ use crate::util::queue::Queue;
 
 const MAX_RETRIES: usize = 5;
 
+#[path = "cardano_proofs.rs"]
+mod cardano_proofs;
+
 /// Whether or not to resubmit packets when pending transactions
 /// fail to process within the given timeout duration.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1773,10 +1776,14 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
     /// also placed in the 'unprocessed' bucket.
     fn execute_schedule_for_target_chain<I: Iterator<Item = OperationalData>>(
         &mut self,
-        mut operations: I,
+        operations: I,
         target_chain: OperationalDataTarget,
     ) -> Result<VecDeque<OperationalData>, (VecDeque<OperationalData>, LinkError)> {
         let mut unprocessed = VecDeque::new();
+        let mut ready = VecDeque::new();
+        let mut operations = operations;
+        let collect_ready = target_chain == OperationalDataTarget::Destination
+            && matches!(self.dst_chain().config(), Ok(ChainConfig::Cardano(_)));
 
         while let Some(od) = operations.next() {
             let elapsed_result = match target_chain {
@@ -1795,19 +1802,17 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
             match elapsed_result {
                 Ok(elapsed) => {
                     if elapsed {
-                        // The current piece of operational data has elapsed; we can go ahead and
-                        // attempt to relay it.
-                        match self
-                            .relay_from_operational_data::<relay_sender::AsyncSender>(od.clone())
-                        {
-                            // The operational data was successfully relayed; enqueue the associated tx.
-                            Ok(reply) => self.enqueue_pending_tx(reply, od),
-                            // The relaying process failed; return all of the subsequent pieces of operational
-                            // data along with the underlying error that occurred.
-                            Err(e) => {
-                                unprocessed.extend(operations);
-
-                                return Err((unprocessed, e));
+                        if collect_ready {
+                            ready.push_back(od);
+                        } else {
+                            match self.relay_from_operational_data::<relay_sender::AsyncSender>(
+                                od.clone(),
+                            ) {
+                                Ok(reply) => self.enqueue_pending_tx(reply, od),
+                                Err(error) => {
+                                    unprocessed.extend(operations);
+                                    return Err((unprocessed, error));
+                                }
                             }
                         }
                     } else {
@@ -1822,10 +1827,25 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
                     // operational data has elapsed or not. Add the current piece of data, along with
                     // all of the subsequent pieces of data, to the unprocessed bucket and return it
                     // along with the error that resulted.
+                    unprocessed.extend(ready);
                     unprocessed.push_back(od);
                     unprocessed.extend(operations);
 
                     return Err((unprocessed, e));
+                }
+            }
+        }
+
+        if collect_ready {
+            self.reuse_cardano_proof_heights(&mut ready);
+            ready = self.pack_cardano_acknowledgements(ready);
+        }
+        while let Some(od) = ready.pop_front() {
+            match self.relay_from_operational_data::<relay_sender::AsyncSender>(od.clone()) {
+                Ok(reply) => self.enqueue_pending_tx(reply, od),
+                Err(error) => {
+                    unprocessed.extend(ready);
+                    return Err((unprocessed, error));
                 }
             }
         }
