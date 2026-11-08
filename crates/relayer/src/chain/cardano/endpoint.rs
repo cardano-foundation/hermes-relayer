@@ -702,51 +702,46 @@ impl CardanoChainEndpoint {
     /// Never wait for another packet to form an acknowledgement batch.
     async fn submit_ready_ibc_message(
         &self,
-        messages: &[ibc_proto::google::protobuf::Any],
+        messages: &mut [ibc_proto::google::protobuf::Any],
     ) -> Result<(usize, TxSubmitResponse), Error> {
-        if messages.len() >= 2 {
-            if let Ok(intent) = SigningIntent::acknowledgement_batch(
-                &messages[..2],
-                &self.signer_address,
-                self.config.network_id,
-            ) {
-                if self.signing_policy.can_batch_acknowledgements(&intent) {
-                    use prost::Message;
-                    let request =
-                        super::generated::ibc::core::channel::v1::MsgAcknowledgement::decode(
-                            messages[0].value.as_slice(),
-                        )
+        if let Some((partner, intent)) = self.signing_policy.ready_acknowledgement_batch(
+            messages,
+            &self.signer_address,
+            self.config.network_id,
+        ) {
+            messages[1..=partner].rotate_right(1);
+            use prost::Message;
+            let request = super::generated::ibc::core::channel::v1::MsgAcknowledgement::decode(
+                messages[0].value.as_slice(),
+            )
+            .map_err(|error| Error::send_tx(error.to_string()))?;
+            let packet = request
+                .packet
+                .ok_or_else(|| Error::send_tx("missing packet".into()))?;
+            let built = self
+                .gateway_client
+                .build_acknowledgement_batch(
+                    &self.signer_address,
+                    &packet.source_port,
+                    &packet.source_channel,
+                    messages[..2]
+                        .iter()
+                        .map(|message| message.value.clone())
+                        .collect(),
+                )
+                .await;
+            if let Ok(batch) = built {
+                if batch.stage == "acknowledge" {
+                    let unsigned = UnsignedTx::from_packet_batch(&batch)
                         .map_err(|error| Error::send_tx(error.to_string()))?;
-                    let packet = request
-                        .packet
-                        .ok_or_else(|| Error::send_tx("missing packet".into()))?;
-                    let built = self
-                        .gateway_client
-                        .build_acknowledgement_batch(
-                            &self.signer_address,
-                            &packet.source_port,
-                            &packet.source_channel,
-                            messages[..2]
-                                .iter()
-                                .map(|message| message.value.clone())
-                                .collect(),
-                        )
-                        .await;
-                    if let Ok(batch) = built {
-                        if batch.stage == "acknowledge" {
-                            let unsigned = UnsignedTx::from_packet_batch(&batch)
-                                .map_err(|error| Error::send_tx(error.to_string()))?;
-                            // A policy rejection or an ambiguous broadcast propagates.
-                            // Only a failed Gateway build can fall back to singletons.
-                            let (response, _) =
-                                self.sign_submit_until_included(&unsigned, &intent).await?;
-                            return Ok((2, response));
-                        }
-                    }
-                    // Build failure is pre-broadcast. Older Gateways and transactions
-                    // beyond their limits keep the existing singleton path.
+                    // A policy rejection or an ambiguous broadcast propagates.
+                    // Only a failed Gateway build can fall back to singletons.
+                    let (response, _) = self.sign_submit_until_included(&unsigned, &intent).await?;
+                    return Ok((2, response));
                 }
             }
+            // Build failure is pre-broadcast. Older Gateways and transactions
+            // beyond their limits keep the existing singleton path.
         }
         let message = messages
             .first()
@@ -1651,7 +1646,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn send_messages_and_wait_commit(
         &mut self,
-        tracked_msgs: TrackedMsgs,
+        mut tracked_msgs: TrackedMsgs,
     ) -> Result<Vec<IbcEventWithHeight>, Error> {
         tracing::info!(
             "send_messages_and_wait_commit: processing {} messages",
@@ -1737,13 +1732,13 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
             let mut message_index = 0;
             while !transfers_only && message_index < tracked_msgs.msgs.len() {
-                let msg = &tracked_msgs.msgs[message_index];
+                let msg = tracked_msgs.msgs[message_index].clone();
                 tracing::debug!("Processing message type: {:?}", msg.type_url);
 
                 // Build, sign, and submit. Tendermint header updates repeat this
                 // operation while the Gateway returns an intermediate marker.
                 let (consumed, tx_response) = self
-                    .submit_ready_ibc_message(&tracked_msgs.msgs[message_index..])
+                    .submit_ready_ibc_message(&mut tracked_msgs.msgs[message_index..])
                     .await?;
                 message_index += consumed;
 
@@ -1877,7 +1872,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
     fn send_messages_and_wait_check_tx(
         &mut self,
-        tracked_msgs: TrackedMsgs,
+        mut tracked_msgs: TrackedMsgs,
     ) -> Result<Vec<TxResponse>, Error> {
         tracing::info!(
             "send_messages_and_wait_check_tx: processing {} messages",
@@ -1898,7 +1893,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             let mut message_index = 0;
             while message_index < tracked_msgs.msgs.len() {
                 let (consumed, tx_response) = self
-                    .submit_ready_ibc_message(&tracked_msgs.msgs[message_index..])
+                    .submit_ready_ibc_message(&mut tracked_msgs.msgs[message_index..])
                     .await?;
                 message_index += consumed;
 

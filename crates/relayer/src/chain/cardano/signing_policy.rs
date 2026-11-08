@@ -496,6 +496,35 @@ enum ClientWithdrawal<'a> {
 }
 
 impl TransactionSigningPolicy {
+    /// Search only messages already supplied by the ready queue. A conflicting
+    /// lane must not hide a usable partner. Keep other IBC messages as barriers.
+    pub(crate) fn ready_acknowledgement_batch(
+        &self,
+        messages: &[ibc_proto::google::protobuf::Any],
+        signer: &str,
+        network: u8,
+    ) -> Option<(usize, SigningIntent)> {
+        let first = messages.first()?;
+        if first.type_url != "/ibc.core.channel.v1.MsgAcknowledgement" {
+            return None;
+        }
+        messages
+            .iter()
+            .enumerate()
+            .skip(1)
+            .take_while(|(_, next)| next.type_url == first.type_url)
+            .find_map(|(index, next)| {
+                let intent = SigningIntent::acknowledgement_batch(
+                    &[first.clone(), next.clone()],
+                    signer,
+                    network,
+                )
+                .ok()?;
+                self.can_batch_acknowledgements(&intent)
+                    .then_some((index, intent))
+            })
+    }
+
     pub(crate) fn can_batch_acknowledgements(&self, intent: &SigningIntent) -> bool {
         if !self.packet_lanes.acknowledgement_batch {
             return false;
@@ -8199,6 +8228,45 @@ mod tests {
         )
         .unwrap();
         assert!(!policy.can_batch_acknowledgements(&shared));
+    }
+
+    #[test]
+    fn ready_acknowledgements_find_a_partner_beyond_a_conflicting_lane() {
+        let signer = format!("60{}", "99".repeat(28));
+        let mut policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        policy.packet_lanes.lane_count = Some(16);
+        policy.packet_lanes.acknowledgement_batch = true;
+        let mut messages = vec![
+            ready_acknowledgement(1, 10),
+            ready_acknowledgement(17, 10),
+            ready_acknowledgement(2, 11),
+            ready_acknowledgement(2, 10),
+        ];
+        let (partner, intent) = policy
+            .ready_acknowledgement_batch(&messages, &signer, 0)
+            .unwrap();
+        assert_eq!(partner, 3);
+        assert_eq!(intent.acknowledgement_packets.len(), 2);
+        messages[1..=partner].rotate_right(1);
+        assert!(SigningIntent::acknowledgement_batch(&messages[..2], &signer, 0).is_ok());
+        assert_eq!(messages[2], ready_acknowledgement(17, 10));
+        assert_eq!(messages[3], ready_acknowledgement(2, 11));
+        assert!(policy
+            .ready_acknowledgement_batch(&messages[..1], &signer, 0)
+            .is_none());
+
+        messages[1].type_url = "/ibc.core.client.v1.MsgUpdateClient".into();
+        assert!(policy
+            .ready_acknowledgement_batch(&messages, &signer, 0)
+            .is_none());
+        policy.packet_lanes.acknowledgement_batch = false;
+        assert!(policy
+            .ready_acknowledgement_batch(
+                &[ready_acknowledgement(1, 10), ready_acknowledgement(2, 10)],
+                &signer,
+                0
+            )
+            .is_none());
     }
 
     #[test]
