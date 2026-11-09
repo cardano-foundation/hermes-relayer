@@ -2525,6 +2525,47 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             })
     }
 
+    /// Root-bearing heights are queried again on every dispatch. A previous
+    /// successful update is not evidence that its root survived a rollback.
+    pub(crate) fn retained_proof_heights(
+        &self,
+        minimum: Height,
+        maximum: Height,
+    ) -> Result<Vec<Height>, ForeignClientError> {
+        let (client, _) = self.validated_client_state()?;
+        let mut usable = Vec::new();
+        for height in self.fetch_consensus_state_heights()? {
+            if height >= minimum
+                && height <= maximum
+                && matches!(
+                    self.check_consensus_state_trusting_period(&client, &height),
+                    Ok(ConsensusStateTrusted::Trusted { .. })
+                )
+            {
+                usable.push(height);
+            }
+        }
+        Ok(usable)
+    }
+
+    pub(crate) fn in_flight_update_heights(&self) -> Vec<Height> {
+        let locks = UPDATE_LOCKS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut heights: Vec<_> = locks
+            .iter()
+            .filter(|((destination, source, client, _), lock)| {
+                *destination == self.dst_chain.id()
+                    && *source == self.src_chain.id()
+                    && *client == self.id
+                    && lock.strong_count() > 0
+            })
+            .map(|((_, _, _, height), _)| *height)
+            .collect();
+        heights.sort_unstable_by(|a, b| b.cmp(a));
+        heights
+    }
+
     fn ensure_cardano_update(
         &self,
         height: Height,

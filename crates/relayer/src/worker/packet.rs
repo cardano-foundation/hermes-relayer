@@ -1,5 +1,6 @@
 use core::time::Duration;
 use std::borrow::BorrowMut;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -22,6 +23,7 @@ use ibc_relayer_types::Height;
 use crate::chain::handle::ChainHandle;
 use crate::chain::requests::QueryHeight;
 use crate::config::filter::FeePolicy;
+use crate::config::ChainConfig;
 use crate::event::source::EventBatch;
 use crate::event::IbcEventWithHeight;
 use crate::foreign_client::HasExpiredOrFrozenError;
@@ -41,6 +43,20 @@ const INCENTIVIZED_CACHE_MAX_CAPACITY: u64 = 1000;
 // Number of NewBlock consecutive NewBlock events before aborting the
 // packet cmd worker.
 const IDLE_TIMEOUT_BLOCKS: u64 = 100;
+
+/// Take a bounded snapshot, including block notifications between packet
+/// batches. Receiving more commands must never postpone this dispatch.
+fn ready_packet_commands(
+    first: WorkerCmd,
+    pending: &mut VecDeque<WorkerCmd>,
+    receiver: &Receiver<WorkerCmd>,
+) -> VecDeque<WorkerCmd> {
+    let already_queued = receiver.len();
+    std::iter::once(first)
+        .chain(pending.drain(..))
+        .chain(receiver.try_iter().take(already_queued))
+        .collect()
+}
 
 fn handle_link_error_in_task(e: LinkError) -> TaskError<RunError> {
     if e.is_expired_or_frozen_error() {
@@ -105,14 +121,14 @@ pub fn spawn_packet_cmd_worker<ChainA: ChainHandle, ChainB: ChainHandle>(
 
     let mut idle_worker_timer = 0;
 
-    let mut route_retry = None;
+    let mut route_retry = VecDeque::new();
     spawn_background_task(span, Some(Duration::from_millis(200)), move || {
-        if let Some(cmd) = route_retry.take().or_else(|| cmd_rx.try_recv().ok()) {
+        if let Some(cmd) = route_retry.pop_front().or_else(|| cmd_rx.try_recv().ok()) {
             let refreshed = link.lock().unwrap().a_to_b.refresh_channel_route();
             if let Err(error) = refreshed {
                 // Keep the command while route discovery is unavailable or
                 // only one endpoint has opened on its replacement connection.
-                route_retry = Some(cmd);
+                route_retry.push_front(cmd);
                 return Err(TaskError::Ignore(RunError::link(error).into()));
             }
             let is_new_batch = cmd.is_ibc_events();
@@ -122,14 +138,40 @@ pub fn spawn_packet_cmd_worker<ChainA: ChainHandle, ChainB: ChainHandle>(
             // If clearing fails after all these retries with ignorable error the task continues
             // (see `handle_link_error_in_task`) and clearing is retried with the next
             // (`NewBlock`) `cmd` that matches the clearing interval.
-            handle_packet_cmd(
-                &mut link.lock().unwrap(),
-                &mut should_clear_on_start,
-                clear_interval,
-                clear_limit,
-                &path,
-                cmd,
-            )?;
+            {
+                let mut link = link.lock().unwrap();
+                if is_new_batch
+                    && link.a_to_b.channel().ordering == Ordering::Unordered
+                    && matches!(
+                        link.a_to_b.dst_chain().config(),
+                        Ok(ChainConfig::Cardano(_))
+                    )
+                {
+                    let mut commands = ready_packet_commands(cmd, &mut route_retry, &cmd_rx);
+                    while let Some(command) = commands.pop_front() {
+                        if let WorkerCmd::IbcEvents { batch } = command {
+                            if let Err(error) = link.a_to_b.update_schedule(batch) {
+                                route_retry.extend(commands);
+                                return Err(handle_link_error_in_task(error));
+                            }
+                        }
+                    }
+                    handle_execute_schedule(
+                        &mut link,
+                        &path,
+                        Resubmit::from_clear_interval(clear_interval),
+                    )?;
+                } else {
+                    handle_packet_cmd(
+                        &mut link,
+                        &mut should_clear_on_start,
+                        clear_interval,
+                        clear_limit,
+                        &path,
+                        cmd,
+                    )?;
+                }
+            }
 
             if is_new_batch {
                 idle_worker_timer = 0;
@@ -697,4 +739,56 @@ fn timeout_metrics(
         dst_port,
         count as u64,
     );
+}
+
+#[cfg(test)]
+mod ready_command_tests {
+    use super::*;
+    use crate::chain::tracking::TrackingId;
+    use ibc_relayer_types::core::ics24_host::identifier::ChainId;
+
+    fn batch(height: u64) -> WorkerCmd {
+        WorkerCmd::IbcEvents {
+            batch: EventBatch {
+                chain_id: ChainId::from_string("source-0"),
+                height: Height::new(0, height).unwrap(),
+                tracking_id: TrackingId::new_static("ready-command-test"),
+                events: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn ready_commands_include_existing_batches_across_block_notifications() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let height = Height::new(0, 12).unwrap();
+        sender
+            .send(WorkerCmd::NewBlock {
+                height,
+                new_block: ibc_relayer_types::core::ics02_client::events::NewBlock::new(height),
+            })
+            .unwrap();
+        sender.send(batch(12)).unwrap();
+        let mut pending = VecDeque::from([batch(10)]);
+        let ready = ready_packet_commands(batch(8), &mut pending, &receiver);
+        assert!(pending.is_empty());
+        let heights: Vec<_> = ready
+            .into_iter()
+            .filter_map(|command| match command {
+                WorkerCmd::IbcEvents { batch } => Some(batch.height.revision_height()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(heights, vec![8, 10, 12]);
+        // Commands arriving after the snapshot are left for the next pass.
+        sender.send(batch(13)).unwrap();
+        assert_eq!(receiver.len(), 1);
+    }
+
+    #[test]
+    fn a_single_ready_batch_does_not_wait_for_another_command() {
+        let (_sender, receiver) = crossbeam_channel::unbounded();
+        let ready = ready_packet_commands(batch(8), &mut VecDeque::new(), &receiver);
+        assert_eq!(ready.len(), 1);
+    }
 }

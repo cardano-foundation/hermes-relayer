@@ -34,25 +34,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # RocksDB 8.1.1 bundled by the Penumbra backend does not compile with the
+  # Ubuntu 26.04 C++ headers. Match the integration jobs' native build image.
   fmt:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          rustup-components: rustfmt
-      - uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
+          components: rustfmt
+      - run: cargo fmt --all -- --check
 
   clippy-all-features:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          rustup-components: clippy
+          components: clippy
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -61,12 +60,12 @@ jobs:
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
   clippy-no-default-features:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          rustup-components: clippy
+          components: clippy
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -78,7 +77,7 @@ jobs:
   # framework requires them, so check the default build and each opt-in
   # backend in isolation.
   clippy-chain-backends:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -87,7 +86,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          rustup-components: clippy
+          components: clippy
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -101,7 +100,7 @@ jobs:
             --all-targets -- -D warnings
 
   test-stable:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -111,18 +110,12 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
-      - uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --workspace --all-features --no-fail-fast --no-run
-      - uses: actions-rs/cargo@v1
-        with:
-          command: nextest
-          args: run --all-features --no-fail-fast --workspace --exclude ibc-integration-test --no-capture
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+      - run: cargo test --workspace --all-features --no-fail-fast --no-run
+      - run: cargo nextest run --all-features --no-fail-fast --workspace --exclude ibc-integration-test --no-capture
 
   msrv:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
