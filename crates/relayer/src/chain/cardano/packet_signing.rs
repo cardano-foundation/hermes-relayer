@@ -71,6 +71,9 @@ impl PacketRoots {
             operation_scripts.push(required_script(scripts, &key)?.clone());
         }
         operation_scripts.push(required_script(scripts, "verifyproof")?.clone());
+        if let Some(membership) = scripts.get("verifymembership") {
+            operation_scripts.push(membership.clone());
+        }
         Ok(Self {
             acknowledgement_batch_tag: if root.get("receipt_storage").and_then(JsonValue::as_str)
                 == Some("merkle-history-v1")
@@ -95,6 +98,24 @@ impl PacketRoots {
             state_policy: required_script(scripts, "packetstate")?.hash.clone(),
             batch_policy: required_script(scripts, "packetbatch")?.hash.clone(),
         })
+    }
+
+    fn operation_mint_allowed(
+        &self,
+        policy: &[u8],
+        references: &HashSet<OutRef>,
+    ) -> Result<bool, String> {
+        let Some(script) = self
+            .operation_scripts
+            .iter()
+            .find(|script| script.hash == policy)
+        else {
+            return Ok(false);
+        };
+        if !references.contains(&script.reference) {
+            return Err("missing pinned packet operation validator".into());
+        }
+        Ok(true)
     }
 }
 
@@ -419,28 +440,18 @@ impl TransactionSigningPolicy {
         }
         if let Some(mint) = &body.mint {
             for (policy, _) in mint.iter() {
+                let operation_mint = self
+                    .packet_lanes
+                    .operation_mint_allowed(policy.as_ref(), reference_set)
+                    .map_err(reject)?;
                 let permitted = if initialization {
                     policy.as_ref() == self.packet_lanes.state_policy
                 } else {
                     policy.as_ref() == self.packet_lanes.batch_policy
                         || policy.as_ref() == self.voucher_policy
                         || policy.as_ref() == self.trace_registry_policy
-                        || self
-                            .packet_lanes
-                            .operation_scripts
-                            .iter()
-                            .any(|script| script.hash.as_slice() == policy.as_ref())
+                        || operation_mint
                 };
-                if let Some(script) = self
-                    .packet_lanes
-                    .operation_scripts
-                    .iter()
-                    .find(|script| script.hash.as_slice() == policy.as_ref())
-                {
-                    if !reference_set.contains(&script.reference) {
-                        return Err(reject("missing pinned packet operation validator".into()));
-                    }
-                }
                 if !permitted {
                     return Err(reject("unrelated minting policy".into()));
                 }
@@ -645,6 +656,78 @@ impl TransactionSigningPolicy {
 mod tests {
     use super::*;
     use pallas_codec::minicbor::{data::Tag, Encoder};
+
+    #[test]
+    fn membership_mints_require_the_manifest_policy_and_its_exact_reference() {
+        for name in ["verify_membership", "verifyMembership"] {
+            let mut manifest: JsonValue =
+                serde_json::from_str(&super::super::tests::manifest()).unwrap();
+            manifest["validators"][name] = serde_json::json!({
+                "script_hash": "ab".repeat(28),
+                "ref_utxo": {"tx_hash": "cd".repeat(32), "output_index": 2}
+            });
+            let policy = TransactionSigningPolicy::from_json(
+                &manifest.to_string(),
+                0,
+                super::super::tests::limits(),
+            )
+            .unwrap();
+            let membership = required_script(&policy.scripts, "verifymembership").unwrap();
+            let pinned = HashSet::from([membership.reference.clone()]);
+            assert_eq!(
+                policy
+                    .packet_lanes
+                    .operation_mint_allowed(&membership.hash, &pinned),
+                Ok(true)
+            );
+            assert!(policy
+                .packet_lanes
+                .operation_mint_allowed(&membership.hash, &HashSet::new())
+                .is_err());
+            let wrong_reference = HashSet::from([(membership.reference.0.clone(), 3)]);
+            assert!(policy
+                .packet_lanes
+                .operation_mint_allowed(&membership.hash, &wrong_reference)
+                .is_err());
+            assert_eq!(
+                policy
+                    .packet_lanes
+                    .operation_mint_allowed(&[0xef; 28], &pinned),
+                Ok(false)
+            );
+            let general = required_script(&policy.scripts, "verifyproof").unwrap();
+            assert_eq!(
+                policy.packet_lanes.operation_mint_allowed(
+                    &general.hash,
+                    &HashSet::from([general.reference.clone()])
+                ),
+                Ok(true)
+            );
+        }
+    }
+
+    #[test]
+    fn older_manifests_keep_the_general_verifier_and_reject_unpinned_membership() {
+        let policy = TransactionSigningPolicy::from_json(
+            &super::super::tests::manifest(),
+            0,
+            super::super::tests::limits(),
+        )
+        .unwrap();
+        let general = required_script(&policy.scripts, "verifyproof").unwrap();
+        assert_eq!(
+            policy
+                .packet_lanes
+                .operation_mint_allowed(&general.hash, &HashSet::from([general.reference.clone()])),
+            Ok(true)
+        );
+        assert_eq!(
+            policy
+                .packet_lanes
+                .operation_mint_allowed(&[0xab; 28], &HashSet::new()),
+            Ok(false)
+        );
+    }
 
     fn reserve_input(liquidity: bool, native: bool) -> ResolvedInput {
         let mut cbor = Vec::new();
