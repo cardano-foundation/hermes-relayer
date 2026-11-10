@@ -6,13 +6,13 @@ on:
       - master
       - main
     paths:
-      - .github/workflows/cargo-doc.yml
+      - .github/workflows/cargo-doc.yaml
       - Cargo.toml
       - Cargo.lock
       - crates/**
   pull_request:
     paths:
-      - .github/workflows/cargo-doc.yml
+      - .github/workflows/cargo-doc.yaml
       - Cargo.toml
       - Cargo.lock
       - crates/**
@@ -24,7 +24,8 @@ concurrency:
 
 jobs:
   cargo-doc:
-    runs-on: ubuntu-latest
+    # Match Rust and integration builds for the bundled RocksDB C++ headers.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
