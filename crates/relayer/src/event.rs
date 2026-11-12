@@ -36,6 +36,7 @@ use ibc_relayer_types::{
 };
 
 pub mod bus;
+mod decoder;
 pub mod error;
 pub mod source;
 pub mod tx;
@@ -71,6 +72,7 @@ impl Display for IbcEventWithHeight {
 /// defined in this crate. Hence, we are forced to make an ad-hoc function for
 /// it.
 pub fn ibc_event_try_from_abci_event(abci_event: &AbciEvent) -> Result<IbcEvent, IbcEventError> {
+    decoder::warn_on_fallback(abci_event);
     match abci_event.kind.parse() {
         Ok(IbcEventType::CreateClient) => Ok(IbcEvent::CreateClient(
             create_client_try_from_abci_event(abci_event).map_err(IbcEventError::client)?,
