@@ -278,6 +278,7 @@ impl TransactionSigningPolicy {
         let admission = intent.operation == "/ibc.applications.transfer.v1.MsgTransfer";
         let initialization = intent.operation == "InitializePacketLanes";
         let batch = intent.operation == "PacketBatch";
+        let consolidation = intent.operation == "ConsolidatePacketLiquidity";
         if admission {
             return self.validate_funded_intent(body, signer, intent, resolved, reject);
         }
@@ -389,7 +390,17 @@ impl TransactionSigningPolicy {
                 return Err(reject("packet operation refers to another channel".into()));
             }
             let operation = &authorized[1];
-            if batch {
+            if consolidation {
+                self.validate_liquidity_consolidation(
+                    body,
+                    operation,
+                    signer,
+                    intent,
+                    resolved,
+                    reference_set,
+                )
+                .map_err(reject)?;
+            } else if batch {
                 if constructor_fields(operation, 0).is_none() {
                     return Err(reject("unexpected send-batch operation".into()));
                 }
@@ -444,7 +455,13 @@ impl TransactionSigningPolicy {
                     .packet_lanes
                     .operation_mint_allowed(policy.as_ref(), reference_set)
                     .map_err(reject)?;
-                let permitted = if initialization {
+                let permitted = if consolidation {
+                    policy.as_ref() == self.packet_lanes.batch_policy
+                        || policy.as_ref()
+                            == required_script(&self.scripts, "packetoperationretire")
+                                .map_err(reject)?
+                                .hash
+                } else if initialization {
                     policy.as_ref() == self.packet_lanes.state_policy
                 } else {
                     policy.as_ref() == self.packet_lanes.batch_policy
@@ -547,6 +564,246 @@ impl TransactionSigningPolicy {
         }
         if protocol_lovelace > self.limits.max_total_protocol_output_lovelace {
             return Err(reject("packet protocol ADA exceeds signing limit".into()));
+        }
+        Ok(())
+    }
+
+    fn validate_liquidity_consolidation(
+        &self,
+        body: &pallas_primitives::conway::MintedTransactionBody<'_>,
+        operation: &PlutusData,
+        signer: &[u8],
+        intent: &SigningIntent,
+        resolved: &ResolvedTransactionInputs,
+        references: &HashSet<OutRef>,
+    ) -> Result<(), String> {
+        let fields = constructor_fields(operation, 4)
+            .filter(|f| f.len() == 2)
+            .ok_or("expected liquidity consolidation")?;
+        let PlutusData::Array(items) = &fields[0] else {
+            return Err("invalid consolidation inputs".into());
+        };
+        let selected = items
+            .iter()
+            .map(plutus_output_reference)
+            .collect::<Option<Vec<_>>>()
+            .ok_or("invalid consolidation reference")?;
+        let unique: BTreeSet<_> = selected.iter().cloned().collect();
+        let script_inputs: BTreeSet<_> = resolved
+            .regular
+            .iter()
+            .filter(|(_, input)| input.address != signer)
+            .map(|(reference, _)| reference.clone())
+            .collect();
+        if !(2..=5).contains(&selected.len())
+            || unique.len() != selected.len()
+            || unique != script_inputs
+        {
+            return Err("consolidation must consume two to five distinct escrow inputs".into());
+        }
+        let survivor =
+            plutus_output_reference(&fields[1]).ok_or("invalid consolidation survivor")?;
+        if !unique.contains(&survivor) {
+            return Err("consolidation survivor is not an input".into());
+        }
+        let transfer = intent
+            .transfer
+            .as_ref()
+            .ok_or("missing consolidation transfer")?;
+        let source_prefix = format!(
+            "{}/{}/",
+            transfer
+                .source_port
+                .as_deref()
+                .ok_or("missing source port")?,
+            transfer
+                .source_channel
+                .as_deref()
+                .ok_or("missing source channel")?
+        );
+        let denom = match transfer.action {
+            TransferAction::Receive => transfer
+                .denom
+                .strip_prefix(&source_prefix)
+                .ok_or("receive does not release escrow")?,
+            TransferAction::Refund if !transfer.denom.starts_with(&source_prefix) => {
+                &transfer.denom
+            }
+            _ => return Err("packet does not release escrow".into()),
+        };
+        let channel = format!(
+            "channel-{}",
+            intent
+                .state_sequence
+                .ok_or("missing consolidation channel")?
+        );
+        let retire = required_script(&self.scripts, "packetoperationretire")?;
+        if !references.contains(&retire.reference)
+            || !body.mint.as_ref().is_some_and(|mint| {
+                mint.iter()
+                    .any(|(policy, _)| policy.as_ref() == retire.hash)
+            })
+        {
+            return Err("missing pinned consolidation policy".into());
+        }
+        let mut total = 0u64;
+        let mut survivor_datum = None;
+        for reference in &selected {
+            let input = &resolved.regular[reference];
+            if input.address != self.packet_lanes.batch {
+                return Err("consolidation spends unrelated state".into());
+            }
+            let datum: PlutusData = minicbor::decode(
+                input
+                    .inline_datum
+                    .as_deref()
+                    .ok_or("missing liquidity datum")?,
+            )
+            .map_err(|_| "invalid liquidity datum")?;
+            let data = constructor_fields(&datum, 0)
+                .filter(|f| f.len() == 8)
+                .ok_or("invalid liquidity record")?;
+            if plutus_bytes(&data[0]) != Some(b"transfer".as_slice())
+                || plutus_bytes(&data[1]) != Some(channel.as_bytes())
+                || plutus_bytes(&data[2]) != Some(denom.as_bytes())
+            {
+                return Err("consolidation changes the requested channel or denomination".into());
+            }
+            let principal = plutus_u64(&data[6])
+                .filter(|amount| *amount > 0)
+                .ok_or("invalid liquidity principal")?;
+            total = total
+                .checked_add(principal)
+                .ok_or("liquidity principal overflow")?;
+            if reference == &survivor {
+                survivor_datum = Some(datum);
+            }
+        }
+        let mut burns = BTreeMap::new();
+        for reference in selected.iter().filter(|reference| **reference != survivor) {
+            let input = &resolved.regular[reference];
+            let identities: Vec<_> = input
+                .assets
+                .iter()
+                .filter(|asset| asset.policy_id.as_slice() == self.packet_lanes.batch_policy)
+                .collect();
+            if identities.len() != 1 || identities[0].quantity != 1 {
+                return Err("invalid donor identity".into());
+            }
+            let name = &identities[0].asset_name;
+            if burns.insert(name.clone(), -1i64).is_some() {
+                return Err("duplicate donor identity".into());
+            }
+            let refunds = body
+                .outputs
+                .iter()
+                .filter(|output| {
+                    let value = unpack_output(output);
+                    inline_datum(output).is_some_and(|datum| {
+                        auth_token_matches(datum, &self.packet_lanes.batch_policy, name)
+                    }) && value.assets.is_empty()
+                        && reserve_payment_matches(
+                            input,
+                            &value.address,
+                            value.coin,
+                            true,
+                            self.network_id,
+                        )
+                })
+                .count();
+            if refunds != 1 {
+                return Err("missing or duplicate donor reserve reimbursement".into());
+            }
+        }
+        let minted: BTreeMap<_, _> = body
+            .mint
+            .as_ref()
+            .into_iter()
+            .flat_map(|mint| mint.iter())
+            .filter(|(policy, _)| policy.as_ref() == self.packet_lanes.batch_policy)
+            .flat_map(|(_, assets)| {
+                assets
+                    .iter()
+                    .map(|(name, quantity)| (name.to_vec(), i64::from(*quantity)))
+            })
+            .collect();
+        if minted != burns {
+            return Err("consolidation must burn exactly the donor identities".into());
+        }
+        // A sufficient bounded selection should settle directly instead of spending
+        // another maintenance fee. The pinned retire validator enforces NFT identity,
+        // equal asset units, donor burns and all reserve reimbursements.
+        if total >= transfer.amount {
+            return Err("selected liquidity already covers the packet".into());
+        }
+        let input = &resolved.regular[&survivor];
+        let mut datum = survivor_datum.ok_or("missing survivor datum")?;
+        let old = constructor_fields(&datum, 0).ok_or("invalid survivor datum")?;
+        let principal = plutus_u64(&old[6]).ok_or("invalid survivor principal")?;
+        let policy = plutus_bytes(&old[3])
+            .ok_or("invalid asset policy")?
+            .to_vec();
+        let name = plutus_bytes(&old[4]).ok_or("invalid asset name")?.to_vec();
+        let delta = total - principal;
+        let mut coin = input.lovelace;
+        let mut assets: BTreeMap<_, _> = input
+            .assets
+            .iter()
+            .map(|a| ((a.policy_id.to_vec(), a.asset_name.clone()), a.quantity))
+            .collect();
+        if policy.is_empty() && name.is_empty() {
+            coin = coin.checked_add(delta).ok_or("liquidity value overflow")?;
+        } else {
+            let amount = assets
+                .get_mut(&(policy, name))
+                .ok_or("missing principal asset")?;
+            *amount = amount
+                .checked_add(delta)
+                .ok_or("liquidity value overflow")?;
+        }
+        let PlutusData::Constr(ref mut constructor) = datum else {
+            unreachable!()
+        };
+        constructor.fields[6] = PlutusData::BigInt(BigInt::Int(
+            i128::from(total)
+                .try_into()
+                .map_err(|_| "principal overflow")?,
+        ));
+        let mut survivors = 0;
+        for output in &body.outputs {
+            let value = unpack_output(output);
+            if value.address == self.packet_lanes.batch {
+                survivors += 1;
+                let output_assets: BTreeMap<_, _> = value
+                    .assets
+                    .iter()
+                    .map(|(p, n, q)| ((p.clone(), n.clone()), *q))
+                    .collect();
+                if value.coin != coin
+                    || output_assets != assets
+                    || inline_datum(output) != Some(&datum)
+                {
+                    return Err("consolidation changes principal or survivor reserve".into());
+                }
+            } else if value.address != signer
+                && !selected
+                    .iter()
+                    .filter(|reference| **reference != survivor)
+                    .any(|reference| {
+                        reserve_payment_matches(
+                            &resolved.regular[reference],
+                            &value.address,
+                            value.coin,
+                            true,
+                            self.network_id,
+                        )
+                    })
+            {
+                return Err("consolidation has an unrelated output".into());
+            }
+        }
+        if survivors != 1 {
+            return Err("consolidation requires one survivor".into());
         }
         Ok(())
     }

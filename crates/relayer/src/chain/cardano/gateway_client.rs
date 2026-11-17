@@ -2039,19 +2039,13 @@ impl GatewayClient {
             sequence
         );
 
-        if !unsigned_tx_any.type_url.is_empty() {
-            return Err(Error::Transaction(format!(
-                "Unsupported RecvPacket transaction profile {}: first-seen voucher receive must atomically spend the channel and mint both voucher tokens",
-                unsigned_tx_any.type_url
-            )));
-        }
         Ok(UnsignedTx {
             cbor_hex,
-            description: if unsigned_tx_any.type_url == "/ibc.cardano.v1.InitializePacketLanes" {
-                "InitializePacketLanes".into()
-            } else {
-                format!("MsgRecvPacket (sequence: {})", sequence)
-            },
+            description: packet_transaction_description(
+                &unsigned_tx_any.type_url,
+                "MsgRecvPacket",
+                sequence,
+            )?,
         })
     }
 
@@ -2089,7 +2083,11 @@ impl GatewayClient {
 
         Ok(UnsignedTx {
             cbor_hex,
-            description: format!("MsgAcknowledgement (sequence: {})", sequence),
+            description: packet_transaction_description(
+                &unsigned_tx_any.type_url,
+                "MsgAcknowledgement",
+                sequence,
+            )?,
         })
     }
 
@@ -2174,7 +2172,11 @@ impl GatewayClient {
 
         Ok(UnsignedTx {
             cbor_hex,
-            description: format!("MsgTimeout (sequence: {})", sequence),
+            description: packet_transaction_description(
+                &unsigned_tx_any.type_url,
+                "MsgTimeout",
+                sequence,
+            )?,
         })
     }
 
@@ -2212,7 +2214,11 @@ impl GatewayClient {
 
         Ok(UnsignedTx {
             cbor_hex,
-            description: format!("MsgTimeoutOnClose (sequence: {})", sequence),
+            description: packet_transaction_description(
+                &unsigned_tx_any.type_url,
+                "MsgTimeoutOnClose",
+                sequence,
+            )?,
         })
     }
 
@@ -2639,6 +2645,23 @@ fn parse_cardano_native_asset_quantity(amount: &str, denom: &str) -> Result<u64,
             amount, denom, CARDANO_NATIVE_ASSET_MAX_QUANTITY
         ))
     })
+}
+
+fn packet_transaction_description(
+    profile: &str,
+    operation: &str,
+    sequence: u64,
+) -> Result<String, Error> {
+    match profile {
+        "" => Ok(format!("{operation} (sequence: {sequence})")),
+        "/ibc.cardano.v1.InitializePacketLanes" if operation == "MsgRecvPacket" => {
+            Ok("InitializePacketLanes".into())
+        }
+        "/ibc.cardano.v1.ConsolidatePacketLiquidity" => Ok("ConsolidatePacketLiquidity".into()),
+        _ => Err(Error::Transaction(format!(
+            "Unsupported {operation} transaction profile {profile}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -3334,6 +3357,35 @@ mod tests {
                 }
                 other => panic!("unexpected error: {other:?}"),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod packet_profile_tests {
+    use super::*;
+
+    #[test]
+    fn settlement_profiles_preserve_maintenance_and_reject_unknown_work() {
+        for operation in [
+            "MsgRecvPacket",
+            "MsgTimeout",
+            "MsgTimeoutOnClose",
+            "MsgAcknowledgement",
+        ] {
+            assert_eq!(
+                packet_transaction_description(
+                    "/ibc.cardano.v1.ConsolidatePacketLiquidity",
+                    operation,
+                    1
+                )
+                .unwrap(),
+                "ConsolidatePacketLiquidity"
+            );
+            assert!(packet_transaction_description("/unknown", operation, 1).is_err());
+            assert!(packet_transaction_description("", operation, 1)
+                .unwrap()
+                .starts_with(operation));
         }
     }
 }

@@ -4,7 +4,7 @@
 
 use super::config::CardanoConfig;
 use super::gateway_client::{
-    BuiltIbcTxKind, GatewayClient, TxSubmitResponse, UnsignedTx,
+    BuiltIbcTx, BuiltIbcTxKind, GatewayClient, TxSubmitResponse, UnsignedTx,
     MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH,
 };
 use super::intent_executor::{ExecutorPolicy, ExecutorSchedule};
@@ -772,7 +772,40 @@ impl CardanoChainEndpoint {
         self.resolve_signing_intent_denom(&mut direct_signing_intent)
             .await?;
 
-        let mut packet_initializations = 0usize;
+        if direct_signing_intent.uses_packet_lanes() {
+            let included = submit_packet_with_maintenance(
+                &direct_signing_intent,
+                || async {
+                    self.gateway_client
+                        .build_ibc_tx(message_type_url, message_value.to_vec())
+                        .await
+                        .map_err(|error| {
+                            Error::send_tx(format!("Failed to build packet transaction: {error}"))
+                        })
+                },
+                |unsigned, intent| async move {
+                    self.sign_submit_until_included(&unsigned, &intent)
+                        .await
+                        .map(|(response, _)| response)
+                },
+            )
+            .await?;
+            if message_type_url == "/ibc.applications.transfer.v1.MsgTransfer" {
+                let request: ibc_proto::ibc::applications::transfer::v1::MsgTransfer =
+                    prost::Message::decode(message_value)
+                        .map_err(|e| Error::send_tx(e.to_string()))?;
+                return self
+                    .complete_funded_intent(
+                        &direct_signing_intent,
+                        &request.source_port,
+                        &request.source_channel,
+                        &included.tx_hash,
+                    )
+                    .await;
+            }
+            return Ok(included);
+        }
+
         let mut completed_steps = 0usize;
         let mut completed_chain_transactions = 0usize;
         let mut completed_rebuild_phases = 0usize;
@@ -793,49 +826,6 @@ impl CardanoChainEndpoint {
                         ))
                     }
                 })?;
-
-            if direct_signing_intent.uses_packet_lanes() {
-                if built.kind != BuiltIbcTxKind::Singleton
-                    || built.transactions.len() != 1
-                    || built.rebuild_after_submission
-                {
-                    return Err(Error::send_tx(
-                        "Packet operation requires one bounded transaction".into(),
-                    ));
-                }
-                let unsigned = &built.transactions[0];
-                if unsigned.description == "InitializePacketLanes" {
-                    if packet_initializations >= 64 {
-                        return Err(Error::send_tx(
-                            "Packet initialization limit reached. Resume the request".into(),
-                        ));
-                    }
-                    self.sign_submit_until_included(
-                        unsigned,
-                        &SigningIntent::packet_initialization(&direct_signing_intent),
-                    )
-                    .await?;
-                    packet_initializations += 1;
-                    continue;
-                }
-                let (included, _) = self
-                    .sign_submit_until_included(unsigned, &direct_signing_intent)
-                    .await?;
-                if message_type_url == "/ibc.applications.transfer.v1.MsgTransfer" {
-                    let request: ibc_proto::ibc::applications::transfer::v1::MsgTransfer =
-                        prost::Message::decode(message_value)
-                            .map_err(|e| Error::send_tx(e.to_string()))?;
-                    return self
-                        .complete_funded_intent(
-                            &direct_signing_intent,
-                            &request.source_port,
-                            &request.source_channel,
-                            &included.tx_hash,
-                        )
-                        .await;
-                }
-                return Ok(included);
-            }
 
             let trace_registry_prelude = built
                 .transactions
@@ -4337,8 +4327,178 @@ fn cardano_latest_height_unhealthy_error(
     }
 }
 
+// Rebuild only after the preceding transaction has been observed on the ledger.
+// The submit callback includes independent authorization and inclusion tracking.
+async fn submit_packet_with_maintenance<B, BF, S, SF>(
+    original: &SigningIntent,
+    mut build: B,
+    mut submit: S,
+) -> Result<TxSubmitResponse, Error>
+where
+    B: FnMut() -> BF,
+    BF: std::future::Future<Output = Result<BuiltIbcTx, Error>>,
+    S: FnMut(UnsignedTx, SigningIntent) -> SF,
+    SF: std::future::Future<Output = Result<TxSubmitResponse, Error>>,
+{
+    let mut initializations = 0;
+    let mut consolidations = 0;
+    loop {
+        let mut built = build().await?;
+        if built.kind != BuiltIbcTxKind::Singleton
+            || built.transactions.len() != 1
+            || built.rebuild_after_submission
+        {
+            return Err(Error::send_tx(
+                "Packet operation requires one bounded transaction".into(),
+            ));
+        }
+        let unsigned = built.transactions.remove(0);
+        let intent = match unsigned.description.as_str() {
+            "InitializePacketLanes" => {
+                if initializations >= 64 {
+                    return Err(Error::send_tx(
+                        "Packet initialization limit reached. Resume the request".into(),
+                    ));
+                }
+                initializations += 1;
+                SigningIntent::packet_initialization(original)
+            }
+            "ConsolidatePacketLiquidity" => {
+                // Each transaction still obeys the operator's fee and wallet limits.
+                // At most eight maintenance fees can be spent by this request.
+                if consolidations >= 8 {
+                    return Err(Error::send_tx(
+                        "Packet consolidation limit reached. Resume the request".into(),
+                    ));
+                }
+                consolidations += 1;
+                SigningIntent::packet_consolidation(original)
+                    .map_err(|error| Error::send_tx(error.to_string()))?
+            }
+            _ => return submit(unsigned, original.clone()).await,
+        };
+        submit(unsigned, intent).await?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    fn escrow_return_intent() -> SigningIntent {
+        use super::super::generated::ibc::core::channel::v1::{MsgRecvPacket, Packet};
+        use prost::Message;
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/packet-consolidation-signing.json"))
+                .unwrap();
+        let signer = fixture["signer"].as_str().unwrap();
+        let request = MsgRecvPacket {
+            packet: Some(Packet {
+                sequence: 1, source_port: "transfer".into(), source_channel: "channel-7".into(),
+                destination_port: "transfer".into(), destination_channel: "channel-0".into(),
+                data: serde_json::to_vec(&serde_json::json!({"denom":"transfer/channel-7/6c6f76656c616365", "amount":"12000000", "sender":"cosmos1sender", "receiver":signer})).unwrap(),
+                timeout_timestamp: 1800000000000000000, ..Default::default()
+            }), signer: signer.into(), ..Default::default()
+        };
+        SigningIntent::ibc(
+            "/ibc.core.channel.v1.MsgRecvPacket",
+            &request.encode_to_vec(),
+            signer,
+            0,
+        )
+        .unwrap()
+    }
+
+    fn packet_build(description: &str) -> BuiltIbcTx {
+        BuiltIbcTx {
+            transactions: vec![UnsignedTx {
+                cbor_hex: "fixture".into(),
+                description: description.into(),
+            }],
+            kind: BuiltIbcTxKind::Singleton,
+            rebuild_after_submission: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn packet_rebuild_waits_for_included_consolidation_and_returns_only_settlement() {
+        use std::cell::Cell;
+        let built = Cell::new(0);
+        let confirmed = Cell::new(0);
+        let result = submit_packet_with_maintenance(
+            &escrow_return_intent(),
+            || async {
+                assert_eq!(
+                    built.get(),
+                    confirmed.get(),
+                    "rebuild preceded confirmation"
+                );
+                let description = if built.get() == 0 {
+                    "ConsolidatePacketLiquidity"
+                } else {
+                    "MsgRecvPacket"
+                };
+                built.set(built.get() + 1);
+                Ok(packet_build(description))
+            },
+            |unsigned, _| {
+                let confirmed = &confirmed;
+                async move {
+                    tokio::task::yield_now().await;
+                    confirmed.set(confirmed.get() + 1);
+                    Ok(TxSubmitResponse {
+                        tx_hash: unsigned.description,
+                        height: Some(ICSHeight::new(0, 1).unwrap()),
+                        events: vec![],
+                    })
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.tx_hash, "MsgRecvPacket");
+        assert_eq!(built.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_consolidation_confirmation_stops_before_rebuild() {
+        use std::cell::Cell;
+        let built = Cell::new(0);
+        let result = submit_packet_with_maintenance(
+            &escrow_return_intent(),
+            || async {
+                built.set(built.get() + 1);
+                Ok(packet_build("ConsolidatePacketLiquidity"))
+            },
+            |_, _| async { Err(Error::send_tx("inclusion failed".into())) },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(built.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_consolidation_is_bounded_before_a_ninth_signing_call() {
+        use std::cell::Cell;
+        let signed = Cell::new(0);
+        let result = submit_packet_with_maintenance(
+            &escrow_return_intent(),
+            || async { Ok(packet_build("ConsolidatePacketLiquidity")) },
+            |_, _| async {
+                signed.set(signed.get() + 1);
+                Ok(TxSubmitResponse {
+                    tx_hash: "included".into(),
+                    height: Some(ICSHeight::new(0, 1).unwrap()),
+                    events: vec![],
+                })
+            },
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("consolidation limit"));
+        assert_eq!(signed.get(), 8);
+    }
+
     use super::*;
 
     #[test]
