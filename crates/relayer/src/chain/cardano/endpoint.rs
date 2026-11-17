@@ -7,7 +7,7 @@ use super::gateway_client::{
     BuiltIbcTxKind, GatewayClient, TxSubmitResponse, UnsignedTx,
     MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH,
 };
-use super::intent_executor::ExecutorSchedule;
+use super::intent_executor::{ExecutorPolicy, ExecutorSchedule};
 use super::signing_key_pair::CardanoSigningKeyPair;
 use super::signing_policy::{
     SigningIntent, SigningPolicyLimits, TendermintSessionAction, TransactionSigningPolicy,
@@ -112,6 +112,7 @@ pub struct CardanoChainEndpoint {
     signer_address: String,
     event_source_cmd: Option<crate::event::source::TxEventSourceCmd>,
     stop_intent_executor: Arc<AtomicBool>,
+    intent_executor_policy: ExecutorPolicy,
     pending_new_client_consensus_states: Mutex<HashMap<u64, AnyConsensusState>>,
     mithril_stake_polls: super::mithril_stake::MithrilStakePolls,
 }
@@ -1040,28 +1041,26 @@ impl CardanoChainEndpoint {
     }
 
     async fn execute_pending_intents(&self, schedule: &mut ExecutorSchedule) -> Result<(), Error> {
-        schedule.begin_pass(std::time::Instant::now());
         use ibc_proto::ibc::core::channel::v1::QueryChannelsResponse;
         use prost::Message;
-        let bytes = self
-            .gateway_client
-            .query_channels()
-            .await
-            .map_err(|error| Error::query(error.to_string()))?;
-        let channels = QueryChannelsResponse::decode(bytes.as_slice())
-            .map_err(|error| Error::query(error.to_string()))?;
-        let eligible = channels
-            .channels
-            .into_iter()
-            .filter(|channel| channel.port_id == "transfer" && channel.state == 3)
-            .map(|channel| channel.channel_id);
-        let failures = schedule
-            .execute(
-                eligible,
+        let failures = self
+            .intent_executor_policy
+            .execute_pass(
+                schedule,
                 self.config.packet_executor_concurrency,
+                || async {
+                    let bytes = self
+                        .gateway_client
+                        .query_channels()
+                        .await
+                        .map_err(|error| Error::query(error.to_string()))?;
+                    QueryChannelsResponse::decode(bytes.as_slice())
+                        .map(|response| response.channels)
+                        .map_err(|error| Error::query(error.to_string()))
+                },
                 |channel| async move { self.execute_channel_batch(&channel).await },
             )
-            .await;
+            .await?;
         for (channel, error) in failures {
             tracing::warn!(%channel, %error,
                 "Funded request batch will retry from canonical state");
@@ -1102,9 +1101,14 @@ impl CardanoChainEndpoint {
     }
 
     fn spawn_intent_executor(&self) -> Result<(), Error> {
+        if !self.intent_executor_policy.enabled() {
+            return Ok(());
+        }
         // Use the configured relayer signer and the same pinned script, fee,
         // collateral and trusted-node evaluation policy as ordinary relay work.
-        let executor = Self::bootstrap(ChainConfig::Cardano(self.config.clone()), self.rt.clone())?;
+        let mut executor =
+            Self::bootstrap(ChainConfig::Cardano(self.config.clone()), self.rt.clone())?;
+        executor.intent_executor_policy = self.intent_executor_policy.clone();
         let stop = self.stop_intent_executor.clone();
         std::thread::spawn(move || {
             let mut schedule = ExecutorSchedule::default();
@@ -1399,6 +1403,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
         ChainConfig::Cardano(self.config.clone())
     }
 
+    fn set_packet_execution_enabled(&mut self, enabled: bool) {
+        self.intent_executor_policy =
+            ExecutorPolicy::new(enabled, self.config.packet_filter.channel_policy.clone());
+    }
+
     fn bootstrap(config: ChainConfig, rt: Arc<TokioRuntime>) -> Result<Self, Error> {
         tracing::info!("Bootstrapping Cardano chain endpoint");
 
@@ -1527,6 +1536,10 @@ impl ChainEndpoint for CardanoChainEndpoint {
         tracing::info!("Keyring initialized successfully");
 
         let endpoint = Self {
+            intent_executor_policy: ExecutorPolicy::new(
+                false,
+                cardano_config.packet_filter.channel_policy.clone(),
+            ),
             config: cardano_config,
             rt,
             gateway_client,

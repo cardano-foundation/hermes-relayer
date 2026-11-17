@@ -58,7 +58,7 @@ pub fn spawn_chain_runtime<Handle: ChainHandle>(
         .cloned()
         .ok_or_else(|| SpawnError::missing_chain_config(chain_id.clone()))?;
 
-    spawn_chain_runtime_with_config(chain_config, rt)
+    spawn_chain_runtime_with_packet_execution(chain_config, rt, config.mode.packets.enabled)
 }
 
 /// Spawns a chain runtime from the configuration and given a chain identifier,
@@ -77,7 +77,7 @@ pub fn spawn_chain_runtime_with_modified_config<Handle: ChainHandle>(
 
     modify(&mut chain_config);
 
-    spawn_chain_runtime_with_config(chain_config, rt)
+    spawn_chain_runtime_with_packet_execution(chain_config, rt, config.mode.packets.enabled)
 }
 
 /// Spawns a chain runtime from the given chain configuration
@@ -86,13 +86,25 @@ pub fn spawn_chain_runtime_with_config<Handle: ChainHandle>(
     config: ChainConfig,
     rt: Arc<TokioRuntime>,
 ) -> Result<Handle, SpawnError> {
+    spawn_chain_runtime_with_packet_execution(config, rt, false)
+}
+
+fn spawn_chain_runtime_with_packet_execution<Handle: ChainHandle>(
+    config: ChainConfig,
+    rt: Arc<TokioRuntime>,
+    packet_execution_enabled: bool,
+) -> Result<Handle, SpawnError> {
     let handle = match config {
         ChainConfig::CosmosSdk(_) => ChainRuntime::<CosmosSdkChain>::spawn(config, rt),
         #[cfg(feature = "namada")]
         ChainConfig::Namada(_) => ChainRuntime::<NamadaChain>::spawn(config, rt),
         #[cfg(feature = "penumbra")]
         ChainConfig::Penumbra(_) => ChainRuntime::<PenumbraChain>::spawn(config, rt),
-        ChainConfig::Cardano(_) => ChainRuntime::<CardanoChain>::spawn(config, rt),
+        ChainConfig::Cardano(_) => ChainRuntime::<CardanoChain>::spawn_with_packet_execution(
+            config,
+            rt,
+            packet_execution_enabled,
+        ),
     }
     .map_err(SpawnError::relayer)?;
 

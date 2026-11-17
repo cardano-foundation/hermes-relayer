@@ -123,6 +123,10 @@ pub trait ChainEndpoint: Sized {
     /// Constructs the chain
     fn bootstrap(config: ChainConfig, rt: Arc<TokioRuntime>) -> Result<Self, Error>;
 
+    /// Configure autonomous packet execution before starting the runtime.
+    /// Endpoints bootstrapped without a global mode decision leave it disabled.
+    fn set_packet_execution_enabled(&mut self, _enabled: bool) {}
+
     /// Shutdown the chain runtime
     fn shutdown(self) -> Result<(), Error>;
 
