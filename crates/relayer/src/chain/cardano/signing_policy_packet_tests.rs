@@ -12,8 +12,12 @@ struct Fixture {
 
 impl Fixture {
     fn load(name: &str) -> Self {
-        let data: JsonValue =
-            serde_json::from_str(include_str!("fixtures/packet-lane-signing.json")).unwrap();
+        let data: JsonValue = serde_json::from_str(if name == "consolidate" {
+            include_str!("fixtures/packet-consolidation-signing.json")
+        } else {
+            include_str!("fixtures/packet-lane-signing.json")
+        })
+        .unwrap();
         let row = data["cases"]
             .as_array()
             .unwrap()
@@ -21,7 +25,24 @@ impl Fixture {
             .find(|row| row["name"] == name)
             .unwrap();
         let signer = data["signer"].as_str().unwrap().to_string();
-        let intent = if name == "send" {
+        let intent = if name == "consolidate" {
+            let message = MsgRecvPacket {
+                packet: Some(super::super::generated::ibc::core::channel::v1::Packet {
+                    sequence: 1, source_port: "transfer".into(), source_channel: "channel-7".into(),
+                    destination_port: "transfer".into(), destination_channel: "channel-0".into(),
+                    data: serde_json::to_vec(&serde_json::json!({"denom": "transfer/channel-7/6c6f76656c616365", "amount": "12000000", "sender": "cosmos1sender", "receiver": signer, "memo": ""})).unwrap(),
+                    timeout_height: None, timeout_timestamp: 1800000000000000000,
+                }), signer: signer.clone(), ..Default::default()
+            };
+            let original = SigningIntent::ibc(
+                "/ibc.core.channel.v1.MsgRecvPacket",
+                &message.encode_to_vec(),
+                &signer,
+                0,
+            )
+            .unwrap();
+            SigningIntent::packet_consolidation(&original).unwrap()
+        } else if name == "send" {
             SigningIntent::funded_batch(
                 "transfer",
                 "channel-0",
@@ -88,10 +109,13 @@ impl Fixture {
         if name == "initialize" {
             limits.max_wallet_lovelace_top_up = 30_000_000;
         }
+        let mut transaction: pallas_primitives::conway::Tx =
+            minicbor::decode(&hex::decode(row["cbor"].as_str().unwrap()).unwrap()).unwrap();
+        transaction.transaction_witness_set.vkeywitness = None;
         Self {
             policy: TransactionSigningPolicy::from_json(&data["manifest"].to_string(), 0, limits)
                 .unwrap(),
-            bytes: hex::decode(row["cbor"].as_str().unwrap()).unwrap(),
+            bytes: minicbor::to_vec(transaction).unwrap(),
             signer,
             intent,
             resolved: ResolvedTransactionInputs {
@@ -318,4 +342,92 @@ fn phase_one_exception_rejects_hidden_script_work_and_invalid_envelopes() {
     let mut trailing = fixture.bytes.clone();
     trailing.push(0);
     assert!(validate_key_only_transaction(&trailing, &fixture.resolved).is_err());
+}
+
+#[test]
+fn fragmented_escrow_consolidation_passes_independent_signing_policy() {
+    let fixture = Fixture::load("consolidate");
+    fixture.validate(&fixture.bytes).unwrap();
+}
+
+#[test]
+fn consolidation_is_bound_to_the_packet_and_cannot_replace_settlement() {
+    for mutation in 0..5 {
+        let mut fixture = Fixture::load("consolidate");
+        match mutation {
+            0 => fixture.intent.state_sequence = Some(1),
+            1 => {
+                fixture.intent.transfer.as_mut().unwrap().denom = "transfer/channel-7/other".into()
+            }
+            2 => fixture.intent.transfer.as_mut().unwrap().amount = 10_000_000,
+            3 => fixture.intent.operation = "/ibc.core.channel.v1.MsgRecvPacket".into(),
+            _ => fixture.intent.transfer.as_mut().unwrap().action = TransferAction::Send,
+        }
+        assert!(
+            fixture.validate(&fixture.bytes).is_err(),
+            "mutation {mutation}"
+        );
+    }
+}
+
+#[test]
+fn consolidation_rejects_changes_to_principal_reserves_and_owners() {
+    let fixture = Fixture::load("consolidate");
+    for index in 0..fixture.transaction().transaction_body.outputs.len() {
+        let mut transaction = fixture.transaction();
+        match &mut transaction.transaction_body.outputs[index] {
+            PseudoTransactionOutput::PostAlonzo(output) => output.address = vec![0x60; 29].into(),
+            PseudoTransactionOutput::Legacy(output) => output.address = vec![0x60; 29].into(),
+        }
+        assert!(
+            fixture
+                .validate(&minicbor::to_vec(transaction).unwrap())
+                .is_err(),
+            "output {index}"
+        );
+    }
+}
+
+#[test]
+fn consolidation_is_not_authorized_for_admission_successful_ack_or_voucher_mint() {
+    for name in ["admission", "acknowledge", "send"] {
+        assert!(SigningIntent::packet_consolidation(&Fixture::load(name).intent).is_err());
+    }
+    let mut intent = Fixture::load("consolidate").intent;
+    intent.transfer.as_mut().unwrap().denom = "uatom".into();
+    assert!(SigningIntent::packet_consolidation(&intent).is_err());
+    intent.transfer.as_mut().unwrap().action = TransferAction::Refund;
+    intent.transfer.as_mut().unwrap().denom = "transfer/channel-7/uatom".into();
+    assert!(SigningIntent::packet_consolidation(&intent).is_err());
+}
+
+#[test]
+fn consolidation_cannot_remove_a_donor_refund_or_change_the_survivor_value() {
+    let fixture = Fixture::load("consolidate");
+    fixture.validate(&fixture.bytes).unwrap();
+    for index in 0..fixture.transaction().transaction_body.outputs.len() {
+        let mut transaction = fixture.transaction();
+        let PseudoTransactionOutput::PostAlonzo(output) =
+            &mut transaction.transaction_body.outputs[index]
+        else {
+            continue;
+        };
+        match &mut output.value {
+            Value::Coin(coin) | Value::Multiasset(coin, _) => *coin += 1,
+        }
+        assert!(
+            fixture
+                .validate(&minicbor::to_vec(transaction).unwrap())
+                .is_err(),
+            "changed value {index}"
+        );
+        let mut transaction = fixture.transaction();
+        transaction.transaction_body.outputs.remove(index);
+        assert!(
+            fixture
+                .validate(&minicbor::to_vec(transaction).unwrap())
+                .is_err(),
+            "missing output {index}"
+        );
+    }
 }

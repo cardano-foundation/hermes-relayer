@@ -3888,6 +3888,34 @@ impl SigningIntent {
         intent
     }
 
+    pub fn packet_consolidation(original: &Self) -> Result<Self, Error> {
+        let transfer = original
+            .transfer
+            .as_ref()
+            .ok_or_else(|| Error::Signer("packet has no escrow payout".into()))?;
+        let prefix = transfer
+            .source_port
+            .as_ref()
+            .zip(transfer.source_channel.as_ref())
+            .map(|(port, channel)| format!("{port}/{channel}/"))
+            .ok_or_else(|| Error::Signer("missing packet source".into()))?;
+        let escrow = match transfer.action {
+            TransferAction::Receive => transfer.denom.starts_with(&prefix),
+            TransferAction::Refund => !transfer.denom.starts_with(&prefix),
+            TransferAction::Send => false,
+        };
+        if !escrow
+            || original.packet.is_none()
+            || original.module_port.as_deref() != Some("transfer")
+        {
+            return Err(Error::Signer("packet does not release escrow".into()));
+        }
+        let mut intent = original.clone();
+        intent.operation = "ConsolidatePacketLiquidity".into();
+        intent.external_output = None;
+        Ok(intent)
+    }
+
     /// Backend execution spends already funded requests, never user wallet funds.
     pub fn funded_batch(
         port: &str,
