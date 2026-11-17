@@ -1,10 +1,69 @@
+use crate::config::filter::ChannelPolicy;
 use futures::{stream, StreamExt};
+use ibc_proto::ibc::core::channel::v1::IdentifiedChannel;
+use ibc_relayer_types::core::ics24_host::identifier::{ChannelId, PortId};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// Operator authorization for autonomous funded-intent work.
+#[derive(Clone)]
+pub(super) struct ExecutorPolicy {
+    enabled: bool,
+    channels: ChannelPolicy,
+}
+
+impl ExecutorPolicy {
+    pub fn new(enabled: bool, channels: ChannelPolicy) -> Self {
+        Self { enabled, channels }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn allows(&self, channel: &IdentifiedChannel) -> bool {
+        if !self.enabled || channel.port_id != "transfer" || channel.state != 3 {
+            return false;
+        }
+        let (Ok(port), Ok(channel)) = (
+            channel.port_id.parse::<PortId>(),
+            channel.channel_id.parse::<ChannelId>(),
+        ) else {
+            return false;
+        };
+        self.channels.is_allowed(&port, &channel)
+    }
+
+    pub async fn execute_pass<E, D, DFut, F, Fut>(
+        &self,
+        schedule: &mut ExecutorSchedule,
+        concurrency: NonZeroUsize,
+        discover: D,
+        execute: F,
+    ) -> Result<Vec<(String, E)>, E>
+    where
+        D: FnOnce() -> DFut,
+        DFut: Future<Output = Result<Vec<IdentifiedChannel>, E>>,
+        F: Fn(String) -> Fut,
+        Fut: Future<Output = Result<bool, E>>,
+    {
+        schedule.begin_pass(Instant::now());
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        let eligible = discover()
+            .await?
+            .into_iter()
+            .filter(|channel| self.allows(channel))
+            .map(|channel| channel.channel_id);
+        // Authorization happens before invoking any build/sign/submit callback.
+        Ok(schedule.execute(eligible, concurrency, execute).await)
+    }
+}
 
 #[derive(Default)]
 pub(super) struct ExecutorSchedule {
@@ -81,6 +140,134 @@ impl ExecutorSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn open_channel(id: &str) -> IdentifiedChannel {
+        IdentifiedChannel {
+            port_id: "transfer".into(),
+            channel_id: id.into(),
+            state: 3,
+            ..Default::default()
+        }
+    }
+
+    // Every discovered open transfer channel has a valid funded intent. The
+    // mock builds, signs and submits whenever the production pass invokes it.
+    // Rejection must happen before reaching any of these operations.
+    async fn exercise_policy(
+        enabled: bool,
+        policy: &str,
+        channels: Vec<IdentifiedChannel>,
+    ) -> (usize, Vec<String>, Vec<String>, Vec<String>) {
+        use std::cell::{Cell, RefCell};
+        let policy = ExecutorPolicy::new(enabled, toml::from_str(policy).unwrap());
+        let discoveries = Cell::new(0);
+        let builds = RefCell::new(Vec::new());
+        let signatures = RefCell::new(Vec::new());
+        let submissions = RefCell::new(Vec::new());
+        let failures = policy
+            .execute_pass(
+                &mut ExecutorSchedule::default(),
+                NonZeroUsize::new(4).unwrap(),
+                || async {
+                    discoveries.set(discoveries.get() + 1);
+                    Ok::<_, ()>(channels)
+                },
+                |channel| {
+                    builds.borrow_mut().push(channel.clone());
+                    let signatures = &signatures;
+                    let submissions = &submissions;
+                    async move {
+                        signatures.borrow_mut().push(channel.clone());
+                        submissions.borrow_mut().push(channel);
+                        Ok(true)
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(failures.is_empty());
+        (
+            discoveries.get(),
+            builds.into_inner(),
+            signatures.into_inner(),
+            submissions.into_inner(),
+        )
+    }
+
+    #[tokio::test]
+    async fn disabled_packets_never_discover_build_sign_or_submit_valid_intents() {
+        let (queries, builds, signs, submits) = exercise_policy(
+            false,
+            "policy = 'allowall'",
+            vec![open_channel("channel-0")],
+        )
+        .await;
+        assert_eq!(queries, 0);
+        assert!(builds.is_empty());
+        assert!(signs.is_empty());
+        assert!(submits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn denied_valid_intents_never_reach_build_sign_or_submit() {
+        for policy in [
+            "policy = 'allow'\nlist = [['transfer', 'channel-0']]",
+            "policy = 'deny'\nlist = [['transfer', 'channel-*']]",
+        ] {
+            let (queries, builds, signs, submits) =
+                exercise_policy(true, policy, vec![open_channel("channel-1")]).await;
+            assert_eq!(queries, 1);
+            assert!(builds.is_empty());
+            assert!(signs.is_empty());
+            assert!(submits.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn allowed_intents_progress_without_servicing_denied_channels() {
+        for policy in [
+            "policy = 'allow'\nlist = [['transfer', 'channel-0']]",
+            "policy = 'deny'\nlist = [['transfer', 'channel-1']]",
+        ] {
+            let (_, builds, signs, submits) = exercise_policy(
+                true,
+                policy,
+                vec![open_channel("channel-1"), open_channel("channel-0")],
+            )
+            .await;
+            assert_eq!(builds, ["channel-0"]);
+            assert_eq!(signs, ["channel-0"]);
+            assert_eq!(submits, ["channel-0"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn wildcard_policy_still_rejects_closed_wrong_port_and_malformed_channels() {
+        let mut closed = open_channel("channel-2");
+        closed.state = 4;
+        let mut wrong_port = open_channel("channel-3");
+        wrong_port.port_id = "other".into();
+        for policy in [
+            "policy = 'allowall'",
+            "policy = 'allow'\nlist = [['transfer', 'channel-*']]",
+        ] {
+            let (_, builds, signs, submits) = exercise_policy(
+                true,
+                policy,
+                vec![
+                    open_channel("channel-0"),
+                    open_channel("channel-1"),
+                    closed.clone(),
+                    wrong_port.clone(),
+                    open_channel("invalid"),
+                ],
+            )
+            .await;
+            assert_eq!(builds, ["channel-0", "channel-1"]);
+            assert_eq!(signs, builds);
+            assert_eq!(submits, builds);
+        }
+    }
 
     #[tokio::test]
     async fn bounds_in_flight_batches_and_drains_after_a_failure() {

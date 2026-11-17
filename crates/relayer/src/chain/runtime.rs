@@ -85,8 +85,16 @@ where
         config: ChainConfig,
         rt: Arc<TokioRuntime>,
     ) -> Result<Handle, Error> {
-        // Similar to `from_config`.
-        let chain = Endpoint::bootstrap(config, rt.clone())?;
+        Self::spawn_with_packet_execution(config, rt, false)
+    }
+
+    pub(crate) fn spawn_with_packet_execution<Handle: ChainHandle>(
+        config: ChainConfig,
+        rt: Arc<TokioRuntime>,
+        packet_execution_enabled: bool,
+    ) -> Result<Handle, Error> {
+        let mut chain = Endpoint::bootstrap(config, rt.clone())?;
+        chain.set_packet_execution_enabled(packet_execution_enabled);
 
         // Instantiate & spawn the runtime
         let (handle, _) = Self::init(chain, rt);
