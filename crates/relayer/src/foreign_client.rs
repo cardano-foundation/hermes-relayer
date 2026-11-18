@@ -2221,6 +2221,9 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             // cannot delay it. The keeper still enforces generation, host
             // continuity and connection delays when verifying the proof.
             if let AnyConsensusState::Probabilistic(state) = &consensus_state {
+                // The initial root exists before bootstrap imports finish. Its
+                // epoch cannot become usable until those imports are committed.
+                self.complete_bootstrap()?;
                 self.wait_for_probabilistic_epoch_challenge(&[state.accepted_epoch], None)?;
             }
             debug!("consensus state already exists at height {target_height}, skipping update");
