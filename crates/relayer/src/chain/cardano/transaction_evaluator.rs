@@ -363,10 +363,10 @@ impl OgmiosTransactionEvaluator {
             return Ok(false);
         };
         let tip = self.query_ledger("queryLedgerState/tip", None).await?;
-        if !tip
+        if tip
             .get("slot")
             .and_then(JsonValue::as_u64)
-            .is_some_and(|slot| slot > ttl)
+            .is_none_or(|slot| slot <= ttl)
             || tip.get("id").and_then(JsonValue::as_str).is_none()
         {
             return Ok(false);
