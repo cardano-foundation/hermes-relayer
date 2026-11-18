@@ -7,7 +7,7 @@ use super::gateway_client::{
     BuiltIbcTx, BuiltIbcTxKind, GatewayClient, TxSubmitResponse, UnsignedTx,
     MAX_TENDERMINT_UPDATE_TX_CHAIN_LENGTH,
 };
-use super::intent_executor::{ExecutorPolicy, ExecutorSchedule};
+use super::intent_executor::{ExecutorPolicy, PendingBatches};
 use super::signing_key_pair::CardanoSigningKeyPair;
 use super::signing_policy::{
     SigningIntent, SigningPolicyLimits, TendermintSessionAction, TransactionSigningPolicy,
@@ -114,6 +114,7 @@ pub struct CardanoChainEndpoint {
     stop_intent_executor: Arc<AtomicBool>,
     intent_executor_policy: ExecutorPolicy,
     pending_new_client_consensus_states: Mutex<HashMap<u64, AnyConsensusState>>,
+    pending_executor_batches: PendingBatches,
     mithril_stake_polls: super::mithril_stake::MithrilStakePolls,
 }
 
@@ -581,7 +582,7 @@ impl CardanoChainEndpoint {
             .await
             .map_err(|error| {
                 Error::send_tx(format!(
-                    "Trusted Ogmios accepted transaction {}, but the Gateway could not verify and finalize it: {error}",
+                    "Gateway could not verify and finalize transaction {}: {error}",
                     signed_tx.tx_hash
                 ))
             })?;
@@ -1030,35 +1031,73 @@ impl CardanoChainEndpoint {
         }
     }
 
-    async fn execute_pending_intents(&self, schedule: &mut ExecutorSchedule) -> Result<(), Error> {
+    async fn execute_pending_intents(&self, stop: &AtomicBool) {
         use ibc_proto::ibc::core::channel::v1::QueryChannelsResponse;
         use prost::Message;
-        let failures = self
-            .intent_executor_policy
-            .execute_pass(
-                schedule,
+        self.intent_executor_policy
+            .run(
                 self.config.packet_executor_concurrency,
                 || async {
-                    let bytes = self
-                        .gateway_client
-                        .query_channels()
-                        .await
+                    let bytes = tokio::time::timeout(std::time::Duration::from_secs(210), self.gateway_client.query_channels())
+                        .await.map_err(|_| Error::query("Gateway channel discovery timed out".into()))?
                         .map_err(|error| Error::query(error.to_string()))?;
                     QueryChannelsResponse::decode(bytes.as_slice())
                         .map(|response| response.channels)
                         .map_err(|error| Error::query(error.to_string()))
                 },
-                |channel| async move { self.execute_channel_batch(&channel).await },
+                |channel| async move {
+                    tokio::time::timeout(std::time::Duration::from_secs(240), self.execute_channel_batch(&channel))
+                        .await.map_err(|_| Error::send_tx(format!("Funded batch attempt timed out on {channel}, retaining any signed transaction for reconciliation")))?
+                },
+                |channel, error| tracing::warn!(?channel, %error, "Funded request executor will retry"),
+                || stop.load(Ordering::Relaxed),
             )
-            .await?;
-        for (channel, error) in failures {
-            tracing::warn!(%channel, %error,
-                "Funded request batch will retry from canonical state");
+            .await;
+    }
+
+    async fn reconcile_executor_batch(
+        &self,
+        channel: &str,
+        signed: &super::signer::SignedTransaction,
+    ) -> Result<bool, Error> {
+        // Expiry alone is insufficient: an accepted transaction may still be
+        // waiting for the Gateway indexer. Require its inputs to be unspent too.
+        match self
+            .transaction_evaluator
+            .expired_transaction_is_unspent(&signed.cbor)
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(%channel, tx_hash = %signed.tx_hash, "Expired funded batch was not included and can be rebuilt");
+                return Ok(false);
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%channel, tx_hash = %signed.tx_hash, %error,
+                "Unable to prove batch expiry, retaining signed bytes and reconciling inclusion"),
         }
-        Ok(())
+        if let Err(error) = self.submit_signed_transaction(signed, false).await {
+            tracing::warn!(%channel, tx_hash = %signed.tx_hash, %error,
+                "Reconciling funded batch after submission error");
+        }
+        let response = self.observe_signed_transaction(signed, true).await?;
+        tracing::info!(%channel, tx_hash = %response.tx_hash, "Funded request batch included");
+        Ok(true)
     }
 
     async fn execute_channel_batch(&self, channel: &str) -> Result<bool, Error> {
+        self.pending_executor_batches
+            .execute(
+                channel,
+                || self.build_executor_batch(channel),
+                |signed| async move { self.reconcile_executor_batch(channel, &signed).await },
+            )
+            .await
+    }
+
+    async fn build_executor_batch(
+        &self,
+        channel: &str,
+    ) -> Result<Option<super::signer::SignedTransaction>, Error> {
         // The Gateway reserves spending and collateral inputs across builds.
         // Busy shared inputs fail this channel and enter its existing backoff.
         let batch = self
@@ -1067,7 +1106,7 @@ impl CardanoChainEndpoint {
             .await
             .map_err(|error| Error::send_tx(error.to_string()))?;
         if batch.stage == "idle" {
-            return Ok(false);
+            return Ok(None);
         }
         if batch.stage != "send" && batch.stage != "initialize" {
             return Err(Error::send_tx("unexpected executor batch stage".into()));
@@ -1083,11 +1122,11 @@ impl CardanoChainEndpoint {
             .map_err(|error| Error::send_tx(error.to_string()))?;
         tracing::info!(%channel, stage = %batch.stage,
             intents = batch.intent_tx_hashes.len(), "Executing funded request batch");
-        let (response, height) = self.sign_submit_until_included(&unsigned, &intent).await?;
-        tracing::info!(%channel, tx_hash = %response.tx_hash, %height,
-            stage = %batch.stage, intents = batch.intent_tx_hashes.len(),
-            "Funded request batch included");
-        Ok(true)
+        let signed = self
+            .sign_transaction_helper(&unsigned.cbor_hex, &intent, &TrustedUtxoOverlay::default())
+            .await?
+            .transaction;
+        Ok(Some(signed))
     }
 
     fn spawn_intent_executor(&self) -> Result<(), Error> {
@@ -1101,21 +1140,9 @@ impl CardanoChainEndpoint {
         executor.intent_executor_policy = self.intent_executor_policy.clone();
         let stop = self.stop_intent_executor.clone();
         std::thread::spawn(move || {
-            let mut schedule = ExecutorSchedule::default();
-            while !stop.load(Ordering::Relaxed) {
-                if let Err(error) = executor
-                    .rt
-                    .block_on(executor.execute_pending_intents(&mut schedule))
-                {
-                    tracing::warn!(%error, "Funded request discovery will retry");
-                }
-                // Successful inclusion makes new sequencer state available now.
-                // Only idle/error passes wait. Failed channels back off separately.
-                let delay = schedule.delay();
-                if !delay.is_zero() {
-                    std::thread::sleep(delay);
-                }
-            }
+            executor
+                .rt
+                .block_on(executor.execute_pending_intents(&stop));
         });
         Ok(())
     }
@@ -1542,6 +1569,7 @@ impl ChainEndpoint for CardanoChainEndpoint {
             stop_intent_executor: Arc::new(AtomicBool::new(false)),
             event_source_cmd: None, // Initialized lazily on first subscribe() call
             pending_new_client_consensus_states: Mutex::new(HashMap::new()),
+            pending_executor_batches: PendingBatches::default(),
             mithril_stake_polls: Default::default(),
         };
 

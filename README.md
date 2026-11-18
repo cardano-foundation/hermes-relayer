@@ -194,7 +194,9 @@ After the source commitment for a received unordered packet has been removed, an
 
 Funded intent execution runs only when `mode.packets.enabled = true` and obeys the Cardano chain's `packet_filter` channel policy before building or signing a batch. Event subscriptions remain available when packet processing is disabled. Chain runtimes created without a global packet-mode decision do not start this background executor.
 
-Funded intent execution uses `packet_executor_concurrency = 4` by default. Independent channels may build, sign and await inclusion together. Each channel still executes one batch per pass and retries from canonical state after a failure. Set the value to `1` to preserve serial execution. Separate wallet inputs are needed for simultaneous fees and collateral. The send builder still includes at most two intents and pruning remains operator managed.
+Funded intent execution uses `packet_executor_concurrency = 4` by default. Each channel has at most one unresolved batch. Successful channels immediately return to the ready queue while idle or failed attempts back off for five seconds. Set the value to `1` for serial execution. Separate wallet inputs are needed for simultaneous fees and collateral. The send builder still includes at most two intents and pruning remains operator managed.
+
+Gateway connections time out after ten seconds. Observation calls have a 210 second deadline. A whole background attempt is bounded to 240 seconds. After an ambiguous submission or observation failure the executor retains the exact signed bytes and reconciles that transaction before building another batch. An expired transaction can be discarded only when trusted Ogmios shows all spending and collateral inputs still unspent at an unchanged ledger tip. Pending signed batches are held in memory for the executor lifetime.
 
 ### Cardano ICS-20 Amount Range
 

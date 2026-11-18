@@ -449,7 +449,13 @@ impl GatewayClient {
             .as_deref()
             .map(read_gateway_auth_token)
             .transpose()?;
-        let channel = channel_endpoint.connect().await?;
+        // Observation normally polls for up to 180 seconds. Bound transport work
+        // as well, including a stalled server or response body.
+        let channel = channel_endpoint
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(210))
+            .connect()
+            .await?;
         let channel = InterceptedService::new(channel, GatewayAuthInterceptor { authorization });
 
         Ok(Self { endpoint, channel })
@@ -2351,13 +2357,34 @@ impl GatewayClient {
         tx_hash: &str,
         allow_untracked: bool,
     ) -> Result<TxSubmitResponse, Error> {
+        self.observe_tx_with_timeout(
+            tx_hash,
+            allow_untracked,
+            std::time::Duration::from_secs(210),
+        )
+        .await
+    }
+
+    async fn observe_tx_with_timeout(
+        &self,
+        tx_hash: &str,
+        allow_untracked: bool,
+        timeout: std::time::Duration,
+    ) -> Result<TxSubmitResponse, Error> {
         let mut client = CardanoMsgClient::new(self.channel.clone());
-        let response: ObserveTxResponse = client
-            .observe_tx(tonic::Request::new(ObserveTxRequest {
-                tx_hash: tx_hash.to_string(),
-                allow_untracked,
-            }))
-            .await?
+        let mut request = tonic::Request::new(ObserveTxRequest {
+            tx_hash: tx_hash.to_string(),
+            allow_untracked,
+        });
+        request.set_timeout(timeout);
+        // The transport timeout covers response headers. Also bound reading the
+        // gRPC response body, retaining the hash at the caller on either failure.
+        let response: ObserveTxResponse = tokio::time::timeout(timeout, client.observe_tx(request))
+            .await
+            .map_err(|_| Error::GatewayStatus {
+                code: tonic::Code::DeadlineExceeded,
+                message: format!("Gateway observation timed out for transaction {tx_hash}"),
+            })??
             .into_inner();
 
         let height = parse_submit_signed_tx_height(&response.height)?;
@@ -2666,6 +2693,43 @@ fn packet_transaction_description(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn observation_times_out_when_gateway_accepts_connection_but_never_replies() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let channel = tonic::transport::Channel::from_shared(endpoint.clone())
+            .unwrap()
+            .connect_lazy();
+        let client = super::GatewayClient {
+            endpoint,
+            channel: tonic::service::interceptor::InterceptedService::new(
+                channel,
+                super::GatewayAuthInterceptor {
+                    authorization: None,
+                },
+            ),
+        };
+        let (connected, accepted) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            connected.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.observe_tx_with_timeout(
+                "pending-hash",
+                true,
+                std::time::Duration::from_millis(100),
+            ),
+        )
+        .await
+        .unwrap();
+        accepted.await.unwrap();
+        assert!(result.is_err());
+        server.abort();
+    }
+
     #[test]
     fn acknowledgement_batch_request_decodes_gateway_wire_fields() {
         use prost::Message;

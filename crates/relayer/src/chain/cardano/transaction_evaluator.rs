@@ -353,6 +353,101 @@ impl OgmiosTransactionEvaluator {
         Ok(evaluated)
     }
 
+    /// Prove that an expired envelope has not spent either normal or collateral
+    /// inputs. Bracket the UTxO query with the same ledger tip, failing closed if
+    /// the node advances or rolls back between these independent HTTP queries.
+    pub(super) async fn expired_transaction_is_unspent(&self, cbor: &[u8]) -> Result<bool, Error> {
+        let tx: MintedTx<'_> =
+            minicbor::decode(cbor).map_err(|error| Error::CborDecode(error.to_string()))?;
+        let Some(ttl) = tx.transaction_body.ttl else {
+            return Ok(false);
+        };
+        let tip = self.query_ledger("queryLedgerState/tip", None).await?;
+        if tip
+            .get("slot")
+            .and_then(JsonValue::as_u64)
+            .is_none_or(|slot| slot <= ttl)
+            || tip.get("id").and_then(JsonValue::as_str).is_none()
+        {
+            return Ok(false);
+        }
+        let references: Vec<_> = tx.transaction_body.inputs.iter()
+            .chain(tx.transaction_body.collateral.iter().flat_map(|inputs| inputs.iter()))
+            .map(|input| serde_json::json!({"transaction": {"id": input.transaction_id.to_string()}, "index": input.index}))
+            .collect();
+        if references.is_empty() {
+            return Ok(false);
+        }
+        let utxos = self
+            .query_ledger(
+                "queryLedgerState/utxo",
+                Some(serde_json::json!({"outputReferences": references})),
+            )
+            .await?;
+        let Some(utxos) = utxos.as_array() else {
+            return Ok(false);
+        };
+        if !references.iter().all(|input| {
+            utxos.iter().any(|utxo| {
+                utxo["transaction"] == input["transaction"] && utxo["index"] == input["index"]
+            })
+        }) {
+            return Ok(false);
+        }
+        Ok(self.query_ledger("queryLedgerState/tip", None).await? == tip)
+    }
+
+    async fn query_ledger(
+        &self,
+        method: &str,
+        params: Option<JsonValue>,
+    ) -> Result<JsonValue, Error> {
+        let mut payload = serde_json::json!({"jsonrpc": "2.0", "method": method, "id": 3});
+        if let Some(params) = params {
+            payload["params"] = params;
+        }
+        let mut request = self.client.post(self.endpoint.clone()).json(&payload);
+        if let Some(api_key) = &self.api_key {
+            request = request.header(OGMIOS_API_KEY_HEADER, api_key.clone());
+        }
+        let error = |error: reqwest::Error| {
+            Error::Query(format!(
+                "trusted Ogmios ledger query failed: {}",
+                error.without_url()
+            ))
+        };
+        let mut response = request
+            .send()
+            .await
+            .map_err(error)?
+            .error_for_status()
+            .map_err(error)?;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(error)? {
+            if chunk.len() > MAX_OGMIOS_RESPONSE_BYTES.saturating_sub(body.len()) {
+                return Err(Error::Query(
+                    "trusted Ogmios ledger response exceeds size limit".into(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let response: JsonValue = serde_json::from_slice(&body)
+            .map_err(|error| Error::Query(format!("invalid Ogmios ledger response: {error}")))?;
+        if response["jsonrpc"] != "2.0"
+            || response["id"] != 3
+            || response["method"] != method
+            || response.get("error").is_some()
+        {
+            return Err(Error::Query(
+                "trusted Ogmios returned a failed or mismatched ledger query".into(),
+            ));
+        }
+        response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| Error::Query("trusted Ogmios ledger response has no result".into()))
+    }
+
     /// Submit the exact signed transaction through the same trusted node path.
     ///
     /// This is security-sensitive: Cardano's `is_valid` wrapper is not covered
@@ -1030,6 +1125,160 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    fn expiring_transaction() -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut e = minicbor::Encoder::new(&mut output);
+        e.array(4).unwrap().map(5).unwrap();
+        e.u8(0)
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .bytes(&[0x11; 32])
+            .unwrap()
+            .u8(0)
+            .unwrap();
+        e.u8(1).unwrap().array(0).unwrap();
+        e.u8(2).unwrap().u8(1).unwrap();
+        e.u8(3).unwrap().u64(100).unwrap();
+        e.u8(13)
+            .unwrap()
+            .array(1)
+            .unwrap()
+            .array(2)
+            .unwrap()
+            .bytes(&[0x22; 32])
+            .unwrap()
+            .u8(1)
+            .unwrap();
+        e.map(0).unwrap().bool(true).unwrap().null().unwrap();
+        output
+    }
+
+    fn mock_ledger(responses: Vec<(&'static str, JsonValue)>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            for (method, result) in responses {
+                let status = 200;
+                let response_body =
+                    serde_json::json!({"jsonrpc":"2.0", "method":method, "id":3, "result":result})
+                        .to_string();
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let header_end = loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0, "client closed before sending HTTP headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(position) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        break position + 4;
+                    }
+                };
+                let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(str::trim)
+                            .map(str::parse::<usize>)
+                    })
+                    .transpose()
+                    .unwrap()
+                    .unwrap();
+                while request.len() - header_end < content_length {
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0, "client closed before sending HTTP body");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let payload: JsonValue =
+                    serde_json::from_slice(&request[header_end..header_end + content_length])
+                        .unwrap();
+                assert_eq!(payload["jsonrpc"], "2.0");
+                assert_eq!(payload["method"], method);
+                assert_eq!(payload["id"], 3);
+                if method == "queryLedgerState/utxo" {
+                    let refs = payload["params"]["outputReferences"].as_array().unwrap();
+                    assert_eq!(refs.len(), 2);
+                    assert_eq!(refs[0]["transaction"]["id"], "11".repeat(32));
+                    assert_eq!(refs[1]["transaction"]["id"], "22".repeat(32));
+                }
+
+                let response = format!(
+                    "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[tokio::test]
+    async fn expiry_requires_unspent_normal_and_collateral_inputs_at_unchanged_tip() {
+        let tip = serde_json::json!({"slot":101,"id":"aa".repeat(32)});
+        let inputs = serde_json::json!([
+            {"transaction":{"id":"11".repeat(32)},"index":0},
+            {"transaction":{"id":"22".repeat(32)},"index":1}
+        ]);
+        for (available, after, expected) in [
+            (inputs.clone(), Some(tip.clone()), true),
+            (serde_json::json!([inputs[0]]), None, false),
+            (serde_json::json!([inputs[1]]), None, false),
+            (serde_json::json!([]), None, false),
+            (
+                inputs.clone(),
+                Some(serde_json::json!({"slot":102,"id":"bb".repeat(32)})),
+                false,
+            ),
+            (
+                inputs,
+                Some(serde_json::json!({"slot":99,"id":"cc".repeat(32)})),
+                false,
+            ),
+        ] {
+            let mut responses = vec![
+                ("queryLedgerState/tip", tip.clone()),
+                ("queryLedgerState/utxo", available),
+            ];
+            if let Some(after) = after {
+                responses.push(("queryLedgerState/tip", after));
+            }
+            let (url, server) = mock_ledger(responses);
+            let client = OgmiosTransactionEvaluator::new_with_security(&url, None, None).unwrap();
+            assert_eq!(
+                client
+                    .expired_transaction_is_unspent(&expiring_transaction())
+                    .await
+                    .unwrap(),
+                expected
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unexpired_or_unknown_ledger_tip_cannot_release_signed_batch() {
+        for tip in [
+            serde_json::json!({"slot":100,"id":"aa".repeat(32)}),
+            serde_json::json!("origin"),
+            serde_json::json!({"slot":101}),
+        ] {
+            let (url, server) = mock_ledger(vec![("queryLedgerState/tip", tip)]);
+            let client = OgmiosTransactionEvaluator::new_with_security(&url, None, None).unwrap();
+            assert!(!client
+                .expired_transaction_is_unspent(&expiring_transaction())
+                .await
+                .unwrap());
+            server.join().unwrap();
+        }
+    }
 
     fn unsigned_tx_with_redeemers() -> Vec<u8> {
         unsigned_tx_with_declared_budgets([(50, 500), (25, 250)])
