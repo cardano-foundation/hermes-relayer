@@ -342,6 +342,7 @@ fn decode_update_client_transactions(
 pub struct GatewayClient {
     endpoint: String,
     channel: InterceptedService<Channel, GatewayAuthInterceptor>,
+    initialization_channel: InterceptedService<Channel, GatewayAuthInterceptor>,
 }
 
 #[derive(Clone)]
@@ -451,6 +452,18 @@ impl GatewayClient {
             .transpose()?;
         // Observation normally polls for up to 180 seconds. Bound transport work
         // as well, including a stalled server or response body.
+        // Public-network bootstrap gathers historical pool and Mithril evidence.
+        // Keep its longer deadline separate from packet and observation RPCs.
+        let initialization_channel = InterceptedService::new(
+            channel_endpoint
+                .clone()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(1800))
+                .connect_lazy(),
+            GatewayAuthInterceptor {
+                authorization: authorization.clone(),
+            },
+        );
         let channel = channel_endpoint
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(210))
@@ -458,7 +471,11 @@ impl GatewayClient {
             .await?;
         let channel = InterceptedService::new(channel, GatewayAuthInterceptor { authorization });
 
-        Ok(Self { endpoint, channel })
+        Ok(Self {
+            endpoint,
+            channel,
+            initialization_channel,
+        })
     }
 
     fn request_with_query_height<T>(
@@ -508,12 +525,17 @@ impl GatewayClient {
             query_client::QueryClient, QueryNewClientRequest,
         };
 
-        let mut client = QueryClient::new(self.channel.clone());
-        let request = tonic::Request::new(QueryNewClientRequest {
+        let mut client = QueryClient::new(self.initialization_channel.clone());
+        let mut request = tonic::Request::new(QueryNewClientRequest {
             height,
             initialization_sequence,
         });
-        let response = client.new_client(request).await?.into_inner();
+        let timeout = std::time::Duration::from_secs(1800);
+        request.set_timeout(timeout);
+        let response = tokio::time::timeout(timeout, client.new_client(request))
+            .await
+            .map_err(|_| Error::Query("Gateway client initialization timed out".into()))??
+            .into_inner();
 
         Ok(response)
     }
@@ -2701,6 +2723,12 @@ mod tests {
             .unwrap()
             .connect_lazy();
         let client = super::GatewayClient {
+            initialization_channel: tonic::service::interceptor::InterceptedService::new(
+                channel.clone(),
+                super::GatewayAuthInterceptor {
+                    authorization: None,
+                },
+            ),
             endpoint,
             channel: tonic::service::interceptor::InterceptedService::new(
                 channel,
