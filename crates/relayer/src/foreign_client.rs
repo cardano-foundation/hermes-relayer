@@ -1663,10 +1663,8 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             };
         match self.verification_query(client, 10, vec![], vec![]) {
             Ok(pending) => {
-                let proposals = pending
-                    .as_array()
-                    .ok_or_else(|| fail("Invalid pending proposal response".into()))?;
-                for proposal in proposals {
+                let proposals = pending_epoch_proposals(pending).map_err(fail)?;
+                for proposal in &proposals {
                     let result = staging::decode_bytes(proposal, "Receipt").and_then(|id| {
                         if id.len() != 32 {
                             return Err("Invalid proposal receipt identifier".into());
@@ -3329,8 +3327,37 @@ pub fn fetch_ccv_consumer_id(
     Ok(consumer_id)
 }
 
+// Go encodes the nil slice returned for no pending epoch proposals as JSON null.
+fn pending_epoch_proposals(value: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    serde_json::from_value::<Option<Vec<serde_json::Value>>>(value)
+        .map(Option::unwrap_or_default)
+        .map_err(|_| "Invalid pending proposal response".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_epoch_proposals_accepts_go_empty_slice_encoding() {
+        assert!(super::pending_epoch_proposals(serde_json::Value::Null)
+            .unwrap()
+            .is_empty());
+        assert!(super::pending_epoch_proposals(serde_json::json!([]))
+            .unwrap()
+            .is_empty());
+        let proposal = serde_json::json!({"Receipt": "receipt"});
+        assert_eq!(
+            super::pending_epoch_proposals(serde_json::json!([proposal.clone()])).unwrap(),
+            vec![proposal]
+        );
+        for malformed in [
+            serde_json::json!({}),
+            serde_json::json!(false),
+            serde_json::json!("null"),
+        ] {
+            assert!(super::pending_epoch_proposals(malformed).is_err());
+        }
+    }
+
     use std::thread;
     use std::time::{Duration, Instant};
 
