@@ -2221,6 +2221,9 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
             // cannot delay it. The keeper still enforces generation, host
             // continuity and connection delays when verifying the proof.
             if let AnyConsensusState::Probabilistic(state) = &consensus_state {
+                // The initial root exists before bootstrap imports finish. Its
+                // epoch cannot become usable until those imports are committed.
+                self.complete_bootstrap()?;
                 self.wait_for_probabilistic_epoch_challenge(&[state.accepted_epoch], None)?;
             }
             debug!("consensus state already exists at height {target_height}, skipping update");
@@ -3872,9 +3875,9 @@ mod tests {
         let (result, source, destination) = prepare_proof_with_checkpoint_cursor(true, false);
 
         assert!(result.expect("the exact proof root exists").is_empty());
-        // Challenge checks also revalidate the client before and after preparing updates.
+        // Bootstrap readiness and challenge checks revalidate the client before preparing updates.
         assert_eq!(destination.consensus_heights, vec![height(33); 2]);
-        assert_eq!(destination.client_state_queries, 3);
+        assert_eq!(destination.client_state_queries, 4);
         assert_eq!(source.application_status_queries, 0);
         assert_eq!(source.submissions + destination.submissions, 0);
     }

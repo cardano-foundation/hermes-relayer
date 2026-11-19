@@ -62,6 +62,7 @@ impl Harness {
         let (tx, rx) = crossbeam_channel::unbounded();
         let source = BaseChainHandle::new(client.chain_id.clone(), tx);
         let (calls, wrong, initial) = (requests.clone(), wrong_point.clone(), client.clone());
+        let retained_consensus = consensus.clone();
         let source_thread = thread::spawn(move || {
             for (_, request) in rx {
                 match request {
@@ -143,6 +144,11 @@ impl Harness {
                             .send(Ok("cosmos1operator".parse::<Signer>().unwrap()))
                             .unwrap();
                     }
+                    ChainRequest::QueryConsensusState { reply_to, .. } => {
+                        reply_to
+                            .send(Ok((retained_consensus.clone(), None)))
+                            .unwrap();
+                    }
                     ChainRequest::QueryClientState { reply_to, .. } => {
                         reply_to
                             .send(Ok((
@@ -156,6 +162,21 @@ impl Harness {
                     ChainRequest::QueryProbabilisticVerification {
                         request, reply_to, ..
                     } => {
+                        if request.kind == 13 {
+                            assert!(
+                                !stored.lock().unwrap().as_ref().unwrap().bootstrap_pending,
+                                "epoch readiness must only be checked after bootstrap finishes"
+                            );
+                            reply_to
+                                .send(Ok(serde_json::to_vec(&serde_json::json!({
+                                    "status": "usable", "epoch": request.epoch,
+                                    "generation": request.generation, "revision": 0,
+                                    "height": 1, "timestamp": 101_000_000_000u64
+                                }))
+                                .unwrap()))
+                                .unwrap();
+                            continue;
+                        }
                         assert_eq!(request.kind, 11);
                         reply_to
                             .send(Ok(serde_json::to_vec(
@@ -322,5 +343,28 @@ fn refresh_resumes_creation_before_waiting_for_maintenance_or_source_settlement(
     harness.interrupted.store(false, Ordering::SeqCst);
     assert!(harness.client().refresh().unwrap().is_some());
     assert_eq!(*harness.committed.lock().unwrap(), 2);
+    harness.close();
+}
+
+#[test]
+fn update_resumes_bootstrap_before_waiting_for_an_existing_root() {
+    let harness = Harness::new();
+    harness.interrupted.store(true, Ordering::SeqCst);
+    assert!(harness
+        .client()
+        .build_create_client_and_send(CreateOptions::default())
+        .is_err());
+    assert_eq!(*harness.committed.lock().unwrap(), 1);
+    harness.interrupted.store(false, Ordering::SeqCst);
+    let messages = harness
+        .client()
+        .wait_and_build_update_client_with_trusted(Height::new(0, 10).unwrap(), None)
+        .unwrap();
+    assert!(messages.is_empty());
+    assert_eq!(*harness.committed.lock().unwrap(), 2);
+    assert_eq!(
+        *harness.requests.lock().unwrap(),
+        vec![(0, 0), (10, 1), (10, 2), (10, 2)]
+    );
     harness.close();
 }
