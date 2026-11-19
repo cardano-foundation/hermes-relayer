@@ -521,6 +521,20 @@ impl GatewayClient {
         height: u64,
         initialization_sequence: u32,
     ) -> Result<super::generated::ibc::core::client::v1::QueryNewClientResponse, Error> {
+        self.query_new_client_with_timeout(
+            height,
+            initialization_sequence,
+            std::time::Duration::from_secs(1800),
+        )
+        .await
+    }
+
+    async fn query_new_client_with_timeout(
+        &self,
+        height: u64,
+        initialization_sequence: u32,
+        timeout: std::time::Duration,
+    ) -> Result<super::generated::ibc::core::client::v1::QueryNewClientResponse, Error> {
         use super::generated::ibc::core::client::v1::{
             query_client::QueryClient, QueryNewClientRequest,
         };
@@ -530,7 +544,6 @@ impl GatewayClient {
             height,
             initialization_sequence,
         });
-        let timeout = std::time::Duration::from_secs(1800);
         request.set_timeout(timeout);
         let response = tokio::time::timeout(timeout, client.new_client(request))
             .await
@@ -2750,6 +2763,45 @@ mod tests {
                 true,
                 std::time::Duration::from_millis(100),
             ),
+        )
+        .await
+        .unwrap();
+        accepted.await.unwrap();
+        assert!(result.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_times_out_when_gateway_accepts_connection_but_never_replies() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let channel = tonic::transport::Channel::from_shared(endpoint.clone())
+            .unwrap()
+            .connect_lazy();
+        let client = super::GatewayClient {
+            initialization_channel: tonic::service::interceptor::InterceptedService::new(
+                channel.clone(),
+                super::GatewayAuthInterceptor {
+                    authorization: None,
+                },
+            ),
+            endpoint,
+            channel: tonic::service::interceptor::InterceptedService::new(
+                channel,
+                super::GatewayAuthInterceptor {
+                    authorization: None,
+                },
+            ),
+        };
+        let (connected, accepted) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            connected.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.query_new_client_with_timeout(0, 0, std::time::Duration::from_millis(100)),
         )
         .await
         .unwrap();
