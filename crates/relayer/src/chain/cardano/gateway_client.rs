@@ -343,6 +343,7 @@ pub struct GatewayClient {
     endpoint: String,
     channel: InterceptedService<Channel, GatewayAuthInterceptor>,
     initialization_channel: InterceptedService<Channel, GatewayAuthInterceptor>,
+    proof_channel: InterceptedService<Channel, GatewayAuthInterceptor>,
 }
 
 #[derive(Clone)]
@@ -464,6 +465,19 @@ impl GatewayClient {
                 authorization: authorization.clone(),
             },
         );
+        // Historical IBC proofs perform several authenticated history reads.
+        // Give read-only proof queries their own finite budget without extending
+        // transaction construction, submission, or observation deadlines.
+        let proof_channel = InterceptedService::new(
+            channel_endpoint
+                .clone()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(600))
+                .connect_lazy(),
+            GatewayAuthInterceptor {
+                authorization: authorization.clone(),
+            },
+        );
         let channel = channel_endpoint
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(210))
@@ -475,6 +489,7 @@ impl GatewayClient {
             endpoint,
             channel,
             initialization_channel,
+            proof_channel,
         })
     }
 
@@ -501,7 +516,7 @@ impl GatewayClient {
             query_client::QueryClient, QueryLatestHeightRequest,
         };
 
-        let mut client = QueryClient::new(self.channel.clone());
+        let mut client = QueryClient::new(self.proof_channel.clone());
 
         let request = tonic::Request::new(QueryLatestHeightRequest {});
 
@@ -559,7 +574,7 @@ impl GatewayClient {
         client_id: &str,
         query_height: Option<Height>,
     ) -> Result<QueryClientStateResponse, Error> {
-        let mut client = ClientQueryClient::new(self.channel.clone());
+        let mut client = ClientQueryClient::new(self.proof_channel.clone());
 
         let request = Self::request_with_query_height(
             QueryClientStateRequest {
@@ -580,7 +595,7 @@ impl GatewayClient {
         height: Height,
         query_height: Option<Height>,
     ) -> Result<QueryConsensusStateResponse, Error> {
-        let mut client = ClientQueryClient::new(self.channel.clone());
+        let mut client = ClientQueryClient::new(self.proof_channel.clone());
 
         let request = Self::request_with_query_height(
             QueryConsensusStateRequest {
@@ -602,7 +617,7 @@ impl GatewayClient {
         &self,
         request: QueryConsensusStateHeightsRequest,
     ) -> Result<QueryConsensusStateHeightsResponse, Error> {
-        let mut client = ClientQueryClient::new(self.channel.clone());
+        let mut client = ClientQueryClient::new(self.proof_channel.clone());
         let request = tonic::Request::new(request);
         let response = client.consensus_state_heights(request).await?.into_inner();
         Ok(response)
@@ -613,7 +628,7 @@ impl GatewayClient {
         &self,
         request: QueryConsensusStatesRequest,
     ) -> Result<QueryConsensusStatesResponse, Error> {
-        let mut client = ClientQueryClient::new(self.channel.clone());
+        let mut client = ClientQueryClient::new(self.proof_channel.clone());
         let request = tonic::Request::new(request);
         let response = client.consensus_states(request).await?.into_inner();
         Ok(response)
@@ -695,7 +710,7 @@ impl GatewayClient {
         use super::generated::ibc::core::types::v1::QueryIbcHeaderRequest;
 
         // Cardano headers include proof data and can exceed tonic's 4 MiB default.
-        let mut client = TypesQueryClient::new(self.channel.clone())
+        let mut client = TypesQueryClient::new(self.proof_channel.clone())
             .max_decoding_message_size(GATEWAY_HEADER_GRPC_MESSAGE_LIMIT);
 
         let effective_trusted_height = if trusted_height < height {
@@ -747,7 +762,7 @@ impl GatewayClient {
         };
         use ibc_relayer_types::clients::ics08_cardano_probabilistic::raw;
         use prost::Message;
-        let mut client = QueryClient::new(self.channel.clone())
+        let mut client = QueryClient::new(self.proof_channel.clone())
             .max_decoding_message_size(GATEWAY_HEADER_GRPC_MESSAGE_LIMIT);
         let response = client
             .ibc_header(QueryIbcHeaderRequest {
@@ -783,7 +798,7 @@ impl GatewayClient {
         use super::generated::ibc::core::types::v1::{
             query_client::QueryClient, QueryMithrilStakeCertificatesRequest,
         };
-        let mut client = QueryClient::new(self.channel.clone())
+        let mut client = QueryClient::new(self.proof_channel.clone())
             .max_decoding_message_size(GATEWAY_HEADER_GRPC_MESSAGE_LIMIT);
         let response = client
             .mithril_stake_certificates(QueryMithrilStakeCertificatesRequest { mithril_epoch })
@@ -803,7 +818,7 @@ impl GatewayClient {
         use super::generated::ibc::core::types::v1::query_client::QueryClient as TypesQueryClient;
         use super::generated::ibc::core::types::v1::QueryBlockResultsRequest;
 
-        let mut client = TypesQueryClient::new(self.channel.clone());
+        let mut client = TypesQueryClient::new(self.proof_channel.clone());
 
         let request = tonic::Request::new(QueryBlockResultsRequest { height });
         let response = client.block_results(request).await?.into_inner();
@@ -891,7 +906,7 @@ impl GatewayClient {
         use super::generated::ibc::core::types::v1::query_client::QueryClient as TypesQueryClient;
         use super::generated::ibc::core::types::v1::QueryBlockSearchRequest;
 
-        let mut client = TypesQueryClient::new(self.channel.clone());
+        let mut client = TypesQueryClient::new(self.proof_channel.clone());
 
         let request = tonic::Request::new(QueryBlockSearchRequest {
             packet_src_channel,
@@ -913,7 +928,7 @@ impl GatewayClient {
         use super::generated::ibc::core::types::v1::query_client::QueryClient as TypesQueryClient;
         use super::generated::ibc::core::types::v1::QueryTransactionByHashRequest;
 
-        let mut client = TypesQueryClient::new(self.channel.clone());
+        let mut client = TypesQueryClient::new(self.proof_channel.clone());
 
         let request = tonic::Request::new(QueryTransactionByHashRequest { hash });
         let response = client.transaction_by_hash(request).await?.into_inner();
@@ -926,7 +941,7 @@ impl GatewayClient {
         port_id: &str,
         channel_id: &str,
     ) -> Result<Vec<u8>, Error> {
-        let mut client = ChannelQueryClient::new(self.channel.clone());
+        let mut client = ChannelQueryClient::new(self.proof_channel.clone());
 
         let request = tonic::Request::new(QueryChannelClientStateRequest {
             port_id: port_id.to_string(),
@@ -945,7 +960,7 @@ impl GatewayClient {
         connection_id: &str,
         query_height: Option<Height>,
     ) -> Result<Vec<u8>, Error> {
-        let mut client = ConnectionQueryClient::new(self.channel.clone());
+        let mut client = ConnectionQueryClient::new(self.proof_channel.clone());
 
         let request = Self::request_with_query_height(
             QueryConnectionRequest {
@@ -962,7 +977,7 @@ impl GatewayClient {
 
     /// Query all connections
     pub async fn query_connections(&self) -> Result<Vec<u8>, Error> {
-        let mut client = ConnectionQueryClient::new(self.channel.clone());
+        let mut client = ConnectionQueryClient::new(self.proof_channel.clone());
 
         let request = tonic::Request::new(QueryConnectionsRequest { pagination: None });
 
@@ -978,7 +993,7 @@ impl GatewayClient {
         channel_id: &str,
         query_height: Option<Height>,
     ) -> Result<Vec<u8>, Error> {
-        let mut client = ChannelQueryClient::new(self.channel.clone());
+        let mut client = ChannelQueryClient::new(self.proof_channel.clone());
 
         let request = Self::request_with_query_height(
             QueryChannelRequest {
@@ -1007,7 +1022,7 @@ impl GatewayClient {
             },
             query_height,
         )?;
-        Ok(ChannelQueryClient::new(self.channel.clone())
+        Ok(ChannelQueryClient::new(self.proof_channel.clone())
             .upgrade(request)
             .await?
             .into_inner())
@@ -1027,7 +1042,7 @@ impl GatewayClient {
             },
             query_height,
         )?;
-        Ok(ChannelQueryClient::new(self.channel.clone())
+        Ok(ChannelQueryClient::new(self.proof_channel.clone())
             .upgrade_error(request)
             .await?
             .into_inner())
@@ -1036,7 +1051,7 @@ impl GatewayClient {
     /// Query all channels
     pub async fn query_channels(&self) -> Result<Vec<u8>, Error> {
         use ibc_proto::cosmos::base::query::v1beta1::PageRequest;
-        let mut client = ChannelQueryClient::new(self.channel.clone());
+        let mut client = ChannelQueryClient::new(self.proof_channel.clone());
         let mut key = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut channels = QueryChannelsResponse::default();
@@ -1096,7 +1111,7 @@ impl GatewayClient {
 
     /// Query all clients
     pub async fn query_clients(&self) -> Result<Vec<u8>, Error> {
-        let mut client = ClientQueryClient::new(self.channel.clone());
+        let mut client = ClientQueryClient::new(self.proof_channel.clone());
 
         let request = tonic::Request::new(QueryClientStatesRequest { pagination: None });
 
@@ -1142,7 +1157,7 @@ impl GatewayClient {
 
     /// Query connections associated with a client
     pub async fn query_client_connections(&self, client_id: &str) -> Result<Vec<u8>, Error> {
-        let mut client = ConnectionQueryClient::new(self.channel.clone());
+        let mut client = ConnectionQueryClient::new(self.proof_channel.clone());
 
         let request = tonic::Request::new(QueryClientConnectionsRequest {
             client_id: client_id.to_string(),
@@ -1155,7 +1170,7 @@ impl GatewayClient {
 
     /// Query channels associated with a connection
     pub async fn query_connection_channels(&self, connection_id: &str) -> Result<Vec<u8>, Error> {
-        let mut client = ChannelQueryClient::new(self.channel.clone());
+        let mut client = ChannelQueryClient::new(self.proof_channel.clone());
 
         let request = tonic::Request::new(QueryConnectionChannelsRequest {
             connection: connection_id.to_string(),
@@ -1175,7 +1190,7 @@ impl GatewayClient {
         sequence: u64,
         query_height: Option<Height>,
     ) -> Result<Vec<u8>, Error> {
-        let mut client = ChannelQueryClient::new(self.channel.clone());
+        let mut client = ChannelQueryClient::new(self.proof_channel.clone());
 
         let request = Self::request_with_query_height(
             QueryPacketCommitmentRequest {
@@ -1197,7 +1212,7 @@ impl GatewayClient {
         port_id: &str,
         channel_id: &str,
     ) -> Result<Vec<u8>, Error> {
-        let mut client = ChannelQueryClient::new(self.channel.clone());
+        let mut client = ChannelQueryClient::new(self.proof_channel.clone());
 
         let request = tonic::Request::new(QueryPacketCommitmentsRequest {
             port_id: port_id.to_string(),
@@ -1218,7 +1233,7 @@ impl GatewayClient {
         sequence: u64,
         query_height: Option<Height>,
     ) -> Result<Vec<u8>, Error> {
-        let mut client = ChannelQueryClient::new(self.channel.clone());
+        let mut client = ChannelQueryClient::new(self.proof_channel.clone());
 
         let request = Self::request_with_query_height(
             QueryPacketReceiptRequest {
@@ -1242,7 +1257,7 @@ impl GatewayClient {
         sequence: u64,
         query_height: Option<Height>,
     ) -> Result<Vec<u8>, Error> {
-        let mut client = ChannelQueryClient::new(self.channel.clone());
+        let mut client = ChannelQueryClient::new(self.proof_channel.clone());
 
         let request = Self::request_with_query_height(
             QueryPacketAcknowledgementRequest {
@@ -1264,7 +1279,7 @@ impl GatewayClient {
         port_id: &str,
         channel_id: &str,
     ) -> Result<Vec<u8>, Error> {
-        let mut client = ChannelQueryClient::new(self.channel.clone());
+        let mut client = ChannelQueryClient::new(self.proof_channel.clone());
 
         let request = tonic::Request::new(QueryPacketAcknowledgementsRequest {
             port_id: port_id.to_string(),
@@ -1285,7 +1300,7 @@ impl GatewayClient {
         channel_id: &str,
         sequences: Vec<u64>,
     ) -> Result<Vec<u8>, Error> {
-        let mut client = ChannelQueryClient::new(self.channel.clone());
+        let mut client = ChannelQueryClient::new(self.proof_channel.clone());
 
         let request = tonic::Request::new(QueryUnreceivedPacketsRequest {
             port_id: port_id.to_string(),
@@ -1305,7 +1320,7 @@ impl GatewayClient {
         channel_id: &str,
         sequences: Vec<u64>,
     ) -> Result<Vec<u8>, Error> {
-        let mut client = ChannelQueryClient::new(self.channel.clone());
+        let mut client = ChannelQueryClient::new(self.proof_channel.clone());
 
         let request = tonic::Request::new(QueryUnreceivedAcksRequest {
             port_id: port_id.to_string(),
@@ -1325,7 +1340,7 @@ impl GatewayClient {
         channel_id: &str,
         query_height: Option<Height>,
     ) -> Result<Vec<u8>, Error> {
-        let mut client = ChannelQueryClient::new(self.channel.clone());
+        let mut client = ChannelQueryClient::new(self.proof_channel.clone());
 
         let request = Self::request_with_query_height(
             QueryNextSequenceReceiveRequest {
@@ -2465,7 +2480,7 @@ impl GatewayClient {
 
         tracing::debug!("Querying events since height: {}", since_height);
 
-        let mut client = QueryClient::new(self.channel.clone());
+        let mut client = QueryClient::new(self.proof_channel.clone());
         let request = tonic::Request::new(QueryEventsRequest {
             since_height: since_height.revision_height(),
         });
@@ -2729,6 +2744,40 @@ fn packet_transaction_description(
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn client_proof_uses_the_separate_read_channel() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let normal = tonic::transport::Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        let proof = tonic::transport::Channel::from_shared(endpoint.clone())
+            .unwrap()
+            .connect_lazy();
+        let auth = super::GatewayAuthInterceptor {
+            authorization: None,
+        };
+        let client = super::GatewayClient {
+            endpoint,
+            channel: tonic::service::interceptor::InterceptedService::new(
+                normal.clone(),
+                auth.clone(),
+            ),
+            initialization_channel: tonic::service::interceptor::InterceptedService::new(
+                normal,
+                auth.clone(),
+            ),
+            proof_channel: tonic::service::interceptor::InterceptedService::new(proof, auth),
+        };
+        let request =
+            tokio::spawn(async move { client.query_client_state("07-tendermint-0", None).await });
+        let (_stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                .await
+                .expect("client proof did not use the proof channel")
+                .unwrap();
+        assert!(!request.is_finished());
+        request.abort();
+    }
+
+    #[tokio::test]
     async fn observation_times_out_when_gateway_accepts_connection_but_never_replies() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -2736,6 +2785,12 @@ mod tests {
             .unwrap()
             .connect_lazy();
         let client = super::GatewayClient {
+            proof_channel: tonic::service::interceptor::InterceptedService::new(
+                channel.clone(),
+                super::GatewayAuthInterceptor {
+                    authorization: None,
+                },
+            ),
             initialization_channel: tonic::service::interceptor::InterceptedService::new(
                 channel.clone(),
                 super::GatewayAuthInterceptor {
@@ -2779,6 +2834,12 @@ mod tests {
             .unwrap()
             .connect_lazy();
         let client = super::GatewayClient {
+            proof_channel: tonic::service::interceptor::InterceptedService::new(
+                channel.clone(),
+                super::GatewayAuthInterceptor {
+                    authorization: None,
+                },
+            ),
             initialization_channel: tonic::service::interceptor::InterceptedService::new(
                 channel.clone(),
                 super::GatewayAuthInterceptor {
