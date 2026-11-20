@@ -112,6 +112,7 @@ enum ConsensusHistoryFormat {
 pub struct TransactionSigningPolicy {
     network_id: u8,
     consensus_history_format: ConsensusHistoryFormat,
+    host_upgrade_redeemer: u64,
     limits: SigningPolicyLimits,
     protocol_addresses: HashSet<Vec<u8>>,
     scripts: HashMap<String, ScriptRoot>,
@@ -591,6 +592,7 @@ impl TransactionSigningPolicy {
                     "cardano-ibc-compatible-v3"
                         | "cardano-ibc-compatible-v4"
                         | "cardano-ibc-compatible-v5"
+                        | "cardano-ibc-compatible-v6"
                 )
             ) {
                 return Err("unsupported migration profile".to_string());
@@ -790,9 +792,18 @@ impl TransactionSigningPolicy {
                 return Err("validator cache address overlaps another protocol role".into());
             }
         }
+        // v6 removes ClaimBackup from the HostState ABI, moving UpgradeChannel
+        // from constructor 14 to 13. Only the operator-pinned manifest selects it.
+        let host_upgrade_redeemer =
+            if manifest["migration"]["profile"] == "cardano-ibc-compatible-v6" {
+                13
+            } else {
+                14
+            };
         Ok(Self {
             network_id,
             consensus_history_format,
+            host_upgrade_redeemer,
             limits,
             protocol_addresses,
             scripts,
@@ -2584,7 +2595,9 @@ impl TransactionSigningPolicy {
             | "/ibc.applications.transfer.v1.MsgTransfer"
             | "/ibc.cardano.v1.MsgPrunePacketHistory" => 7,
             // UpgradeChannel
-            operation if operation.starts_with(CHANNEL_UPGRADE_TYPE_PREFIX) => 14,
+            operation if operation.starts_with(CHANNEL_UPGRADE_TYPE_PREFIX) => {
+                self.host_upgrade_redeemer
+            }
             operation => {
                 return Err(reject(format!(
                     "no HostState redeemer policy exists for {operation}"
@@ -5942,17 +5955,23 @@ mod tests {
         TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).unwrap()
     }
 
-    #[test]
-    fn migration_profile_is_explicit_and_cannot_select_legacy_authorization() {
+    fn governed_manifest() -> JsonValue {
         let mut value: JsonValue = serde_json::from_str(&manifest()).unwrap();
         value["consensus_history_format"] = "proof-backed-v1".into();
         value["migration"] = serde_json::json!({
-            "profile": "cardano-ibc-compatible-v3", "generation": "2",
+            "profile": "cardano-ibc-compatible-v6", "generation": "2",
             "compatibility": "ab".repeat(32),
             "registryUnit": format!("{}{}", "cd".repeat(28), hex::encode(b"ibc_implementation_registry")),
             "registryAddress": format!("70{}", "ef".repeat(28))
         });
-        TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).unwrap();
+        value
+    }
+
+    #[test]
+    fn migration_profile_is_explicit_and_cannot_select_legacy_authorization() {
+        let mut value = governed_manifest();
+        let policy = TransactionSigningPolicy::from_json(&value.to_string(), 0, limits()).unwrap();
+        assert_eq!(policy.host_upgrade_redeemer, 13);
         for (key, bad) in [
             ("profile", "future"),
             ("generation", "0"),
@@ -8707,7 +8726,9 @@ mod tests {
     #[test]
     fn authority_cancel_rejects_a_replaced_proposal_in_the_resolved_input() {
         use pallas_primitives::conway::RedeemerTag;
-        let policy = TransactionSigningPolicy::from_json(&manifest(), 0, limits()).unwrap();
+        let policy =
+            TransactionSigningPolicy::from_json(&governed_manifest().to_string(), 0, limits())
+                .unwrap();
         let signer = recovery_signer();
         let mut message = MsgChannelUpgradeCancel {
             port_id: "transfer".into(),
@@ -8726,7 +8747,7 @@ mod tests {
             for (key, value) in redeemers {
                 if key.tag == RedeemerTag::Spend {
                     value.data = if key.index == 0 {
-                        data_constructor(14, vec![])
+                        data_constructor(13, vec![])
                     } else {
                         data_constructor(
                             11,
@@ -8753,7 +8774,7 @@ mod tests {
         });
         let encoded = minicbor::to_vec(&tx).unwrap();
         let transaction: MintedTx<'_> = minicbor::decode(&encoded).unwrap();
-        let check = |sequence: i64, port: &str, pending: bool| {
+        let check = |transaction: &MintedTx<'_>, sequence: i64, port: &str, pending: bool| {
             let integer = |value: i64| PlutusData::BigInt(BigInt::Int(value.into()));
             let mut channel = vec![integer(0); 6];
             channel[5] = integer(sequence);
@@ -8804,17 +8825,30 @@ mod tests {
                 &Error::Signer,
             )
         };
-        assert!(check(4, "transfer", true).is_ok());
+        assert!(check(&transaction, 4, "transfer", true).is_ok());
         for changed in [
-            check(5, "transfer", true),
-            check(4, "other", true),
-            check(4, "transfer", false),
+            check(&transaction, 5, "transfer", true),
+            check(&transaction, 4, "other", true),
+            check(&transaction, 4, "transfer", false),
         ] {
             assert!(changed
                 .unwrap_err()
                 .to_string()
                 .contains("proposal sequence differs"));
         }
+        edit_redeemers(&mut tx, |redeemers| {
+            for (key, value) in redeemers {
+                if key.tag == RedeemerTag::Spend && key.index == 0 {
+                    value.data = data_constructor(14, vec![]);
+                }
+            }
+        });
+        let wrong_encoded = minicbor::to_vec(&tx).unwrap();
+        let wrong_transaction: MintedTx<'_> = minicbor::decode(&wrong_encoded).unwrap();
+        assert!(check(&wrong_transaction, 4, "transfer", true)
+            .unwrap_err()
+            .to_string()
+            .contains("HostState redeemer"));
         message.expected_upgrade_sequence = None;
         assert!(SigningIntent::ibc(type_url, &message.encode_to_vec(), &signer, 0).is_err());
         message.proof_error_receipt = vec![1];
