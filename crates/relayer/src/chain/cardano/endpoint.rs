@@ -2232,41 +2232,9 @@ impl ChainEndpoint for CardanoChainEndpoint {
     }
 
     fn query_application_status(&self) -> Result<ChainStatus, Error> {
-        tracing::debug!("Querying Cardano application status via Gateway");
-
-        // Query the latest proof/accepted height from Gateway. In probabilistic mode this is the
-        // latest accepted HostState anchor height.
-        let height = self
-            .rt
-            .block_on(self.gateway_client.query_latest_height())
-            .map_err(|e| {
-                tracing::error!("Failed to query latest height: {}", e);
-                Error::query(format!("Gateway query_latest_height failed: {}", e))
-            })?;
-
-        tracing::info!("Cardano chain at height: {}", height);
-
-        // The status timestamp must match the accepted Cardano header at `height`.
-        // Hermes uses this timestamp to classify a packet as recv-vs-timeout.
-        // Returning local wall-clock time here can cause Hermes to build a timeout
-        // even when the source chain still sees the destination client timestamp as earlier.
-        let trusted_height = height.decrement().unwrap_or(height);
-        let header = self
-            .rt
-            .block_on(self.gateway_client.query_header(trusted_height, height))
-            .map_err(|e| {
-                tracing::error!(
-                    "Failed to query Cardano header for application status at {}: {}",
-                    height,
-                    e
-                );
-                Error::query(format!(
-                    "Gateway query_header failed for application status at {height}: {e}"
-                ))
-            })?;
-        let timestamp = header.timestamp();
-
-        Ok(ChainStatus { height, timestamp })
+        self.rt
+            .block_on(self.gateway_client.query_application_status())
+            .map_err(|error| Error::query(format!("Gateway application status failed: {error}")))
     }
 
     fn query_clients(
