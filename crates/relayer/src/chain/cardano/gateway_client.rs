@@ -605,19 +605,39 @@ impl GatewayClient {
     }
 
     /// Query client state for a specific client ID
+    fn set_include_proof<T>(request: &mut tonic::Request<T>, include_proof: bool) {
+        if !include_proof {
+            request
+                .metadata_mut()
+                .insert("x-cardano-include-proof", "false".parse().unwrap());
+        }
+    }
+
     pub async fn query_client_state(
         &self,
         client_id: &str,
         query_height: Option<Height>,
     ) -> Result<QueryClientStateResponse, Error> {
+        self.query_client_state_with_proof(client_id, query_height, true)
+            .await
+    }
+
+    pub async fn query_client_state_with_proof(
+        &self,
+        client_id: &str,
+        query_height: Option<Height>,
+        include_proof: bool,
+    ) -> Result<QueryClientStateResponse, Error> {
         let mut client = ClientQueryClient::new(self.proof_channel.clone());
 
-        let request = Self::request_with_query_height(
+        let mut request = Self::request_with_query_height(
             QueryClientStateRequest {
                 client_id: client_id.to_string(),
             },
             query_height,
         )?;
+
+        Self::set_include_proof(&mut request, include_proof);
 
         let response = client.client_state(request).await?.into_inner();
 
@@ -631,9 +651,20 @@ impl GatewayClient {
         height: Height,
         query_height: Option<Height>,
     ) -> Result<QueryConsensusStateResponse, Error> {
+        self.query_consensus_state_with_proof(client_id, height, query_height, true)
+            .await
+    }
+
+    pub async fn query_consensus_state_with_proof(
+        &self,
+        client_id: &str,
+        height: Height,
+        query_height: Option<Height>,
+        include_proof: bool,
+    ) -> Result<QueryConsensusStateResponse, Error> {
         let mut client = ClientQueryClient::new(self.proof_channel.clone());
 
-        let request = Self::request_with_query_height(
+        let mut request = Self::request_with_query_height(
             QueryConsensusStateRequest {
                 client_id: client_id.to_string(),
                 revision_number: height.revision_number(),
@@ -642,6 +673,8 @@ impl GatewayClient {
             },
             query_height,
         )?;
+
+        Self::set_include_proof(&mut request, include_proof);
 
         let response = client.consensus_state(request).await?.into_inner();
 
@@ -996,14 +1029,26 @@ impl GatewayClient {
         connection_id: &str,
         query_height: Option<Height>,
     ) -> Result<Vec<u8>, Error> {
+        self.query_connection_with_proof(connection_id, query_height, true)
+            .await
+    }
+
+    pub async fn query_connection_with_proof(
+        &self,
+        connection_id: &str,
+        query_height: Option<Height>,
+        include_proof: bool,
+    ) -> Result<Vec<u8>, Error> {
         let mut client = ConnectionQueryClient::new(self.proof_channel.clone());
 
-        let request = Self::request_with_query_height(
+        let mut request = Self::request_with_query_height(
             QueryConnectionRequest {
                 connection_id: connection_id.to_string(),
             },
             query_height,
         )?;
+
+        Self::set_include_proof(&mut request, include_proof);
 
         let response = client.connection(request).await?.into_inner();
 
@@ -2795,6 +2840,31 @@ mod tests {
         assert_eq!(status.height.revision_height(), 123);
         assert_eq!(status.timestamp.nanoseconds(), 1795210428123456789);
         assert!(super::GatewayClient::accepted_status(0, &metadata).is_err());
+    }
+
+    #[test]
+    fn state_only_metadata_preserves_the_requested_height() {
+        for include_proof in [true, false] {
+            let height =
+                ibc_relayer_types::core::ics02_client::height::Height::new(0, 123).unwrap();
+            let mut request =
+                super::GatewayClient::request_with_query_height((), Some(height)).unwrap();
+            super::GatewayClient::set_include_proof(&mut request, include_proof);
+            assert_eq!(
+                request.metadata().get("x-cosmos-block-height").unwrap(),
+                "123"
+            );
+            assert_eq!(
+                request.metadata().get("x-cardano-include-proof").is_none(),
+                include_proof
+            );
+            if !include_proof {
+                assert_eq!(
+                    request.metadata().get("x-cardano-include-proof").unwrap(),
+                    "false"
+                );
+            }
+        }
     }
 
     #[tokio::test]
