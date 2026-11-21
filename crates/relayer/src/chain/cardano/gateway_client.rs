@@ -530,6 +530,42 @@ impl GatewayClient {
             .map_err(|e| Error::Query(format!("Invalid height {}: {}", response.height, e)))
     }
 
+    pub async fn query_application_status(
+        &self,
+    ) -> Result<crate::chain::endpoint::ChainStatus, Error> {
+        use super::generated::ibc::core::client::v1::{
+            query_client::QueryClient, QueryLatestHeightRequest,
+        };
+        let mut client = QueryClient::new(self.proof_channel.clone());
+        let mut request = tonic::Request::new(QueryLatestHeightRequest {});
+        request
+            .metadata_mut()
+            .insert("x-cardano-include-timestamp", "true".parse().unwrap());
+        let response = client.latest_height(request).await?;
+        Self::accepted_status(response.get_ref().height, response.metadata())
+    }
+
+    fn accepted_status(
+        height: u64,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<crate::chain::endpoint::ChainStatus, Error> {
+        let raw = metadata
+            .get("x-cardano-block-timestamp-ns")
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| {
+                Error::Query("Gateway did not return the accepted block timestamp".into())
+            })?;
+        let nanos = raw
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| Error::Query("Invalid accepted block timestamp".into()))?;
+        let timestamp = ibc_relayer_types::timestamp::Timestamp::from_nanoseconds(nanos)
+            .map_err(|error| Error::Query(format!("Invalid accepted block timestamp: {error}")))?;
+        let height = Height::new(0, height).map_err(|error| Error::Query(error.to_string()))?;
+        Ok(crate::chain::endpoint::ChainStatus { height, timestamp })
+    }
+
     /// Query the canonical Cardano client state/consensus state for creating a new client.
     pub async fn query_new_client(
         &self,
@@ -2743,6 +2779,24 @@ fn packet_transaction_description(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn accepted_status_uses_exact_ledger_nanoseconds_and_fails_closed() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        assert!(super::GatewayClient::accepted_status(123, &metadata).is_err());
+        for invalid in ["0", "-1", "not-a-time", "18446744073709551616"] {
+            metadata.insert("x-cardano-block-timestamp-ns", invalid.parse().unwrap());
+            assert!(super::GatewayClient::accepted_status(123, &metadata).is_err());
+        }
+        metadata.insert(
+            "x-cardano-block-timestamp-ns",
+            "1795210428123456789".parse().unwrap(),
+        );
+        let status = super::GatewayClient::accepted_status(123, &metadata).unwrap();
+        assert_eq!(status.height.revision_height(), 123);
+        assert_eq!(status.timestamp.nanoseconds(), 1795210428123456789);
+        assert!(super::GatewayClient::accepted_status(0, &metadata).is_err());
+    }
+
     #[tokio::test]
     async fn client_proof_uses_the_separate_read_channel() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
