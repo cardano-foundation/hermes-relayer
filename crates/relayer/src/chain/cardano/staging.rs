@@ -183,7 +183,12 @@ pub(crate) fn hydrate(
         row.first_registration_slot = binding.first_registration_slot;
     }
     let credit = records(&client, &reference, 3, &mut query)?;
-    let production = records(&client, &reference, 4, &mut query)?;
+    let mut production: Vec<raw::PoolProductionRecord> =
+        records(&client, &reference, 4, &mut query)?;
+    // Snapshot queries retain identities whose activity has aged out. Expanded
+    // histories omit these empty projections, as the verifier requires.
+    production
+        .retain(|record| record.completed_epochs_bitmap != 0 || record.produced_current_epoch);
     let pools = records(&client, &reference, 6, &mut query)?;
     let mark = records(&client, &reference, 7, &mut query)?;
     let nonce: raw::PraosNonceState = serde_json::from_value(
@@ -789,6 +794,64 @@ mod tests {
             966
         );
         assert_eq!(requested, vec![9, 0, 1, 2, 3, 4, 6, 7]);
+    }
+
+    #[test]
+    fn hydration_omits_aged_out_production_without_losing_later_pages() {
+        for (epoch, expired_bitmap) in [(1487, 16), (1488, 0)] {
+            let client = raw::ClientState {
+                storage_version: 2,
+                current_epoch: epoch,
+                current_epoch_start_slot: 100,
+                current_epoch_end_slot_exclusive: 200,
+                ..Default::default()
+            };
+            let mut production_pages = 0;
+            let hydrated = hydrate(client, vec![2; 32], |request| {
+                let page = match request.kind {
+                    0 => json!({
+                        "Height": 4877485, "Slot": 150, "Epoch": epoch,
+                        "Timestamp": 1000, "BlockHash": "01".repeat(32), "Nonce": {}
+                    }),
+                    4 => {
+                        production_pages += 1;
+                        if request.after.is_empty() {
+                            // Go omits zero-valued fields in projected records.
+                            let row = if expired_bitmap == 0 {
+                                json!({"pool_id": "expired"})
+                            } else {
+                                json!({"pool_id": "expired", "completed_epochs_bitmap": expired_bitmap})
+                            };
+                            json!({"records": [row], "next": [1]})
+                        } else {
+                            assert_eq!(request.after, vec![1]);
+                            json!({"records": [
+                                {"pool_id": "current", "produced_current_epoch": true},
+                                {"pool_id": "recent", "completed_epochs_bitmap": 1},
+                                {"pool_id": "invalid", "completed_epochs_bitmap": 32}
+                            ], "next": []})
+                        }
+                    }
+                    _ => json!({"records": [], "next": []}),
+                };
+                Ok(serde_json::to_vec(&page).unwrap())
+            }).unwrap();
+            assert_eq!(production_pages, 2);
+            let rows = hydrated.latest_checkpoint_pool_production.unwrap().pools;
+            let expected = if epoch == 1487 {
+                vec!["expired", "current", "recent", "invalid"]
+            } else {
+                vec!["current", "recent", "invalid"]
+            };
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.pool_id.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            // Do not hide malformed nonzero bitmaps from downstream validation.
+            assert_eq!(rows.last().unwrap().completed_epochs_bitmap, 32);
+        }
     }
 
     #[test]
