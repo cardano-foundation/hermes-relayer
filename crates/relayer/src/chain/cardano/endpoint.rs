@@ -2329,10 +2329,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
         let response = self
             .rt
-            .block_on(
-                self.gateway_client
-                    .query_client_state(request.client_id.as_str(), gateway_height),
-            )
+            .block_on(self.gateway_client.query_client_state_with_proof(
+                request.client_id.as_str(),
+                gateway_height,
+                include_proof == IncludeProof::Yes,
+            ))
             .map_err(|e| {
                 tracing::error!("Failed to query client state: {}", e);
                 Error::query(format!("Gateway query_client_state failed: {}", e))
@@ -2380,10 +2381,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
 
         let response = self
             .rt
-            .block_on(self.gateway_client.query_consensus_state(
+            .block_on(self.gateway_client.query_consensus_state_with_proof(
                 request.client_id.as_str(),
                 request.consensus_height,
                 gateway_height,
+                include_proof == IncludeProof::Yes,
             ))
             .map_err(|e| {
                 tracing::error!("Failed to query consensus state: {}", e);
@@ -2621,7 +2623,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
             // Query connection from Gateway
             let response_bytes = self
                 .gateway_client
-                .query_connection(&request.connection_id.to_string(), gateway_height)
+                .query_connection_with_proof(
+                    &request.connection_id.to_string(),
+                    gateway_height,
+                    include_proof == IncludeProof::Yes,
+                )
                 .await
                 .map_err(|e| Error::query(format!("Failed to query connection: {}", e)))?;
 
