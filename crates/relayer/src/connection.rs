@@ -977,11 +977,6 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
 
     /// Choose a proof query height on the source chain for connection handshakes.
     fn proof_query_height_on_src(&self) -> Result<Height, ConnectionError> {
-        let src_latest_height = self
-            .src_chain()
-            .query_latest_height()
-            .map_err(|e| ConnectionError::chain_query(self.src_chain().id(), e))?;
-
         let dst_client_latest_height = self
             .restore_dst_client()
             .validated_client_state()
@@ -994,6 +989,14 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> Connection<ChainA, ChainB> {
             })?
             .0
             .latest_height();
+
+        // Destination validation can take minutes when it reads Cardano history.
+        // Select the source height afterwards so it does not get pruned while
+        // those reads are in progress.
+        let src_latest_height = self
+            .src_chain()
+            .query_latest_height()
+            .map_err(|e| ConnectionError::chain_query(self.src_chain().id(), e))?;
 
         // The proof-bearing handshake message is sent together with any client update
         // needed on the destination. Capping this to the destination client's old
