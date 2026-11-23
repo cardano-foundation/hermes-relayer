@@ -21,6 +21,17 @@ use super::{
     Error,
 };
 
+fn channel_handshake_required<E>(
+    source: ChannelState,
+    destination: ChannelState,
+    pending_packets: impl FnOnce() -> Result<bool, E>,
+) -> Result<bool, E> {
+    let open_handshake = destination.less_or_equal_progress(ChannelState::TryOpen)
+        && destination.less_or_equal_progress(source);
+    let close_handshake = source.is_closed() && !destination.is_closed() && !pending_packets()?;
+    Ok(open_handshake || close_handshake)
+}
+
 /// A context for spawning workers within the supervisor.
 pub struct SpawnContext<'a, Chain: ChainHandle> {
     config: &'a Config,
@@ -345,23 +356,14 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
 
             Ok(mode.clients.enabled)
         } else if mode.channels.enabled && !is_channel_upgrading {
-            let has_packets = !channel_scan
-                .unreceived_packets_on_counterparty(&counterparty_chain, &chain)?
-                .unwrap_or_default()
-                .is_empty();
+            let handshake_required =
+                channel_handshake_required(chan_state_src, chan_state_dst, || {
+                    channel_scan
+                        .unreceived_packets_on_counterparty(&counterparty_chain, &chain)
+                        .map(|sequences| !sequences.unwrap_or_default().is_empty())
+                })?;
 
-            // Determine if open handshake is required
-            let open_handshake = chan_state_dst.less_or_equal_progress(ChannelState::TryOpen)
-                && chan_state_dst.less_or_equal_progress(chan_state_src);
-
-            // Determine if close handshake is required, i.e. if channel state on source is `Closed`,
-            // and on destination channel state is not `Closed, and there are no pending packets.
-            // If there are pending packets on destination then we let the packet worker clear the
-            // packets and we do not finish the channel handshake.
-            let close_handshake =
-                chan_state_src.is_closed() && !chan_state_dst.is_closed() && !has_packets;
-
-            if open_handshake || close_handshake {
+            if handshake_required {
                 // create worker for channel handshake that will advance the counterparty state
                 let channel_object = Object::Channel(Channel {
                     dst_chain_id: counterparty_chain.id(),
@@ -421,5 +423,64 @@ impl<'a, Chain: ChainHandle> SpawnContext<'a, Chain> {
         } else {
             Ok(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::channel_handshake_required;
+    use ibc_relayer_types::core::ics04_channel::channel::{State, UpgradeState};
+
+    #[test]
+    fn opening_discovery_does_not_query_packet_backlogs() {
+        for (source, destination, expected) in [
+            (State::Init, State::Uninitialized, true),
+            (State::TryOpen, State::Init, true),
+            (
+                State::Open(UpgradeState::NotUpgrading),
+                State::TryOpen,
+                true,
+            ),
+            (State::Init, State::TryOpen, false),
+            (
+                State::TryOpen,
+                State::Open(UpgradeState::NotUpgrading),
+                false,
+            ),
+        ] {
+            let required = channel_handshake_required::<()>(source, destination, || {
+                panic!("opening discovery must not depend on a packet query")
+            })
+            .unwrap();
+            assert_eq!(required, expected);
+        }
+    }
+
+    #[test]
+    fn closing_discovery_waits_for_pending_packets() {
+        for pending in [false, true] {
+            let mut queried = false;
+            let required = channel_handshake_required::<()>(
+                State::Closed,
+                State::Open(UpgradeState::NotUpgrading),
+                || {
+                    queried = true;
+                    Ok(pending)
+                },
+            )
+            .unwrap();
+            assert!(queried);
+            assert_eq!(required, !pending);
+        }
+    }
+
+    #[test]
+    fn closing_discovery_keeps_backlog_failures_retryable() {
+        let result = channel_handshake_required(
+            State::Closed,
+            State::Open(UpgradeState::NotUpgrading),
+            || Err("backlog unavailable"),
+        );
+        assert_eq!(result, Err("backlog unavailable"));
     }
 }
