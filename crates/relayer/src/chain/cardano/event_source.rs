@@ -94,6 +94,7 @@ pub struct CardanoEventSource {
 
     /// Last fetched block height
     last_fetched_height: Height,
+    next_page_since: Option<Height>,
 
     /// Gateway events already emitted while polling the replay overlap
     seen_event_keys: BTreeSet<EventCursorKey>,
@@ -163,6 +164,7 @@ impl CardanoEventSource {
             last_fetched_height: Height::new(0, 1).map_err(|e| {
                 Error::collect_events_failed(format!("Failed to create initial height: {}", e))
             })?,
+            next_page_since: None,
             seen_event_keys: BTreeSet::new(),
         };
 
@@ -182,6 +184,7 @@ impl CardanoEventSource {
                 match startup_replay_height(latest_height, self.event_replay_window) {
                     Ok(replay_height) => {
                         self.last_fetched_height = replay_height;
+                        self.next_page_since = Some(replay_height);
                         debug!(
                             latest_height = %latest_height,
                             event_replay_window = self.event_replay_window,
@@ -229,7 +232,8 @@ impl CardanoEventSource {
             return Ok(Next::Abort);
         }
 
-        let poll_since_height = replay_height(self.last_fetched_height, self.event_replay_window)?;
+        let overlap_since = replay_height(self.last_fetched_height, self.event_replay_window)?;
+        let poll_since_height = self.next_page_since.unwrap_or(overlap_since);
 
         // Query Gateway for events since the replay cursor. The overlap handles Gateway
         // event-indexing lag for events whose block height was already scanned.
@@ -249,10 +253,12 @@ impl CardanoEventSource {
             Error::collect_events_failed(format!("Invalid scanned height from Gateway: {}", e))
         })?;
 
-        if scanned_to_height < self.last_fetched_height {
+        if scanned_to_height < poll_since_height
+            || scanned_to_height > current_height
+            || (scanned_to_height == poll_since_height && current_height > poll_since_height)
+        {
             return Err(Error::collect_events_failed(format!(
-                "Gateway scanned height {} regressed behind last fetched height {}",
-                scanned_to_height, self.last_fetched_height
+                "Gateway returned invalid scan bounds: since {poll_since_height}, scanned {scanned_to_height}, tip {current_height}"
             )));
         }
 
@@ -261,7 +267,7 @@ impl CardanoEventSource {
         let end_height = scanned_to_height.revision_height();
 
         self.seen_event_keys
-            .retain(|key| key.height >= overlap_start_height);
+            .retain(|key| key.height > overlap_since.revision_height());
 
         if overlap_start_height <= end_height {
             trace!(
@@ -316,7 +322,9 @@ impl CardanoEventSource {
 
         // Gateway event queries are windowed; advance to the scanned height even when
         // the window has no IBC events so polling eventually catches later packets.
-        self.last_fetched_height = scanned_to_height;
+        self.last_fetched_height = self.last_fetched_height.max(scanned_to_height);
+        // Finish forward pagination before rewinding for delayed indexed events.
+        self.next_page_since = (scanned_to_height < current_height).then_some(scanned_to_height);
 
         Ok(Next::Continue)
     }
@@ -522,6 +530,51 @@ mod tests {
                     CardanoError::GatewayClient("scripted response missing".to_string())
                 })
             })
+        }
+    }
+
+    #[test]
+    fn event_source_finishes_pages_before_replaying_overlap() {
+        for window in [100, 150] {
+            let requested_heights = Arc::new(Mutex::new(Vec::new()));
+            let mut responses = VecDeque::new();
+            let mut expected = Vec::new();
+            // Catch up through bounded pages, then replay the completed tip window.
+            for start in [1000 - window, 1200 - window] {
+                let mut since = start;
+                while since < 1200 {
+                    expected.push(Height::new(0, since).unwrap());
+                    let scanned = (since + 101).min(1200);
+                    responses.push_back(QueryEventsResponse {
+                        current_height: 1200,
+                        scanned_to_height: scanned,
+                        events: vec![],
+                    });
+                    since = scanned;
+                }
+            }
+            let gateway = Arc::new(ScriptedGateway {
+                responses: Mutex::new(responses),
+                requested_heights: Arc::clone(&requested_heights),
+            });
+            let rt = Arc::new(TokioRuntime::new().unwrap());
+            let (mut source, _commands) = CardanoEventSource::new_with_gateway(
+                chain_id(),
+                gateway,
+                Duration::from_secs(5),
+                window,
+                Arc::clone(&rt),
+            )
+            .unwrap();
+            source.last_fetched_height = Height::new(0, 1000).unwrap();
+            rt.block_on(async {
+                for _ in 0..expected.len() {
+                    source.step().await.unwrap();
+                }
+            });
+            assert_eq!(*requested_heights.lock().unwrap(), expected);
+            assert_eq!(source.last_fetched_height.revision_height(), 1200);
+            assert!(source.next_page_since.is_none());
         }
     }
 
