@@ -12,9 +12,14 @@ use super::generated::ibc::cardano::v1::{
 use super::generated::ibc::core::channel::v1::msg_client::MsgClient as GenChannelMsgClient;
 use super::generated::ibc::core::client::v1::msg_client::MsgClient as GenClientMsgClient;
 use super::generated::ibc::core::connection::v1::msg_client::MsgClient as GenConnectionMsgClient;
+use crate::chain::requests::Paginate;
 use crate::client_state::AnyClientState;
+use ibc_proto::cosmos::base::query::v1beta1::{PageRequest, PageResponse};
 use ibc_proto::google::protobuf::Any as ProtoAny;
 use ibc_proto::ibc::core::channel::v1::query_client::QueryClient as ChannelQueryClient;
+use ibc_proto::ibc::core::channel::v1::{
+    PacketState, QueryPacketAcknowledgementsResponse, QueryPacketCommitmentsResponse,
+};
 use ibc_proto::ibc::core::channel::v1::{
     QueryChannelClientStateRequest, QueryChannelClientStateResponse, QueryChannelRequest,
     QueryChannelsRequest, QueryChannelsResponse, QueryConnectionChannelsRequest,
@@ -25,6 +30,7 @@ use ibc_proto::ibc::core::channel::v1::{
     QueryUpgradeRequest, QueryUpgradeResponse,
 };
 use ibc_proto::ibc::core::client::v1::query_client::QueryClient as ClientQueryClient;
+use ibc_proto::ibc::core::client::v1::Height as RawHeight;
 use ibc_proto::ibc::core::client::v1::{
     QueryClientStateRequest, QueryClientStateResponse, QueryClientStatesRequest,
     QueryConsensusStateHeightsRequest, QueryConsensusStateHeightsResponse,
@@ -58,6 +64,78 @@ use tonic::{Request, Status};
 const GATEWAY_HEADER_GRPC_MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
 const CARDANO_NATIVE_ASSET_MAX_QUANTITY: u64 = u64::MAX;
 const PRUNE_PACKET_HISTORY_TYPE_URL: &str = "/ibc.cardano.v1.MsgPrunePacketHistory";
+
+struct PacketPage {
+    packets: Vec<PacketState>,
+    height: Option<RawHeight>,
+    pagination: Option<PageResponse>,
+}
+
+async fn collect_packet_pages<F, Fut>(
+    pagination: Paginate,
+    mut snapshot: Option<Height>,
+    mut fetch: F,
+) -> Result<(Vec<PacketState>, RawHeight), Error>
+where
+    F: FnMut(PageRequest, Option<Height>) -> Fut,
+    Fut: std::future::Future<Output = Result<PacketPage, Error>>,
+{
+    let (per_page, total) = pagination.get_values();
+    let page_size = if per_page == 0 {
+        100
+    } else {
+        per_page.min(4096)
+    };
+    let mut packets = Vec::new();
+    let mut key = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let limit = if total == 0 {
+            page_size
+        } else {
+            page_size.min(total - packets.len() as u64)
+        };
+        let page = fetch(
+            PageRequest {
+                key,
+                offset: 0,
+                limit,
+                count_total: false,
+                reverse: false,
+            },
+            snapshot,
+        )
+        .await?;
+        let raw_height = page
+            .height
+            .ok_or_else(|| Error::GatewayClient("packet page has no snapshot height".into()))?;
+        let height = Height::try_from(raw_height).map_err(|error| {
+            Error::GatewayClient(format!("invalid packet page height: {error}"))
+        })?;
+        if snapshot.is_some_and(|previous| previous != height) {
+            return Err(Error::GatewayClient(
+                "packet pagination snapshot height changed".into(),
+            ));
+        }
+        snapshot = Some(height);
+        key = page
+            .pagination
+            .map(|page| page.next_key)
+            .unwrap_or_default();
+        if !key.is_empty() && (page.packets.is_empty() || !seen.insert(key.clone())) {
+            return Err(Error::GatewayClient(
+                "packet pagination made no progress".into(),
+            ));
+        }
+        packets.extend(page.packets);
+        if total > 0 {
+            packets.truncate(total as usize);
+        }
+        if key.is_empty() || (total > 0 && packets.len() as u64 >= total) {
+            return Ok((packets, raw_height));
+        }
+    }
+}
 
 /// Certifies drained packet lanes of a flushing Cardano transfer channel. Only
 /// the Cardano Gateway serves it, in the `ibc.core.channel.v1.Msg` service.
@@ -1287,23 +1365,41 @@ impl GatewayClient {
         Ok(prost::Message::encode_to_vec(&response))
     }
 
-    /// Query all packet commitments for a channel
+    /// Enumerate commitments at one accepted Gateway snapshot.
     pub async fn query_packet_commitments(
         &self,
         port_id: &str,
         channel_id: &str,
+        pagination: Paginate,
+        query_height: Option<Height>,
     ) -> Result<Vec<u8>, Error> {
-        let mut client = ChannelQueryClient::new(self.proof_channel.clone());
-
-        let request = tonic::Request::new(QueryPacketCommitmentsRequest {
-            port_id: port_id.to_string(),
-            channel_id: channel_id.to_string(),
+        let (commitments, height) =
+            collect_packet_pages(pagination, query_height, |page, height| async move {
+                let request = Self::request_with_query_height(
+                    QueryPacketCommitmentsRequest {
+                        port_id: port_id.to_string(),
+                        channel_id: channel_id.to_string(),
+                        pagination: Some(page),
+                    },
+                    height,
+                )?;
+                let response = ChannelQueryClient::new(self.proof_channel.clone())
+                    .packet_commitments(request)
+                    .await?
+                    .into_inner();
+                Ok(PacketPage {
+                    packets: response.commitments,
+                    height: response.height,
+                    pagination: response.pagination,
+                })
+            })
+            .await?;
+        Ok(QueryPacketCommitmentsResponse {
+            commitments,
             pagination: None,
-        });
-
-        let response = client.packet_commitments(request).await?.into_inner();
-
-        Ok(prost::Message::encode_to_vec(&response))
+            height: Some(height),
+        }
+        .encode_to_vec())
     }
 
     /// Query packet receipt
@@ -1354,24 +1450,44 @@ impl GatewayClient {
         Ok(prost::Message::encode_to_vec(&response))
     }
 
-    /// Query all packet acknowledgements for a channel
+    /// Filter pending sequences before paging through one accepted snapshot.
     pub async fn query_packet_acknowledgements(
         &self,
         port_id: &str,
         channel_id: &str,
+        sequences: Vec<u64>,
+        pagination: Paginate,
     ) -> Result<Vec<u8>, Error> {
-        let mut client = ChannelQueryClient::new(self.proof_channel.clone());
-
-        let request = tonic::Request::new(QueryPacketAcknowledgementsRequest {
-            port_id: port_id.to_string(),
-            channel_id: channel_id.to_string(),
+        let (acknowledgements, height) = collect_packet_pages(pagination, None, |page, height| {
+            let sequences = sequences.clone();
+            async move {
+                let request = Self::request_with_query_height(
+                    QueryPacketAcknowledgementsRequest {
+                        port_id: port_id.to_string(),
+                        channel_id: channel_id.to_string(),
+                        pagination: Some(page),
+                        packet_commitment_sequences: sequences,
+                    },
+                    height,
+                )?;
+                let response = ChannelQueryClient::new(self.proof_channel.clone())
+                    .packet_acknowledgements(request)
+                    .await?
+                    .into_inner();
+                Ok(PacketPage {
+                    packets: response.acknowledgements,
+                    height: response.height,
+                    pagination: response.pagination,
+                })
+            }
+        })
+        .await?;
+        Ok(QueryPacketAcknowledgementsResponse {
+            acknowledgements,
             pagination: None,
-            packet_commitment_sequences: vec![],
-        });
-
-        let response = client.packet_acknowledgements(request).await?.into_inner();
-
-        Ok(prost::Message::encode_to_vec(&response))
+            height: Some(height),
+        }
+        .encode_to_vec())
     }
 
     /// Query unreceived packets
@@ -3012,6 +3128,102 @@ mod tests {
     use ibc_proto::ibc::core::client::v1::MsgRecoverClient as CanonicalMsgRecoverClient;
     use ibc_proto::ibc::core::client::v1::MsgUpgradeClient as CanonicalMsgUpgradeClient;
     use prost::Message;
+
+    fn packet_page(sequences: &[u64], next: &[u8], height: u64) -> PacketPage {
+        PacketPage {
+            packets: sequences
+                .iter()
+                .map(|sequence| PacketState {
+                    port_id: "transfer".into(),
+                    channel_id: "channel-0".into(),
+                    sequence: *sequence,
+                    data: vec![1],
+                })
+                .collect(),
+            height: Some(RawHeight {
+                revision_number: 0,
+                revision_height: height,
+            }),
+            pagination: Some(PageResponse {
+                next_key: next.to_vec(),
+                total: 0,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn packet_pages_all_follows_keys_and_pins_the_first_height() {
+        let calls = std::cell::Cell::new(0);
+        let (packets, height) = collect_packet_pages(Paginate::All, None, |page, height| {
+            let call = calls.get();
+            calls.set(call + 1);
+            assert_eq!(page.limit, 100);
+            assert_eq!(page.offset, 0);
+            let response = if call == 0 {
+                assert!(page.key.is_empty());
+                assert!(height.is_none());
+                packet_page(&(1..=100).collect::<Vec<_>>(), b"next", 42)
+            } else {
+                assert_eq!(page.key, b"next");
+                assert_eq!(height, Some(Height::new(0, 42).unwrap()));
+                packet_page(&[101], b"", 42)
+            };
+            std::future::ready(Ok(response))
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.get(), 2);
+        assert_eq!(packets.len(), 101);
+        assert_eq!(packets.last().unwrap().sequence, 101);
+        assert_eq!(height.revision_height, 42);
+    }
+
+    #[tokio::test]
+    async fn packet_pages_reject_repeated_keys_empty_pages_and_changed_heights() {
+        for mode in 0..3 {
+            let calls = std::cell::Cell::new(0);
+            let result = collect_packet_pages(Paginate::All, None, |_, _| {
+                let call = calls.get();
+                calls.set(call + 1);
+                std::future::ready(Ok(if call == 0 {
+                    packet_page(&[1], b"next", 42)
+                } else {
+                    match mode {
+                        0 => packet_page(&[2], b"next", 42),
+                        1 => packet_page(&[], b"other", 42),
+                        _ => packet_page(&[2], b"", 43),
+                    }
+                }))
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls.get(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn packet_pages_respect_page_size_total_and_requested_height() {
+        let (packets, _) = collect_packet_pages(
+            Paginate::PerPage {
+                per_page: 2,
+                total: 3,
+            },
+            Some(Height::new(0, 42).unwrap()),
+            |page, height| {
+                assert_eq!(height, Some(Height::new(0, 42).unwrap()));
+                std::future::ready(Ok(if page.key.is_empty() {
+                    assert_eq!(page.limit, 2);
+                    packet_page(&[1, 2], b"next", 42)
+                } else {
+                    assert_eq!(page.limit, 1);
+                    packet_page(&[3], b"more", 42)
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(packets.len(), 3);
+    }
 
     fn gateway_uri(value: &str) -> Uri {
         value.parse().expect("valid test URI")

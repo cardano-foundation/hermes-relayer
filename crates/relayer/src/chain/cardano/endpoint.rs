@@ -131,6 +131,55 @@ fn gateway_query_height(query_height: QueryHeight) -> Option<ICSHeight> {
     }
 }
 
+async fn packet_acknowledgements_from_gateway(
+    gateway: &GatewayClient,
+    request: QueryPacketAcknowledgementsRequest,
+) -> Result<(Vec<Sequence>, ICSHeight), Error> {
+    // Query packet acknowledgements from Gateway
+    let response_bytes = gateway
+        .query_packet_acknowledgements(
+            request.port_id.as_ref(),
+            request.channel_id.as_ref(),
+            request
+                .packet_commitment_sequences
+                .iter()
+                .map(|sequence| (*sequence).into())
+                .collect(),
+            request.pagination,
+        )
+        .await
+        .map_err(|e| Error::query(format!("Failed to query packet acknowledgements: {}", e)))?;
+
+    // Decode the response
+    use ibc_proto::ibc::core::channel::v1::QueryPacketAcknowledgementsResponse;
+    use prost::Message;
+
+    let response =
+        QueryPacketAcknowledgementsResponse::decode(&response_bytes[..]).map_err(|e| {
+            Error::query(format!(
+                "Failed to decode packet acknowledgements response: {}",
+                e
+            ))
+        })?;
+
+    // Extract sequences from acknowledgements
+    let sequences: Vec<Sequence> = response
+        .acknowledgements
+        .iter()
+        .map(|ack| Sequence::from(ack.sequence))
+        .collect();
+
+    // Extract height from response
+    let height = response
+        .height
+        .ok_or_else(|| Error::query("No height in packet acknowledgements response".to_string()))?;
+
+    let ics_height = ICSHeight::new(height.revision_number, height.revision_height)
+        .map_err(|e| Error::query(format!("Invalid height: {}", e)))?;
+
+    Ok((sequences, ics_height))
+}
+
 fn assert_gateway_proof_height(
     context: &str,
     response_proof_height: Option<ibc_proto::ibc::core::client::v1::Height>,
@@ -2947,7 +2996,12 @@ impl ChainEndpoint for CardanoChainEndpoint {
             // Query packet commitments from Gateway
             let response_bytes = self
                 .gateway_client
-                .query_packet_commitments(request.port_id.as_ref(), request.channel_id.as_ref())
+                .query_packet_commitments(
+                    request.port_id.as_ref(),
+                    request.channel_id.as_ref(),
+                    request.pagination,
+                    gateway_query_height(request.query_height),
+                )
                 .await
                 .map_err(|e| Error::query(format!("Failed to query packet commitments: {}", e)))?;
 
@@ -3166,55 +3220,10 @@ impl ChainEndpoint for CardanoChainEndpoint {
         &self,
         request: QueryPacketAcknowledgementsRequest,
     ) -> Result<(Vec<Sequence>, ICSHeight), Error> {
-        tracing::info!(
-            "Querying packet acknowledgements: port={}, channel={}",
-            request.port_id,
-            request.channel_id
-        );
-
-        // Block on async operation
-        self.rt.block_on(async {
-            // Query packet acknowledgements from Gateway
-            let response_bytes = self
-                .gateway_client
-                .query_packet_acknowledgements(
-                    request.port_id.as_ref(),
-                    request.channel_id.as_ref(),
-                )
-                .await
-                .map_err(|e| {
-                    Error::query(format!("Failed to query packet acknowledgements: {}", e))
-                })?;
-
-            // Decode the response
-            use ibc_proto::ibc::core::channel::v1::QueryPacketAcknowledgementsResponse;
-            use prost::Message;
-
-            let response = QueryPacketAcknowledgementsResponse::decode(&response_bytes[..])
-                .map_err(|e| {
-                    Error::query(format!(
-                        "Failed to decode packet acknowledgements response: {}",
-                        e
-                    ))
-                })?;
-
-            // Extract sequences from acknowledgements
-            let sequences: Vec<Sequence> = response
-                .acknowledgements
-                .iter()
-                .map(|ack| Sequence::from(ack.sequence))
-                .collect();
-
-            // Extract height from response
-            let height = response.height.ok_or_else(|| {
-                Error::query("No height in packet acknowledgements response".to_string())
-            })?;
-
-            let ics_height = ICSHeight::new(height.revision_number, height.revision_height)
-                .map_err(|e| Error::query(format!("Invalid height: {}", e)))?;
-
-            Ok((sequences, ics_height))
-        })
+        self.rt.block_on(packet_acknowledgements_from_gateway(
+            &self.gateway_client,
+            request,
+        ))
     }
 
     fn query_unreceived_acknowledgements(
@@ -4385,6 +4394,89 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires the Gateway ACK recovery contract fixture"]
+    fn cardano_ack_recovery_gateway_contract() {
+        use crate::chain::handle::{BaseChainHandle, ChainRequest};
+        use crate::chain::requests::Paginate;
+        let endpoint = std::env::var("HERMES_ACK_RECOVERY_GATEWAY").expect("Gateway fixture URL");
+        let restarted = std::env::var("HERMES_ACK_RECOVERY_RESTART").as_deref() == Ok("1");
+        let pending_sets = if restarted {
+            vec![vec![101u64]]
+        } else {
+            vec![vec![101u64], (1..=150).collect()]
+        };
+        // Each handle has a fresh runtime and client, with no write-ack events or process cache.
+        for pending in pending_sets {
+            let (sender, receiver) =
+                crossbeam_channel::unbounded::<(tracing::Span, ChainRequest)>();
+            let handle = BaseChainHandle::new("cardano-0".parse().unwrap(), sender);
+            let endpoint = endpoint.clone();
+            let worker =
+                std::thread::spawn(move || {
+                    let rt = TokioRuntime::new().unwrap();
+                    let gateway = rt.block_on(GatewayClient::new(endpoint)).unwrap();
+                    let (_, message) = receiver.recv().unwrap();
+                    match message {
+                        ChainRequest::QueryPacketAcknowledgements { request, reply_to } => {
+                            reply_to
+                                .send(rt.block_on(packet_acknowledgements_from_gateway(
+                                    &gateway, request,
+                                )))
+                                .unwrap();
+                        }
+                        _ => panic!("unexpected recovery query"),
+                    }
+                });
+            let expected: Vec<Sequence> = pending.into_iter().map(Sequence::from).collect();
+            let (recovered, height) = crate::chain::counterparty::packet_acknowledgements(
+                &handle,
+                &PortId::transfer(),
+                &ChannelId::new(0),
+                expected.clone(),
+                Paginate::All,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(recovered, expected);
+            assert_eq!(
+                height,
+                ICSHeight::new(0, if restarted { 43 } else { 42 }).unwrap()
+            );
+            worker.join().unwrap();
+        }
+        if restarted {
+            return;
+        }
+        let rt = TokioRuntime::new().unwrap();
+        let gateway = rt.block_on(GatewayClient::new(endpoint)).unwrap();
+        let bytes = rt
+            .block_on(gateway.query_packet_commitments(
+                "transfer",
+                "channel-0",
+                Paginate::PerPage {
+                    per_page: 2,
+                    total: 0,
+                },
+                None,
+            ))
+            .unwrap();
+        use prost::Message;
+        let response = ibc_proto::ibc::core::channel::v1::QueryPacketCommitmentsResponse::decode(
+            bytes.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            response
+                .commitments
+                .iter()
+                .map(|packet| packet.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(response.height.unwrap().revision_height, 42);
+    }
+
     fn escrow_return_intent() -> SigningIntent {
         use super::super::generated::ibc::core::channel::v1::{MsgRecvPacket, Packet};
         use prost::Message;
