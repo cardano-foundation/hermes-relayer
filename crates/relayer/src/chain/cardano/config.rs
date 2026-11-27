@@ -87,6 +87,12 @@ pub struct CardanoConfig {
     #[serde(default = "default_max_wallet_lovelace_top_up")]
     pub max_wallet_lovelace_top_up: u64,
 
+    /// Maximum signer contribution to authenticated packet-lane initialization,
+    /// excluding the transaction fee. Replaces the ordinary top-up allowance.
+    /// Defaults to 30 ADA so a new channel can initialize without extra configuration.
+    #[serde(default = "default_max_packet_lane_initialization_lovelace")]
+    pub max_packet_lane_initialization_lovelace: u64,
+
     /// Maximum validity interval width when the transaction includes both bounds.
     #[serde(default = "default_max_validity_interval_slots")]
     pub max_validity_interval_slots: u64,
@@ -272,6 +278,10 @@ impl fmt::Debug for CardanoConfig {
                 &self.max_total_protocol_output_lovelace,
             )
             .field(
+                "max_packet_lane_initialization_lovelace",
+                &self.max_packet_lane_initialization_lovelace,
+            )
+            .field(
                 "max_wallet_lovelace_top_up",
                 &self.max_wallet_lovelace_top_up,
             )
@@ -362,6 +372,10 @@ fn default_max_wallet_lovelace_top_up() -> u64 {
     5_000_000
 }
 
+fn default_max_packet_lane_initialization_lovelace() -> u64 {
+    30_000_000
+}
+
 fn default_max_validity_interval_slots() -> u64 {
     3_600
 }
@@ -414,6 +428,8 @@ impl Default for CardanoConfig {
             max_external_output_lovelace: default_max_external_output_lovelace(),
             max_total_protocol_output_lovelace: default_max_total_protocol_output_lovelace(),
             max_wallet_lovelace_top_up: default_max_wallet_lovelace_top_up(),
+            max_packet_lane_initialization_lovelace:
+                default_max_packet_lane_initialization_lovelace(),
             max_validity_interval_slots: default_max_validity_interval_slots(),
             misbehaviour_witness_gateway_url: None,
             misbehaviour_witness_gateway_tls_ca_file: None,
@@ -447,6 +463,23 @@ mod tests {
     use super::CardanoConfig;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn initialization_allowance_defaults_for_existing_configs_and_can_be_overridden() {
+        let mut config = CardanoConfig::default();
+        assert_eq!(config.max_packet_lane_initialization_lovelace, 30_000_000);
+        let encoded = toml::to_string(&config).unwrap();
+        let existing = encoded
+            .lines()
+            .filter(|line| !line.starts_with("max_packet_lane_initialization_lovelace"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let decoded: CardanoConfig = toml::from_str(&existing).unwrap();
+        assert_eq!(decoded.max_packet_lane_initialization_lovelace, 30_000_000);
+        config.max_packet_lane_initialization_lovelace = 40_000_000;
+        let decoded: CardanoConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(decoded.max_packet_lane_initialization_lovelace, 40_000_000);
+    }
 
     #[test]
     fn executor_concurrency_defaults_and_rejects_zero() {
