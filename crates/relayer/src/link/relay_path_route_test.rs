@@ -676,3 +676,79 @@ fn waiting_for_a_refund_polls_completion_without_competing_route_queries() {
         worker.join().unwrap();
     }
 }
+
+fn readiness_query_error() -> LinkError {
+    LinkError::query("cardano-preview".parse().unwrap(), RelayerError::query(
+        "Gateway query_client_state failed: Current HostState root is not yet stability-accepted for proof generation (queryClientState)".into(),
+    ))
+}
+
+#[test]
+fn refund_readiness_retry_preserves_work_until_the_query_recovers() {
+    use std::cell::Cell;
+    let now = Cell::new(Instant::now());
+    let attempts = Cell::new(0);
+    let delays = std::cell::RefCell::new(vec![]);
+    let result = retry_cardano_refund_readiness(
+        Duration::from_secs(120),
+        || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 3 {
+                Err(readiness_query_error())
+            } else {
+                Ok("refund submitted")
+            }
+        },
+        || now.get(),
+        |delay| {
+            delays.borrow_mut().push(delay);
+            now.set(now.get() + delay);
+        },
+    );
+    assert_eq!(result.unwrap(), "refund submitted");
+    assert_eq!(attempts.get(), 3);
+    assert_eq!(*delays.borrow(), vec![Duration::from_secs(30); 2]);
+}
+
+#[test]
+fn refund_readiness_retry_stops_at_the_configured_wait_budget() {
+    use std::cell::Cell;
+    let now = Cell::new(Instant::now());
+    let attempts = Cell::new(0);
+    let start = now.get();
+    let result: Result<(), _> = retry_cardano_refund_readiness(
+        Duration::from_secs(45),
+        || {
+            attempts.set(attempts.get() + 1);
+            Err(readiness_query_error())
+        },
+        || now.get(),
+        |delay| now.set(now.get() + delay),
+    );
+    assert!(result.is_err());
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(now.get() - start, Duration::from_secs(45));
+}
+
+#[test]
+fn refund_readiness_retry_does_not_repeat_submission_or_unrelated_errors() {
+    for error in [
+        LinkError::relayer(RelayerError::send_tx(
+            "submission outcome unknown: Current HostState root is not yet stability-accepted"
+                .into(),
+        )),
+        LinkError::query(
+            "cardano-preview".parse().unwrap(),
+            RelayerError::query("client is frozen".into()),
+        ),
+    ] {
+        let mut error = Some(error);
+        let result: Result<(), _> = retry_cardano_refund_readiness(
+            Duration::from_secs(120),
+            || Err(error.take().expect("must not repeat this operation")),
+            Instant::now,
+            |_| panic!("must not retry this error"),
+        );
+        assert!(result.is_err());
+    }
+}

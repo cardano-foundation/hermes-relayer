@@ -99,6 +99,42 @@ impl Resubmit {
     }
 }
 
+fn retry_cardano_refund_readiness<T>(
+    timeout: Duration,
+    mut attempt: impl FnMut() -> Result<T, LinkError>,
+    now: impl Fn() -> Instant,
+    mut sleep: impl FnMut(Duration),
+) -> Result<T, LinkError> {
+    let deadline = now() + timeout;
+    loop {
+        let error = match attempt() {
+            Ok(result) => return Ok(result),
+            Err(error) => error,
+        };
+        // Retry only readiness failures from queries and client preparation.
+        // Submission errors may be ambiguous and keep their existing reconciliation.
+        let retryable = matches!(
+            error.detail(),
+            error::LinkErrorDetail::Query(_)
+                | error::LinkErrorDetail::Client(_)
+                | error::LinkErrorDetail::Channel(_)
+        ) && error
+            .to_string()
+            .contains("Current HostState root is not yet stability-accepted");
+        let remaining = deadline.saturating_duration_since(now());
+        if !retryable || remaining.is_zero() {
+            return Err(error);
+        }
+        let delay = Duration::from_secs(30).min(remaining);
+        warn!(%error, retry_after_seconds = delay.as_secs(),
+            "Retaining Cardano refund while HostState proof readiness recovers");
+        sleep(delay);
+        if now() >= deadline {
+            return Err(error);
+        }
+    }
+}
+
 struct SourceSubmission {
     operation: OperationalData,
     reply: crossbeam_channel::Receiver<Result<AsyncReply, LinkError>>,
@@ -2004,9 +2040,28 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
         let span = tracing::Span::current();
         std::thread::spawn(move || {
             let _guard = span.enter();
-            let result = worker.refresh_channel_route().and_then(|_| {
-                worker.relay_from_operational_data::<relay_sender::AsyncSender>(submitted)
-            });
+            let result = worker
+                .src_chain()
+                .config()
+                .map_err(LinkError::relayer)
+                .and_then(|config| {
+                    let ChainConfig::Cardano(config) = config else {
+                        return Err(LinkError::relayer(crate::error::Error::send_tx(
+                            "Independent refund worker requires a Cardano source".into(),
+                        )));
+                    };
+                    retry_cardano_refund_readiness(
+                        config.accepted_height_timeout,
+                        || {
+                            worker.refresh_channel_route()?;
+                            worker.relay_from_operational_data::<relay_sender::AsyncSender>(
+                                submitted.clone(),
+                            )
+                        },
+                        Instant::now,
+                        std::thread::sleep,
+                    )
+                });
             let _ = sender.send(result);
         });
         self.source_submission = Some(SourceSubmission { operation, reply });
