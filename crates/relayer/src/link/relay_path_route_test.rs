@@ -689,7 +689,7 @@ fn refund_readiness_retry_preserves_work_until_the_query_recovers() {
     let now = Cell::new(Instant::now());
     let attempts = Cell::new(0);
     let delays = std::cell::RefCell::new(vec![]);
-    let result = retry_cardano_refund_readiness(
+    let result = retry_cardano_refund_preparation(
         Duration::from_secs(120),
         || {
             attempts.set(attempts.get() + 1);
@@ -716,7 +716,7 @@ fn refund_readiness_retry_stops_at_the_configured_wait_budget() {
     let now = Cell::new(Instant::now());
     let attempts = Cell::new(0);
     let start = now.get();
-    let result: Result<(), _> = retry_cardano_refund_readiness(
+    let result: Result<(), _> = retry_cardano_refund_preparation(
         Duration::from_secs(45),
         || {
             attempts.set(attempts.get() + 1);
@@ -733,6 +733,10 @@ fn refund_readiness_retry_stops_at_the_configured_wait_budget() {
 #[test]
 fn refund_readiness_retry_does_not_repeat_submission_or_unrelated_errors() {
     for error in [
+        LinkError::channel(ChannelError::submit(
+            "cardano-preview".parse().unwrap(),
+            RelayerError::send_tx("Ogmios WebSocket connection timed out after 10000ms".into()),
+        )),
         LinkError::relayer(RelayerError::send_tx(
             "submission outcome unknown: Current HostState root is not yet stability-accepted"
                 .into(),
@@ -743,7 +747,7 @@ fn refund_readiness_retry_does_not_repeat_submission_or_unrelated_errors() {
         ),
     ] {
         let mut error = Some(error);
-        let result: Result<(), _> = retry_cardano_refund_readiness(
+        let result: Result<(), _> = retry_cardano_refund_preparation(
             Duration::from_secs(120),
             || Err(error.take().expect("must not repeat this operation")),
             Instant::now,
@@ -751,4 +755,31 @@ fn refund_readiness_retry_does_not_repeat_submission_or_unrelated_errors() {
         );
         assert!(result.is_err());
     }
+}
+
+#[test]
+fn refund_preparation_retries_ogmios_route_query_timeout() {
+    use std::cell::Cell;
+    let now = Cell::new(Instant::now());
+    let attempts = Cell::new(0);
+    let result = retry_cardano_refund_preparation(
+        Duration::from_secs(120),
+        || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err(LinkError::channel(ChannelError::query(
+                    "cardano-preview".parse().unwrap(),
+                    RelayerError::query(
+                        "Failed to query channel: Ogmios WebSocket connection timed out after 10000ms".into(),
+                    ),
+                )))
+            } else {
+                Ok("refund submitted")
+            }
+        },
+        || now.get(),
+        |delay| now.set(now.get() + delay),
+    );
+    assert_eq!(result.unwrap(), "refund submitted");
+    assert_eq!(attempts.get(), 2);
 }
