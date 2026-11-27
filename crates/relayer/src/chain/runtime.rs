@@ -63,6 +63,7 @@ pub struct Threads {
 pub struct ChainRuntime<Endpoint: ChainEndpoint> {
     /// The specific chain this runtime runs against
     chain: Endpoint,
+    packet_submissions: Option<channel::Sender<(Span, ChainRequest)>>,
 
     /// The sender side of a channel to this runtime. Any `ChainHandle` can use this to send
     /// chain requests to this runtime
@@ -132,6 +133,7 @@ where
             chain,
             request_sender,
             request_receiver,
+            packet_submissions: None,
         }
     }
 
@@ -175,11 +177,21 @@ where
                         },
 
                         ChainRequest::SendMessagesAndWaitCommit { tracked_msgs, reply_to } => {
-                            self.send_messages_and_wait_commit(tracked_msgs, reply_to)?
+                            let worker = if packet_submission(&tracked_msgs) { self.ensure_packet_submission_worker() } else { Ok(false) };
+                            match worker {
+                                Ok(true) => self.dispatch_packet_submission(ChainRequest::SendMessagesAndWaitCommit { tracked_msgs, reply_to })?,
+                                Ok(false) => self.send_messages_and_wait_commit(tracked_msgs, reply_to)?,
+                                Err(error) => reply_to.send(Err(error)).map_err(Error::send)?,
+                            }
                         },
 
                         ChainRequest::SendMessagesAndWaitCheckTx { tracked_msgs, reply_to } => {
-                            self.send_messages_and_wait_check_tx(tracked_msgs, reply_to)?
+                            let worker = if packet_submission(&tracked_msgs) { self.ensure_packet_submission_worker() } else { Ok(false) };
+                            match worker {
+                                Ok(true) => self.dispatch_packet_submission(ChainRequest::SendMessagesAndWaitCheckTx { tracked_msgs, reply_to })?,
+                                Ok(false) => self.send_messages_and_wait_check_tx(tracked_msgs, reply_to)?,
+                                Err(error) => reply_to.send(Err(error)).map_err(Error::send)?,
+                            }
                         },
 
                         ChainRequest::SubmitHostStateHeartbeat { reply_to } => {
@@ -422,6 +434,66 @@ where
     fn subscribe(&mut self, reply_to: ReplyTo<Subscription>) -> Result<(), Error> {
         let subscription = self.chain.subscribe();
         reply_to.send(subscription).map_err(Error::send)
+    }
+
+    fn ensure_packet_submission_worker(&mut self) -> Result<bool, Error> {
+        if self.packet_submissions.is_some() {
+            return Ok(true);
+        }
+        let Some(mut endpoint) = self.chain.fork_for_packet_submissions()? else {
+            return Ok(false);
+        };
+        let (sender, receiver) = channel::bounded::<(Span, ChainRequest)>(16);
+        thread::spawn(move || {
+            for (span, request) in receiver {
+                let _guard = span.enter();
+                match request {
+                    ChainRequest::SendMessagesAndWaitCommit {
+                        tracked_msgs,
+                        reply_to,
+                    } => {
+                        let _ = reply_to.send(endpoint.send_messages_and_wait_commit(tracked_msgs));
+                    }
+                    ChainRequest::SendMessagesAndWaitCheckTx {
+                        tracked_msgs,
+                        reply_to,
+                    } => {
+                        let _ =
+                            reply_to.send(endpoint.send_messages_and_wait_check_tx(tracked_msgs));
+                    }
+                    _ => unreachable!("only packet submissions enter this queue"),
+                }
+            }
+        });
+        self.packet_submissions = Some(sender);
+        Ok(true)
+    }
+
+    fn dispatch_packet_submission(&mut self, request: ChainRequest) -> Result<(), Error> {
+        if let Err(error) = self
+            .packet_submissions
+            .as_ref()
+            .unwrap()
+            .try_send((Span::current(), request))
+        {
+            // A full queue must not block queries on the chain runtime.
+            if error.is_disconnected() {
+                self.packet_submissions = None;
+            }
+            let (_, request) = error.into_inner();
+            let error = Error::send_tx("packet submission worker is busy or unavailable".into());
+            match request {
+                ChainRequest::SendMessagesAndWaitCommit { reply_to, .. } => {
+                    reply_to.send(Err(error)).map_err(Error::send)
+                }
+                ChainRequest::SendMessagesAndWaitCheckTx { reply_to, .. } => {
+                    reply_to.send(Err(error)).map_err(Error::send)
+                }
+                _ => unreachable!("only packet submissions enter this queue"),
+            }
+        } else {
+            Ok(())
+        }
     }
 
     fn send_messages_and_wait_commit(
@@ -963,5 +1035,58 @@ where
         reply_to.send(result).map_err(Error::send)?;
 
         Ok(())
+    }
+}
+
+// Client updates used to prepare packets must not monopolize the query runtime.
+// Bootstrap and handshake operations stay on the original endpoint.
+fn packet_submission(messages: &TrackedMsgs) -> bool {
+    !messages.msgs.is_empty()
+        && messages.msgs.iter().all(|message| {
+            matches!(
+                message.type_url.as_str(),
+                "/ibc.core.client.v1.MsgUpdateClient"
+                    | "/ibc.core.channel.v1.MsgRecvPacket"
+                    | "/ibc.core.channel.v1.MsgAcknowledgement"
+                    | "/ibc.core.channel.v1.MsgTimeout"
+                    | "/ibc.core.channel.v1.MsgTimeoutOnClose"
+            )
+        })
+}
+
+#[cfg(test)]
+mod packet_submission_tests {
+    use super::*;
+    use ibc_proto::google::protobuf::Any;
+
+    #[test]
+    fn handshake_and_bootstrap_batches_keep_the_original_endpoint() {
+        let messages = |types: &[&str]| {
+            TrackedMsgs::new_static(
+                types
+                    .iter()
+                    .map(|kind| Any {
+                        type_url: (*kind).into(),
+                        value: vec![],
+                    })
+                    .collect(),
+                "submission-routing-test",
+            )
+        };
+        assert!(packet_submission(&messages(&[
+            "/ibc.core.client.v1.MsgUpdateClient",
+            "/ibc.core.channel.v1.MsgTimeout"
+        ])));
+        for kind in [
+            "/ibc.core.client.v1.MsgCreateClient",
+            "/ibc.core.connection.v1.MsgConnectionOpenTry",
+            "/ibc.core.channel.v1.MsgChannelOpenInit",
+        ] {
+            assert!(!packet_submission(&messages(&[
+                "/ibc.core.client.v1.MsgUpdateClient",
+                kind
+            ])));
+        }
+        assert!(!packet_submission(&messages(&[])));
     }
 }

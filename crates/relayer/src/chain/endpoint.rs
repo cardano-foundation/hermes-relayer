@@ -164,6 +164,15 @@ pub trait ChainEndpoint: Sized {
 
     // Send transactions
 
+    /// Optional independent endpoint for serialized packet submissions. Queries
+    /// remain on the original runtime while this endpoint waits for acceptance.
+    fn fork_for_packet_submissions(&self) -> Result<Option<Self>, Error>
+    where
+        Self: Sized,
+    {
+        Ok(None)
+    }
+
     /// Sends one or more transactions with `msgs` to chain and
     /// synchronously wait for it to be committed.
     fn send_messages_and_wait_commit(
