@@ -476,3 +476,126 @@ fn fresh_receives_progress_while_a_cardano_refund_is_pending_or_failed() {
     }
     fixture.finish();
 }
+
+#[test]
+fn idle_schedule_does_not_query_an_unavailable_route() {
+    let Fixture {
+        path,
+        replies,
+        workers,
+    } = Fixture::new(false);
+    replies.lock().unwrap().unavailable = true;
+    let packet = crate::object::Packet {
+        src_chain_id: path.src_chain().id(),
+        dst_chain_id: path.dst_chain().id(),
+        src_channel_id: path.src_channel_id().clone(),
+        src_port_id: path.src_port_id().clone(),
+    };
+    let mut link = crate::link::Link { a_to_b: path };
+    assert!(crate::worker::packet::handle_execute_schedule(
+        &mut link,
+        &packet,
+        crate::link::Resubmit::from_clear_interval(100),
+    )
+    .is_ok());
+    assert_eq!(replies.lock().unwrap().status_queries, 0);
+    assert_eq!(replies.lock().unwrap().channel_queries, 0);
+
+    // Real queued work must still authenticate the route before submitting.
+    link.a_to_b
+        .src_operational_data
+        .push_back(OperationalData::new(
+            height(33),
+            OperationalDataTarget::Source,
+            TrackingId::new_static("refund"),
+            Duration::ZERO,
+        ));
+    assert!(crate::worker::packet::handle_execute_schedule(
+        &mut link,
+        &packet,
+        crate::link::Resubmit::from_clear_interval(100),
+    )
+    .is_err());
+    assert!(link.a_to_b.has_pending_work());
+    assert!(replies.lock().unwrap().channel_queries > 0);
+    assert_eq!(replies.lock().unwrap().submitted_packets, 0);
+    drop(link);
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn non_clearing_blocks_are_forwarded_even_when_the_route_is_unavailable() {
+    let Fixture {
+        path,
+        replies,
+        workers,
+    } = Fixture::new(false);
+    replies.lock().unwrap().unavailable = true;
+    let link = Arc::new(Mutex::new(crate::link::Link { a_to_b: path }));
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let (forward, forwarded) = crossbeam_channel::unbounded();
+    let task = crate::worker::packet::spawn_clear_cmd_worker(
+        receiver,
+        link.clone(),
+        false,
+        100,
+        100,
+        forward,
+    );
+    for n in 61..65 {
+        sender
+            .send(crate::worker::WorkerCmd::NewBlock {
+                height: height(n),
+                new_block: ibc_relayer_types::core::ics02_client::events::NewBlock::new(height(n)),
+            })
+            .unwrap();
+        assert!(
+            matches!(forwarded.recv_timeout(Duration::from_secs(3)).unwrap(),
+            crate::worker::WorkerCmd::NewBlock { height: h, .. } if h == height(n))
+        );
+    }
+    task.shutdown_and_wait();
+    assert_eq!(replies.lock().unwrap().status_queries, 0);
+    assert_eq!(replies.lock().unwrap().channel_queries, 0);
+    drop(link);
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn in_flight_refunds_and_confirmations_keep_the_schedule_active() {
+    let mut fixture = Fixture::new(false);
+    assert!(!fixture.path.has_pending_work());
+    let refund = OperationalData::new(
+        height(33),
+        OperationalDataTarget::Source,
+        TrackingId::new_static("refund"),
+        Duration::ZERO,
+    );
+    let (_sender, reply) = crossbeam_channel::bounded(1);
+    fixture.path.source_submission = Some(SourceSubmission {
+        operation: refund.clone(),
+        reply,
+    });
+    assert!(fixture.path.has_pending_work());
+    fixture.path.source_submission = None;
+    fixture.path.confirm_txes = true;
+    for pending in [
+        &fixture.path.pending_txs_src.pending_queue,
+        &fixture.path.pending_txs_dst.pending_queue,
+    ] {
+        pending.push_back(crate::link::pending::PendingData {
+            original_od: refund.clone(),
+            tx_hashes: crate::link::TxHashes(vec![]),
+            submit_time: std::time::Instant::now(),
+            error_events: vec![],
+        });
+        assert!(fixture.path.has_pending_work());
+        pending.take();
+        assert!(!fixture.path.has_pending_work());
+    }
+    fixture.finish();
+}
