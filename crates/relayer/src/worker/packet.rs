@@ -124,14 +124,15 @@ pub fn spawn_packet_cmd_worker<ChainA: ChainHandle, ChainB: ChainHandle>(
     let mut route_retry = VecDeque::new();
     spawn_background_task(span, Some(Duration::from_millis(200)), move || {
         if let Some(cmd) = route_retry.pop_front().or_else(|| cmd_rx.try_recv().ok()) {
-            let refreshed = link.lock().unwrap().a_to_b.refresh_channel_route();
-            if let Err(error) = refreshed {
-                // Keep the command while route discovery is unavailable or
-                // only one endpoint has opened on its replacement connection.
-                route_retry.push_front(cmd);
-                return Err(TaskError::Ignore(RunError::link(error).into()));
-            }
             let is_new_batch = cmd.is_ibc_events();
+            if is_new_batch {
+                let refreshed = link.lock().unwrap().a_to_b.refresh_channel_route();
+                if let Err(error) = refreshed {
+                    // Keep packet work while route discovery is unavailable.
+                    route_retry.push_front(cmd);
+                    return Err(TaskError::Ignore(RunError::link(error).into()));
+                }
+            }
 
             // Try to clear pending packets. At different levels down in `handle_packet_cmd` there
             // are retries mechanisms for MAX_RETRIES (current value hardcoded at 5).
@@ -273,12 +274,21 @@ pub fn spawn_clear_cmd_worker<ChainA: ChainHandle, ChainB: ChainHandle>(
     let mut route_retry = None;
     spawn_background_task(span, Some(Duration::from_millis(200)), move || {
         if let Some(cmd) = route_retry.take().or_else(|| cmd_rx.try_recv().ok()) {
-            let refreshed = link.lock().unwrap().a_to_b.refresh_channel_route();
-            if let Err(error) = refreshed {
-                // Keep the command while route discovery is unavailable or
-                // only one endpoint has opened on its replacement connection.
-                route_retry = Some(cmd);
-                return Err(TaskError::Ignore(RunError::link(error).into()));
+            {
+                let mut link = link.lock().unwrap();
+                if packet_clearing_height(
+                    &cmd,
+                    should_clear_on_start,
+                    clear_interval,
+                    link.a_to_b.channel().ordering,
+                )
+                .is_some()
+                {
+                    if let Err(error) = link.a_to_b.refresh_channel_route() {
+                        route_retry = Some(cmd);
+                        return Err(TaskError::Ignore(RunError::link(error).into()));
+                    }
+                }
             }
             match clear_cmd_tx.send(cmd.clone()) {
                 Ok(_) => trace!("Successfully sent cmd to packet worker"),
@@ -365,11 +375,29 @@ fn handle_packet_cmd<ChainA: ChainHandle, ChainB: ChainHandle>(
     Ok(())
 }
 
-/// Given an `IbcEvent` command, schedule packet clearing if the
-/// `should_clear_on_start` flag has been toggled.
-///
-/// Given a `NewBlock` command, checks if packet clearing should occur
-/// and performs it if so.
+/// Return the clearing height only when this command requires packet clearing.
+fn packet_clearing_height(
+    cmd: &WorkerCmd,
+    should_clear_on_start: bool,
+    clear_interval: u64,
+    ordering: Ordering,
+) -> Option<Option<Height>> {
+    match cmd {
+        // Clearing for Ordered channels is handled by the packet_cmd_worker
+        WorkerCmd::IbcEvents { batch: _batch } if ordering == Ordering::Ordered => None,
+
+        WorkerCmd::IbcEvents { batch } => should_clear_on_start.then_some(Some(batch.height)),
+
+        // Handle the arrival of an event signaling that the
+        // source chain has advanced to a new block
+        WorkerCmd::NewBlock { height, .. } => (should_clear_on_start
+            || should_clear_packets(clear_interval, *height))
+        .then_some(Some(*height)),
+
+        WorkerCmd::ClearPendingPackets => Some(None),
+    }
+}
+
 fn handle_clear_cmd<ChainA: ChainHandle, ChainB: ChainHandle>(
     link: &mut Link<ChainA, ChainB>,
     should_clear_on_start: &mut bool,
@@ -377,37 +405,12 @@ fn handle_clear_cmd<ChainA: ChainHandle, ChainB: ChainHandle>(
     clear_limit: usize,
     cmd: WorkerCmd,
 ) -> Result<(), TaskError<RunError>> {
-    // Handle packet clearing which is triggered from a command
-    let (do_clear, maybe_height) = match &cmd {
-        // Clearing for Ordered channels is handled by the packet_cmd_worker
-        WorkerCmd::IbcEvents { batch: _batch }
-            if link.a_to_b.channel().ordering == Ordering::Ordered =>
-        {
-            (false, None)
-        }
-
-        WorkerCmd::IbcEvents { batch } => {
-            if *should_clear_on_start {
-                (true, Some(batch.height))
-            } else {
-                (false, None)
-            }
-        }
-
-        // Handle the arrival of an event signaling that the
-        // source chain has advanced to a new block
-        WorkerCmd::NewBlock { height, .. } => {
-            if *should_clear_on_start || should_clear_packets(clear_interval, *height) {
-                (true, Some(*height))
-            } else {
-                (false, None)
-            }
-        }
-
-        WorkerCmd::ClearPendingPackets => (true, None),
-    };
-
-    if do_clear {
+    if let Some(maybe_height) = packet_clearing_height(
+        &cmd,
+        *should_clear_on_start,
+        clear_interval,
+        link.a_to_b.channel().ordering,
+    ) {
         info!("packets clearing triggered, looking for packets to clear");
 
         // Reset the `clear_on_start` flag and attempt packet clearing once now.
@@ -585,14 +588,21 @@ fn handle_clear_packet<ChainA: ChainHandle, ChainB: ChainHandle>(
     handle_execute_schedule(link, path, Resubmit::from_clear_interval(clear_interval))
 }
 
-fn handle_execute_schedule<ChainA: ChainHandle, ChainB: ChainHandle>(
+pub(crate) fn handle_execute_schedule<ChainA: ChainHandle, ChainB: ChainHandle>(
     link: &mut Link<ChainA, ChainB>,
     _path: &Packet,
     resubmit: Resubmit,
 ) -> Result<(), TaskError<RunError>> {
-    link.a_to_b
-        .refresh_channel_route()
-        .map_err(|error| TaskError::Ignore(RunError::link(error).into()))?;
+    if !link.a_to_b.has_pending_work() {
+        return Ok(());
+    }
+    // The independent refund worker checks its own route before submitting.
+    // Polling its reply must not compete with that worker for chain queries.
+    if !link.a_to_b.waiting_only_for_source_submission() {
+        link.a_to_b
+            .refresh_channel_route()
+            .map_err(|error| TaskError::Ignore(RunError::link(error).into()))?;
+    }
 
     link.a_to_b
         .refresh_schedule()
