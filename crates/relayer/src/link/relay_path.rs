@@ -1910,6 +1910,13 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
                     || !self.pending_txs_dst.pending_queue.is_empty()))
     }
 
+    pub(crate) fn waiting_only_for_source_submission(&self) -> bool {
+        self.source_submission.is_some()
+            && self.dst_operational_data.is_empty()
+            && self.pending_txs_src.pending_queue.is_empty()
+            && self.pending_txs_dst.pending_queue.is_empty()
+    }
+
     /// While there are pending operational data items, this function
     /// performs the relaying of packets corresponding to those
     /// operational data items to both the source and destination chains.

@@ -599,3 +599,80 @@ fn in_flight_refunds_and_confirmations_keep_the_schedule_active() {
     }
     fixture.finish();
 }
+
+#[test]
+fn waiting_for_a_refund_polls_completion_without_competing_route_queries() {
+    let Fixture {
+        path,
+        replies,
+        workers,
+    } = Fixture::new(false);
+    let packet = crate::object::Packet {
+        src_chain_id: path.src_chain().id(),
+        dst_chain_id: path.dst_chain().id(),
+        src_channel_id: path.src_channel_id().clone(),
+        src_port_id: path.src_port_id().clone(),
+    };
+    let mut link = crate::link::Link { a_to_b: path };
+    let (sender, reply) = crossbeam_channel::bounded(1);
+    link.a_to_b.source_submission = Some(SourceSubmission {
+        operation: OperationalData::new(
+            height(33),
+            OperationalDataTarget::Source,
+            TrackingId::new_static("refund"),
+            Duration::ZERO,
+        ),
+        reply,
+    });
+    replies.lock().unwrap().unavailable = true;
+    assert!(crate::worker::packet::handle_execute_schedule(
+        &mut link,
+        &packet,
+        crate::link::Resubmit::from_clear_interval(100),
+    )
+    .is_ok());
+    assert!(link.a_to_b.source_submission.is_some());
+    sender
+        .send(Ok(relay_sender::AsyncReply { responses: vec![] }))
+        .unwrap();
+    assert!(crate::worker::packet::handle_execute_schedule(
+        &mut link,
+        &packet,
+        crate::link::Resubmit::from_clear_interval(100),
+    )
+    .is_ok());
+    assert!(link.a_to_b.source_submission.is_none());
+    assert_eq!(replies.lock().unwrap().status_queries, 0);
+    assert_eq!(replies.lock().unwrap().channel_queries, 0);
+    // Destination work still needs route authentication even during a refund.
+    let (_sender, reply) = crossbeam_channel::bounded(1);
+    link.a_to_b.source_submission = Some(SourceSubmission {
+        operation: OperationalData::new(
+            height(33),
+            OperationalDataTarget::Source,
+            TrackingId::new_static("another-refund"),
+            Duration::ZERO,
+        ),
+        reply,
+    });
+    link.a_to_b
+        .dst_operational_data
+        .push_back(OperationalData::new(
+            height(33),
+            OperationalDataTarget::Destination,
+            TrackingId::new_static("receive"),
+            Duration::ZERO,
+        ));
+    assert!(crate::worker::packet::handle_execute_schedule(
+        &mut link,
+        &packet,
+        crate::link::Resubmit::from_clear_interval(100),
+    )
+    .is_err());
+    assert!(replies.lock().unwrap().channel_queries > 0);
+    assert_eq!(replies.lock().unwrap().submitted_packets, 0);
+    drop(link);
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}

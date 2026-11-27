@@ -596,9 +596,13 @@ pub(crate) fn handle_execute_schedule<ChainA: ChainHandle, ChainB: ChainHandle>(
     if !link.a_to_b.has_pending_work() {
         return Ok(());
     }
-    link.a_to_b
-        .refresh_channel_route()
-        .map_err(|error| TaskError::Ignore(RunError::link(error).into()))?;
+    // The independent refund worker checks its own route before submitting.
+    // Polling its reply must not compete with that worker for chain queries.
+    if !link.a_to_b.waiting_only_for_source_submission() {
+        link.a_to_b
+            .refresh_channel_route()
+            .map_err(|error| TaskError::Ignore(RunError::link(error).into()))?;
+    }
 
     link.a_to_b
         .refresh_schedule()
