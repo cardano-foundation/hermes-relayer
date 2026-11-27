@@ -1724,6 +1724,11 @@ impl ChainEndpoint for CardanoChainEndpoint {
         }))
     }
 
+    fn fork_for_packet_submissions(&self) -> Result<Option<Self>, Error> {
+        // Do not subscribe this endpoint or start another funded-intent executor.
+        Self::bootstrap(ChainConfig::Cardano(self.config.clone()), self.rt.clone()).map(Some)
+    }
+
     fn send_messages_and_wait_commit(
         &mut self,
         mut tracked_msgs: TrackedMsgs,

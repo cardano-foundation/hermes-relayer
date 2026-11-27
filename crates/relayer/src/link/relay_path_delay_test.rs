@@ -21,7 +21,7 @@ fn height(n: u64) -> Height {
     Height::new(0, n).unwrap()
 }
 
-fn cardano_client() -> AnyClientState {
+pub(super) fn cardano_client() -> AnyClientState {
     AnyClientState::Probabilistic(ProbabilisticClientState {
         storage_version: 2,
         verification_generation: 1,
