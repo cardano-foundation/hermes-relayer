@@ -431,3 +431,81 @@ fn consolidation_cannot_remove_a_donor_refund_or_change_the_survivor_value() {
         );
     }
 }
+
+#[test]
+fn escrow_principal_is_not_counted_as_protocol_reserve() {
+    let mut fixture = Fixture::load("consolidate");
+    // The compiled fixture carries ADA principal plus its surviving reserve.
+    // A cap below that principal must still permit an authenticated carry-forward.
+    fixture.policy.limits.max_total_protocol_output_lovelace = 5_000_000;
+    fixture.validate(&fixture.bytes).unwrap();
+    fixture.policy.limits.max_total_protocol_output_lovelace = 1;
+    let error = fixture.validate(&fixture.bytes).unwrap_err().to_string();
+    assert!(
+        error.contains("protocol ADA exceeds signing limit"),
+        "{error}"
+    );
+}
+
+#[test]
+fn escrow_exemption_requires_existing_identity_and_backed_principal() {
+    let fixture = Fixture::load("consolidate");
+    let tx: MintedTx<'_> = minicbor::decode(&fixture.bytes).unwrap();
+    let policy = &required_script(&fixture.policy.scripts, "packetbatch")
+        .unwrap()
+        .hash;
+    let output = tx
+        .transaction_body
+        .outputs
+        .iter()
+        .find(|output| {
+            unpack_output(output)
+                .assets
+                .iter()
+                .any(|(p, _, _)| p == policy)
+        })
+        .unwrap();
+    let value = unpack_output(output);
+    let mut resolved = fixture.resolved.clone();
+    let key = resolved
+        .regular
+        .iter()
+        .find(|(_, input)| {
+            input.assets.iter().any(|asset| {
+                value
+                    .assets
+                    .iter()
+                    .any(|(p, name, _)| p.as_slice() == policy && *name == asset.asset_name)
+            })
+        })
+        .unwrap()
+        .0
+        .clone();
+    let input = resolved.regular.get_mut(&key).unwrap();
+    input.inline_datum =
+        Some(minicbor::to_vec(packet_signing::inline_datum(output).unwrap()).unwrap());
+    input.lovelace = value.coin;
+    let principal =
+        packet_signing::retained_escrow_principal(output, &value, &resolved, policy, false);
+    assert!(principal > 5_000_000);
+    assert!(
+        principal < value.coin,
+        "reserve must still count toward the cap"
+    );
+    resolved.regular.get_mut(&key).unwrap().lovelace = 1;
+    assert_eq!(
+        packet_signing::retained_escrow_principal(output, &value, &resolved, policy, false),
+        0
+    );
+    resolved.regular.get_mut(&key).unwrap().lovelace = value.coin;
+    resolved.regular.get_mut(&key).unwrap().assets.clear();
+    assert_eq!(
+        packet_signing::retained_escrow_principal(output, &value, &resolved, policy, false),
+        0
+    );
+    assert_eq!(
+        packet_signing::retained_escrow_principal(output, &value, &fixture.resolved, policy, false),
+        0,
+        "ordinary settlement cannot inflate the original principal"
+    );
+}
