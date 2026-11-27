@@ -99,7 +99,7 @@ impl Resubmit {
     }
 }
 
-fn retry_cardano_refund_readiness<T>(
+fn retry_cardano_refund_preparation<T>(
     timeout: Duration,
     mut attempt: impl FnMut() -> Result<T, LinkError>,
     now: impl Fn() -> Instant,
@@ -113,7 +113,7 @@ fn retry_cardano_refund_readiness<T>(
         };
         // Retry only readiness failures from queries and client preparation.
         // Submission errors may be ambiguous and keep their existing reconciliation.
-        let retryable = matches!(
+        let readiness_failure = matches!(
             error.detail(),
             error::LinkErrorDetail::Query(_)
                 | error::LinkErrorDetail::Client(_)
@@ -121,13 +121,29 @@ fn retry_cardano_refund_readiness<T>(
         ) && error
             .to_string()
             .contains("Current HostState root is not yet stability-accepted");
+        // Only retry the observed transport timeout when it came from a query.
+        // A channel submission can contain the same message with an unknown outcome.
+        let query_failure = match error.detail() {
+            error::LinkErrorDetail::Query(_) => true,
+            error::LinkErrorDetail::Channel(channel) => matches!(
+                &channel.source,
+                crate::channel::error::ChannelErrorDetail::Query(_)
+                    | crate::channel::error::ChannelErrorDetail::ChainQuery(_)
+            ),
+            _ => false,
+        };
+        let retryable = readiness_failure
+            || (query_failure
+                && error
+                    .to_string()
+                    .contains("Ogmios WebSocket connection timed out after "));
         let remaining = deadline.saturating_duration_since(now());
         if !retryable || remaining.is_zero() {
             return Err(error);
         }
         let delay = Duration::from_secs(30).min(remaining);
         warn!(%error, retry_after_seconds = delay.as_secs(),
-            "Retaining Cardano refund while HostState proof readiness recovers");
+            "Retaining Cardano refund while a temporary preparation failure recovers");
         sleep(delay);
         if now() >= deadline {
             return Err(error);
@@ -2050,7 +2066,7 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
                             "Independent refund worker requires a Cardano source".into(),
                         )));
                     };
-                    retry_cardano_refund_readiness(
+                    retry_cardano_refund_preparation(
                         config.accepted_height_timeout,
                         || {
                             worker.refresh_channel_route()?;
