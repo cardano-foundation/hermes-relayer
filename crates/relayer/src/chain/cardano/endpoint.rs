@@ -1513,6 +1513,8 @@ impl ChainEndpoint for CardanoChainEndpoint {
                 max_total_protocol_output_lovelace: cardano_config
                     .max_total_protocol_output_lovelace,
                 max_wallet_lovelace_top_up: cardano_config.max_wallet_lovelace_top_up,
+                max_packet_lane_initialization_lovelace: cardano_config
+                    .max_packet_lane_initialization_lovelace,
                 max_validity_interval_slots: cardano_config.max_validity_interval_slots,
             },
         )

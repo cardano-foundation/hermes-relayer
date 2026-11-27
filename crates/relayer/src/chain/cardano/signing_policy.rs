@@ -74,6 +74,7 @@ pub struct SigningPolicyLimits {
     pub max_external_output_lovelace: u64,
     pub max_total_protocol_output_lovelace: u64,
     pub max_wallet_lovelace_top_up: u64,
+    pub max_packet_lane_initialization_lovelace: u64,
     pub max_validity_interval_slots: u64,
 }
 
@@ -2971,9 +2972,16 @@ impl TransactionSigningPolicy {
             .filter(|transfer| transfer.action == TransferAction::Send)
             .filter(|transfer| matches!(expected_asset(transfer), ExpectedAsset::Lovelace))
             .map_or(0, |transfer| transfer.amount);
+        // Lane authentication runs before wallet accounting. This allowance is
+        // exclusive to setup and does not stack with the ordinary top-up budget.
+        let top_up = if intent.operation == "InitializePacketLanes" {
+            self.limits.max_packet_lane_initialization_lovelace
+        } else {
+            self.limits.max_wallet_lovelace_top_up
+        };
         let maximum_lovelace_loss = body
             .fee
-            .checked_add(self.limits.max_wallet_lovelace_top_up)
+            .checked_add(top_up)
             .and_then(|value| value.checked_add(requested_lovelace))
             .ok_or_else(|| reject("authorized signer lovelace loss overflows u64".to_string()))?;
         if lovelace_loss > u128::from(maximum_lovelace_loss) {
@@ -5324,6 +5332,7 @@ mod tests {
             max_external_output_lovelace: 5_000_000,
             max_total_protocol_output_lovelace: 50_000_000,
             max_wallet_lovelace_top_up: 5_000_000,
+            max_packet_lane_initialization_lovelace: 30_000_000,
             max_validity_interval_slots: 3_600,
         }
     }
