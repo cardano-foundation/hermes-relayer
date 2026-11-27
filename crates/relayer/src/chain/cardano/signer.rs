@@ -342,6 +342,7 @@ mod tests {
                 max_external_output_lovelace: 5_000_000,
                 max_total_protocol_output_lovelace: 50_000_000,
                 max_wallet_lovelace_top_up: 5_000_000,
+                max_packet_lane_initialization_lovelace: 30_000_000,
                 max_validity_interval_slots: 3_600,
             },
         )

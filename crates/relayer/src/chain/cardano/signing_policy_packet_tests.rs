@@ -103,12 +103,7 @@ impl Fixture {
                 })
                 .collect()
         };
-        let mut limits = tests::limits();
-        // Creating sixteen lanes commits about 25 ADA once. Keep the ordinary
-        // packet allowance unchanged, but authorize this setup reserve explicitly.
-        if name == "initialize" {
-            limits.max_wallet_lovelace_top_up = 30_000_000;
-        }
+        let limits = tests::limits();
         let mut transaction: pallas_primitives::conway::Tx =
             minicbor::decode(&hex::decode(row["cbor"].as_str().unwrap()).unwrap()).unwrap();
         transaction.transaction_witness_set.vkeywitness = None;
@@ -428,6 +423,55 @@ fn consolidation_cannot_remove_a_donor_refund_or_change_the_survivor_value() {
                 .validate(&minicbor::to_vec(transaction).unwrap())
                 .is_err(),
             "missing output {index}"
+        );
+    }
+}
+
+#[test]
+fn initialization_uses_its_own_bounded_allowance() {
+    let mut fixture = Fixture::load("initialize");
+    fixture.policy.limits.max_wallet_lovelace_top_up = 1;
+    fixture.validate(&fixture.bytes).unwrap();
+    fixture
+        .policy
+        .limits
+        .max_packet_lane_initialization_lovelace = 20_000_000;
+    fixture.policy.limits.max_wallet_lovelace_top_up = 100_000_000;
+    let error = fixture.validate(&fixture.bytes).unwrap_err().to_string();
+    assert!(error.contains("configured top-up allowance"), "{error}");
+}
+
+#[test]
+fn initialization_allowance_does_not_override_fee_cap() {
+    let mut fixture = Fixture::load("initialize");
+    fixture.policy.limits.max_fee_lovelace = 1;
+    assert!(fixture.validate(&fixture.bytes).is_err());
+}
+
+#[test]
+fn ordinary_packet_cannot_borrow_initialization_allowance() {
+    let mut fixture = Fixture::load("receive");
+    fixture.policy.limits.max_wallet_lovelace_top_up = 1;
+    let error = fixture.validate(&fixture.bytes).unwrap_err().to_string();
+    assert!(error.contains("configured top-up allowance"), "{error}");
+    fixture.intent.operation = "InitializePacketLanes".into();
+    assert!(fixture.validate(&fixture.bytes).is_err());
+}
+
+#[test]
+fn initialization_allowance_cannot_fund_an_unrelated_wallet() {
+    let fixture = Fixture::load("initialize");
+    for index in 0..fixture.transaction().transaction_body.outputs.len() {
+        let mut transaction = fixture.transaction();
+        match &mut transaction.transaction_body.outputs[index] {
+            PseudoTransactionOutput::PostAlonzo(output) => output.address = vec![0x60; 29].into(),
+            PseudoTransactionOutput::Legacy(output) => output.address = vec![0x60; 29].into(),
+        }
+        assert!(
+            fixture
+                .validate(&minicbor::to_vec(transaction).unwrap())
+                .is_err(),
+            "output {index}"
         );
     }
 }
