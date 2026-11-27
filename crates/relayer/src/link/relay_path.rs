@@ -99,6 +99,11 @@ impl Resubmit {
     }
 }
 
+struct SourceSubmission {
+    operation: OperationalData,
+    reply: crossbeam_channel::Receiver<Result<AsyncReply, LinkError>>,
+}
+
 pub struct RelayPath<ChainA: ChainHandle, ChainB: ChainHandle> {
     channel: Channel<ChainA, ChainB>,
     refresh_cardano_route: bool,
@@ -118,6 +123,8 @@ pub struct RelayPath<ChainA: ChainHandle, ChainB: ChainHandle> {
 
     // Toggle for the transaction confirmation mechanism.
     confirm_txes: bool,
+    source_submission: Option<SourceSubmission>,
+    independent_source_submission: bool,
 
     // Stores pending (i.e., unconfirmed) operational data.
     // The relaying path periodically tries to confirm these pending
@@ -169,7 +176,15 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
             ChainConfig::Cardano(_)
         );
 
+        let independent_source_submission = channel.ordering == Ordering::Unordered
+            && channel.connection_delay.is_zero()
+            && matches!(
+                src_chain.config().map_err(LinkError::relayer)?,
+                ChainConfig::Cardano(_)
+            );
         Ok(Self {
+            source_submission: None,
+            independent_source_submission,
             channel,
             refresh_cardano_route,
             route_heights: None,
@@ -1894,14 +1909,25 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
     /// dropped. Subsequent pending operational data items that went unprocessed
     /// are queued up again for re-submission.
     pub fn execute_schedule(&mut self) -> Result<(), LinkError> {
-        let src_od_iter = self.src_operational_data.take().into_iter();
-
-        match self.execute_schedule_for_target_chain(src_od_iter, OperationalDataTarget::Source) {
-            Ok(unprocessed_src_data) => self.src_operational_data = unprocessed_src_data.into(),
-            Err((unprocessed_src_data, e)) => {
-                self.src_operational_data = unprocessed_src_data.into();
-                return Err(e);
+        let source_error = if self.independent_source_submission {
+            self.poll_source_submission().err()
+        } else {
+            let src_od_iter = self.src_operational_data.take().into_iter();
+            match self.execute_schedule_for_target_chain(src_od_iter, OperationalDataTarget::Source)
+            {
+                Ok(unprocessed) => {
+                    self.src_operational_data = unprocessed.into();
+                    None
+                }
+                Err((unprocessed, error)) => {
+                    self.src_operational_data = unprocessed.into();
+                    return Err(error);
+                }
             }
+        };
+        // A failed refund must not prevent already scheduled receives from running.
+        if let Some(error) = source_error {
+            warn!(%error, "Cardano refund submission failed independently of destination work");
         }
 
         let dst_od_iter = self.dst_operational_data.take().into_iter();
@@ -1916,6 +1942,58 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
             }
         }
 
+        Ok(())
+    }
+
+    fn poll_source_submission(&mut self) -> Result<(), LinkError> {
+        if let Some(pending) = self.source_submission.take() {
+            match pending.reply.try_recv() {
+                Ok(result) => self.enqueue_pending_tx(result?, pending.operation),
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    self.source_submission = Some(pending);
+                    return Ok(());
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    return Err(LinkError::relayer(crate::error::Error::send_tx(
+                        "Cardano refund worker stopped before returning its submission result"
+                            .into(),
+                    )));
+                }
+            }
+        }
+        let Some(mut operation) = self.src_operational_data.pop_front() else {
+            return Ok(());
+        };
+        // Preserve the receipt for each submitted refund even if a later
+        // refund in the clearing batch fails validation or signing.
+        if operation.batch.len() > 1 {
+            let remaining = operation.batch.split_off(1);
+            let mut remainder = operation.clone();
+            remainder.batch = remaining;
+            self.src_operational_data.push_front(remainder);
+        }
+        let mut worker = Self::new(
+            self.channel.clone(),
+            self.confirm_txes,
+            LinkParameters {
+                src_port_id: self.src_port_id().clone(),
+                src_channel_id: self.src_channel_id().clone(),
+                max_memo_size: self.max_memo_size,
+                max_receiver_size: self.max_receiver_size,
+                exclude_src_sequences: self.exclude_src_sequences.clone(),
+            },
+        )?;
+        let (sender, reply) = crossbeam_channel::bounded(1);
+        let submitted = operation.clone();
+        let span = tracing::Span::current();
+        std::thread::spawn(move || {
+            let _guard = span.enter();
+            let result = worker.refresh_channel_route().and_then(|_| {
+                worker.relay_from_operational_data::<relay_sender::AsyncSender>(submitted)
+            });
+            let _ = sender.send(result);
+        });
+        self.source_submission = Some(SourceSubmission { operation, reply });
         Ok(())
     }
 
@@ -2098,6 +2176,21 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
             return Ok(());
         }
 
+        let mut od = od;
+        if od.target == OperationalDataTarget::Source {
+            if let Some(pending) = &self.source_submission {
+                od.batch.retain(|message| {
+                    !pending.operation.batch.iter().any(|in_flight| {
+                        message.event_with_height.event.packet().is_some()
+                            && message.event_with_height.event.packet()
+                                == in_flight.event_with_height.event.packet()
+                    })
+                });
+                if od.batch.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
         let od = self.prepare_operational_data(od)?;
 
         match od.target {

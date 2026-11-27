@@ -20,6 +20,7 @@ struct Replies {
     height: u64,
     status_queries: usize,
     channel_queries: usize,
+    submitted_packets: usize,
 }
 
 fn height(n: u64) -> Height {
@@ -144,6 +145,19 @@ fn runtime(
                     reply_to
                         .send(Ok("fixture-signer".parse().unwrap()))
                         .unwrap();
+                }
+                ChainRequest::QueryClientState { reply_to, .. } => {
+                    reply_to
+                        .send(Ok((super::delayed_height_tests::cardano_client(), None)))
+                        .unwrap();
+                }
+                ChainRequest::SendMessagesAndWaitCheckTx {
+                    tracked_msgs,
+                    reply_to,
+                } => {
+                    assert_eq!(side, 1, "fresh receives must target the destination");
+                    state.submitted_packets += tracked_msgs.msgs.len();
+                    reply_to.send(Ok(vec![])).unwrap();
                 }
                 unexpected => panic!("unexpected route request: {unexpected:?}"),
             }
@@ -382,4 +396,83 @@ fn route_rejection_identifies_every_mismatch_and_retries_same_heights() {
         assert_eq!(fixture.replies.lock().unwrap().channel_queries, 4);
         fixture.finish();
     }
+}
+
+#[test]
+fn fresh_receives_progress_while_a_cardano_refund_is_pending_or_failed() {
+    let mut fixture = Fixture::new(false);
+    let refund = OperationalData::new(
+        height(33),
+        OperationalDataTarget::Source,
+        TrackingId::new_static("older-refund"),
+        Duration::ZERO,
+    );
+    let (sender, reply) = crossbeam_channel::bounded(1);
+    fixture.path.source_submission = Some(SourceSubmission {
+        operation: refund,
+        reply,
+    });
+    fixture
+        .path
+        .src_operational_data
+        .push_back(OperationalData::new(
+            height(33),
+            OperationalDataTarget::Source,
+            TrackingId::new_static("next-refund"),
+            Duration::ZERO,
+        ));
+    for sequence in 22..=24 {
+        // The update and connection delay for this receive are already satisfied.
+        let mut receive = OperationalData::new(
+            height(33),
+            OperationalDataTarget::Destination,
+            TrackingId::new_static("fresh-receive"),
+            Duration::from_nanos(1),
+        );
+        receive.set_update_height(height(33));
+        receive
+            .set_scheduled_time(fixture.path.dst_time_latest().unwrap() - Duration::from_secs(1));
+        receive.push(TransitMessage {
+            event_with_height: IbcEventWithHeight::new(
+                IbcEvent::SendPacket(SendPacket {
+                    packet: Packet {
+                        sequence: Sequence::from(sequence),
+                        source_port: PortId::transfer(),
+                        source_channel: ChannelId::new(0),
+                        destination_port: PortId::transfer(),
+                        destination_channel: ChannelId::new(7),
+                        data: vec![],
+                        timeout_height:
+                            ibc_relayer_types::core::ics04_channel::timeout::TimeoutHeight::Never,
+                        timeout_timestamp: Timestamp::from_nanoseconds(200_000_000_000).unwrap(),
+                    },
+                }),
+                height(33),
+            ),
+            msg: Any {
+                type_url: "/ibc.core.channel.v1.MsgRecvPacket".into(),
+                value: vec![],
+            },
+        });
+        if sequence == 24 {
+            sender
+                .send(Err(LinkError::relayer(RelayerError::send_tx(
+                    "refund signing rejected".into(),
+                ))))
+                .unwrap();
+        }
+        fixture.path.dst_operational_data.push_back(receive);
+        fixture.path.execute_schedule().unwrap();
+        assert_eq!(
+            fixture.replies.lock().unwrap().submitted_packets,
+            (sequence - 21) as usize
+        );
+        assert_eq!(fixture.path.source_submission.is_some(), sequence < 24);
+        assert_eq!(
+            fixture.path.src_operational_data.len(),
+            1,
+            "only one refund can be in flight"
+        );
+    }
+    fixture.finish();
 }
