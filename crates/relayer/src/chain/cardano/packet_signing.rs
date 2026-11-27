@@ -151,7 +151,7 @@ pub(super) fn acknowledgement_batch_matches(
         })
 }
 
-fn inline_datum<'a>(output: &'a MintedTransactionOutput<'_>) -> Option<&'a PlutusData> {
+pub(super) fn inline_datum<'a>(output: &'a MintedTransactionOutput<'_>) -> Option<&'a PlutusData> {
     match output {
         PseudoTransactionOutput::PostAlonzo(output) => match output.datum_option.as_ref()? {
             PseudoDatumOption::Data(data) => Some(&data.0),
@@ -499,8 +499,19 @@ impl TransactionSigningPolicy {
                 || value.address == self.trace_registry_address
                 || value.address == self.voucher_metadata_address
             {
+                let escrow_principal = if value.address == self.packet_lanes.batch {
+                    retained_escrow_principal(
+                        output,
+                        &value,
+                        resolved,
+                        &self.packet_lanes.batch_policy,
+                        consolidation,
+                    )
+                } else {
+                    0
+                };
                 protocol_lovelace = protocol_lovelace
-                    .checked_add(value.coin)
+                    .checked_add(value.coin - escrow_principal)
                     .ok_or_else(|| reject("protocol ADA overflow".into()))?;
                 continue;
             }
@@ -907,6 +918,68 @@ impl TransactionSigningPolicy {
         }
         Ok(())
     }
+}
+
+// Exclude only existing ADA principal kept at an authenticated escrow identity.
+// Reserves and any new contribution still count toward the protocol output cap.
+pub(super) fn retained_escrow_principal(
+    output: &MintedTransactionOutput<'_>,
+    value: &OutputValue,
+    resolved: &ResolvedTransactionInputs,
+    policy: &[u8],
+    consolidation: bool,
+) -> u64 {
+    let Some(fields) = inline_datum(output)
+        .and_then(|datum| constructor_fields(datum, 0))
+        .filter(|fields| fields.len() == 8)
+    else {
+        return 0;
+    };
+    if plutus_bytes(&fields[3]) != Some(&[][..]) || plutus_bytes(&fields[4]) != Some(&[][..]) {
+        return 0;
+    }
+    let Some(principal) = plutus_u64(&fields[6]).filter(|principal| *principal <= value.coin)
+    else {
+        return 0;
+    };
+    for input in resolved
+        .regular
+        .values()
+        .filter(|input| input.address == value.address)
+    {
+        let identity_matches = input.assets.iter().any(|asset| {
+            asset.policy_id.as_slice() == policy
+                && asset.quantity == 1
+                && value.assets.iter().any(|(p, name, quantity)| {
+                    p == policy && *name == asset.asset_name && *quantity == 1
+                })
+        });
+        if !identity_matches {
+            continue;
+        }
+        let Some(datum) = input
+            .inline_datum
+            .as_deref()
+            .and_then(|bytes| minicbor::decode::<PlutusData>(bytes).ok())
+        else {
+            continue;
+        };
+        let Some(previous) = constructor_fields(&datum, 0).filter(|fields| fields.len() == 8)
+        else {
+            continue;
+        };
+        let Some(previous_principal) =
+            plutus_u64(&previous[6]).filter(|amount| *amount <= input.lovelace)
+        else {
+            continue;
+        };
+        // Consolidation has already checked exact principal conservation and
+        // donor reserve reimbursements before output accounting reaches here.
+        if fields[..6] == previous[..6] && (consolidation || principal <= previous_principal) {
+            return principal;
+        }
+    }
+    0
 }
 
 #[cfg(test)]
