@@ -95,7 +95,14 @@ pub async fn abci_query(
         .await
         .map_err(|e| Error::rpc(rpc_address.clone(), e))?;
 
-    if !response.code.is_ok() {
+    decode_abci_response(response, prove)
+}
+
+fn decode_abci_response(
+    response: tendermint_rpc::endpoint::abci_query::AbciQuery,
+    prove: bool,
+) -> Result<QueryResponse, Error> {
+    if !response.code.is_ok() || unavailable_store_version(&response.log) {
         // Fail with response log.
         return Err(Error::abci_query(response));
     }
@@ -155,4 +162,41 @@ pub async fn fetch_version_specs(
     version
         .try_into()
         .map_err(|e| Error::fetch_version_parsing(chain_id.clone(), rpc_addr.to_string(), e))
+}
+
+// Some Injective backends report unavailable historical state with ABCI code 0.
+// An empty value from that response is not evidence of an absent IBC object.
+fn unavailable_store_version(log: &str) -> bool {
+    log.trim() == "version does not exist"
+}
+
+#[cfg(test)]
+mod unavailable_history_tests {
+    use super::*;
+
+    #[test]
+    fn code_zero_with_missing_store_version_is_rejected_before_decoding() {
+        let response = tendermint_rpc::endpoint::abci_query::AbciQuery {
+            code: tendermint::abci::Code::Ok,
+            log: "version does not exist".into(),
+            value: vec![],
+            height: 150579556u32.into(),
+            ..Default::default()
+        };
+        let error = decode_abci_response(response, false).unwrap_err();
+        assert!(error.to_string().contains("version does not exist"));
+    }
+
+    #[test]
+    fn real_absence_is_preserved_but_a_requested_proof_is_still_required() {
+        let response = tendermint_rpc::endpoint::abci_query::AbciQuery {
+            height: 150579556u32.into(),
+            ..Default::default()
+        };
+        assert!(decode_abci_response(response.clone(), false)
+            .unwrap()
+            .value
+            .is_empty());
+        assert!(decode_abci_response(response, true).is_err());
+    }
 }
