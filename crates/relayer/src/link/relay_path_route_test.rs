@@ -15,6 +15,7 @@ use crate::error::Error as RelayerError;
 struct Replies {
     switched: [bool; 2],
     unavailable: bool,
+    mismatched: bool,
     packet_query_fails: bool,
     height: u64,
     status_queries: usize,
@@ -74,13 +75,13 @@ fn runtime(
                         Ok((
                             ChannelEnd::new(
                                 ChannelState::Open(ibc_relayer_types::core::ics04_channel::channel::UpgradeState::NotUpgrading),
-                                Ordering::Unordered,
+                                if state.mismatched { Ordering::Ordered } else { Ordering::Unordered },
                                 ChannelCounterparty::new(
-                                    PortId::transfer(),
-                                    Some(ChannelId::new([7, 0][side])),
+                                    if state.mismatched { "wrong-port".parse().unwrap() } else { PortId::transfer() },
+                                    if state.mismatched { None } else { Some(ChannelId::new([7, 0][side])) },
                                 ),
                                 vec![hop(side, state.switched[side])],
-                                "ics20-1".parse().unwrap(),
+                                if state.mismatched && side == 1 { "wrong-version" } else { "ics20-1" }.parse().unwrap(),
                                 Sequence::from(1),
                             ),
                             None,
@@ -346,4 +347,39 @@ fn queued_messages_survive_failed_rebuild_on_the_replacement_route() {
         data.tracking_id.to_string()
     );
     fixture.finish();
+}
+
+#[test]
+fn route_rejection_identifies_every_mismatch_and_retries_same_heights() {
+    for reverse in [false, true] {
+        let mut fixture = Fixture::new(reverse);
+        fixture.replies.lock().unwrap().mismatched = true;
+        let error = fixture
+            .path
+            .refresh_channel_route()
+            .unwrap_err()
+            .to_string();
+        for side in ["source", "destination"] {
+            for field in [
+                "counterparty.port_id",
+                "counterparty.channel_id",
+                "ordering",
+            ] {
+                assert!(
+                    error.contains(&format!("{side}.{field} expected=")),
+                    "{error}"
+                );
+            }
+        }
+        assert!(error.contains("destination.version expected="), "{error}");
+        assert!(error.contains("actual=None"), "{error}");
+        assert!(error.contains("wrong-port"), "{error}");
+        assert!(error.contains("wrong-version"), "{error}");
+        assert_eq!(error.matches(" at 0-60").count(), 2, "{error}");
+        assert!(fixture.path.route_heights.is_none());
+        fixture.replies.lock().unwrap().mismatched = false;
+        fixture.path.refresh_channel_route().unwrap();
+        assert_eq!(fixture.replies.lock().unwrap().channel_queries, 4);
+        fixture.finish();
+    }
 }

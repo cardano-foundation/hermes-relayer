@@ -247,15 +247,48 @@ impl<ChainA: ChainHandle, ChainB: ChainHandle> RelayPath<ChainA, ChainB> {
         let source = self.src_channel(QueryHeight::Specific(heights.0))?;
         let destination = self.dst_channel(QueryHeight::Specific(heights.1))?;
         let unavailable = |detail: &str| LinkError::channel_route(detail.to_string());
-        if source.counterparty().port_id() != self.dst_port_id()
-            || source.counterparty().channel_id() != Some(self.dst_channel_id())
-            || destination.counterparty().port_id() != self.src_port_id()
-            || destination.counterparty().channel_id() != Some(self.src_channel_id())
-            || source.ordering != self.channel.ordering
-            || destination.ordering != self.channel.ordering
-            || source.version != destination.version
-        {
-            return Err(unavailable("channel identity, ordering or version changed"));
+        let mut mismatches = Vec::new();
+        for (side, actual, expected_port, expected_channel) in [
+            ("source", &source, self.dst_port_id(), self.dst_channel_id()),
+            (
+                "destination",
+                &destination,
+                self.src_port_id(),
+                self.src_channel_id(),
+            ),
+        ] {
+            if actual.counterparty().port_id() != expected_port {
+                mismatches.push(format!(
+                    "{side}.counterparty.port_id expected={expected_port} actual={}",
+                    actual.counterparty().port_id()
+                ));
+            }
+            if actual.counterparty().channel_id() != Some(expected_channel) {
+                mismatches.push(format!(
+                    "{side}.counterparty.channel_id expected={expected_channel} actual={:?}",
+                    actual.counterparty().channel_id()
+                ));
+            }
+            if actual.ordering != self.channel.ordering {
+                mismatches.push(format!(
+                    "{side}.ordering expected={:?} actual={:?}",
+                    self.channel.ordering, actual.ordering
+                ));
+            }
+        }
+        if source.version != destination.version {
+            mismatches.push(format!(
+                "destination.version expected={} actual={}",
+                source.version, destination.version
+            ));
+        }
+        if !mismatches.is_empty() {
+            return Err(unavailable(&format!(
+                "channel identity, ordering or version changed: source={}/{} on {} at {} destination={}/{} on {} at {}: {}",
+                self.src_port_id(), self.src_channel_id(), self.src_chain().id(), heights.0,
+                self.dst_port_id(), self.dst_channel_id(), self.dst_chain().id(), heights.1,
+                mismatches.join(" | "),
+            )));
         }
         let ([source_hop], [destination_hop]) = (
             source.connection_hops().as_slice(),
