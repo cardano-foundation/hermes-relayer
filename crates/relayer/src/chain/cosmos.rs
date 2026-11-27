@@ -1846,6 +1846,12 @@ impl ChainEndpoint for CosmosSdkChain {
             matches!(include_proof, IncludeProof::Yes),
         )?;
 
+        if res.value.is_empty() {
+            return Err(Error::query(format!(
+                "channel {}/{} has no value at {:?}, refusing to infer a channel from an empty response",
+                request.port_id, request.channel_id, request.height
+            )));
+        }
         let mut channel_end = ChannelEnd::decode_vec(&res.value).map_err(Error::decode)?;
 
         if channel_end.is_open() {
