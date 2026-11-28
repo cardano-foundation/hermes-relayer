@@ -73,6 +73,41 @@ fn update_lock(key: UpdateKey) -> Arc<Mutex<()>> {
     lock
 }
 
+// A forward observation activates against one mutable checkpoint reference.
+// Different proof heights must therefore share a lock for the whole client.
+type ObservationKey = (ChainId, ChainId, ClientId);
+static OBSERVATION_LOCKS: LazyLock<Mutex<HashMap<ObservationKey, Weak<Mutex<()>>>>> =
+    LazyLock::new(Mutex::default);
+
+fn coordinate_observation<T>(
+    key: ObservationKey,
+    mut prepare_and_activate: impl FnMut() -> Result<T, ForeignClientError>,
+) -> Result<T, ForeignClientError> {
+    let lock = {
+        let mut locks = OBSERVATION_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = locks.get(&key).and_then(Weak::upgrade).unwrap_or_default();
+        locks.insert(key.clone(), Arc::downgrade(&lock));
+        lock
+    };
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    for attempt in 0..3 {
+        let result = prepare_and_activate();
+        let stale = matches!(&result, Err(error) if matches!(error.detail(),
+            ForeignClientErrorDetail::CheckpointUpdate(detail)
+                if detail.description.contains("forward observation base became stale during staging")));
+        if !stale || attempt == 2 {
+            return result;
+        }
+        // Another relayer can still advance the client. This explicit rejection
+        // means activation did not commit. Requery state and rebuild the header,
+        // rather than resending the old session or retrying ambiguous failures.
+        warn!(client = %key.2, attempt = attempt + 1,
+            "forward observation base changed, rebuilding from current client state");
+    }
+    unreachable!()
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ExpiredOrFrozen {
     Expired,
@@ -1325,6 +1360,13 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
     }
 
     fn refresh_probabilistic_checkpoint(&self) -> Result<Vec<IbcEvent>, ForeignClientError> {
+        coordinate_observation(
+            (self.dst_chain.id(), self.src_chain.id(), self.id.clone()),
+            || self.refresh_probabilistic_checkpoint_once(),
+        )
+    }
+
+    fn refresh_probabilistic_checkpoint_once(&self) -> Result<Vec<IbcEvent>, ForeignClientError> {
         let before = self.validated_client_state()?.0;
         let evidence = self.maintenance_evidence_client(&before)?;
         let header = self
@@ -2193,6 +2235,31 @@ impl<DstChain: ChainHandle, SrcChain: ChainHandle> ForeignClient<DstChain, SrcCh
         fields(client = %self, %target_height)
     )]
     pub fn wait_and_build_update_client_with_trusted(
+        &self,
+        target_height: Height,
+        trusted_height: Option<Height>,
+    ) -> Result<Vec<Any>, ForeignClientError> {
+        if self.id.as_str().starts_with(&format!(
+            "{}-",
+            ClientId::prefix(ClientType::CardanoProbabilistic)
+        )) {
+            let mut next_trusted_height = trusted_height;
+            return coordinate_observation(
+                (self.dst_chain.id(), self.src_chain.id(), self.id.clone()),
+                || {
+                    let result = self.wait_and_build_update_client_with_trusted_once(
+                        target_height,
+                        next_trusted_height,
+                    );
+                    next_trusted_height = None;
+                    result
+                },
+            );
+        }
+        self.wait_and_build_update_client_with_trusted_once(target_height, trusted_height)
+    }
+
+    fn wait_and_build_update_client_with_trusted_once(
         &self,
         target_height: Height,
         trusted_height: Option<Height>,
@@ -3383,6 +3450,107 @@ mod tests {
 
     fn height(revision_height: u64) -> Height {
         Height::new(0, revision_height).expect("valid test height")
+    }
+
+    #[test]
+    fn observation_workers_read_the_base_after_the_previous_activation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let key = (
+            ChainId::from_string("observation-destination"),
+            ChainId::from_string("cardano-0"),
+            "08-cardano-probabilistic-0".parse().unwrap(),
+        );
+        let base = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let first_key = key.clone();
+        let first_base = base.clone();
+        let first = thread::spawn(move || {
+            super::coordinate_observation(first_key, || {
+                let trusted = first_base.load(Ordering::SeqCst);
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                assert_eq!(trusted, 0);
+                first_base.store(20, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // A separate client can progress while the first client's activation waits.
+        let mut other = key.clone();
+        other.2 = "08-cardano-probabilistic-1".parse().unwrap();
+        super::coordinate_observation(other, || Ok(())).unwrap();
+        let (second_tx, second_rx) = crossbeam_channel::bounded(1);
+        let second = thread::spawn(move || {
+            super::coordinate_observation(key, || {
+                let trusted = base.load(Ordering::SeqCst);
+                second_tx.send(trusted).unwrap();
+                base.store(21, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        });
+        assert!(second_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        release_tx.send(()).unwrap();
+        assert_eq!(second_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 20);
+        first.join().unwrap();
+        second.join().unwrap();
+    }
+
+    #[test]
+    fn observation_rebuilds_only_for_explicit_stale_base_rejection() {
+        let key = (
+            ChainId::from_string("observation-retry-destination"),
+            ChainId::from_string("cardano-0"),
+            "08-cardano-probabilistic-0".parse().unwrap(),
+        );
+        let stale = || {
+            ForeignClientError::checkpoint_update(
+                key.0.clone(),
+                "forward observation base became stale during staging".into(),
+            )
+        };
+        let mut preparations = 0;
+        let result = super::coordinate_observation(key.clone(), || {
+            preparations += 1;
+            if preparations == 1 {
+                Err(stale())
+            } else {
+                Ok(42)
+            }
+        });
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(preparations, 2);
+        let mut attempts = 0;
+        assert!(super::coordinate_observation(key.clone(), || {
+            attempts += 1;
+            Err::<(), _>(stale())
+        })
+        .is_err());
+        assert_eq!(attempts, 3);
+        for description in [
+            "submission timed out",
+            "connection reset",
+            "invalid observation proof",
+        ] {
+            let mut attempts = 0;
+            assert!(super::coordinate_observation(key.clone(), || {
+                attempts += 1;
+                Err::<(), _>(ForeignClientError::checkpoint_update(
+                    key.0.clone(),
+                    description.into(),
+                ))
+            })
+            .is_err());
+            assert_eq!(
+                attempts, 1,
+                "must not replay an ambiguous or unrelated failure"
+            );
+        }
     }
 
     #[test]
