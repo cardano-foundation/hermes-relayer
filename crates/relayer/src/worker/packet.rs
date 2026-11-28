@@ -2,6 +2,7 @@ use core::time::Duration;
 use std::borrow::BorrowMut;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
 use itertools::Itertools;
@@ -43,6 +44,56 @@ const INCENTIVIZED_CACHE_MAX_CAPACITY: u64 = 1000;
 // Number of NewBlock consecutive NewBlock events before aborting the
 // packet cmd worker.
 const IDLE_TIMEOUT_BLOCKS: u64 = 100;
+
+const PACKET_PROOF_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+// Cardano emits confirmed events before the corresponding tree is accepted
+// for proofs. Keep the command until that tree is available. This gate runs
+// before scheduling or submission, so it cannot replay an ambiguous broadcast.
+struct PacketProofGate {
+    enabled: bool,
+    pending: Option<WorkerCmd>,
+    retry_at: Instant,
+}
+
+impl PacketProofGate {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            pending: None,
+            retry_at: Instant::now(),
+        }
+    }
+
+    fn next<E>(
+        &mut self,
+        now: Instant,
+        next_command: impl FnOnce() -> Option<WorkerCmd>,
+        accepted_height: impl FnOnce() -> Result<Height, E>,
+    ) -> Result<Option<WorkerCmd>, E> {
+        if self.pending.is_some() && now < self.retry_at {
+            return Ok(None);
+        }
+        let Some(command) = self.pending.take().or_else(next_command) else {
+            return Ok(None);
+        };
+        if self.enabled {
+            if let WorkerCmd::IbcEvents { batch } = &command {
+                let required_height = batch.height;
+                // Retain ownership even when the readiness query fails.
+                self.pending = Some(command);
+                self.retry_at = now + PACKET_PROOF_RETRY_INTERVAL;
+                let accepted = accepted_height()?;
+                if accepted < required_height {
+                    debug!(%accepted, %required_height, "waiting for Cardano packet proof readiness");
+                    return Ok(None);
+                }
+                return Ok(self.pending.take());
+            }
+        }
+        Ok(Some(command))
+    }
+}
 
 /// Take a bounded snapshot, including block notifications between packet
 /// batches. Receiving more commands must never postpone this dispatch.
@@ -121,9 +172,20 @@ pub fn spawn_packet_cmd_worker<ChainA: ChainHandle, ChainB: ChainHandle>(
 
     let mut idle_worker_timer = 0;
 
+    let mut proof_gate = PacketProofGate::new(matches!(
+        link.lock().unwrap().a_to_b.src_chain().config(),
+        Ok(ChainConfig::Cardano(_))
+    ));
     let mut route_retry = VecDeque::new();
     spawn_background_task(span, Some(Duration::from_millis(200)), move || {
-        if let Some(cmd) = route_retry.pop_front().or_else(|| cmd_rx.try_recv().ok()) {
+        let command = proof_gate
+            .next(
+                Instant::now(),
+                || route_retry.pop_front().or_else(|| cmd_rx.try_recv().ok()),
+                || link.lock().unwrap().a_to_b.src_latest_height(),
+            )
+            .map_err(handle_link_error_in_task)?;
+        if let Some(cmd) = command {
             let is_new_batch = cmd.is_ibc_events();
             if is_new_batch {
                 let refreshed = link.lock().unwrap().a_to_b.refresh_channel_route();
@@ -220,9 +282,20 @@ pub fn spawn_incentivized_packet_cmd_worker<ChainA: ChainHandle, ChainB: ChainHa
             .build(),
     );
 
+    let mut proof_gate = PacketProofGate::new(matches!(
+        link.lock().unwrap().a_to_b.src_chain().config(),
+        Ok(ChainConfig::Cardano(_))
+    ));
     let mut route_retry = None;
     spawn_background_task(span, Some(Duration::from_millis(200)), move || {
-        if let Some(cmd) = route_retry.take().or_else(|| cmd_rx.try_recv().ok()) {
+        let command = proof_gate
+            .next(
+                Instant::now(),
+                || route_retry.take().or_else(|| cmd_rx.try_recv().ok()),
+                || link.lock().unwrap().a_to_b.src_latest_height(),
+            )
+            .map_err(handle_link_error_in_task)?;
+        if let Some(cmd) = command {
             let refreshed = link.lock().unwrap().a_to_b.refresh_channel_route();
             if let Err(error) = refreshed {
                 // Keep the command while route discovery is unavailable or
@@ -766,6 +839,83 @@ mod ready_command_tests {
                 events: vec![],
             },
         }
+    }
+
+    #[test]
+    fn packet_survives_early_proof_queries_and_dispatches_once_when_ready() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        sender.send(batch(4_904_685)).unwrap();
+        let mut gate = PacketProofGate::new(true);
+        let start = Instant::now();
+        let mut dispatched = Vec::new();
+        // Both early heights match the failed live run. No new event or
+        // periodic clearing command arrives after the original packet event.
+        for (i, height) in [4_904_669, 4_904_679, 4_904_685].into_iter().enumerate() {
+            let command = gate
+                .next(
+                    start + PACKET_PROOF_RETRY_INTERVAL * i as u32,
+                    || receiver.try_recv().ok(),
+                    || Ok::<_, ()>(Height::new(0, height).unwrap()),
+                )
+                .unwrap();
+            if let Some(WorkerCmd::IbcEvents { batch }) = command {
+                dispatched.push(batch.height.revision_height());
+            }
+            if i < 2 {
+                assert!(
+                    dispatched.is_empty(),
+                    "must not construct or sign before proof readiness"
+                );
+            }
+        }
+        assert_eq!(dispatched, vec![4_904_685]);
+        assert!(gate
+            .next::<()>(
+                start + PACKET_PROOF_RETRY_INTERVAL * 3,
+                || receiver.try_recv().ok(),
+                || panic!("no remaining command should query readiness"),
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn readiness_failure_keeps_packet_and_respects_retry_interval() {
+        let mut gate = PacketProofGate::new(true);
+        let start = Instant::now();
+        let error = gate.next(start, || Some(batch(10)), || Err("unavailable"));
+        assert_eq!(error.unwrap_err(), "unavailable");
+        assert!(gate
+            .next::<&str>(
+                start + Duration::from_secs(1),
+                || panic!("pending event must stay ahead of later commands"),
+                || panic!("readiness queries must be bounded"),
+            )
+            .unwrap()
+            .is_none());
+        let ready = gate
+            .next(
+                start + PACKET_PROOF_RETRY_INTERVAL,
+                || panic!("original event must be retained"),
+                || Ok::<_, &str>(Height::new(0, 10).unwrap()),
+            )
+            .unwrap();
+        assert!(
+            matches!(ready, Some(WorkerCmd::IbcEvents { batch }) if batch.height.revision_height() == 10)
+        );
+    }
+
+    #[test]
+    fn cosmos_events_do_not_wait_for_cardano_proof_readiness() {
+        let mut gate = PacketProofGate::new(false);
+        assert!(gate
+            .next::<()>(
+                Instant::now(),
+                || Some(batch(10)),
+                || panic!("Cosmos events do not need the Cardano readiness query"),
+            )
+            .unwrap()
+            .is_some());
     }
 
     #[test]
